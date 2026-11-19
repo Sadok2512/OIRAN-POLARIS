@@ -239,7 +239,10 @@ fn decode_ie(ie: &NgapIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
         110 | 130 => decode_aggregate_bitrate(&ie.value),
         112 => decode_single_enum("ue_context_request", &ie.value),
         113 => decode_single_enum("paging_priority", &ie.value),
-        114 => decode_ue_ngap_ids(&ie.value),
+        // 2.21.66+ (ordre #9 7005689840) — IE 114 UE-NGAP-IDs décodé
+        // pour les DEUX branches du CHOICE (pair + aMF-UE-NGAP-ID seul),
+        // sans la limite `len()==4` du décodeur 2.21.65.
+        114 => decode_ue_ngap_ids_full(&ie.value),
         117 => (
             Some(format!(
                 "ue_radio_capability_sha256={}",
@@ -1007,6 +1010,111 @@ fn decode_plmn(v: &[u8]) -> String {
     format!("{mcc}-{mnc}")
 }
 
+/// 2.21.66+ (ordre #9 7005689840) — IE 114 UE-NGAP-IDs : décodage
+/// complet des 2 branches du CHOICE (TS 38.413 §9.3.1.19).
+/// Header de l'octet 0 (bits MSB→LSB) :
+///   - bit 7 : extension (0 pour les deux branches du root)
+///   - bit 6 : choice tag (0 = uE-NGAP-ID-pair, 1 = aMF-UE-NGAP-ID)
+/// Puis pour chaque branche, aligné APER :
+///   - uE-NGAP-ID-pair : SEQUENCE { aMF-UE-NGAP-ID (INTEGER 0..2^40-1),
+///     rAN-UE-NGAP-ID (INTEGER 0..2^32-1) [, iE-Extensions] } ;
+///     SEQ_ext(1b) + opt_iEExt(1b) + aMF_len_minus_1(3b) + pad(1b) = 1 octet
+///     (ou dans le header si place) ; valeur aMF sur `len` octets ;
+///     rAN_len_minus_1(2b) + pad(6b) = 1 octet ; valeur rAN sur `len` octets.
+///   - aMF-UE-NGAP-ID : length_minus_1(3b) + pad(2b) = partagé avec le header
+///     de l'octet 0, puis `len` octets de valeur.
+/// Fixtures pycrate vérifiées : `000c0022` (pair small 12/34),
+/// `0612345678c0deadbeef` (pair large 0x12345678/0xdeadbeef),
+/// `580a0b0c0d` (aMF seul 0x0a0b0c0d).
+fn decode_ue_ngap_ids_full(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+    if v.is_empty() {
+        return malformed();
+    }
+    let ext = (v[0] >> 7) & 1;
+    if ext != 0 {
+        return (
+            Some(format!("ue_ngap_ids_choice_extension=true,ue_ngap_ids_sha256={}", sha256_hex(v))),
+            DecodeStatus::Partial,
+            false,
+        );
+    }
+    let tag = (v[0] >> 6) & 1;
+    match tag {
+        0 => {
+            // uE-NGAP-ID-pair : bits restants du header octet 0 =
+            //   SEQ_ext(1b) + opt_iEExt(1b) + aMF_len_minus_1(3b) + pad(1b).
+            // Donc bits 5..3 = SEQ_ext + opt_iEExt + bit2 de len
+            // Et bits 2..0 = reste de len + pad... en fait :
+            //   octet 0 = [ext=0, tag=0, SEQ_ext, opt, lm2, lm1, lm0, pad1]
+            //   lm = aMF_len_minus_1 sur 3 bits, lm+1 octets.
+            // Attention : les bits 5 (SEQ_ext) et 4 (opt) doivent être 0
+            // pour la version root-only sans extension ; non-zéro → Partial.
+            let seq_ext = (v[0] >> 5) & 1;
+            let opt_ext = (v[0] >> 4) & 1;
+            let amf_len = ((v[0] >> 1) & 0x07) as usize + 1;
+            if seq_ext != 0 {
+                return (
+                    Some(format!("ue_ngap_ids_pair_seq_extension=true,ue_ngap_ids_sha256={}", sha256_hex(v))),
+                    DecodeStatus::Partial,
+                    false,
+                );
+            }
+            if amf_len > 5 {
+                return malformed();
+            }
+            let mut cursor = 1usize;
+            if cursor + amf_len > v.len() {
+                return malformed();
+            }
+            let amf = u64_be(&v[cursor..cursor + amf_len]);
+            cursor += amf_len;
+            if cursor >= v.len() {
+                return malformed();
+            }
+            let ran_len = ((v[cursor] >> 6) & 0x03) as usize + 1;
+            cursor += 1;
+            if ran_len > 4 || cursor + ran_len > v.len() {
+                return malformed();
+            }
+            let ran = u64_be(&v[cursor..cursor + ran_len]);
+            let mut extra = String::new();
+            if opt_ext != 0 {
+                extra.push_str(",ue_ngap_ids_pair_ie_extensions=present");
+            }
+            (
+                Some(format!(
+                    "amf_ue_ngap_id={amf},ran_ue_ngap_id={ran},ue_ngap_ids_choice=pair{extra}"
+                )),
+                DecodeStatus::Decoded,
+                false,
+            )
+        }
+        _ => {
+            // aMF-UE-NGAP-ID seul : header octet 0 =
+            //   [ext=0, tag=1, lm2, lm1, lm0, pad(3b)] — lm = len_minus_1.
+            let amf_len = ((v[0] >> 3) & 0x07) as usize + 1;
+            if amf_len > 5 {
+                return malformed();
+            }
+            if 1 + amf_len > v.len() {
+                return malformed();
+            }
+            let amf = u64_be(&v[1..1 + amf_len]);
+            (
+                Some(format!(
+                    "amf_ue_ngap_id={amf},ue_ngap_ids_choice=amf_only"
+                )),
+                DecodeStatus::Decoded,
+                false,
+            )
+        }
+    }
+}
+
+fn u64_be(v: &[u8]) -> u64 {
+    v.iter().fold(0u64, |a, b| (a << 8) | u64::from(*b))
+}
+
 /// 2.21.66 (ordre #9 7004955176) — IE 60 / 67 / 70 / 79 / 133 : walker
 /// APER SEQUENCE OF `PDUSessionResource*Item` (TS 38.413 §9.3.4.*). Chaque
 /// item est une SEQUENCE { pDUSessionID (INTEGER 0..255, 1 octet) [,
@@ -1031,27 +1139,27 @@ fn decode_pdu_session_release_list(id: u16, v: &[u8]) -> (Option<String>, Decode
         _ => "release",
     };
     let has_inner_transfer = matches!(id, 67 | 70 | 79);
-    // SEQUENCE OF APER : bit d'extension (1b, doit être 0 pour nos versions)
-    // + length determinant (7b pour N-1, N ≤ 128 ; forme longue non gérée
-    // ici, documentée OUVERTE).
-    let first = v[0];
-    if first & 0x80 != 0 {
-        return (
-            Some(format!(
-                "nested_list_sha256={},release_list_type={label_prefix},length_form=unsupported",
-                sha256_hex(v)
-            )),
-            DecodeStatus::Partial,
-            false,
-        );
-    }
-    let count = (first & 0x7f) as usize + 1;
+    // PDUSessionResource*List : SIZE(1..maxnoofPDUSessions=256). En
+    // aligned PER, le length determinant d'une SEQUENCE OF contrainte
+    // avec `ub-lb+1 <= 256` est codé sur 1 octet (`len - 1` sur 8 bits,
+    // range 0..255). 2.21.66+ (ordre #9 7005689840) : correction de la
+    // lecture — anciennement `(v[0] & 0x7f) + 1`, ce qui plafonnait à
+    // 128. Fixture pycrate `pdu_session_resource_list_cxt_rel_cpl_200`
+    // a `v[0] = 0xc7` (199 = N-1) → N=200 avec la nouvelle lecture.
+    let count = (v[0] as usize) + 1;
     let mut value = format!("nested_list_sha256={}", sha256_hex(v));
     value.push_str(&format!(
         ",release_list_type={label_prefix},release_item_count={count}"
     ));
     let mut cursor = 1usize;
     let mut extracted = 0usize;
+    // Cap d'émission par item pour les grandes listes : au-delà de 64,
+    // on arrête d'émettre les champs `item_<i>_*` (sinon un event
+    // explose à 6-10 kB pour les captures bulk 256 sessions). Les items
+    // au-delà de 64 sont néanmoins comptés et parcourus pour le `cursor`,
+    // et leurs pdu_session_id apparaissent dans le `item_summary_sha256`.
+    const ITEM_EMIT_CAP: usize = 64;
+    let mut summary_bytes: Vec<u8> = Vec::with_capacity(count.min(1024));
     for index in 0..count {
         // SEQUENCE Item : 1 bit d'extension + preamble optionnel +
         // pDUSessionID (1 octet). APER aligné : preamble = 1 octet.
@@ -1062,11 +1170,14 @@ fn decode_pdu_session_release_list(id: u16, v: &[u8]) -> (Option<String>, Decode
         cursor += 1;
         let pdu_session_id = v[cursor];
         cursor += 1;
-        value.push_str(&format!(",item_{index}_pdu_session_id={pdu_session_id}"));
-        // Alias canonique 1er item (comme setup su_req / su_res) : la
-        // session-engine indexe sur `pdu_session_id` nu.
-        if index == 0 {
-            value.push_str(&format!(",pdu_session_id={pdu_session_id}"));
+        summary_bytes.push(pdu_session_id);
+        if index < ITEM_EMIT_CAP {
+            value.push_str(&format!(",item_{index}_pdu_session_id={pdu_session_id}"));
+            // Alias canonique 1er item (comme setup su_req / su_res) : la
+            // session-engine indexe sur `pdu_session_id` nu.
+            if index == 0 {
+                value.push_str(&format!(",pdu_session_id={pdu_session_id}"));
+            }
         }
         if has_inner_transfer {
             if cursor >= v.len() {
@@ -1082,12 +1193,20 @@ fn decode_pdu_session_release_list(id: u16, v: &[u8]) -> (Option<String>, Decode
             }
             let transfer_bytes = &v[cursor..cursor + len];
             cursor += len;
-            value.push_str(&format!(
-                ",item_{index}_transfer_length={len},item_{index}_transfer_sha256={}",
-                sha256_hex(transfer_bytes)
-            ));
+            if index < ITEM_EMIT_CAP {
+                value.push_str(&format!(
+                    ",item_{index}_transfer_length={len},item_{index}_transfer_sha256={}",
+                    sha256_hex(transfer_bytes)
+                ));
+            }
         }
         extracted += 1;
+    }
+    if count > ITEM_EMIT_CAP && extracted > ITEM_EMIT_CAP {
+        value.push_str(&format!(
+            ",items_cap_reached={ITEM_EMIT_CAP},items_summary_sha256={}",
+            sha256_hex(&summary_bytes)
+        ));
     }
     let status = if extracted == count {
         DecodeStatus::Decoded
@@ -1142,24 +1261,163 @@ fn decode_time_to_wait(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
     }
 }
 
-/// 2.21.66 (ordre #9 7004955176) — IE 19 CriticalityDiagnostics
-/// (TS 38.413 §9.3.1.23). SEQUENCE { procedureCode?, triggeringMessage?,
-/// procedureCriticality?, iEsCriticalityDiagnostics? (SEQUENCE OF {
-/// iECriticality, iE-ID, typeOfError }) }. Décodage structural seulement :
-/// preamble d'optionnalité + sha256. Décodage complet déclaré OUVERT.
+/// 2.21.66+ (ordre #9 7005689840) — IE 19 CriticalityDiagnostics décodé
+/// complètement (TS 38.413 §9.3.1.21). SEQUENCE {
+///   procedureCode       ProcedureCode OPTIONAL,
+///   triggeringMessage   TriggeringMessage OPTIONAL,
+///   procedureCriticality  Criticality OPTIONAL,
+///   iEsCriticalityDiagnostics CriticalityDiagnostics-IE-List OPTIONAL,
+///   iE-Extensions       OPTIONAL, ...
+/// }. Preamble octet 0 = ext(1b) + 5 bits d'optionnalité (procedureCode,
+/// triggeringMessage, procedureCriticality, iEsCriticalityDiagnostics,
+/// iE-Extensions) + 2 bits de padding. procedureCode = INTEGER(0..255),
+/// 1 octet. triggeringMessage/Criticality = ENUMERATED root-3 → 2 bits
+/// + 1 ext = 3 bits. iEsCriticalityDiagnostics = SEQUENCE OF item avec
+/// item { iECriticality(1ext+2b=3b), iE-ID(2 oct aligné), typeOfError(
+/// 1ext+1b=2b, root-2) }. Fixture pycrate :
+/// `780f000100000a44005500` → procedureCode=15, trigger=initiating,
+/// crit=reject, 2 items {10,reject,missing} + {85,ignore,not-understood}.
 fn decode_criticality_diagnostics(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
     if v.is_empty() {
         return malformed();
     }
-    (
-        Some(format!(
-            "criticality_diagnostics_sha256={},crit_diag_preamble=0x{:02x}",
-            sha256_hex(v),
-            v[0]
-        )),
-        DecodeStatus::Partial,
-        false,
-    )
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("criticality_diagnostics_sha256={}", sha256_hex(v)));
+    // Preamble bits.
+    let mut br = BitReader::new(v);
+    let Some(_ext) = br.read(1) else { return malformed(); };
+    let Some(opt_pc) = br.read(1) else { return malformed(); };
+    let Some(opt_tm) = br.read(1) else { return malformed(); };
+    let Some(opt_pcrit) = br.read(1) else { return malformed(); };
+    let Some(opt_ies) = br.read(1) else { return malformed(); };
+    let Some(_opt_ext) = br.read(1) else { return malformed(); };
+    // 2 bits de padding pour aligner octet.
+    let _ = br.read(2);
+    let mut cursor = 1usize;
+    let mut status = DecodeStatus::Decoded;
+    // procedureCode : 1 octet.
+    if opt_pc == 1 {
+        if cursor >= v.len() {
+            return (Some(parts.join(",")), DecodeStatus::Partial, false);
+        }
+        parts.push(format!("procedure_code={}", v[cursor]));
+        cursor += 1;
+    }
+    // triggeringMessage + procedureCriticality + items : on relit en bits
+    // depuis `cursor`.
+    let mut br2 = BitReader::new(&v[cursor..]);
+    let mut bits_consumed = 0usize;
+    // 2.21.66+ : TriggeringMessage et Criticality ne sont PAS extensibles
+    // dans NGAP (vérifié via pycrate `_ext: None`) ; chacun = 2 bits (pas
+    // de bit d'extension préfixe).
+    if opt_tm == 1 {
+        let Some(tm) = br2.read(2) else {
+            return (Some(parts.join(",")), DecodeStatus::Partial, false);
+        };
+        bits_consumed += 2;
+        let label = match tm {
+            0 => "initiating-message",
+            1 => "successful-outcome",
+            2 => "unsuccessful-outcome",
+            _ => "reserved",
+        };
+        parts.push(format!("triggering_message={label}"));
+    }
+    if opt_pcrit == 1 {
+        let Some(c) = br2.read(2) else {
+            return (Some(parts.join(",")), DecodeStatus::Partial, false);
+        };
+        bits_consumed += 2;
+        let label = match c {
+            0 => "reject",
+            1 => "ignore",
+            2 => "notify",
+            _ => "reserved",
+        };
+        parts.push(format!("procedure_criticality={label}"));
+    }
+    // Aligner au prochain octet avant le length determinant.
+    let pad = (8 - (bits_consumed % 8)) % 8;
+    if pad > 0 {
+        let _ = br2.read(pad);
+        bits_consumed += pad;
+    }
+    cursor += bits_consumed / 8;
+    if opt_ies == 1 {
+        if cursor >= v.len() {
+            return (Some(parts.join(",")), DecodeStatus::Partial, false);
+        }
+        // CriticalityDiagnostics-IE-List : SIZE(1..maxnoofErrors=256). 1 octet
+        // de length-1. (NB : maxnoofErrors vaut souvent 256 dans TS 38.413.)
+        let item_count = (v[cursor] as usize) + 1;
+        cursor += 1;
+        parts.push(format!("ies_diag_item_count={item_count}"));
+        let mut item_br = BitReader::new(&v[cursor..]);
+        let mut item_bits = 0usize;
+        for i in 0..item_count {
+            // SEQ preamble item : ext(1b) + opt_iEExt(1b) = 2 bits.
+            let Some(_i_ext) = item_br.read(1) else {
+                status = DecodeStatus::Partial;
+                break;
+            };
+            let Some(_i_opt) = item_br.read(1) else {
+                status = DecodeStatus::Partial;
+                break;
+            };
+            item_bits += 2;
+            // iECriticality : 2 bits (Criticality non extensible).
+            let Some(ic_val) = item_br.read(2) else {
+                status = DecodeStatus::Partial;
+                break;
+            };
+            item_bits += 2;
+            let ic_label = match ic_val {
+                0 => "reject",
+                1 => "ignore",
+                2 => "notify",
+                _ => "reserved",
+            };
+            // Aligner au prochain octet avant iE-ID (2 octets).
+            let pad = (8 - (item_bits % 8)) % 8;
+            if pad > 0 {
+                let _ = item_br.read(pad);
+                item_bits += pad;
+            }
+            let Some(hi) = item_br.read(8) else {
+                status = DecodeStatus::Partial;
+                break;
+            };
+            let Some(lo) = item_br.read(8) else {
+                status = DecodeStatus::Partial;
+                break;
+            };
+            item_bits += 16;
+            let ie_id = ((hi as u16) << 8) | (lo as u16);
+            // typeOfError : 1 ext + 1 bit (root-2 : not-understood, missing).
+            let Some(te_ext) = item_br.read(1) else {
+                status = DecodeStatus::Partial;
+                break;
+            };
+            let Some(te_val) = item_br.read(1) else {
+                status = DecodeStatus::Partial;
+                break;
+            };
+            item_bits += 2;
+            let te_label = if te_ext == 1 {
+                "extension"
+            } else {
+                match te_val {
+                    0 => "not-understood",
+                    1 => "missing",
+                    _ => "reserved",
+                }
+            };
+            parts.push(format!(
+                "ies_diag_item_{i}_ie_id={ie_id},ies_diag_item_{i}_criticality={ic_label},ies_diag_item_{i}_type_of_error={te_label}"
+            ));
+        }
+    }
+    (Some(parts.join(",")), status, false)
 }
 
 fn malformed() -> (Option<String>, DecodeStatus, bool) {
@@ -2142,15 +2400,101 @@ fn time_to_wait_decodes_v10s_from_pycrate_octet() {
     assert_eq!(decode_time_to_wait(&[]).1, DecodeStatus::Malformed);
 }
 
-/// 2.21.66 — IE 19 CriticalityDiagnostics : structural seulement.
+/// 2.21.66+ (ordre #9 7005689840) — IE 19 CriticalityDiagnostics
+/// décodage complet : fixture pycrate `780f000100000a44005500` →
+/// procedureCode=15, triggeringMessage=initiating-message,
+/// procedureCriticality=reject, 2 items (10/reject/missing,
+/// 85/ignore/not-understood).
 #[test]
-fn criticality_diagnostics_returns_structural_sha256_and_preamble() {
-    let (text, status, _) = decode_criticality_diagnostics(&[0xc0, 0x12]);
-    assert_eq!(status, DecodeStatus::Partial);
+fn criticality_diagnostics_decodes_procedure_code_trigger_criticality_and_items() {
+    let fixture = [0x78, 0x0f, 0x00, 0x01, 0x00, 0x00, 0x0a, 0x44, 0x00, 0x55, 0x00];
+    let (text, status, _) = decode_criticality_diagnostics(&fixture);
+    assert_eq!(status, DecodeStatus::Decoded);
     let text = text.expect("some");
-    assert!(text.contains("criticality_diagnostics_sha256="), "{text}");
-    assert!(text.contains("crit_diag_preamble=0xc0"), "{text}");
+    assert!(text.contains("procedure_code=15"), "{text}");
+    assert!(text.contains("triggering_message=initiating-message"), "{text}");
+    assert!(text.contains("procedure_criticality=reject"), "{text}");
+    assert!(text.contains("ies_diag_item_count=2"), "{text}");
+    assert!(text.contains("ies_diag_item_0_ie_id=10"), "{text}");
+    assert!(text.contains("ies_diag_item_0_criticality=reject"), "{text}");
+    assert!(text.contains("ies_diag_item_0_type_of_error=missing"), "{text}");
+    assert!(text.contains("ies_diag_item_1_ie_id=85"), "{text}");
+    assert!(text.contains("ies_diag_item_1_criticality=ignore"), "{text}");
+    assert!(text.contains("ies_diag_item_1_type_of_error=not-understood"), "{text}");
+    // Fixture pycrate minimale (tous optionnels absents) → `0x00`.
+    let (text_empty, status_empty, _) = decode_criticality_diagnostics(&[0x00]);
+    assert_eq!(status_empty, DecodeStatus::Decoded);
+    let text_empty = text_empty.expect("some");
+    assert!(text_empty.contains("criticality_diagnostics_sha256="), "{text_empty}");
+    assert!(!text_empty.contains("procedure_code="), "{text_empty}");
+    assert!(!text_empty.contains("ies_diag_item_count="), "{text_empty}");
+    // Preuve de mutation : vide → Malformed.
     assert_eq!(decode_criticality_diagnostics(&[]).1, DecodeStatus::Malformed);
+}
+
+/// 2.21.66+ — IE 114 UE-NGAP-IDs : décodage complet CHOICE pair.
+#[test]
+fn ue_ngap_ids_decodes_pair_small_values_from_pycrate_octets() {
+    // Fixture pycrate `ue_ngap_ids_pair_small` : aMF=12, rAN=34 → 4 octets.
+    let (text, status, _) = decode_ue_ngap_ids_full(&[0x00, 0x0c, 0x00, 0x22]);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("amf_ue_ngap_id=12"), "{text}");
+    assert!(text.contains("ran_ue_ngap_id=34"), "{text}");
+    assert!(text.contains("ue_ngap_ids_choice=pair"), "{text}");
+}
+
+/// 2.21.66+ — IE 114 UE-NGAP-IDs : décodage CHOICE pair avec grandes
+/// valeurs (aMF 4 octets, rAN 4 octets). Prouve que `len()==4` n'est
+/// plus la seule forme supportée.
+#[test]
+fn ue_ngap_ids_decodes_pair_large_values_from_pycrate_octets() {
+    // Fixture pycrate `ue_ngap_ids_pair_large` : aMF=0x12345678, rAN=0xdeadbeef → 10 octets.
+    let fixture = [0x06, 0x12, 0x34, 0x56, 0x78, 0xc0, 0xde, 0xad, 0xbe, 0xef];
+    let (text, status, _) = decode_ue_ngap_ids_full(&fixture);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("amf_ue_ngap_id=305419896"), "{text}"); // 0x12345678
+    assert!(text.contains("ran_ue_ngap_id=3735928559"), "{text}"); // 0xdeadbeef
+    assert!(text.contains("ue_ngap_ids_choice=pair"), "{text}");
+}
+
+/// 2.21.66+ — IE 114 UE-NGAP-IDs : CHOICE aMF-UE-NGAP-ID seul.
+#[test]
+fn ue_ngap_ids_decodes_amf_only_choice_from_pycrate_octets() {
+    // Fixture pycrate `ue_ngap_ids_amf_only` : aMF=0x0a0b0c0d → 5 octets.
+    let fixture = [0x58, 0x0a, 0x0b, 0x0c, 0x0d];
+    let (text, status, _) = decode_ue_ngap_ids_full(&fixture);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("amf_ue_ngap_id=168496141"), "{text}"); // 0x0a0b0c0d
+    assert!(text.contains("ue_ngap_ids_choice=amf_only"), "{text}");
+    // Preuve de mutation : vide → Malformed.
+    assert_eq!(decode_ue_ngap_ids_full(&[]).1, DecodeStatus::Malformed);
+}
+
+/// 2.21.66+ — Forme longue (len-1 sur 8 bits, SIZE(1..256)) : 200 items.
+/// Preuve que l'ancien décodage (`& 0x7f`) qui plafonnait à 128 est corrigé.
+#[test]
+fn release_list_long_length_form_decodes_200_items() {
+    // Construit une liste synthétique de 200 items IE 60 (pas de transfer) :
+    // length-1 = 199 = 0xc7, puis 200 fois [00 <pdu_id>].
+    let mut v = vec![0xc7];
+    for i in 0..200 {
+        v.push(0x00);
+        v.push((i % 256) as u8);
+    }
+    let (text, status, _) = decode_pdu_session_release_list(60, &v);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("release_item_count=200"), "{text}");
+    // Les 64 premiers items sont émis explicitement, puis les autres sont
+    // dans le `items_summary_sha256` avec le marqueur `items_cap_reached`.
+    assert!(text.contains("item_0_pdu_session_id=0"), "{text}");
+    assert!(text.contains("item_63_pdu_session_id=63"), "{text}");
+    assert!(!text.contains("item_64_pdu_session_id="), "{text}");
+    assert!(text.contains("items_cap_reached=64"), "{text}");
+    assert!(text.contains("items_summary_sha256="), "{text}");
 }
 
 /// 2.21.66 — Couverture données stockées : les octets d'un IE 60 (list
