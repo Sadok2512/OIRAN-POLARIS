@@ -198,7 +198,7 @@ version = "0.3.0"
 
 [[package]]
 name = "capture-helper"
-version = "0.1.1-dev"
+version = "0.1.2"
 dependencies = [
  "disk-safety",
  "event-schema",
@@ -574,7 +574,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.6.27"
+version = "0.6.28"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.87"
+version = "2.21.89"
 dependencies = [
  "axum",
  "callflow-renderer",

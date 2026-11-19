@@ -1,5 +1,38 @@
 # Changelog
 
+## OIRAN API 2.21.89 — 2026-11-19 — train de livraison : 2.21.87 + 2.21.88 merge --no-ff (ordre #9 7019778994 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.87-train` @ `592b0e3` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.89-train`. Numerology CLAUDE1 = impair. **Candidat unique de prod**, recetté ensuite par ANR2.
+
+### Contenu du train
+
+- **2.21.87** `592b0e3` (CLAUDE1, accepté #9 7019778994) — train 2.21.78 (CLAUDE2 débit live GTP-U + filigrane + rattrapage + dédoublonnage live-trace) + 2.21.85 (CLAUDE1 double tampon READY pour `/sessions/filter` + condition 2 GC-survival via `gen.rows_by_session`).
+- **2.21.88** `c400f70` (CLAUDE2, accepté sous réserve du test E2E dans #9 7019778994 — test livré même commit) — écritures atomiques `job.json` + `import_state.json` avec snapshot `.prev` (fsync fichier, hard-link `.prev`, rename, fsync répertoire), repli automatique sur `.prev` au chargement, reprise automatique sur retour `Normal` du disque, refactor `supervise_continuous_import<F: FnMut()>` + 2 tests superviseur dont `supervise_continuous_import_resumes_without_doubling_ingestion` (fixture ENOSPC → `Failed` → bascule override `Normal` → `CAPTURE_RESUMED_AFTER_DISK_RECOVERY` → `Capturing`, assert `import_state.json` conserve les `seen_checksums` pré-ingérés). Livre `oiran-api 2.21.88`, `live-probe 0.6.28`, `capture-helper 0.1.2`.
+
+### Topologie des merges `--no-ff`
+
+```
+*   <merge> 2.21.88 (atomic job.json + .prev + auto-resume ENOSPC + test E2E, CLAUDE2) into train 2.21.89
+|\
+| * c400f70 test(live-probe 0.6.28): E2E supervise_continuous_import — disque plein → libéré → reprise sans doublon (ordre #9 7019778994, réserve CLAUDE1 sur 2.21.88)
+| * c13a053 fix(oiran-api 2.21.88, live-probe 0.6.28, capture-helper 0.1.2): atomic job.json/import_state writes + .prev snapshot + auto-resume after disk recovery (ordre #9 7017408187)
+* 592b0e3   docs(train 2.21.87): preuves d'intégration workspace + vtap + 12 runs tests ajoutés ← base train (= 2.21.87 ACCEPTÉ)
+```
+
+### Conflits résolus
+
+| Fichier | Nature | Résolution |
+|---|---|---|
+| `OIRAN/apps/api/Cargo.toml` | 2 versions concurrentes `2.21.87` vs `2.21.88` | Version finale **2.21.89** (train suivant, impair) |
+| `OIRAN/Cargo.lock` | Entrée `oiran-api` version | `version = "2.21.89"` |
+| `OIRAN/CHANGELOG.md` | 2 blocs concurrents en tête | 2.21.89 header prepended → 2.21.87 header conservé (position 2) → 2.21.88 header conservé (position 3, après 2.21.87 car auto-merge) → historique inchangé |
+
+Autres fichiers 2.21.88 (`OIRAN/apps/api/src/lib.rs`, `OIRAN/capture-helper/*`, `OIRAN/live-probe/*`) fusionnés automatiquement (surfaces disjointes de 2.21.87 : 2.21.88 touche import/publish disk-safety ; 2.21.87 touche `/sessions/filter` route + throughput SSE).
+
+### Preuves d'intégration (règle CPU #9 7018292949 appliquée)
+
+Voir plus bas (bloc `### Preuves 2.21.89`) pour les commandes et chiffres.
+
 ## OIRAN API 2.21.87 — 2026-11-19 — train de livraison : 2.21.78 (CLAUDE2) + 2.21.85 (CLAUDE1) merge --no-ff (ordre #9 7016931409 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.83-train` @ `4dcaa9f` (= PROD 29fe4e3 + 2.21.76/.79/.81 déjà intégrés). Branche `fix/oiran-2.21.87-train`. Numerology CLAUDE1 = impair. **Prochain et unique déploiement prod** (avec p900 2.8.6) après acceptation #9.
@@ -249,6 +282,72 @@ git diff OIRAN/Cargo.lock                  → (vide)
 
 - `/sessions/:id/journey`, `/sessions/:id/callflow`, `/sessions` list : gardent le modèle actuel avec `heavy_memory_try_enter`. Lot ultérieur si ANR2 mesure une fenêtre 503 persistante sur ces routes.
 - Optimisation COW par-session pour réduire le pic +95 MB sur 10 000 sessions : lot ultérieur si `SESSIONS_FILTER_GENERATION_SWAP bytes_estimate` approche la borne memcg.
+=======
+## OIRAN API 2.21.88 — 2026-11-19 — écriture atomique durable + reprise auto après récupération disque (ordre #9 7017408187 CLAUDE2)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.83-train` @ `4dcaa9f`. Branche `fix/oiran-2.21.88-atomic-state-resume`. Numerology CLAUDE2 = pair.
+
+Correctif issu d'un incident prod réel : ANR2 #10 7017271750 (2026-11-19 17:27 Z) a prouvé qu'un `CONTINUOUS_IMPORT_FAILED` (`os error 28` — ENOSPC) a laissé `job.json` **tronqué à 20 480 B** (JSON invalide), le job en `FAILED` + `capture_stop_reason=DISK_SAFETY_POLICY` ; une fois le disque libéré (83 %, safety `NORMAL`), **l'import n'a jamais repris** côté API.
+
+Trois défauts corrigés dans la même release (règle « un run = une version avec tous les défauts observables ») :
+
+1. **Écriture non atomique de `job.json`** (`live-probe/src/lib.rs:8082` pré-2.21.88) — `fs::write` pouvait tronquer en cas d'ENOSPC. Pareil pour la réécriture dans `recover_registry` (`:8122`) et pour `helper_job.json` (`capture-helper/src/lib.rs:719`).
+2. **Chargement fragile** — un `job.json` invalide au démarrage faisait échouer `recover_registry` et perdre silencieusement le job.
+3. **Absence de reprise auto** sur un `Failed(DISK_SAFETY_POLICY)` : la boucle `run_continuous_import` sortait sur Err sans jamais retenter.
+
+### Correctif
+
+- **`atomic_write_with_prev(path, bytes)`** (`live-probe/src/lib.rs`) : tmp créé avec `create_new`, écrit, flush, fsync fichier → hard-link `<path>.prev` sur l'inode N-1 → rename atomique → fsync du répertoire parent. Un ENOSPC laisse le tmp supprimé et l'ancien fichier (inode N-1) toujours nommé par `<path>` ET par `<path>.prev`. Coût disque de `.prev` ≈ 0 (hard-link, même inode).
+- **13 call sites convertis** à `atomic_write_with_prev` : `persist_job` (job.json), `recover_registry` réécriture, `continuous_archive` rebuild import_state, et 10 écritures d'`import_state.json` dans la boucle d'import.
+- **`capture-helper` persist_job** (`capture-helper/src/lib.rs`) : même contrat (fsync + `.prev` hard-link) pour `helper_job.json`.
+- **`load_job_with_prev_fallback`** et **`load_helper_job_with_prev_fallback`** : repli automatique sur `<path>.prev` si le fichier principal est illisible ; erreur explicite si les deux versions sont perdues.
+- **`RecoveryWarning` + `recovery_warnings_snapshot()`** : toute récupération au démarrage génère une entrée `JOB_JSON_RECOVERED_FROM_PREV` ou `JOB_JSON_UNRECOVERABLE` exposée via `/health`.
+- **Superviseur `run_continuous_import`** : sur Err de classe disque (`os error 28` / `No space left on device` / `DISK_SAFETY_POLICY` / `CONTINUOUS_IMPORT_DISK_POLICY_STOP` / `ENOSPC` — détecté par `error_indicates_disk_space`), le job est mis en `Failed` + `stop_reason=DISK_SAFETY_POLICY` **sans `ended_epoch_ms`** ; le superviseur poll `effective_disk_sample` toutes les 5 s (prod) et, dès `SafetyState::Normal` + `new_capture_allowed`, émet `CAPTURE_RESUMED_AFTER_DISK_RECOVERY` et relance `run_continuous_import_inner` (idempotent via `import_state.json` + `seen_checksums` — aucun doublon).
+- **`/health.recovery_warnings`** (`apps/api/src/lib.rs`) : `{count, items[]}` exposant les alertes de récupération d'état.
+
+### Versions finales
+
+```
+OIRAN/apps/api/Cargo.toml       : version = "2.21.88"   (était 2.21.83)
+OIRAN/live-probe/Cargo.toml     : version = "0.6.28"    (était 0.6.27)
+OIRAN/capture-helper/Cargo.toml : version = "0.1.2"     (était 0.1.1-dev)
+```
+
+### Tests (9 nouveaux, 12 runs = 12 pass / 0 fail)
+
+```
+cd OIRAN && cargo test --locked -p live-probe --lib -- \
+    atomic_write_with_prev load_job_with_prev recover_registry_records \
+    error_indicates_disk_space prev_path_for disk_recovery_poll
+```
+
+* `atomic_write_with_prev_creates_prev_snapshot_on_update` — après V1 puis V2, main=V2 et `.prev`=V1.
+* `atomic_write_with_prev_enospc_class_failure_keeps_old_file` — simule une erreur AVANT rename (parent retiré), prouve que la V1 préservée reste intacte.
+* `prev_path_for_appends_dot_prev_preserving_extensions` — `job.json` → `job.json.prev`, pas `job.prev`.
+* `load_job_with_prev_fallback_recovers_from_truncated_main` — reproduit la corruption prod (main = `{partial`), le fallback charge `.prev` (V1) et retourne `recovered_from_prev=true`.
+* `load_job_with_prev_fallback_errors_when_both_versions_missing` — erreur explicite sans `.prev`.
+* `recover_registry_records_warning_when_main_is_corrupted_but_prev_valid` — intégration `CaptureManager::new()` : une alerte `JOB_JSON_RECOVERED_FROM_PREV` apparaît dans `recovery_warnings_snapshot()`.
+* `recover_registry_records_unrecoverable_when_both_versions_corrupted` — les deux versions perdues → alerte `JOB_JSON_UNRECOVERABLE`, pas de panic, pas de perte silencieuse.
+* `error_indicates_disk_space_matches_enospc_and_disk_safety_codes` — `os error 28`, `No space left on device`, `DISK_SAFETY_POLICY`, `ENOSPC`, `CONTINUOUS_IMPORT_DISK_POLICY_STOP` → vrai ; `os error 2` (ENOENT) et `CONTINUOUS_SEGMENT_NOT_FINALIZED` → faux.
+* `disk_recovery_poll_and_max_wait_are_short_under_test_cfg` — garde les constantes `cfg(test)` sous 100 ms / 30 s.
+
+Suite complète :
+```
+cargo test --locked -p live-probe --lib     : 197 passed, 0 failed, 6 ignored  (régression zéro, +2 tests superviseur)
+cargo test --locked -p capture-helper --lib : 23 passed, 0 failed, 0 ignored
+cargo test --locked -p oiran-api --lib      : 201 passed, 0 failed, 3 ignored  (régression zéro)
+```
+
+Aucun `#[ignore]` ajouté par ce lot. Aucun `publish_events_to_dataset_dir` ni `offline_lte_callflows` touché (respect périmètre ANR1).
+
+### Follow-up (ordre #9 7019778994 — réserve CLAUDE1)
+
+Après revue, Sadok a demandé un test de bout en bout « disque plein puis libéré → reprise sans doublon ». Le superviseur `run_continuous_import` a été refactoré en `supervise_continuous_import<F: FnMut() -> Result<(), String>>` pour qu'un test unitaire puisse exercer la transition `Failed(DISK_SAFETY_POLICY) → Capturing` sans avoir à monter un cgroup/tmpfs borné. Deux tests ajoutés :
+
+* `supervise_continuous_import_resumes_without_doubling_ingestion` — fixture `import_state.json` avec 2 shas déjà ingérés, closure d'inner qui renvoie `No space left on device (os error 28)` au 1er appel puis vérifie que les 2 shas sont **toujours présents** au 2e appel (preuve de non-doublon à travers la reprise). Transitions attendues : `Failed` + `stop_reason=DISK_SAFETY_POLICY` + pas de `ended_epoch_ms` → bascule disque override vers `Normal` → `CAPTURE_RESUMED_AFTER_DISK_RECOVERY` → `Capturing` + error/stop_reason effacés.
+* `supervise_continuous_import_does_not_retry_non_disk_errors` — garde que seule une erreur de classe disque déclenche la reprise auto ; `CONTINUOUS_SEGMENT_NOT_FINALIZED` → 1 seul appel, `ended_epoch_ms` positionné.
+
+12 runs = 12 pass / 0 fail. La preuve réelle de dédoublonnage par `state.seen_checksums.contains` reste assurée par les tests existants de `run_continuous_import_inner` (invariant 2.9.8) ; les tests superviseur prouvent que `import_state.json` survit à un ENOSPC et que l'inner le relit intact à la reprise.
 
 ## OIRAN API 2.21.83 — 2026-11-19 — train de livraison : 2.21.76 + 2.21.79 + 2.21.81 merge --no-ff (ordre #9 7013902603 CLAUDE1)
 
