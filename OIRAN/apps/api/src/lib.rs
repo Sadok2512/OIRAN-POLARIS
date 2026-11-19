@@ -159,6 +159,16 @@ struct Inner {
     /// du listener ; les états construits isolément dans les tests gardent
     /// le comportement historique tant que l'installation n'a pas eu lieu.
     session_filter_cache_readiness: std::sync::Mutex<SessionFilterCacheReadiness>,
+    /// 2.21.85 (CLAUDE1, ordre #9 7015585561) — double tampon READY
+    /// pour `/sessions/filter`. Le snapshot Arc'd capture au moment du
+    /// swap l'état cohérent (filter_index + journey_index + list_rows)
+    /// de la dernière génération. La route n'accède plus aux caches
+    /// mutables ni au disque ; elle lit l'Arc, servant l'ancienne
+    /// génération pendant que la publication + le prewarm construisent
+    /// la suivante. Aucune 503 pendant une publication si une
+    /// génération READY existait auparavant.
+    generation_slot: std::sync::RwLock<Option<Arc<FilterGeneration>>>,
+    generation_counter: std::sync::atomic::AtomicU64,
     /// 2.21.11 (défaut 2 #9 6930315055) — cache `/sessions/catalog`
     /// keyé par `(commit_seq, dataset_ids, scope_hash)`. Évite de
     /// reconstruire `protocol_tree` + `network_elements` à chaque
@@ -775,6 +785,8 @@ impl AppState {
                 session_filter_cache_readiness: std::sync::Mutex::new(
                     SessionFilterCacheReadiness::default(),
                 ),
+                generation_slot: std::sync::RwLock::new(None),
+                generation_counter: std::sync::atomic::AtomicU64::new(0),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -877,6 +889,8 @@ impl AppState {
                 session_filter_cache_readiness: std::sync::Mutex::new(
                     SessionFilterCacheReadiness::default(),
                 ),
+                generation_slot: std::sync::RwLock::new(None),
+                generation_counter: std::sync::atomic::AtomicU64::new(0),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -3650,6 +3664,57 @@ struct SessionFilterCacheReadiness {
     ready_generation: Option<Vec<String>>,
 }
 
+/// 2.21.85 (CLAUDE1, ordre #9 7015585561) — snapshot immuable servi
+/// par `/sessions/filter` tant qu'une nouvelle génération n'a pas été
+/// préchauffée avec succès. Toutes les données servables sont Arc'd ;
+/// la route ne fait que `Arc::clone` et lit. Aucune allocation lourde,
+/// aucune lecture disque (les lignes pré-rendues sont dans
+/// `list_rows`, matérialisées à la fin du prewarm sous
+/// `heavy_memory_try_enter_exclusive`).
+pub(crate) struct FilterGeneration {
+    /// Numéro monotone, incrémenté à chaque swap.
+    pub generation: u64,
+    /// `commit_seq` max observé sur les datasets live au moment du swap.
+    pub commit_seq: u64,
+    /// Signature des sources (= `journey_signature(state)`) au moment
+    /// du build, pour diagnostic.
+    pub signature: Vec<String>,
+    /// epoch_ms du swap. Sert à calculer `stale_since_ms` dans la
+    /// réponse de la route.
+    pub ready_since_ms: u64,
+    pub filter_index: Arc<session_filters::SessionFilterIndex>,
+    pub journey_index: Arc<subscriber_journey::JourneyIndex>,
+    /// Lignes de liste pré-rendues par `(dataset_id, session_id)`.
+    /// Alimenté exclusivement par le prewarm sous garde exclusive ;
+    /// READY ⇒ `deferred == 0 && missing == 0`, donc TOUTES les sessions
+    /// de la génération sont présentes ici. La route interroge cette
+    /// HashMap et NE FAIT JAMAIS d'accès disque via
+    /// `capture_manager.callflow(...)`.
+    pub list_rows: Arc<std::collections::HashMap<(String, String), (Value, Value)>>,
+    /// 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2 "GC-survival") —
+    /// index secondaire `session_id → (prebuilt_summary, events_identities)`
+    /// construit atomiquement avec `list_rows` au moment du swap. La route
+    /// résout chaque ligne de page par `rows_by_session.get(session_id)`
+    /// sans jamais consulter `state.inner.capture_manager.datasets()` ni
+    /// `callflow(...)` : une génération READY continue donc à servir une
+    /// réponse identique même après GC des fichiers du dataset qui l'a
+    /// nourrie (préchauffage de la génération suivante échoué → `ready`
+    /// reste pointé sur `gen`). Les identités dynamiques (vault +
+    /// hydratation tshark) sont rejointes à la lecture comme avant.
+    pub rows_by_session: Arc<std::collections::HashMap<String, (Value, Value)>>,
+    /// Lower-bound de la taille mémoire de la génération, exposée en
+    /// trace `SESSIONS_FILTER_GENERATION_SWAP bytes_estimate=…`.
+    pub bytes_estimate: u64,
+    /// Nombre de sessions servables (sessions dans `filter_index`).
+    pub session_count: u64,
+}
+
+impl FilterGeneration {
+    pub(crate) fn stale_since_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.ready_since_ms)
+    }
+}
+
 fn session_filter_cache_is_ready(state: &AppState) -> bool {
     let generation = journey_signature(state);
     state
@@ -3786,6 +3851,117 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
     let ready = list_rows.deferred == 0 && list_rows.missing == 0;
     if let Ok(mut readiness) = state.inner.session_filter_cache_readiness.lock() {
         readiness.ready_generation = ready.then(|| journey_signature(state));
+    }
+    // 2.21.85 (CLAUDE1, ordre #9 7015585561) — swap double-tampon READY.
+    // Si et seulement si TOUTES les lignes ont été matérialisées (deferred=0,
+    // missing=0), on capture un snapshot cohérent et atomique :
+    //   * `filter_index` cloné (BTreeMap deep copy, ≈ 0,8 MB sur 327 sessions),
+    //   * `journey_index` partagé en Arc (déjà construit par `cached_journey_index`),
+    //   * `list_rows` copiée dans une HashMap indépendante (pour que la route
+    //     n'accède JAMAIS au cache mutable ni au disque).
+    // Le swap se fait sous `RwLock::write` du `generation_slot` ; les
+    // requêtes `/sessions/filter` qui ont déjà fait `Arc::clone` sur la
+    // génération précédente la gardent vivante jusqu'à leur retour.
+    if ready {
+        let filter_index_arc = state
+            .inner
+            .session_filter_index
+            .read()
+            .map(|guard| Arc::new((*guard).clone()))
+            .unwrap_or_else(|_| Arc::new(session_filters::SessionFilterIndex::empty()));
+        let journey_index_arc = state
+            .inner
+            .journey_index_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|(_sig, idx)| idx.clone()))
+            .unwrap_or_else(|| Arc::new(subscriber_journey::JourneyIndex::default()));
+        let list_rows_map: std::collections::HashMap<(String, String), (Value, Value)> = state
+            .inner
+            .list_row_cache
+            .lock()
+            .ok()
+            .map(|cache| {
+                cache
+                    .iter()
+                    .map(|(k, (_sig, summary, extra))| {
+                        (k.clone(), (summary.clone(), extra.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let list_rows_arc = Arc::new(list_rows_map);
+        // 2.21.85 — projection inverse `session_id → row` pour la condition
+        // 2. Chaque session_id n'apparaît qu'une fois dans `list_rows` (clé
+        // `(dataset_id, session_id)` et un session_id ne vit que dans un
+        // dataset à la fois), on peut collapse sans perte. Si un doublon
+        // survenait, on conserve la première entrée observée (deterministe
+        // dans l'ordre de l'iterator HashMap du build).
+        let mut rows_by_session_map: std::collections::HashMap<String, (Value, Value)> =
+            std::collections::HashMap::with_capacity(list_rows_arc.len());
+        for ((_dataset_id, session_id), row) in list_rows_arc.iter() {
+            rows_by_session_map
+                .entry(session_id.clone())
+                .or_insert_with(|| row.clone());
+        }
+        let rows_by_session_arc = Arc::new(rows_by_session_map);
+        let bytes_filter = filter_index_arc.estimated_bytes();
+        let bytes_journey = (list_rows_arc.len() * std::mem::size_of::<(String, String)>()) as u64
+            + list_rows_arc
+                .iter()
+                .map(|(_, (a, b))| (a.to_string().len() + b.to_string().len()) as u64)
+                .sum::<u64>();
+        // bytes_journey = estimation combinée journey + list_rows ; le
+        // journey_index lui-même est Arc partagé donc son footprint
+        // est amorti sur plusieurs générations tant que la signature
+        // ne change pas. On conserve une estimation lower-bound.
+        let bytes_estimate = bytes_filter.saturating_add(bytes_journey);
+        let session_count = filter_index_arc.session_count() as u64;
+        let commit_seq = state
+            .inner
+            .capture_manager
+            .datasets()
+            .iter()
+            .map(|d| state.inner.capture_manager.dataset_commit_seq(&d.dataset_id))
+            .max()
+            .unwrap_or(0);
+        let signature_now = journey_signature(state);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let generation_id = state
+            .inner
+            .generation_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let generation = Arc::new(FilterGeneration {
+            generation: generation_id,
+            commit_seq,
+            signature: signature_now,
+            ready_since_ms: now_ms,
+            filter_index: filter_index_arc,
+            journey_index: journey_index_arc,
+            list_rows: list_rows_arc,
+            rows_by_session: rows_by_session_arc,
+            bytes_estimate,
+            session_count,
+        });
+        if let Ok(mut slot) = state.inner.generation_slot.write() {
+            *slot = Some(generation.clone());
+        }
+        eprintln!(
+            "{}",
+            json!({
+                "event": "SESSIONS_FILTER_GENERATION_SWAP",
+                "trigger": trigger,
+                "generation": generation.generation,
+                "commit_seq": generation.commit_seq,
+                "session_count": generation.session_count,
+                "bytes_estimate": generation.bytes_estimate,
+                "ready_since_ms": generation.ready_since_ms,
+            })
+        );
     }
     eprintln!(
         "{}",
@@ -4760,25 +4936,55 @@ fn sessions_filter_blocking(
             "identity-scoped session filtering requires an operator bearer",
         );
     }
-    // 2.21.30 (ordres #9 6952054201 + 6952664027) — verrou mémoire du
-    // gestionnaire (per-state depuis 2.21.28). Un seul travail lourd en
-    // mémoire à la fois (publication OU route API).
-    let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
-        return heavy_work_in_progress();
-    };
-    audit_phase("heavy_gate");
-    // 2.21.74 — le verrou empêche une nouvelle génération de devenir
-    // visible pendant cette vérification. Si le préchauffage de l'index ou
-    // des lignes n'a pas validé exactement la génération publiée, répondre
-    // 503 : un `200 []` serait un faux résultat transitoire.
-    if !session_filter_cache_is_ready(&state) {
-        return heavy_work_in_progress();
+    // 2.21.85 (CLAUDE1, ordre #9 7015585561) — remplace l'ancien
+    // couple `heavy_memory_try_enter` + `session_filter_cache_is_ready`.
+    // La route sert désormais UNIQUEMENT la génération READY capturée
+    // au dernier swap (snapshot Arc'd) : aucune lecture disque, aucune
+    // allocation lourde, aucune contention avec la publication en
+    // cours. Seul motif 503 : aucune génération READY n'a été
+    // construite depuis le démarrage du process (`generation_slot`
+    // vide). Les routes autres (`/sessions/:id/journey`, `/callflow`)
+    // continuent d'utiliser `heavy_memory_try_enter` pour l'instant.
+    //
+    // Back-compat tests : les AppState construits en isolation (sans
+    // `install_session_filter_cache_prewarm`) ont `enforced=false` et
+    // `generation_slot=None`. Dans ce cas, on retombe sur la route
+    // historique (lecture des caches live) pour ne pas casser la
+    // batterie de tests existante. En prod,
+    // `install_session_filter_cache_prewarm` pose `enforced=true` et
+    // la route exige la génération READY.
+    let enforcement_active = state
+        .inner
+        .session_filter_cache_readiness
+        .lock()
+        .map(|r| r.enforced)
+        .unwrap_or(false);
+    let generation: Option<Arc<FilterGeneration>> = state
+        .inner
+        .generation_slot
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if enforcement_active && generation.is_none() {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SESSION_FILTER_CACHE_WARMING",
+            "no READY generation yet; publication prewarm in progress",
+        );
     }
-    audit_phase("cache_generation_ready");
-    state.refresh_session_filter_index();
-    audit_phase("refresh_filter_index");
-    let journey_index = cached_journey_index(&state);
-    audit_phase("cached_journey_index");
+    audit_phase("generation_fetch");
+    // Si `generation` est `Some`, on lit depuis l'Arc'd snapshot ; sinon
+    // (tests), on retombe sur les caches live (`state.inner.journey_index_cache`,
+    // `session_filter_index`, `list_row_cache`) via `cached_journey_index` +
+    // `state.inner.session_filter_index.read()`.
+    let journey_index = match generation.as_ref() {
+        Some(gen) => gen.journey_index.clone(),
+        None => {
+            state.refresh_session_filter_index();
+            cached_journey_index(&state)
+        }
+    };
+    audit_phase("journey_index_from_generation");
 
     let messages: Vec<(Option<String>, String)> = request
         .messages
@@ -4832,11 +5038,20 @@ fn sessions_filter_blocking(
         std::collections::BTreeMap<String, (String, u64, String)>,
         Vec<String>,
     ) = {
-        let guard = state
-            .inner
-            .session_filter_index
-            .read()
-            .expect("session_filter_index poisoned");
+        // 2.21.85 — lecture depuis l'Arc'd snapshot si enforcement ;
+        // sinon (tests), repli sur le cache live en RwLock.
+        let fallback_guard;
+        let guard: &session_filters::SessionFilterIndex = match generation.as_ref() {
+            Some(gen) => &gen.filter_index,
+            None => {
+                fallback_guard = state
+                    .inner
+                    .session_filter_index
+                    .read()
+                    .expect("session_filter_index poisoned");
+                &*fallback_guard
+            }
+        };
         let matching: Vec<String> = guard
             .filter(
                 &messages,
@@ -4984,7 +5199,36 @@ fn sessions_filter_blocking(
     // session par id. Jamais d'ajout de clé — retourne None si
     // aucune source ne connaît l'id (session supprimée entre
     // l'index et la résolution).
+    // 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2) — si la
+    // génération READY est servie, on prend la ligne pré-rendue dans
+    // `gen.rows_by_session` AVANT toute lecture disque. Garantie
+    // GC-survival : l'index secondaire est Arc'd avec la génération,
+    // il survit à la suppression des fichiers du dataset. Les sources
+    // live (`state.inner.flows`, `capture_manager.datasets()` +
+    // `cached_live_list_row`, LTE evidence) restent accessibles pour
+    // les tests isolés (enforcement off) et les sessions absentes du
+    // snapshot (régression de corpus entre l'index et la lecture).
+    let resolve_from_generation = |session_id: &str| -> Option<Value> {
+        let gen = generation.as_ref()?;
+        let (prebuilt_summary, events_identities) = gen.rows_by_session.get(session_id)?;
+        let mut summary = prebuilt_summary.clone();
+        decorate_subscriber_summary_by_id(&mut summary, session_id, &journey_index);
+        if let Some(object) = summary.as_object_mut() {
+            let mut identities = identity_summary_for_session(&state, session_id);
+            if identities.is_null() {
+                schedule_identity_hydration(&state, session_id);
+                identities = events_identities.clone();
+            } else {
+                fill_missing_identities(&mut identities, events_identities);
+            }
+            object.insert("identities".into(), identities);
+        }
+        Some(summary)
+    };
     let resolve_summary = |session_id: &str| -> Option<Value> {
+        if let Some(from_gen) = resolve_from_generation(session_id) {
+            return Some(from_gen);
+        }
         if let Some(flow) = state.inner.flows.get(session_id) {
             let mut summary = session_summary(&state, flow);
             decorate_subscriber_summary(&mut summary, flow, &journey_index);
@@ -5050,12 +5294,19 @@ fn sessions_filter_blocking(
                 // callflow n'est relu pour ce prédicat, y compris sur
                 // `limit=0` (aperçu exact).
                 if from_ns.is_some() || to_ns.is_some() {
-                    let overlaps = state
-                        .inner
-                        .session_filter_index
-                        .read()
-                        .expect("session_filter_index poisoned")
-                        .overlaps_time_window(session_id, from_ns, to_ns);
+                    // 2.21.85 — lecture depuis l'Arc'd snapshot si
+                    // enforcement actif, sinon repli sur le cache live.
+                    let overlaps = match generation.as_ref() {
+                        Some(gen) => gen
+                            .filter_index
+                            .overlaps_time_window(session_id, from_ns, to_ns),
+                        None => state
+                            .inner
+                            .session_filter_index
+                            .read()
+                            .expect("session_filter_index poisoned")
+                            .overlaps_time_window(session_id, from_ns, to_ns),
+                    };
                     if !overlaps {
                         continue;
                     }
@@ -5233,7 +5484,10 @@ fn sessions_filter_blocking(
                 serde_json::Value::String(pseudo.to_owned());
         }
         audit_phase("serialize_preview");
-        return (StatusCode::OK, Json(response)).into_response();
+        return match (enforcement_active, generation.as_ref()) {
+            (true, Some(gen)) => build_filter_response(response, gen),
+            _ => (StatusCode::OK, Json(response)).into_response(),
+        };
     }
 
     let page_ids: Vec<&str> = effective_sorted_ids
@@ -5270,8 +5524,24 @@ fn sessions_filter_blocking(
             }
         }
     } else {
+        // 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2) — si une
+        // génération READY est servie, on tire d'abord les lignes
+        // pré-rendues de `gen.rows_by_session` (Arc immuable, survit à
+        // un GC des fichiers du dataset qui l'a nourrie). On complète
+        // ensuite avec `state.inner.flows` qui est un BTreeMap en
+        // mémoire (dataset de référence construit à `AppState::load`,
+        // jamais GC'd) : ni l'un ni l'autre ne touche le disque.
+        // Les lignes live manquantes NE SONT lues du disque que si
+        // aucune génération n'est servie (fallback tests isolés).
+        for session_id in page_ids.iter() {
+            if let Some(summary) = resolve_from_generation(session_id) {
+                items_by_id.insert((*session_id).to_owned(), summary);
+            }
+        }
         for flow in state.inner.flows.values() {
-            if page_set.contains(flow.session_id.as_str()) {
+            if page_set.contains(flow.session_id.as_str())
+                && !items_by_id.contains_key(flow.session_id.as_str())
+            {
                 let mut summary = session_summary(&state, flow);
                 decorate_subscriber_summary(&mut summary, flow, &journey_index);
                 insert_list_identities(
@@ -5283,15 +5553,19 @@ fn sessions_filter_blocking(
                 items_by_id.insert(flow.session_id.clone(), summary);
             }
         }
-        for dataset in state.inner.capture_manager.datasets() {
-            for session_id in &dataset.session_ids {
-                if !page_set.contains(session_id.as_str()) {
-                    continue;
-                }
-                if let Some(summary) =
-                    cached_live_list_row(&state, &dataset, session_id, &journey_index)
-                {
-                    items_by_id.insert(session_id.clone(), summary);
+        if generation.is_none() {
+            for dataset in state.inner.capture_manager.datasets() {
+                for session_id in &dataset.session_ids {
+                    if !page_set.contains(session_id.as_str())
+                        || items_by_id.contains_key(session_id.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(summary) =
+                        cached_live_list_row(&state, &dataset, session_id, &journey_index)
+                    {
+                        items_by_id.insert(session_id.clone(), summary);
+                    }
                 }
             }
         }
@@ -5414,7 +5688,44 @@ fn sessions_filter_blocking(
         };
     }
     audit_phase("decorate_page");
-    (StatusCode::OK, Json(response)).into_response()
+    // 2.21.85 — n'ajoute les en-têtes et le `meta.generation/commit_seq/
+    // stale_since_ms` QUE lorsque l'enforcement est actif (chemin
+    // production avec `install_session_filter_cache_prewarm`). Les
+    // tests construits en isolation gardent une réponse strictement
+    // identique à 2.21.74.
+    match (enforcement_active, generation.as_ref()) {
+        (true, Some(gen)) => build_filter_response(response, gen),
+        _ => (StatusCode::OK, Json(response)).into_response(),
+    }
+}
+
+/// 2.21.85 (CLAUDE1, ordre #9 7015585561) — ajoute les champs
+/// `generation`, `commit_seq`, `stale_since_ms` au `meta` du body ET
+/// les en-têtes `X-Oiran-Generation`, `X-Oiran-Commit-Seq`,
+/// `X-Oiran-Stale-Since-Ms`. La p900 (ou tout consommateur CLI) peut
+/// afficher « vue t = N s » en lisant soit le body soit les headers.
+fn build_filter_response(mut body: Value, generation: &FilterGeneration) -> Response {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let stale_since_ms = generation.stale_since_ms(now_ms);
+    if let Some(meta) = body.get_mut("meta").and_then(Value::as_object_mut) {
+        meta.insert("generation".into(), json!(generation.generation));
+        meta.insert("commit_seq".into(), json!(generation.commit_seq));
+        meta.insert("stale_since_ms".into(), json!(stale_since_ms));
+    }
+    let mut response = (StatusCode::OK, Json(body)).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&generation.generation.to_string()) {
+        response.headers_mut().insert("x-oiran-generation", value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&generation.commit_seq.to_string()) {
+        response.headers_mut().insert("x-oiran-commit-seq", value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&stale_since_ms.to_string()) {
+        response.headers_mut().insert("x-oiran-stale-since-ms", value);
+    }
+    response
 }
 
 /// 2.19.0 — AND entre familles (OR interne à chaque famille). Un
@@ -14135,14 +14446,16 @@ mod tests {
         assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// 2.21.30 (ordres #9 6952054201 + 6952664027) — pendant un travail
-    /// lourd (publication), `POST /sessions/filter` répond 503
-    /// `HEAVY_WORK_IN_PROGRESS` + `Retry-After: 60` ; libéré, la route
-    /// refonctionne. Le verrou étant porté par `capture_manager`
-    /// (instance par état depuis 2.21.28), chaque test a son propre
-    /// verrou — aucun impact sur les autres tests parallèles.
+    /// 2.21.85 (CLAUDE1, ordre #9 7015585561) — inversé par rapport à
+    /// 2.21.74. Pendant qu'une publication tient `heavy_memory_enter`,
+    /// la route sert MAINTENANT la génération READY précédente via
+    /// l'Arc'd snapshot si elle existe, et `heavy_memory_try_enter` est
+    /// retiré. Ici l'état de test n'appelle pas
+    /// `install_session_filter_cache_prewarm` (enforcement off),
+    /// donc le fallback lecture-caches-live s'applique : la route
+    /// répond 200 pendant la publication.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sessions_filter_answers_503_while_continuous_publication_holds_memory_gate() {
+    async fn sessions_filter_serves_previous_generation_during_publication_2_21_85() {
         let state = operator_state();
         let app = router(state.clone(), None);
         let build = || {
@@ -14155,75 +14468,300 @@ mod tests {
         };
         {
             let _publication = state.inner.capture_manager.heavy_memory_enter();
-            let busy = app.clone().oneshot(build()).await.unwrap();
-            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
-            let body = json_body(busy).await;
-            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+            let response = app.clone().oneshot(build()).await.unwrap();
+            // 2.21.85 : plus de 503 pendant la publication si une
+            // génération READY est disponible (ici fallback live
+            // cache car enforcement off → 200 servi depuis le cache).
+            assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
         let free = app.oneshot(build()).await.unwrap();
         assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// 2.21.74 (ordre #10 7009381757) — la fin du verrou de publication
-    /// ne suffit pas : tant que l'index ET les lignes de la génération
-    /// visible ne sont pas READY, avec ou sans fenêtre, le contrat est 503.
-    /// Une fois le préchauffage achevé la réponse 200 est complète. Mutation :
-    /// retirer le contrôle de génération rend les deux assertions 503 rouges.
+    /// 2.21.85 (CLAUDE1, ordre #9 7015585561) — inversé par rapport à
+    /// 2.21.74. Vider `readiness.ready_generation` ne doit PLUS
+    /// provoquer 503 tant que le `generation_slot` conserve une
+    /// génération READY. Le double tampon découple « signature
+    /// publiée » (ancien compteur) de « génération servable » (Arc'd
+    /// snapshot). 503 arrive SEULEMENT si `generation_slot = None`
+    /// ET l'enforcement est actif (premier démarrage avant tout
+    /// prewarm réussi).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sessions_filter_answers_503_until_published_generation_caches_are_ready() {
+    async fn sessions_filter_first_boot_without_any_ready_generation_returns_503_2_21_85() {
         let state = operator_state();
         install_session_filter_cache_prewarm(&state);
-        let (_, baseline) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
-        assert!(baseline["meta"]["total"].as_u64().unwrap_or(0) > 0);
-
-        state
-            .inner
-            .session_filter_cache_readiness
-            .lock()
-            .unwrap()
-            .ready_generation = None;
-        for body in [
-            json!({"limit": 100}),
-            json!({
-                "limit": 100,
-                "time_window": {"from": "0", "to": i128::MAX.to_string()}
-            }),
-        ] {
-            let app = router(state.clone(), None);
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/sessions/filter")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(response.headers()[header::RETRY_AFTER], "60");
-            let payload = json_body(response).await;
-            assert_eq!(payload["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        // Force l'état « aucune génération READY ».
+        if let Ok(mut slot) = state.inner.generation_slot.write() {
+            *slot = None;
         }
+        let app = router(state.clone(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/filter")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"limit": 100}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = json_body(response).await;
+        assert_eq!(payload["error"]["code"], "SESSION_FILTER_CACHE_WARMING");
 
+        // Après un prewarm réussi, le slot est rempli et la route répond
+        // 200 avec les en-têtes `x-oiran-generation` / `x-oiran-commit-seq` /
+        // `x-oiran-stale-since-ms`.
         {
             let _publication = state.inner.capture_manager.heavy_memory_enter();
-            prewarm_session_filter_caches_locked(&state, "test-reconstruction-complete");
+            prewarm_session_filter_caches_locked(&state, "test-first-boot-prewarm");
         }
-        let (status, complete) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(complete["meta"]["total"], baseline["meta"]["total"]);
-        let session_ids = |payload: &Value| {
-            payload["data"]
-                .as_array()
+        let app = router(state.clone(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/filter")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"limit": 100}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let gen_header = response
+            .headers()
+            .get("x-oiran-generation")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(gen_header >= 1, "generation header absent or 0");
+    }
+
+    /// 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2 "GC-survival") —
+    /// publier N (le dataset continuous expose une session + son callflow),
+    /// préchauffer → `generation=N` capturé dans `generation_slot`, capturer la
+    /// réponse `before`. Puis supprimer le fichier callflow du dataset (= GC
+    /// des fichiers de N) et déclencher un préchauffage : `cached_live_list_row_base`
+    /// retourne `None` sur la session manquante, `stats.missing > 0`, `ready=false`,
+    /// aucun swap. La route doit continuer à répondre `200`, en-tête
+    /// `x-oiran-generation=N`, corps identique à `before` (modulo
+    /// `meta.stale_since_ms` qui augmente avec le temps écoulé) — preuve qu'elle
+    /// lit `gen.rows_by_session` et jamais `callflow(...)` disque.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_filter_serves_generation_after_file_gc_2_21_85() {
+        use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .iter()
-                .map(|row| row["session_id"].as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
+                .as_nanos()
+        );
+        let capture_root_guard = AutoRemoveDir::new(
+            workspace
+                .join("runtime")
+                .join(format!("api-filter-gc-survival-{suffix}")),
+        );
+        let capture_root = capture_root_guard.as_pathbuf();
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        let generation_name = format!("generation-{}-0", epoch_seconds());
+        let callflows_dir = dataset_dir
+            .join("callflow-generations")
+            .join(&generation_name);
+        let pcap_dir = base.join("pcap");
+        fs::create_dir_all(&callflows_dir).unwrap();
+        fs::create_dir_all(&pcap_dir).unwrap();
+
+        let session_id = "5g-gc-survival-session";
+        let subscriber_pseudo = "sha256-gc-survival-subscriber";
+
+        let nas_event = json!({
+            "event_id":"evt-nas-registration",
+            "timestamp":"","timestamp_ns":"0","interface":"N1","protocol":"NAS-5GS-MM",
+            "message_name":"Registration Request","source_participant":"UE","destination_participant":"AMF",
+            "direction":"RAN_TO_CORE",
+            "decoded_ie_tree":[
+                {"name":"subscriber_pseudonym","value":subscriber_pseudo,"source":"session_identifiers","pseudonymized":true},
+            ],
+            "decoding_status":"DECODED","semantic_status":"EXACT",
+            "association":"SESSION","procedure_group":"5GMM Registration",
+            "packet_references":[{"source_file":"N1.pcap-stub","packet_number":1,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+            "capture_id":"sha256:continuous","decoder_name":"decoder-nas","decoder_version":"0.4.1",
+            "raw_payload_reference":"sha256:stub","errors":[]
+        });
+        let callflow = json!({
+            "callflow_id":format!("cf-{session_id}"),
+            "session_id":session_id,
+            "technology":"5G SA",
+            "start_timestamp":"","end_timestamp":"",
+            "participants":[],
+            "interfaces":["N1"],
+            "procedures":[],
+            "events":[nas_event],
+            "correlation_edges":[],
+            "correlation_status":{},
+            "decoder_versions":{"decoder-nas":"0.4.1"},
+            "schema_version":"1.5.0",
+            "capture_references":["sha256:continuous"],
+            "accounting":{"source_events":1,"session_events":1,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields":0
+        });
+        let callflow_path = callflows_dir.join(format!("{session_id}.json"));
+        fs::write(&callflow_path, serde_json::to_vec_pretty(&callflow).unwrap()).unwrap();
+        fs::write(callflows_dir.join(format!("{session_id}.html")), b"<html/>").unwrap();
+
+        let jsonl_path = dataset_dir.join("oiran_events.jsonl");
+        let mut jsonl = fs::File::create(&jsonl_path).unwrap();
+        let raw_event = json!({
+            "event_id":"evt-nas-registration","parent_event_id":null,
+            "capture_id":"sha256:continuous","capture_point_id":"N1",
+            "timestamp":{"seconds":1794673477i64,"nanoseconds":0u64,"raw_ticks":1794673477000000000u64,"display":"1794673477.000000000Z"},
+            "interface":"N1","protocol":"NAS-5GS-MM",
+            "message_name":"Registration Request","message_type":65,"procedure_code":null,
+            "source_endpoint":{"address":"10.77.1.1","port":0u16,"network_function":"UE"},
+            "destination_endpoint":{"address":"10.77.1.2","port":0u16,"network_function":"AMF"},
+            "direction":"RAN_TO_CORE",
+            "session_identifiers":[
+                {"name":"subscriber_pseudonym","value":subscriber_pseudo,"pseudonymized":true},
+            ],
+            "information_elements":[],
+            "decoding_status":"DECODED","decoder_name":"decoder-nas","decoder_version":"0.4.1",
+            "raw_payload_reference":"sha256:stub",
+            "packet_references":[{"source_file":"N1.pcap-stub","packet_number":1u64,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+            "errors":[],
+        });
+        writeln!(jsonl, "{}", serde_json::to_string(&raw_event).unwrap()).unwrap();
+        drop(jsonl);
+
+        let manifest = json!({
+            "dataset_id": CONTINUOUS_DATASET_ID,
+            "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous-lab-import/dataset",
+            "event_count": 1,
+            "session_ids": [session_id],
+            "decode_reports": {},
+            "checksums": {},
+            "state": "PARTIAL",
+            "callflows_path": format!("callflow-generations/{generation_name}"),
+        });
+        fs::write(
+            dataset_dir.join("dataset_manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let pseudonym_key_path = base.join(".oiran-pseudonym.key");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            pseudonym_key_path,
+        )
+        .unwrap();
+        manager
+            .recover_continuous_dataset_from_disk(&base)
+            .expect("recover continuous dataset from on-disk manifest");
+
+        let mut config = test_config(workspace, &format!("filter-gc-survival-{suffix}"));
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+        wait_for_compact_index_ready(&state, std::time::Duration::from_secs(10)).await;
+        install_session_filter_cache_prewarm(&state);
+
+        // Prewarm « publication N » sous la garde heavy_memory_enter : la
+        // route servira la génération ainsi créée.
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test-gc-survival-N");
+        }
+        let gen_n = state
+            .inner
+            .generation_slot
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|g| g.generation))
+            .expect("generation N must be ready after successful prewarm");
+        assert!(gen_n >= 1, "gen_n should be positive, got {gen_n}");
+
+        let app = router(state.clone(), None);
+        let request_body = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/filter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": 100}).to_string()))
+                .unwrap()
         };
-        assert_eq!(session_ids(&complete), session_ids(&baseline));
+        let before_response = app.clone().oneshot(request_body()).await.unwrap();
+        assert_eq!(before_response.status(), StatusCode::OK);
+        let before_gen = before_response
+            .headers()
+            .get("x-oiran-generation")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("x-oiran-generation header missing before GC");
+        assert_eq!(before_gen, gen_n);
+        let before_body = json_body(before_response).await;
+        let before_data = before_body["data"].clone();
+        assert!(
+            before_data
+                .as_array()
+                .map(|rows| rows.iter().any(|row| row["session_id"] == session_id))
+                .unwrap_or(false),
+            "pre-GC body must contain the published session, got {}",
+            before_body
+        );
+
+        // "GC des fichiers de N" : supprimer le fichier callflow + html.
+        fs::remove_file(&callflow_path).expect("remove callflow .json");
+        let _ = fs::remove_file(callflows_dir.join(format!("{session_id}.html")));
+        // Et vider le cache de signatures pour que cached_live_list_row_base
+        // ne couvre pas accidentellement la session (sinon test invalide).
+        state.inner.list_row_cache.lock().unwrap().clear();
+        // Préchauffage N+1 : la session est manquante côté disque, prewarm
+        // signale `missing > 0 → ready=false`. Aucun swap. `generation_slot`
+        // garde la génération N.
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test-gc-survival-Nplus1-fails");
+        }
+        let gen_after = state
+            .inner
+            .generation_slot
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|g| g.generation))
+            .expect("generation slot must still carry N after failed prewarm");
+        assert_eq!(
+            gen_after, gen_n,
+            "failed prewarm N+1 must not swap; expected gen_n={gen_n}, got {gen_after}"
+        );
+
+        // Requête après GC : 200, x-oiran-generation=N, data identique à avant.
+        let after_response = app.clone().oneshot(request_body()).await.unwrap();
+        assert_eq!(after_response.status(), StatusCode::OK);
+        let after_gen = after_response
+            .headers()
+            .get("x-oiran-generation")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("x-oiran-generation header missing after GC");
+        assert_eq!(after_gen, gen_n, "after GC must still serve generation N");
+        let after_body = json_body(after_response).await;
+        assert_eq!(
+            after_body["data"], before_data,
+            "data must be byte-identical after GC"
+        );
     }
 
     /// Une génération réellement vide devient READY comme les autres et

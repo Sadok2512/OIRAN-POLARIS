@@ -97,9 +97,57 @@ pub struct SessionFilterEntry {
     pub first_packet_number: u64,
 }
 
+/// 2.21.85 (CLAUDE1, ordre #9 7015585561) — `Clone` dérivé pour permettre
+/// au `Generation` double-tampon de capturer un snapshot Arc'd atomique
+/// de l'index au moment du swap, pendant que la ligne de prewarm continue
+/// à muter la copie travail dans `AppState`. Clone = deep copy des entrées
+/// (`BTreeMap<String, SessionFilterEntry>`) ; `SessionFilterEntry: Clone`
+/// était déjà posé depuis 2.10.0. Sur 327 sessions prod (ANR2 7014844628),
+/// un clone ≈ 0,8 MB, exécuté une fois par cycle de publication réussi.
+#[derive(Clone)]
 pub struct SessionFilterIndex {
     sessions: BTreeMap<String, SessionFilterEntry>,
 }
+
+impl SessionFilterIndex {
+    /// 2.21.85 — somme octets lower-bound du contenu de l'index.
+    /// Chaque `SessionFilterEntry` contient `session_id`, `interfaces`,
+    /// `messages`, `causes`, `pseudonyms`, `anchor_capture_id`
+    /// (toutes des `String`/`BTreeSet<String>`), plus les bornes
+    /// timestamps et le packet_number. On somme les capacités String
+    /// + size_of structural. Exposé en compteur
+    /// `generation_bytes_estimate` par le consommateur.
+    pub fn estimated_bytes(&self) -> u64 {
+        let mut total: u64 = 0;
+        for (id, entry) in &self.sessions {
+            total = total.saturating_add(id.capacity() as u64);
+            total = total.saturating_add(entry.session_id.capacity() as u64);
+            total = total.saturating_add(entry.anchor_capture_id.capacity() as u64);
+            for iface in &entry.interfaces {
+                total = total.saturating_add(iface.capacity() as u64);
+            }
+            for (iface, msg) in &entry.messages {
+                total = total.saturating_add(iface.capacity() as u64);
+                total = total.saturating_add(msg.capacity() as u64);
+            }
+            for (dom, val, _) in &entry.causes {
+                total = total.saturating_add(dom.capacity() as u64);
+                total = total.saturating_add(val.capacity() as u64);
+            }
+            for pseudo in &entry.pseudonyms {
+                total = total.saturating_add(pseudo.capacity() as u64);
+            }
+            total = total.saturating_add(std::mem::size_of::<SessionFilterEntry>() as u64);
+        }
+        total.saturating_add(std::mem::size_of::<Self>() as u64)
+    }
+
+}
+
+// Note : le second bloc `impl SessionFilterIndex` ci-dessous contient
+// toujours l'API publique historique (`empty`, `from_flows`, `filter`,
+// `overlaps_time_window`, etc.) ; les méthodes ci-dessus s'ajoutent
+// sans toucher à ces signatures.
 
 impl SessionFilterIndex {
     pub fn empty() -> Self {

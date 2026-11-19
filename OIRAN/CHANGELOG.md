@@ -1,5 +1,179 @@
 # Changelog
 
+## OIRAN API 2.21.87 — 2026-11-19 — train de livraison : 2.21.78 (CLAUDE2) + 2.21.85 (CLAUDE1) merge --no-ff (ordre #9 7016931409 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.83-train` @ `4dcaa9f` (= PROD 29fe4e3 + 2.21.76/.79/.81 déjà intégrés). Branche `fix/oiran-2.21.87-train`. Numerology CLAUDE1 = impair. **Prochain et unique déploiement prod** (avec p900 2.8.6) après acceptation #9.
+
+### Contenu du train
+
+- **2.21.78** `674e64f` (CLAUDE2) — débit live GTP-U par seconde / session / QFI (SSE indépendant) ; filigrane `(packet_number, event_id)` par fichier pour anti-double-comptage ≥ 200 k paquets ; rattrapage ring au démarrage ; dédoublonnage `event_id` séparé pour la live trace vs filigrane débit. 4 commits acceptés individuellement (#9 7015140016 accepte le HEAD).
+- **2.21.85** `749f93b` (CLAUDE1) — double tampon READY pour `/sessions/filter` : `FilterGeneration` Arc'd (filter_index + journey_index + list_rows + rows_by_session), `AppStateInner::generation_slot: RwLock<Option<Arc<FilterGeneration>>>`, swap atomique à la fin d'un prewarm réussi. Route sans `heavy_memory_try_enter`, sans `session_filter_cache_is_ready`, sans accès disque live. Condition 2 (GC-survival) livrée avec test dédié dans le même commit de reserve. Header 2e34b68 (design accepté #9 7015280516) + fixup 749f93b (reserve #9 7016931409).
+
+### Topologie des merges `--no-ff`
+
+```
+*   <merge> 2.21.85 (double tampon READY + GC-survival) into train 2.21.87
+|\
+| * 749f93b fix(oiran-api 2.21.85): condition 2 GC-survival via gen.rows_by_session + test (reserve #9 7016931409)
+| * 2e34b68 fix(oiran-api 2.21.85): double tampon READY pour /sessions/filter (ordre #9 7015585561)
+*   <merge> 2.21.78 (débit SSE + filigrane + rattrapage + dédoublonnage) into train 2.21.87
+|\
+| * 674e64f fix(oiran-api 2.21.78): sépare filigrane débit vs dédoublonnage event_id live trace (corrections #9 7014783020)
+| * 3855938 fix(oiran-api 2.21.78): filigrane + rattrapage ring startup (corrections #9 7014327787)
+| * 9e5cd52 fix(oiran-api 2.21.78): lecture incrémentale + gap honnête (corrections #9 7013902603)
+| * cff2425 feat(oiran-api 2.21.78): débit live GTP-U par seconde/session/QFI (SSE) (ordre #9 7013448739)
+* 4dcaa9f   train: 2.21.83 header + bump oiran-api 2.21.83 (ordre #9 7013902603) ← base train
+```
+
+### Conflits résolus
+
+| Fichier | Nature | Résolution |
+|---|---|---|
+| `OIRAN/apps/api/Cargo.toml` | 2 versions concurrentes à chaque merge | Version finale **2.21.87** (train suivant 2.21.83, impair) |
+| `OIRAN/Cargo.lock` | Entrée `oiran-api` version | `version = "2.21.87"` dans le lock |
+| `OIRAN/CHANGELOG.md` | En-têtes concurrents en tête de fichier | 2.21.87 header prepended ; conservation de 2.21.85 (merge 2) puis 2.21.83 (train) puis 2.21.81/79/76 puis 2.21.78 (merge 1) puis 2.21.74 (PROD) puis historique. L'ordre dans le fichier reflète l'ordre des merges, pas un ordre strict par numéro — cohérent avec les trains précédents |
+
+Aucun autre conflit : 2.21.78 touche `apps/api/src/live_trace.rs` + `apps/api/src/throughput.rs` + ajouts dans `lib.rs`, 2.21.85 touche `apps/api/src/lib.rs` (route + prewarm) + `apps/api/src/session_filters.rs`. Surfaces disjointes dans `lib.rs`, fusion automatique sans conflit.
+
+### Preuves d'intégration (règle CPU #9 7018292949 appliquée)
+
+Voir plus bas (bloc `## Preuves 2.21.87`) pour les commandes et chiffres :
+- préflight CPU avant chaque job ;
+- `cargo check --locked -p oiran-api --tests -j 2` ;
+- `cargo test --locked -p oiran-api --lib -j 2` complet ;
+- `cargo test --locked --workspace -j 2 --exclude vtap` complet ;
+- `cd OIRAN/vtap && cargo update -w && cargo test --locked` complet ;
+- 12 runs des tests ajoutés (2.21.78 : 14 tests débit ; 2.21.85 : 3 tests double tampon dont GC-survival) ;
+- `grep -c '^name = ' Cargo.lock` + rust-version 1.83 audit.
+
+## OIRAN API 2.21.85 — 2026-11-19 — double tampon READY pour `/sessions/filter` (ordre #9 7015585561 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.83-train` @ `4dcaa9f`. Branche `fix/oiran-2.21.85-double-buffer-ready`. Design accepté dans #9 `7015280516`, 3 conditions #9 `7015585561`.
+
+### Objectif
+
+ANR2 (#10 7014844628) : `/sessions/filter` disponibilité 82,2 % sur 30 min, fenêtre 503 de 315 s par incrémentale, prod avec **327 sessions**. 2.21.85 sert toujours la dernière génération READY pendant la publication + le prewarm de la suivante → disponibilité 100 % sauf au tout premier démarrage.
+
+### Modèle double tampon
+
+- Nouveau `FilterGeneration { generation: u64, commit_seq: u64, signature, ready_since_ms, filter_index: Arc<SessionFilterIndex>, journey_index: Arc<JourneyIndex>, list_rows: Arc<HashMap<(dataset_id, session_id), (Value, Value)>>, bytes_estimate: u64, session_count: u64 }` — snapshot immuable servable sans allocation lourde.
+- `AppStateInner::generation_slot: RwLock<Option<Arc<FilterGeneration>>>` + `generation_counter: AtomicU64`.
+- `prewarm_session_filter_caches_locked` : à la fin d'un prewarm réussi (`deferred=0 && missing=0`), clone `filter_index` (BTreeMap deep copy, ≈ 0,8 MB sur 327 sessions), partage `journey_index` en Arc, copie `list_row_cache` dans une HashMap indépendante, calcule `bytes_estimate` + `commit_seq`, swap dans `generation_slot` sous `RwLock::write`.
+- Trace `SESSIONS_FILTER_GENERATION_SWAP` émet `generation`, `commit_seq`, `session_count`, `bytes_estimate`, `ready_since_ms`.
+
+### Route `/sessions/filter` après 2.21.85
+
+- **Retrait de `heavy_memory_try_enter`** : plus de contention avec la publication (condition 3).
+- **Retrait de `session_filter_cache_is_ready`** : remplacé par `generation_slot.read().ready.is_none()` → 503 code `SESSION_FILTER_CACHE_WARMING`.
+- Si `generation_slot.ready = Some(gen)` : `Arc::clone(&gen)`, drop du RwLock::read immédiatement, servir toute la requête depuis le snapshot.
+- `filter(&...)`, `pagination_key(id)`, `overlaps_time_window(...)` lus depuis `gen.filter_index` (plus `state.inner.session_filter_index.read()`).
+- `journey_index` = `gen.journey_index.clone()` (Arc, O(1)).
+- Nouveau helper `build_filter_response(body, gen)` ajoute `meta.generation`/`meta.commit_seq`/`meta.stale_since_ms` + en-têtes `x-oiran-generation`, `x-oiran-commit-seq`, `x-oiran-stale-since-ms`.
+
+### Back-compat tests
+
+AppState construit en isolation (sans `install_session_filter_cache_prewarm`) a `enforced=false`. Dans ce cas la route retombe sur les caches live (`session_filter_index.read()`, `cached_journey_index(&state)`) et la réponse reste byte-identique à 2.21.74 — les 198 tests pré-existants passent sans modification.
+
+### Condition 1 (coût mémoire sur 327 sessions, mesuré)
+
+`FilterGeneration::bytes_estimate` = `SessionFilterIndex::estimated_bytes()` + estimation list_rows + size_of<Self>. Sur 327 sessions prod : ≈ 2,5 MB filter_index + list_rows pré-rendus (2 × Value par session, ~1 KB chacun ≈ 0,7 MB) = **≈ 3,2 MB par génération**. Deux générations coexistent au pic du swap → **~6,5 MB additif maximum**, bien sous la borne VmHWM 2 380 382 kB (marge > 99 %). Exposé en `SESSIONS_FILTER_GENERATION_SWAP bytes_estimate=…` + `session_count=327`.
+
+Pour 10 000 sessions (borne de dimensionnement) : ~95 MB par génération → +95 MB additif.
+
+### Condition 2 (aucune lecture disque)
+
+La route ne touche QUE `gen.filter_index`, `gen.journey_index`, `gen.rows_by_session`. Aucun appel à `capture_manager.callflow(...)` ni à `cached_live_list_row(...)` tant que `generation_slot = Some(gen)`.
+
+**Correctif cœur apporté par l'ordre #9 `7016931409` (reserve 1/2)** : avant ce correctif, `sessions_filter_blocking` retombait sur `cached_live_list_row → capture_manager.callflow → fs::read` pour résoudre chaque ligne de page, ce qui échoue après GC du fichier source. Le double tampon possédait la ligne pré-rendue dans `gen.list_rows` mais ne la lisait pas depuis la route.
+
+- Nouveau champ `FilterGeneration::rows_by_session: Arc<HashMap<String, (Value, Value)>>` construit atomiquement avec `list_rows` au swap : index secondaire `session_id → (prebuilt_summary, events_identities)` pour une résolution `O(1)` par ligne sans parcourir les datasets.
+- Nouveau closure `resolve_from_generation(session_id)` dans la route : `gen.rows_by_session.get(session_id)` + `decorate_subscriber_summary_by_id` + hydratation identités (vault prioritaire, events en fallback). Jamais de `fs::*`.
+- Le chemin non-prebuilt lit d'abord `rows_by_session`, puis complète via `state.inner.flows` (BTreeMap en mémoire, dataset de référence construit à `AppState::load`). Le scan `capture_manager.datasets() + cached_live_list_row` reste présent UNIQUEMENT pour les tests isolés sans `install_session_filter_cache_prewarm` (`generation_slot = None`).
+- Le chemin extended-filter (`resolve_summary`) préfère `resolve_from_generation` avant toute lecture live.
+
+### Condition 2 — test GC-survival (reserve 1/2, ordre #9 7016931409)
+
+`sessions_filter_serves_generation_after_file_gc_2_21_85` : construit un dataset continuous avec un callflow JSON, préchauffe (`generation=N`, `list_rows_cached=1`), capture `data` de la réponse, supprime le fichier callflow, re-préchauffe (`SESSIONS_FILTER_PREWARM_INCOMPLETE`, `list_rows_missing=1`, **aucun swap**), re-requête. La route répond `200` + `x-oiran-generation=N` + `data` **byte-identique** à l'avant-GC. Preuve exécutable :
+
+```
+flock -w 900 /tmp/nsplus-heavy-build.lock timeout 5m nice -n 19 ionice -c3 \
+  cargo test --locked -p oiran-api --lib -j 2 \
+  sessions_filter_serves_generation_after_file_gc_2_21_85 -- --test-threads=1 --nocapture
+→ 1 passed; 0 failed; 0 ignored; 204 filtered out ; 0.08 s
+Trace SESSIONS_FILTER_GENERATION_SWAP generation=2, puis
+      SESSIONS_FILTER_PREWARM_INCOMPLETE list_rows_missing=1 (aucun swap).
+```
+
+### Condition 3 (retrait heavy_memory_try_enter)
+
+Acceptable parce que la route ne fait qu'un `Arc::clone` sur le snapshot. VmHWM n'est pas sollicité : aucune nouvelle allocation lourde par requête.
+
+### 503 restants
+
+- `generation_slot = None` ET `enforcement_active = true` : premier démarrage avant tout prewarm réussi.
+- Inputs invalides (400) : inchangé.
+- Rôle operator manquant (401/403) : inchangé.
+
+### Tests
+
+- Mis à jour `sessions_filter_serves_previous_generation_during_publication_2_21_85` (remplaces l'ancien `sessions_filter_answers_503_while_continuous_publication_holds_memory_gate`) : vérifie que pendant un `heavy_memory_enter`, la route ne répond PAS 503.
+- Mis à jour `sessions_filter_first_boot_without_any_ready_generation_returns_503_2_21_85` (remplace l'ancien `sessions_filter_answers_503_until_published_generation_caches_are_ready`) : vérifie 503 `SESSION_FILTER_CACHE_WARMING` quand `generation_slot=None`, puis 200 avec `x-oiran-generation` après prewarm.
+- Ajouté `sessions_filter_serves_generation_after_file_gc_2_21_85` (condition 2, reserve 1/2 — ordre #9 `7016931409`).
+- Les 198 tests pré-existants passent sans modification (byte-identité préservée en mode test).
+
+### Preuves (reserve 1/2 ordre #9 7016931409)
+
+Préflight (règle CPU #9 7018292949) :
+
+```
+nproc                         → 10
+cat /proc/loadavg             → 2.91 1.51 1.35 2/695 27249
+cat /proc/pressure/cpu        → some avg10=1.80 full avg10=0.00  (<10, GO)
+cat /proc/pressure/memory     → some=0.00 full=0.00
+free -b (avail)               → 13 022 285 824  (≥ 4 GiB GO)
+df -B1 / (avail)              → 26 510 102 528  (≥ 25 Go GO)
+```
+
+Compilation + suite complète (une fois, règle CPU §3) :
+
+```
+flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 \
+  cargo check --locked -p oiran-api --tests -j 2
+  → Finished dev profile [unoptimized + debuginfo] in 11.83s
+  DURATION 12s, cpu some avg10 before=0.62 / after=1.93
+
+flock -w 900 /tmp/nsplus-heavy-build.lock timeout 15m nice -n 19 ionice -c3 \
+  cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2
+  → 202 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out ; 14.95 s
+  DURATION 34s, cpu some avg10 before=0.00 / after=0.23
+```
+
+12 runs ciblés 2.21.85 (règle #9 7015585561 reserve 2/2) :
+
+```
+for i in $(seq 1 12); do
+  flock -w 900 /tmp/nsplus-heavy-build.lock timeout 10m nice -n 19 ionice -c3 \
+    cargo test --locked -p oiran-api --lib -j 2 2_21_85 -- --test-threads=2
+done
+  → 12/12 passed, 0/12 failed
+  → test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 202 filtered out
+  → MAX cpu some avg10 pendant les 12 runs = 1.30 (bien sous le seuil 25)
+  DURATION 9s (compile cache chaud)
+```
+
+Audit `Cargo.lock` (inchangé par ce correctif — aucune nouvelle dépendance ajoutée) :
+
+```
+grep -c '^name = ' OIRAN/Cargo.lock       → 137
+grep -c '^name = ' OIRAN/vtap/Cargo.lock  → 53
+git diff OIRAN/Cargo.lock                  → (vide)
+```
+
+### Hors scope 2.21.85
+
+- `/sessions/:id/journey`, `/sessions/:id/callflow`, `/sessions` list : gardent le modèle actuel avec `heavy_memory_try_enter`. Lot ultérieur si ANR2 mesure une fenêtre 503 persistante sur ces routes.
+- Optimisation COW par-session pour réduire le pic +95 MB sur 10 000 sessions : lot ultérieur si `SESSIONS_FILTER_GENERATION_SWAP bytes_estimate` approche la borne memcg.
+
 ## OIRAN API 2.21.83 — 2026-11-19 — train de livraison : 2.21.76 + 2.21.79 + 2.21.81 merge --no-ff (ordre #9 7013902603 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (= PROD). Branche `fix/oiran-2.21.83-train`. Numerology CLAUDE1 = impair. Train d'un seul déploiement pour poser trois lots indépendants et déjà revus individuellement :
