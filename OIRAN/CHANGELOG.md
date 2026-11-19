@@ -29,9 +29,104 @@ Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.87-train` @ `592b
 
 Autres fichiers 2.21.88 (`OIRAN/apps/api/src/lib.rs`, `OIRAN/capture-helper/*`, `OIRAN/live-probe/*`) fusionnés automatiquement (surfaces disjointes de 2.21.87 : 2.21.88 touche import/publish disk-safety ; 2.21.87 touche `/sessions/filter` route + throughput SSE).
 
-### Preuves d'intégration (règle CPU #9 7018292949 appliquée)
+### Preuves 2.21.89 (règle CPU #9 7018292949 appliquée)
 
-Voir plus bas (bloc `### Preuves 2.21.89`) pour les commandes et chiffres.
+Préflight final :
+
+```
+cat /proc/loadavg             → 3.29 2.83 2.38
+cat /proc/pressure/cpu        → some avg10=0.20 full avg10=0.00  (GO)
+cat /proc/pressure/memory     → full avg10=0.00  (GO)
+free -b (avail)               → 7 114 735 616 (≥ 4 GiB GO)
+df -B1 / (avail)              → 42 962 640 896 (≥ 25 Go GO)
+pgrep -af "cargo|rustc"       → (vide, aucun cargo concurrent côté POLARIS)
+```
+
+Workspace check sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3` :
+
+```
+cargo check --locked --workspace --tests -j 2
+→ Finished dev profile [unoptimized + debuginfo] target(s) in 1m 02s
+DURATION 62s, cpu some avg10 before=0.27 / after=0.49.
+```
+
+Tests lib `oiran-api` complets :
+
+```
+cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2
+→ test result: ok. 217 passed; 0 failed; 3 ignored; 0 measured ; 15.80 s.
+DURATION 124s, cpu some avg10 before=0.65 / after=0.78.
+```
+
+Tests lib `live-probe` complets (nouveau : 197 passed, +11 vs 186 en 2.21.87) :
+
+```
+cargo test --locked -p live-probe --lib -j 2 -- --test-threads=2
+→ test result: ok. 197 passed; 0 failed; 6 ignored; 0 measured ; 73.17 s.
+DURATION 119s, cpu some avg10 before=0.43 / after=0.09.
+```
+
+Tests workspace complets :
+
+```
+cargo test --locked --workspace -j 2 -- --test-threads=2
+→ Aucun FAILED, aucun error. Chaque crate OK. Totaux notables :
+   capture-helper 23 passed, correlation-engine 39, decoder-sbi 43,
+   decoder-ngap 31, event-schema 37, read-time-patch 52 + 1 ignored,
+   live-probe 197 + 6 ignored, oiran-api 217 + 3 ignored, session-engine 22.
+DURATION 189s (approx), cpu some avg10 before=0.05 / after≈0.54 pendant run.
+```
+
+Vtap (lock + tests), ordre `cd OIRAN/vtap && cargo update -w && cargo test --locked` :
+
+```
+cd OIRAN/vtap && cargo update -w && cargo test --locked -j 2 -- --test-threads=2
+→ Cargo.lock vtap inchangé (diff vide) ; 53 packages.
+→ test result: ok. 12 passed; 0 failed. (binaire vtap unit tests)
+→ test result: ok.  3 passed; 0 failed. (dataset_restore intégration)
+→ test result: ok.  0 passed; 0 failed. (vtap_wiring : skip quand env lab absent)
+DURATION 23s, cpu some avg10 before=0.18 / after=0.54.
+```
+
+12 runs des tests ajoutés par 2.21.88 (11 tests superviseur / atomic / disk-recovery) :
+
+```
+Filtre : with_prev + supervise_continuous_import + disk_recovery_poll +
+         prev_path_for + recover_registry_records + error_indicates_disk_space
+
+for i in $(seq 1 12); do
+  flock -w 900 /tmp/nsplus-heavy-build.lock timeout 10m nice -n 19 ionice -c3 \
+    cargo test --locked -p live-probe --lib -j 2 -- --test-threads=2 \
+    with_prev supervise_continuous_import disk_recovery_poll \
+    prev_path_for recover_registry_records error_indicates_disk_space
+done
+→ 12/12 passed, 0/12 failed. test result: ok. 11 passed; 0 failed; 0 ignored.
+→ Les 11 tests couverts :
+   atomic_write_with_prev_creates_prev_snapshot_on_update
+   atomic_write_with_prev_enospc_class_failure_keeps_old_file
+   prev_path_for_appends_dot_prev_preserving_extensions
+   load_job_with_prev_fallback_recovers_from_truncated_main
+   load_job_with_prev_fallback_errors_when_both_versions_missing
+   recover_registry_records_warning_when_main_is_corrupted_but_prev_valid
+   recover_registry_records_unrecoverable_when_both_versions_corrupted
+   error_indicates_disk_space_matches_enospc_and_disk_safety_codes
+   disk_recovery_poll_and_max_wait_are_short_under_test_cfg
+   supervise_continuous_import_resumes_without_doubling_ingestion  ← test E2E réserve
+   supervise_continuous_import_does_not_retry_non_disk_errors
+MAX cpu some avg10 pendant les 12 runs = 0.00 (compile cache chaud).
+DURATION 3s (cache chaud).
+```
+
+Audit `Cargo.lock` :
+
+```
+grep -c '^name = ' OIRAN/Cargo.lock       → 137
+grep -c '^name = ' OIRAN/vtap/Cargo.lock  → 53
+cd OIRAN/vtap && git diff Cargo.lock      → (vide)
+cd OIRAN      && git diff 29fe4e3..HEAD -- Cargo.lock
+  → entrée oiran-api v2.21.74 → v2.21.89 uniquement (+ live-probe 0.6.26 → 0.6.28,
+    capture-helper 0.1.1-dev → 0.1.2 via 2.21.88 ; aucune nouvelle dépendance externe)
+```
 
 ## OIRAN API 2.21.87 — 2026-11-19 — train de livraison : 2.21.78 (CLAUDE2) + 2.21.85 (CLAUDE1) merge --no-ff (ordre #9 7016931409 CLAUDE1)
 
