@@ -1425,31 +1425,72 @@ impl RawEventIndex {
 ///   on ne scanne pas le JSONL (zéro I/O).
 /// - Retourne le nombre d'events ajoutés (0 = pas de sibling,
 ///   comportement idempotent).
-pub fn extend_items_with_pfcp_siblings_from_jsonl(
-    items: &mut Vec<Value>,
-    dataset_root: &Path,
-) -> Result<usize, String> {
-    let mut known_sequences: BTreeSet<String> = BTreeSet::new();
-    let mut known_seids: BTreeSet<String> = BTreeSet::new();
-    let mut known_event_ids: BTreeSet<String> = BTreeSet::new();
-    // 2.18.2 — `pfcp_sequence` et les SEID Open5GS sont de petits
-    // compteurs par nœud : ils se répètent entre N4 (5G) et Sxa/Sxb
-    // (LTE). Sans contrainte d'interface, une session 5G aspirait
-    // 48 events Sxab (ANR1 #10 6898944250). Un sibling n'est retenu
-    // que sur une interface déjà portée par la session.
-    let mut known_interfaces: BTreeSet<String> = BTreeSet::new();
+/// 2.21.70 (ordre #9 7006855142) — Clés PFCP d'une **session complète**,
+/// extraites d'une liste d'events persistés. Utilisées par les deux
+/// entrées d'enrichissement (`extend_items_*` + `count_*`) pour que les
+/// pages 1 et 2+ reposent sur les MÊMES clés et que `total_events`
+/// reste cohérent.
+#[derive(Default, Debug, Clone)]
+pub struct PfcpSessionKeys {
+    pub known_sequences: BTreeSet<String>,
+    pub known_seids: BTreeSet<String>,
+    pub known_interfaces: BTreeSet<String>,
+    pub known_event_ids: BTreeSet<String>,
+}
+
+/// 2.21.70 — Collecte les clés PFCP (sequence, seid, interface, event_id)
+/// de la liste d'events fournie. Idempotent, pure, pas d'I/O.
+pub fn collect_pfcp_session_keys(items: &[Value]) -> PfcpSessionKeys {
+    let mut keys = PfcpSessionKeys::default();
     for item in items.iter() {
         if let Some(id) = item.get("event_id").and_then(Value::as_str) {
-            known_event_ids.insert(id.to_owned());
+            keys.known_event_ids.insert(id.to_owned());
         }
         if item.get("protocol").and_then(Value::as_str) != Some("PFCP") {
             continue;
         }
         if !is_pfcp_node_message(item) {
-            collect_pfcp_keys(item, &mut known_sequences, &mut known_seids);
+            collect_pfcp_keys(item, &mut keys.known_sequences, &mut keys.known_seids);
         }
         if let Some(interface) = pfcp_interface_of(item) {
-            known_interfaces.insert(interface);
+            keys.known_interfaces.insert(interface);
+        }
+    }
+    keys
+}
+
+pub fn extend_items_with_pfcp_siblings_from_jsonl(
+    items: &mut Vec<Value>,
+    dataset_root: &Path,
+) -> Result<usize, String> {
+    // Chemin historique : les clés sont extraites des `items` passés.
+    // Utile quand on enrichit directement un callflow complet en mémoire.
+    // Pour la pagination 2.21.70, utiliser
+    // `extend_items_with_pfcp_siblings_using_session_keys` à la place.
+    let session_keys = collect_pfcp_session_keys(items);
+    extend_items_with_pfcp_siblings_using_session_keys(items, dataset_root, &session_keys)
+}
+
+/// 2.21.70 (ordre #9 7006855142) — Variante de
+/// `extend_items_with_pfcp_siblings_from_jsonl` qui prend les clés de la
+/// session EN AMONT (collectées sur la liste persistée complète) plutôt
+/// que de les déduire des `items` à enrichir. Permet à la pagination
+/// d'inserter les siblings en page 1 même si cette page ne contient
+/// pas les events PFCP porteurs des clés (cas ANR2 : limit petit).
+pub fn extend_items_with_pfcp_siblings_using_session_keys(
+    items: &mut Vec<Value>,
+    dataset_root: &Path,
+    session_keys: &PfcpSessionKeys,
+) -> Result<usize, String> {
+    let known_sequences = &session_keys.known_sequences;
+    let known_seids = &session_keys.known_seids;
+    let known_interfaces = &session_keys.known_interfaces;
+    // `known_event_ids` doit inclure CEUX de la session complète ET
+    // ceux déjà présents dans `items` (déduplication serrée).
+    let mut known_event_ids: BTreeSet<String> = session_keys.known_event_ids.clone();
+    for item in items.iter() {
+        if let Some(id) = item.get("event_id").and_then(Value::as_str) {
+            known_event_ids.insert(id.to_owned());
         }
     }
     if known_sequences.is_empty() && known_seids.is_empty() {
@@ -1476,7 +1517,7 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
             Some(interface) => known_interfaces.contains(&interface),
             None => known_interfaces.is_empty(),
         };
-        if same_interface && pfcp_event_matches(value, &known_sequences, &known_seids) {
+        if same_interface && pfcp_event_matches(value, known_sequences, known_seids) {
             known_event_ids.insert(event_id.to_owned());
             items.push(value.clone());
             added += 1;
@@ -1486,6 +1527,25 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
         items.sort_by(|a, b| canonical_sort_tuple(a).cmp(&canonical_sort_tuple(b)));
     }
     Ok(added)
+}
+
+/// 2.21.70 (ordre #9 7006855142) — Compte les siblings PFCP du JSONL
+/// pour la **session entière**, à partir de la liste PERSISTÉE complète
+/// (indépendant du curseur de pagination). Renvoie le nombre de
+/// candidats qui seraient ajoutés par `extend_items_with_pfcp_siblings_
+/// from_jsonl`, sans muter la liste. Permet à `/callflow` d'annoncer
+/// un `total_events` cohérent sur **toutes les pages** : jusqu'à
+/// 2.21.69, le total n'était bump qu'en page 1 (quand les siblings
+/// sont effectivement insérés), laissant les pages 2+ annoncer le
+/// seul total persisté. Noté en revue cœur 7006855142 §CLAUDE2.
+pub fn count_pfcp_siblings_for_persisted_events(
+    events: &[Value],
+    dataset_root: &Path,
+) -> Result<usize, String> {
+    let mut scratch = events.to_vec();
+    let before = scratch.len();
+    extend_items_with_pfcp_siblings_from_jsonl(&mut scratch, dataset_root)?;
+    Ok(scratch.len().saturating_sub(before))
 }
 
 /// 2.18.8 — messages PFCP de NŒUD (TS 29.244 §7.4 : Heartbeat,
@@ -1972,12 +2032,30 @@ pub fn insert_pfcp_siblings_into_callflow(
     events: &mut Vec<Value>,
     dataset_root: &Path,
 ) -> Result<usize, String> {
+    // Chemin historique : clés dérivées des `events` passés. Pour la
+    // pagination 2.21.70, passer par `insert_pfcp_siblings_into_callflow_using_session_keys`.
+    let session_keys = collect_pfcp_session_keys(events);
+    insert_pfcp_siblings_into_callflow_using_session_keys(events, dataset_root, &session_keys)
+}
+
+/// 2.21.70 (ordre #9 7006855142) — Variante utilisée par la pagination
+/// `/callflow` : les clés PFCP proviennent de la session COMPLÈTE
+/// (`collect_pfcp_session_keys(full_persisted_events)`), pas de la
+/// page restreinte reçue. Permet d'insérer les siblings en page 1
+/// MÊME quand cette page ne contient pas les events PFCP porteurs des
+/// clés (cas limit petit → pages 2+ servent les events PFCP, mais la
+/// page 1 doit déjà exposer les siblings comme avant).
+pub fn insert_pfcp_siblings_into_callflow_using_session_keys(
+    events: &mut Vec<Value>,
+    dataset_root: &Path,
+    session_keys: &PfcpSessionKeys,
+) -> Result<usize, String> {
     let known: BTreeSet<String> = events
         .iter()
         .filter_map(|e| e.get("event_id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let mut scratch = events.clone();
-    extend_items_with_pfcp_siblings_from_jsonl(&mut scratch, dataset_root)?;
+    extend_items_with_pfcp_siblings_using_session_keys(&mut scratch, dataset_root, session_keys)?;
     let mut added = 0usize;
     for raw in scratch.into_iter().filter(|e| {
         e.get("event_id")
@@ -2896,6 +2974,150 @@ mod tests {
 mod callflow_pfcp_insert_tests {
     use super::*;
     use serde_json::json;
+
+    /// 2.21.70 (ordre #9 7006855142) — `count_pfcp_siblings_for_persisted_events`
+    /// doit retourner EXACTEMENT le delta ajouté par
+    /// `insert_pfcp_siblings_into_callflow` quand les deux sont appelés
+    /// sur les MÊMES events persistés + le MÊME dataset_root. Preuve
+    /// d'équivalence : le comptage ne mute pas la liste et ne scanne pas
+    /// différemment du chemin d'insertion.
+    #[test]
+    fn count_pfcp_siblings_matches_insert_pfcp_siblings_delta_2_21_70() {
+        let dir = std::env::temp_dir().join(format!("rtp-count-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 3 siblings PFCP partagent des sequences/seid connus par la
+        // session, un 4e appartient à une autre session (interface N4
+        // mais sequence inconnue) — non compté.
+        let sibling_a = json!({"event_id":"evt-sib-a","capture_id":"c","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","pfcp_sequence":"100",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"100"}],
+            "timestamp":{"seconds":1,"nanoseconds":0,"raw_ticks":1u64,"display":"x"},
+            "source_endpoint":{"address":"10.0.0.1","port":8805,"network_function":"SMF"},
+            "destination_endpoint":{"address":"10.0.0.2","port":8805,"network_function":"UPF"}});
+        let sibling_b = json!({"event_id":"evt-sib-b","capture_id":"c","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Deletion Request","pfcp_sequence":"101",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"101"}],
+            "timestamp":{"seconds":1,"nanoseconds":0,"raw_ticks":2u64,"display":"x"},
+            "source_endpoint":{"address":"10.0.0.1","port":8805,"network_function":"SMF"},
+            "destination_endpoint":{"address":"10.0.0.2","port":8805,"network_function":"UPF"}});
+        let sibling_other = json!({"event_id":"evt-sib-other","capture_id":"c","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","pfcp_sequence":"999",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"999"}]});
+        std::fs::write(
+            dir.join("oiran_events.jsonl"),
+            format!("{}\n{}\n{}\n", sibling_a, sibling_b, sibling_other),
+        )
+        .unwrap();
+        // Les events persistés contiennent des PFCP responses qui
+        // référencent les mêmes pfcp_sequence que les siblings a/b.
+        let persisted = vec![
+            json!({"event_id":"evt-ngap","protocol":"NGAP","interface":"N2","message_name":"InitialUEMessage"}),
+            json!({"event_id":"evt-resp-a","protocol":"PFCP","interface":"N4","message_name":"PFCP Session Establishment Response",
+                "decoded_ie_tree":[{"name":"pfcp_sequence","value":"100"}]}),
+            json!({"event_id":"evt-resp-b","protocol":"PFCP","interface":"N4","message_name":"PFCP Session Deletion Response",
+                "decoded_ie_tree":[{"name":"pfcp_sequence","value":"101"}]}),
+        ];
+        let count = count_pfcp_siblings_for_persisted_events(&persisted, &dir).unwrap();
+        let mut scratch = persisted.clone();
+        let delta = insert_pfcp_siblings_into_callflow(&mut scratch, &dir).unwrap();
+        assert_eq!(
+            count, delta,
+            "count helper must match insert delta ; count={count} delta={delta}"
+        );
+        assert_eq!(count, 2, "exactly 2 siblings (a + b), not the 'other' session's PFCP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.21.70 (ordre #9 7006855142) — Invariant pagination multi-pages :
+    /// pour un callflow persisté de N events + K siblings PFCP (ajoutés
+    /// à la page 1 par `insert_pfcp_siblings_into_callflow`), toutes
+    /// les pages doivent annoncer `total_events = N + K` et la somme
+    /// des `returned_events` sur toutes les pages doit égaler N + K
+    /// SANS doublon d'`event_id`. Simulé ici au niveau de la session
+    /// (sans spawner le serveur axum) via `count_pfcp_siblings_for_persisted_events`
+    /// + pagination manuelle sur la liste persistée.
+    #[test]
+    fn multi_page_total_events_is_coherent_and_no_event_id_duplicate_2_21_70() {
+        use std::collections::BTreeSet;
+        let dir = std::env::temp_dir().join(format!("rtp-multipage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1 sibling PFCP ajouté hors persisté.
+        let sibling = json!({"event_id":"evt-sib","capture_id":"c","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","pfcp_sequence":"42",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"42"}],
+            "timestamp":{"seconds":1,"nanoseconds":0,"raw_ticks":42u64,"display":"x"},
+            "source_endpoint":{"address":"10.0.0.1","port":8805,"network_function":"SMF"},
+            "destination_endpoint":{"address":"10.0.0.2","port":8805,"network_function":"UPF"}});
+        std::fs::write(dir.join("oiran_events.jsonl"), format!("{}\n", sibling)).unwrap();
+        // 5 events persistés dont 1 PFCP response porteuse de la seq 42.
+        let persisted = vec![
+            json!({"event_id":"e0","protocol":"NGAP","interface":"N2","message_name":"InitialUEMessage"}),
+            json!({"event_id":"e1","protocol":"NGAP","interface":"N2","message_name":"InitialContextSetupRequest"}),
+            json!({"event_id":"e2","protocol":"PFCP","interface":"N4","message_name":"PFCP Session Establishment Response",
+                "decoded_ie_tree":[{"name":"pfcp_sequence","value":"42"}]}),
+            json!({"event_id":"e3","protocol":"NGAP","interface":"N2","message_name":"InitialContextSetupResponse"}),
+            json!({"event_id":"e4","protocol":"NGAP","interface":"N2","message_name":"UEContextReleaseCommand"}),
+        ];
+        // Compte canonique au niveau session (nouveau comportement
+        // 2.21.70) : indépendant de la page.
+        let siblings_count = count_pfcp_siblings_for_persisted_events(&persisted, &dir).unwrap();
+        assert_eq!(siblings_count, 1);
+        let session_total = persisted.len() + siblings_count; // = 6
+
+        // Simule la pagination server-side : page 1 reçoit les siblings
+        // (insertés par `insert_pfcp_siblings_into_callflow`), pages 2+
+        // ne servent QUE des events persistés.
+        let limit = 2usize;
+        // 2.21.70 : page 1 utilise les clés de la SESSION COMPLÈTE,
+        // pas de la page restreinte. L'ancienne fonction
+        // `insert_pfcp_siblings_into_callflow` (clés dérivées des page
+        // events) renvoyait 0 siblings quand la page ne contenait pas
+        // les events PFCP porteurs (régression noté par le cœur).
+        let session_keys = collect_pfcp_session_keys(&persisted);
+        let mut page_1 = persisted.iter().take(limit).cloned().collect::<Vec<_>>();
+        let delta = insert_pfcp_siblings_into_callflow_using_session_keys(
+            &mut page_1,
+            &dir,
+            &session_keys,
+        )
+        .unwrap();
+        assert_eq!(delta, 1, "page 1 doit recevoir le sibling via les clés de session");
+        let total_events_page_1 = (persisted.len() + siblings_count) as u64;
+        let returned_page_1 = page_1.len();
+
+        // Page 2 et 3 : persisted events seulement, total_events = session_total.
+        let page_2 = persisted.iter().skip(limit).take(limit).cloned().collect::<Vec<_>>();
+        let page_3 = persisted.iter().skip(2 * limit).cloned().collect::<Vec<_>>();
+        let total_events_page_2 = session_total as u64;
+        let total_events_page_3 = session_total as u64;
+
+        // Invariant 1 : total_events CONSTANT sur toutes les pages.
+        assert_eq!(total_events_page_1, total_events_page_2);
+        assert_eq!(total_events_page_2, total_events_page_3);
+        assert_eq!(total_events_page_1, session_total as u64);
+
+        // Invariant 2 : sum(returned_events) = total_events.
+        let returned_sum = returned_page_1 + page_2.len() + page_3.len();
+        assert_eq!(
+            returned_sum as u64, total_events_page_1,
+            "sum des returned_events doit égaler total_events ; sum={returned_sum} total={total_events_page_1}"
+        );
+
+        // Invariant 3 : aucun doublon d'event_id entre pages.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for page in [&page_1, &page_2, &page_3] {
+            for event in page.iter() {
+                let id = event["event_id"].as_str().unwrap().to_owned();
+                assert!(
+                    seen.insert(id.clone()),
+                    "event_id {id} dupliqué entre pages"
+                );
+            }
+        }
+        // Le sibling fait partie du set global.
+        assert!(seen.contains("evt-sib"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn raw_request_is_converted_and_placed_before_its_response() {
