@@ -1,5 +1,49 @@
 # Changelog
 
+## OIRAN API 2.21.81 + live-probe 0.6.27 — 2026-11-19 — carry HPACK enclenché dès la première rotation (ordre #9 7013285585 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (PROD). Écart OUVERT par ANR2 (#10 7012038887) : après déploiement `hpack_carry.connections_tracked=0, connections_resumed=0, off_ring_segments_decoded=2`.
+
+### Cause (audit, lecture seule, base `29fe4e3`)
+
+`process_continuous_capture_inner` (OIRAN/live-probe/src/lib.rs, boucle d'ingestion) :
+- **ligne 4200** `state.segments.insert(sha, segment)` : le segment fraîchement ingéré est ajouté en mémoire seulement.
+- **ligne 4296** `self.process_continuous_capture_selected_at(...)` déclenche le publish → **ligne 6241-6259** `process_capture_into_selected` RE-LIT `import_state.json` DEPUIS LE DISQUE pour alimenter `partition_sbi_segments_for_carry`.
+- **ligne 4335** `persist_published_checksums` persiste `state` SEULEMENT APRÈS le publish réussi.
+
+Entre 4200 et 4335, le `state.json` sur disque est **périmé** : il ne contient pas le segment fraîchement ingéré. `partition_sbi_segments_for_carry` ne trouve pas son `source_path` → segment classé **hors ring** → `off_ring_segments_decoded += 1` → carry HPACK jamais enclenché pour ce segment. Au cycle suivant, `seen_checksums` contient le sha → `prior_capture_checksums.contains(&checksum) continue` (ligne 6315) → segment skippé, carry jamais rattrapé.
+
+### Correctif 2.21.81
+
+- `process_continuous_capture_inner` : **`atomic_write` de `state`** AVANT `process_continuous_capture_selected_at` (juste après l'`eprintln!` `CONTINUOUS_PUBLICATION_INCREMENTAL phase=begin`, nouveau bloc commenté `2.21.81 (CLAUDE1, ordre #9 7013285585)`). `seen_checksums` reste inchangé ici ; `persist_published_checksums` continue de l'écrire après succès du publish.
+- Sémantique crash : `state.segments` persisté sans `seen_checksum` → prochain scan voit le candidat, `copy_verified` sur destination existante idempotent (même checksum), le cycle reprend proprement. Aucune perte, aucune corruption.
+
+### Test de non-régression + preuve de mutation
+
+`restart_then_two_sbi_rotations_classify_both_as_ring_after_persist_before_publish` (OIRAN/live-probe/src/lib.rs, test suivant `continuous_import_drains_a_burst_of_250_segments_without_blocking`) :
+
+1. Fresh state (restart) + source vide.
+2. Rotation 1 : drop `sbi_20261119T100000Z_00001_<...>.pcapng` avec HPACK préface + literal headers → attend `segments_ingested >= 1` → lit `state.json` et assert le `source_path` dumpcap y figure.
+3. Rotation 2 : drop `sbi_20261119T100000Z_00002_<...>.pcapng` avec bloc indexed-only → attend `segments_ingested >= 2` → assert les DEUX `source_path` sont dans `state.json`.
+4. **Preuve 3/3** : `hpack_carry_metrics_snapshot()["SBI"].off_ring_segments_decoded == 0`.
+
+**Mutation vérifiée** : retirer l'`atomic_write` (commenté en `MUTATION_DISABLED_FOR_PROOF`) fait échouer l'assertion 3/3 avec **exactement** les chiffres ANR2 (#10 7012038887) : `off_ring_segments_decoded=2, connections_tracked=0, connections_resumed=0`. Avec l'`atomic_write` : `off_ring=0`.
+
+### Preuves exécutées
+
+```
+cargo test --locked -p live-probe --lib -j 2 restart_then_two_sbi → 1 passed; 0 failed
+cargo test --locked -p live-probe --lib -j 2                      → 186 passed; 0 failed; 6 ignored
+cargo test --locked -p oiran-api  --lib -j 2                      → 199 passed; 0 failed; 3 ignored
+
+12 × cargo test --locked -p live-probe --lib -j 2 restart_then_two_sbi
+→ 12 × "1 passed; 0 failed"
+
+python3 /tmp/audit.py OIRAN/Cargo.lock → OK 137 pkg, 0 > 1.83
+```
+
+**Mesure ANR2 en régime établi attendue** : si elle montre toujours le carry à 0 à chaque rotation, ce lot devient prioritaire pour déploiement.
+
 ## OIRAN API 2.21.79 + decoder-sip 0.2.0 + decoder-rtp 0.2.0 + correlation-engine 0.6.12 + oiran-decode 0.8.2 — 2026-11-19 — corrections voix sûres (ordre #9 7012275179 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (= PROD). Lot CLAUDE1 numéroté impair (règle numerology 7007412446). **Trois correctifs sûrs, AVANT le gros chantier GTP-U inner (ligne 11 de l'audit A0-VOIX 7012175926).**
@@ -68,45 +112,6 @@ cargo test --locked -p oiran-api       --lib → 199 passed; 0 failed; 3 ignored
 python3 /tmp/audit.py OIRAN/Cargo.lock       → OK 137 pkg, 0 > 1.83
 python3 /tmp/audit.py OIRAN/vtap/Cargo.lock  → OK  53 pkg, 0 > 1.83
 ```
-
-## OIRAN API 2.21.74 + live-probe 0.6.26 — 2026-11-19 — `/sessions/filter` 503 jusqu'aux caches READY (ordre #10 7009381757)
-
-Branche `fix/oiran-2.21.74-filter-ready-503`, base exacte `fix/oiran-2.21.72-train @ eaa21f0`. Aucun déploiement.
-
-### Audit et fenêtre fautive
-
-- `CaptureManager::publish_events_to_dataset_dir` libérait la garde lourde de publication en retournant le dataset ; `upsert_dataset` rendait ensuite la nouvelle génération visible ; l'observateur API reprenait seulement après cela une nouvelle garde exclusive pour préchauffer l'index de filtre et `ListRowCache`.
-- Dans cette fenêtre, `sessions_filter_blocking` pouvait obtenir une garde de lecture, observer la nouvelle génération avec les caches de l'ancienne, et répondre transitoirement `200 []`.
-- Le test 2.21.30 ne couvrait que la période où la garde de publication était encore tenue ; il ne couvrait pas l'intervalle après son relâchement et avant le préchauffage.
-- Audit de `c1f2798` (2.21.57) : le verrou pouvait déjà être relâché avant l'exposition de la génération et aucune invariance READY par génération n'existait. Le symptôme précis « caches de préchauffage incomplets » est apparu avec l'observateur post-publication ajouté ensuite ; la classe de défaut (visibilité sans état READY) était donc déjà présente en 2.21.57.
-
-### Correctif
-
-- `live-probe 0.6.26` garde désormais le verrou lourd exclusif pendant l'insertion de la génération et tout l'observateur synchrone : aucune route lourde ne peut entrer entre visibilité et préchauffage.
-- L'API mémorise explicitement la génération dont l'index de filtre et toutes les lignes sont READY. Sa signature inclut désormais le `commit_seq`, l'identifiant du dataset et son nombre de sessions, en plus des signatures de fichiers.
-- `/sessions/filter`, avec ou sans `time_window`, répond `503 HEAVY_WORK_IN_PROGRESS` et `Retry-After: 60` si la génération visible ne correspond pas à la génération READY. Un préchauffage incomplet (`deferred` ou `missing`) ne publie jamais READY.
-- Une génération publiée réellement vide est préchauffée, marquée READY, puis conserve `200` avec `data: []`.
-
-### Régression
-
-- `sessions_filter_answers_503_until_published_generation_caches_are_ready` : 503 avec/sans fenêtre pendant la reconstruction, puis 200 avec total et liste complète après READY.
-- `sessions_filter_ready_empty_generation_stays_200` : distinction explicite entre cache non prêt et génération réellement vide.
-- Validation finale : 12/12 runs ciblés sans échec ; API `199 passed, 0 failed, 3 ignored` ; live-probe `185 passed, 0 failed, 6 ignored` ; workspace complet vert ; vTAP `12 + 3 passed` après `cargo update -w` (0 package modifié) ; audit Rust 1.83 : workspace 137 packages et vTAP 33 packages, 0 violation.
-
----
-
-## OIRAN API 2.21.72 — 2026-11-19 — train de livraison : 2.21.66 + 2.21.68 + 2.21.70 merge --no-ff (ordre #9 7007412446)
-
-Train objectif « un seul déploiement après 2.21.64 ». Branche `fix/oiran-2.21.72-train`, base `2468bfc` (`fix/oiran-2.21.64-merge`). Trois merges `--no-ff` dans l'ordre chronologique :
-
-1. **2.21.66** (NGAP partiels — `a3fc681`) : décoder-ngap 0.6.3, procedureCode 28, IE 19/107 décodés, forme longue release lists, UE-NGAP-IDs 2 branches CHOICE. Voir section dédiée ci-dessous.
-2. **2.21.68** (queue_occupancy honnête + quarantaine — `77efd30`) : live-probe 0.6.25, redéfinition `queue_occupancy_percent`, nouveau `owned_bytes_percent` sans clamp, `quarantined_segments` exclu de pending. Voir section dédiée ci-dessous.
-3. **2.21.70** (pagination /callflow — `17dc76d`) : `total_events` cohérent multi-pages, clés PFCP session complète. Voir section dédiée ci-dessous.
-
-### Conflits résolus
-- `apps/api/Cargo.toml` : trois versions concurrentes → version finale `2.21.72`.
-- `Cargo.lock` : idem pour l'entrée `oiran-api`.
-- `CHANGELOG.md` : trois en-têtes concurrents → ordre conservé (chronologique descendant).
 
 ## OIRAN API 2.21.76 + decoder-gtpu 0.2.2 — 2026-11-19 — confidentialité L2 + corrections data S (ordre #9 7012275179)
 
