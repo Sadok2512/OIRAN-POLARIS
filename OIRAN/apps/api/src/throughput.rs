@@ -184,36 +184,56 @@ pub(crate) struct ThroughputRegistry {
 /// `0` si tous les essais ont échoué. Un fichier disparu contribue
 /// `size - consumed_bytes` au gap (= 0 si entièrement consommé).
 ///
-/// 2.21.78 (correction 7014327787) — **filigrane par fichier** :
-/// `last_packet_number` + `last_event_id` identifient le dernier
-/// event déjà routé. Un event re-apparu après un décodage ultérieur
-/// (fichier qui grossit) n'est routé que si
-/// `(packet_number, event_id) > (last_packet_number, last_event_id)`
-/// en ordre lexicographique. Ce filigrane **n'est jamais effacé**,
-/// il disparaît avec le fichier. Supprime le besoin d'un
-/// dédoublonnage global (`prior.clear()` à 200 000 → double comptage
-/// sous charge iperf).
+/// 2.21.78 (corrections 7014327787 + 7014783020) — **deux
+/// dédoublonnages distincts** par fichier :
+///
+/// 1. **Filigrane pour le débit** (`last_packet_number`,
+///    `last_event_id`) : monotone, avance uniquement. Garantit qu'un
+///    event dont le `(packet_number, event_id)` ne dépasse pas le
+///    filigrane n'est **jamais compté** dans les buckets de débit
+///    (anti-double-comptage sous iperf).
+///
+/// 2. **Dédoublonnage par `event_id` pour la live trace**
+///    (`routed_event_ids`) : set d'identifiants d'events déjà routés
+///    depuis ce fichier. Un event late reconstruit (p.ex. réassemblage
+///    HTTP/2 / SCTP qui sort avec `packet_number` inférieur au
+///    filigrane mais `event_id` nouveau) **est routé** vers la
+///    live trace, qui le marquera `late:true`. Le set n'est jamais
+///    vidé à un seuil global — il disparaît avec le fichier.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PcapFileState {
     pub size: u64,
     pub mtime: Option<std::time::SystemTime>,
     pub consumed_bytes: u64,
-    /// Plus grand `packet_references[0].packet_number` déjà routé
-    /// depuis ce fichier. `0` tant qu'aucun event n'a été observé.
+    /// Plus grand `packet_references[0].packet_number` déjà **compté
+    /// dans le débit** depuis ce fichier.
     pub last_packet_number: u64,
-    /// `event_id` du dernier event routé au `last_packet_number`
-    /// courant. Permet la coexistence d'events multiples sur un même
-    /// packet (p.ex. NGAP + NAS enfant) via comparaison lexicographique
-    /// sur `(packet_number, event_id)`.
+    /// `event_id` du dernier event compté dans le débit au
+    /// `last_packet_number` courant (tie-breaker lexicographique).
     pub last_event_id: String,
+    /// 2.21.78 (correction 7014783020) — `event_id` de tous les events
+    /// déjà routés vers la **live trace** depuis ce fichier.
+    /// Garantit que la live trace reçoit un event late (packet_number
+    /// < filigrane, mais event_id nouveau) avec `late:true`, et ne le
+    /// voit pas deux fois si le fichier est re-décodé.
+    pub routed_event_ids: std::collections::HashSet<String>,
 }
 
 impl PcapFileState {
-    /// 2.21.78 (correction 7014327787) — un event doit être routé si
-    /// son `(packet_number, event_id)` dépasse le filigrane. Retourne
-    /// `true` **et** avance le filigrane dans la même opération ; le
-    /// caller n'a pas besoin de synchroniser.
-    pub fn consume(&mut self, packet_number: u64, event_id: &str) -> bool {
+    /// 2.21.78 (correction 7014783020) — un event doit être routé
+    /// vers la live trace si son `event_id` n'a jamais été vu dans ce
+    /// fichier. Avance le set et retourne `true` à la première
+    /// occurrence. Un event late (pn < filigrane) passe le test tant
+    /// que son `event_id` est inédit.
+    pub fn route_once_for_live_trace(&mut self, event_id: &str) -> bool {
+        self.routed_event_ids.insert(event_id.to_owned())
+    }
+
+    /// 2.21.78 (correction 7014327787) — un event doit être compté
+    /// dans le débit si son `(packet_number, event_id)` dépasse le
+    /// filigrane. Monotone : un event late (pn < filigrane) est
+    /// rejeté, ses octets ne seront donc jamais comptés deux fois.
+    pub fn should_count_in_throughput(&mut self, packet_number: u64, event_id: &str) -> bool {
         if packet_number > self.last_packet_number
             || (packet_number == self.last_packet_number && event_id > self.last_event_id.as_str())
         {
@@ -873,6 +893,7 @@ mod tests {
             consumed_bytes: 4096,
             last_packet_number: 0,
             last_event_id: String::new(),
+            routed_event_ids: Default::default(),
         };
         // 3 polls avec (size, mtime) identiques → 0 incrément.
         for _ in 0..3 {
@@ -901,6 +922,7 @@ mod tests {
             consumed_bytes: 1500, // lu en entier
             last_packet_number: 0,
             last_event_id: String::new(),
+            routed_event_ids: Default::default(),
         };
         let gap = prev.size.saturating_sub(prev.consumed_bytes);
         if gap > 0 {
@@ -922,6 +944,7 @@ mod tests {
             consumed_bytes: 500, // seulement 500/1500 consommés (decode erroré)
             last_packet_number: 0,
             last_event_id: String::new(),
+            routed_event_ids: Default::default(),
         };
         let gap = prev.size.saturating_sub(prev.consumed_bytes);
         if gap > 0 {
@@ -954,7 +977,7 @@ mod tests {
         let mut routed_pass1 = 0u64;
         for pn in 1..=total_events {
             let event_id = format!("evt-{pn}");
-            if state.consume(pn, &event_id) {
+            if state.should_count_in_throughput(pn, &event_id) {
                 routed_pass1 += 1;
             }
         }
@@ -966,7 +989,7 @@ mod tests {
         for _pass in 2..=5u32 {
             for pn in 1..=total_events {
                 let event_id = format!("evt-{pn}");
-                if state.consume(pn, &event_id) {
+                if state.should_count_in_throughput(pn, &event_id) {
                     routed_rest += 1;
                 }
             }
@@ -984,15 +1007,63 @@ mod tests {
     #[test]
     fn watermark_lets_multiple_events_on_same_packet_pass() {
         let mut state = PcapFileState::default();
-        assert!(state.consume(5, "evt-aaa"));
+        assert!(state.should_count_in_throughput(5, "evt-aaa"));
         assert!(
-            state.consume(5, "evt-bbb"),
+            state.should_count_in_throughput(5, "evt-bbb"),
             "même packet, event_id lexicalement > doit passer"
         );
         // Mais un event antérieur ou identique est rejeté.
-        assert!(!state.consume(5, "evt-bbb"), "même packet, même event_id = doublon");
-        assert!(!state.consume(5, "evt-aaa"), "event_id lexicalement < = doublon");
-        assert!(!state.consume(4, "evt-zzz"), "packet antérieur = doublon");
+        assert!(
+            !state.should_count_in_throughput(5, "evt-bbb"),
+            "même packet, même event_id = doublon"
+        );
+        assert!(
+            !state.should_count_in_throughput(5, "evt-aaa"),
+            "event_id lexicalement < = doublon"
+        );
+        assert!(
+            !state.should_count_in_throughput(4, "evt-zzz"),
+            "packet antérieur = doublon"
+        );
+    }
+
+    /// 2.21.78 (correction 7014783020) — un event late reconstruit
+    /// (p.ex. message HTTP/2 réassemblé qui sort avec packet_number
+    /// INFÉRIEUR au filigrane) doit être **routé** vers la live trace
+    /// avec `late:true` (via `route_once_for_live_trace`), MAIS **pas
+    /// compté** dans le débit (via `should_count_in_throughput`).
+    /// Preuve par les deux méthodes séparées.
+    #[test]
+    fn late_event_routed_to_live_trace_but_not_counted_in_throughput() {
+        let mut state = PcapFileState::default();
+        // Premier event : packet 10, event A → routed + counted.
+        assert!(state.route_once_for_live_trace("evt-A"));
+        assert!(state.should_count_in_throughput(10, "evt-A"));
+        assert_eq!(state.last_packet_number, 10);
+
+        // Event late : packet 5, event B (NOUVEAU event_id) →
+        // ROUTED à la live trace (late:true dans route_normalized),
+        // mais PAS compté dans le débit (filigrane ne recule pas).
+        assert!(
+            state.route_once_for_live_trace("evt-B"),
+            "event late avec event_id inédit DOIT être routé à la live trace"
+        );
+        assert!(
+            !state.should_count_in_throughput(5, "evt-B"),
+            "event late ne DOIT PAS être compté dans le débit"
+        );
+        // Filigrane reste à 10 (ne recule pas).
+        assert_eq!(state.last_packet_number, 10);
+
+        // Un re-decode du même event A → les deux méthodes rejettent.
+        assert!(
+            !state.route_once_for_live_trace("evt-A"),
+            "event_id déjà routé = doublon live trace"
+        );
+        assert!(
+            !state.should_count_in_throughput(10, "evt-A"),
+            "event_id déjà compté = doublon débit"
+        );
     }
 
     /// Cap `MAX_ACTIVE_BUCKETS_PER_SESSION` — au-delà, les octets sont

@@ -393,6 +393,7 @@ pub(crate) fn start_reader(state: AppState) {
                                         consumed_bytes: size,
                                         last_packet_number: u64::MAX,
                                         last_event_id: String::new(),
+                                        routed_event_ids: Default::default(),
                                     },
                                 );
                                 continue;
@@ -421,6 +422,7 @@ pub(crate) fn start_reader(state: AppState) {
                                         consumed_bytes: prev.consumed_bytes,
                                         last_packet_number: prev.last_packet_number,
                                         last_event_id: prev.last_event_id,
+                                        routed_event_ids: prev.routed_event_ids,
                                     },
                                 );
                                 continue;
@@ -443,11 +445,17 @@ pub(crate) fn start_reader(state: AppState) {
                                     Ok(())
                                 });
                             sort_by_capture_order(&mut fresh);
-                            // 2.21.78 (correction 7014327787) — **filigrane
-                            // par fichier** : `consume(packet_number, event_id)`
-                            // avance le filigrane et retourne `true` si
-                            // l'event doit être routé. Remplace l'ancien
-                            // `prior` global qui `clear()` à 200 000.
+                            // 2.21.78 (corrections 7014327787 + 7014783020)
+                            // — **deux dédoublonnages distincts** :
+                            //   - live trace : `route_once_for_live_trace`
+                            //     via set d'`event_id` par fichier. Un event
+                            //     late (packet_number < filigrane mais
+                            //     event_id inédit) est routé avec `late:true`
+                            //     par la logique interne de `route_normalized`.
+                            //   - débit : `should_count_in_throughput` avance
+                            //     le filigrane `(packet_number, event_id)`
+                            //     monotone — aucun double comptage même sous
+                            //     iperf 10⁵ pps.
                             let mut file_state_entry =
                                 states.remove(path).unwrap_or_default();
                             for event in &fresh {
@@ -456,17 +464,21 @@ pub(crate) fn start_reader(state: AppState) {
                                     .first()
                                     .map(|p| p.packet_number)
                                     .unwrap_or(0);
-                                if !file_state_entry.consume(packet_number, &event.event_id) {
-                                    continue;
+                                if file_state_entry.route_once_for_live_trace(&event.event_id) {
+                                    state2.inner.live_traces.route_normalized(event);
                                 }
-                                state2.inner.live_traces.route_normalized(event);
-                                let session_id = crate::throughput::resolve_session_id_for_event(
-                                    &state2, event,
-                                );
-                                state2
-                                    .inner
-                                    .throughput
-                                    .observe_event(event, session_id.as_deref());
+                                if file_state_entry.should_count_in_throughput(
+                                    packet_number,
+                                    &event.event_id,
+                                ) {
+                                    let session_id = crate::throughput::resolve_session_id_for_event(
+                                        &state2, event,
+                                    );
+                                    state2
+                                        .inner
+                                        .throughput
+                                        .observe_event(event, session_id.as_deref());
+                                }
                             }
                             file_state_entry.size = size;
                             file_state_entry.mtime = mtime;

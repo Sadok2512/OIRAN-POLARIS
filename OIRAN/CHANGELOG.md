@@ -2,6 +2,14 @@
 
 ## OIRAN API 2.21.78 — 2026-11-19 — débit live GTP-U par seconde / session / QFI (SSE indépendant) (ordre #9 7013448739, corrections #9 7013902603)
 
+### Correction suite à l'ordre 7014783020 (séparation live trace / débit)
+
+5. **Régression live trace sur les events late — fermée.** Le filigrane `(packet_number, event_id)` monotone (étape précédente) jetait en silence les events reconstruits en retard que la live trace doit **justement** exposer avec `late:true` (contrat 2.18.10 ANR2 #10 6902524402). Correctif : **deux dédoublonnages distincts** sur `PcapFileState` :
+   - `route_once_for_live_trace(event_id)` — ensemble `routed_event_ids: HashSet<String>` par fichier. Un event late (pn < filigrane, event_id inédit) est routé à la live trace, qui le marque `late:true` via sa logique interne existante.
+   - `should_count_in_throughput(packet_number, event_id)` — filigrane monotone inchangé. Un event late est **rejeté** (débit non recompté).
+   - Les deux sets disparaissent avec le fichier et ne sont jamais vidés à un seuil global.
+   - Test `late_event_routed_to_live_trace_but_not_counted_in_throughput` : un event `(pn=5, "evt-B")` late après `(pn=10, "evt-A")` est routé à la live trace mais pas compté dans le débit ; `last_packet_number` reste à 10.
+
 ### Corrections suite à l'ordre 7014327787 (filigrane + rattrapage startup)
 
 3. **Double comptage sous charge — fermé.** L'ancien dédoublonnage via `prior: HashSet<event_id>` global avec `clear()` à 200 000 doublonnait les bytes du fichier courant sous iperf (clear → tous les events paraissent neufs). Correctif : **filigrane `(packet_number, event_id)` par fichier** stocké dans `PcapFileState`. L'event n'est routé que si `(packet_number, event_id) > (last_packet_number, last_event_id)` lexicographiquement — ne se vide **jamais**, disparaît avec le fichier. La méthode `PcapFileState::consume` avance le filigrane et retourne `true`/`false` dans la même opération. Tests :
