@@ -1043,7 +1043,17 @@ fn flush_representative_run(
         writer.write_all(b"\n").map_err(|error| error.to_string())?;
         offset = last + 1;
     }
-    writer.flush().map_err(|error| error.to_string())?;
+    let inner = writer.into_inner().map_err(|error| error.to_string())?;
+    inner.sync_data().map_err(|error| error.to_string())?;
+    // 2.21.71 (CLAUDE1, ordre #9 7006855142 §2) — les pages du run
+    // qu'on vient d'écrire sont maintenant propres (sync_data a flushé
+    // les données sur disque). Les relâcher tout de suite évite que le
+    // stock de runs (`.publish-staging/representatives/run-XXXXXX.jsonl`)
+    // accumule son propre page cache en parallèle de la lecture des
+    // shards. Reprise en lecture lors de la merge finale paiera un
+    // single re-read séquentiel, ce qui est l'intention du spill.
+    advise_file_range_no_longer_needed(&inner, 0, 0);
+    drop(inner);
     records.clear();
     Ok(path)
 }
@@ -1247,6 +1257,15 @@ where
             advised_bytes,
             consumed_bytes.saturating_sub(advised_bytes),
         );
+        // 2.21.71 (CLAUDE1, ordre #9 7006855142 §2) — second
+        // DONTNEED « whole file » après le dernier DONTNEED « range ».
+        // Sur certains kernels le flag DONTNEED est traité comme un
+        // hint LRU : un appel final à offset=0, len=0 (= tout le
+        // fichier) laisse au kernel l'opportunité d'évacuer en bloc
+        // ce qui résistait aux hints par bloc 16 MiB. Mesuré par ANR1
+        // (#10 7006752946) : 2,18 Go de page cache en fin de phase 01,
+        // malgré les DONTNEED 2.21.63 déjà en place.
+        advise_file_range_no_longer_needed(&file, 0, 0);
         stage(
             "01-40-shard-end",
             &[
@@ -1257,6 +1276,7 @@ where
                 ("run_count", run_paths.len() as u64),
             ],
         );
+        drop(file);
     }
     stage(
         "01-50-scan-end",
@@ -1334,6 +1354,12 @@ where
             ("events_len", events.len() as u64),
         ],
     );
+    // 2.21.71 (CLAUDE1, ordre #9 7006855142 §2) — les readers de runs
+    // terminent avec leur fd ouvert. On libère les fds (drop), puis on
+    // ré-ouvre chaque run juste pour émettre un DONTNEED « whole file »
+    // avant unlink. Le page cache est indexé par inode, donc un fd
+    // frais suffit tant que le fichier n'a pas été remove.
+    drop(readers);
     deterministic_sort(&mut events);
     stage(
         "01-90-post-sort",
@@ -1342,6 +1368,9 @@ where
     progress(source_event_count, events.len());
 
     for path in run_paths {
+        if let Ok(file) = fs::File::open(&path) {
+            advise_file_range_no_longer_needed(&file, 0, 0);
+        }
         fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     }
     fs::remove_dir(&staging_dir)

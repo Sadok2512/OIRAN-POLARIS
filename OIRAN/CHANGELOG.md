@@ -1,5 +1,32 @@
 # Changelog
 
+## OIRAN API 2.21.71 + live-probe 0.6.28 + session-engine 0.5.26 — 2026-11-19 — fadvise DONTNEED par bloc (étape 2/3, ordre #9 7006855142 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur 2.21.69 (`058adc2`). Étape 2/3 du lot 2.21.69 : viser les 2,18 Go de `cgroup_file_kb` mesurés par ANR1 (#10 7006752946).
+
+### Constat
+
+Le `POSIX_FADV_DONTNEED` par bloc 16 MiB ajouté en 2.21.63 n'empêche pas 2,18 Go de page cache en fin de phase 01. Deux sources manquantes :
+1. Les **runs spillés** `.publish-staging/representatives/run-XXXXXX.jsonl` : chaque `flush_representative_run` écrit un run, puis la merge finale re-lit tous les runs. Ces écritures et lectures ne sont jamais `fadvise(DONTNEED)`'d → leur page cache s'accumule.
+2. Sur certains kernels, un `fadvise(DONTNEED)` par petit bloc est traité comme un hint LRU qui peut rester sans effet si les pages semblent « chaudes ». Un appel final `fadvise(DONTNEED, 0, 0)` sur le fichier entier (= « tout », pas une plage) permet au kernel de batcher l'éviction.
+
+### Correctif 2.21.71
+
+- `flush_representative_run` (session-engine) : après écriture, `writer.into_inner()?` + `file.sync_data()?` (garantit les pages propres) + `advise_file_range_no_longer_needed(&file, 0, 0)` avant drop.
+- Fin de boucle de shard dans `_with_stages` : après le `fadvise(DONTNEED, tail_range)` existant, ajouter un second `fadvise(DONTNEED, 0, 0)` « whole file ». `drop(file)` explicite pour fermer le fd avant d'ouvrir le shard suivant.
+- Fin de merge (après `drop(readers)`) : avant `fs::remove_file(&path)` pour chaque run spillé, ré-ouvrir le run et `fadvise(DONTNEED, 0, 0)`. Le page cache est indexé par inode, un fd frais suffit tant que le fichier n'est pas unlinké.
+
+### Byte-identique
+
+`sync_data()` est une opération sans effet sur le contenu (garantit la durabilité disque sans toucher les octets). Les `fadvise` sont des hints kernel qui ne modifient pas le fichier. Les tests de non-régression existants
+(`spilling_with_stages_matches_with_progress_byte_identical`,
+`spilling_with_stages_byte_identical_twelve_consecutive_runs`,
+`spilling_representatives_match_legacy_across_multiple_runs`) couvrent l'identité octet pour octet du `StreamingRepresentativesIndex`. 12 invocations `cargo test` séparées : 12/12 ok.
+
+### Prochaine étape
+
+2.21.73 — somme comptée par champ de `publication_projection_field_bytes` sur les représentants retenus à `01-50-scan-end`, plus `capacity()` vs `len()` des Vec/String principaux. Chiffre les 3,55 Ko d'anon par représentant observés par ANR1.
+
 ## OIRAN API 2.21.69 + live-probe 0.6.27 — 2026-11-19 — cgroup via /proc/self/cgroup (étape 1/3, ordre #9 7006855142 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur 2.21.67 (`1840ebd`). Lot 2.21.69 étape 1 **poussée seule** selon l'ordre explicite du cœur (ANR1 en a besoin pour mesurer 2.21.67/2.21.69 juste).
