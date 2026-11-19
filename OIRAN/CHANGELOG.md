@@ -36,7 +36,27 @@ Pour 10 000 sessions (borne de dimensionnement) : ~95 MB par génération → +9
 
 ### Condition 2 (aucune lecture disque)
 
-La route ne touche QUE `gen.filter_index`, `gen.journey_index`, `gen.list_rows`. Aucun appel à `capture_manager.callflow(...)`. Ce point est garanti par construction : si une session_id n'a pas de ligne pré-rendue dans `gen.list_rows`, elle n'aurait pas été dans `filter_index` au moment du swap (prewarm READY ⇒ `missing=0`). Un dataset GC'd après swap ne perturbe pas la lecture.
+La route ne touche QUE `gen.filter_index`, `gen.journey_index`, `gen.rows_by_session`. Aucun appel à `capture_manager.callflow(...)` ni à `cached_live_list_row(...)` tant que `generation_slot = Some(gen)`.
+
+**Correctif cœur apporté par l'ordre #9 `7016931409` (reserve 1/2)** : avant ce correctif, `sessions_filter_blocking` retombait sur `cached_live_list_row → capture_manager.callflow → fs::read` pour résoudre chaque ligne de page, ce qui échoue après GC du fichier source. Le double tampon possédait la ligne pré-rendue dans `gen.list_rows` mais ne la lisait pas depuis la route.
+
+- Nouveau champ `FilterGeneration::rows_by_session: Arc<HashMap<String, (Value, Value)>>` construit atomiquement avec `list_rows` au swap : index secondaire `session_id → (prebuilt_summary, events_identities)` pour une résolution `O(1)` par ligne sans parcourir les datasets.
+- Nouveau closure `resolve_from_generation(session_id)` dans la route : `gen.rows_by_session.get(session_id)` + `decorate_subscriber_summary_by_id` + hydratation identités (vault prioritaire, events en fallback). Jamais de `fs::*`.
+- Le chemin non-prebuilt lit d'abord `rows_by_session`, puis complète via `state.inner.flows` (BTreeMap en mémoire, dataset de référence construit à `AppState::load`). Le scan `capture_manager.datasets() + cached_live_list_row` reste présent UNIQUEMENT pour les tests isolés sans `install_session_filter_cache_prewarm` (`generation_slot = None`).
+- Le chemin extended-filter (`resolve_summary`) préfère `resolve_from_generation` avant toute lecture live.
+
+### Condition 2 — test GC-survival (reserve 1/2, ordre #9 7016931409)
+
+`sessions_filter_serves_generation_after_file_gc_2_21_85` : construit un dataset continuous avec un callflow JSON, préchauffe (`generation=N`, `list_rows_cached=1`), capture `data` de la réponse, supprime le fichier callflow, re-préchauffe (`SESSIONS_FILTER_PREWARM_INCOMPLETE`, `list_rows_missing=1`, **aucun swap**), re-requête. La route répond `200` + `x-oiran-generation=N` + `data` **byte-identique** à l'avant-GC. Preuve exécutable :
+
+```
+flock -w 900 /tmp/nsplus-heavy-build.lock timeout 5m nice -n 19 ionice -c3 \
+  cargo test --locked -p oiran-api --lib -j 2 \
+  sessions_filter_serves_generation_after_file_gc_2_21_85 -- --test-threads=1 --nocapture
+→ 1 passed; 0 failed; 0 ignored; 204 filtered out ; 0.08 s
+Trace SESSIONS_FILTER_GENERATION_SWAP generation=2, puis
+      SESSIONS_FILTER_PREWARM_INCOMPLETE list_rows_missing=1 (aucun swap).
+```
 
 ### Condition 3 (retrait heavy_memory_try_enter)
 
@@ -52,13 +72,55 @@ Acceptable parce que la route ne fait qu'un `Arc::clone` sur le snapshot. VmHWM 
 
 - Mis à jour `sessions_filter_serves_previous_generation_during_publication_2_21_85` (remplaces l'ancien `sessions_filter_answers_503_while_continuous_publication_holds_memory_gate`) : vérifie que pendant un `heavy_memory_enter`, la route ne répond PAS 503.
 - Mis à jour `sessions_filter_first_boot_without_any_ready_generation_returns_503_2_21_85` (remplace l'ancien `sessions_filter_answers_503_until_published_generation_caches_are_ready`) : vérifie 503 `SESSION_FILTER_CACHE_WARMING` quand `generation_slot=None`, puis 200 avec `x-oiran-generation` après prewarm.
+- Ajouté `sessions_filter_serves_generation_after_file_gc_2_21_85` (condition 2, reserve 1/2 — ordre #9 `7016931409`).
 - Les 198 tests pré-existants passent sans modification (byte-identité préservée en mode test).
 
-### Preuves
+### Preuves (reserve 1/2 ordre #9 7016931409)
+
+Préflight (règle CPU #9 7018292949) :
 
 ```
-cargo test --locked -p oiran-api --lib -j 2 → 201 passed; 0 failed; 3 ignored; 0 measured
-python3 /tmp/audit.py OIRAN/Cargo.lock → OK 137 packages, 0 > 1.83
+nproc                         → 10
+cat /proc/loadavg             → 2.91 1.51 1.35 2/695 27249
+cat /proc/pressure/cpu        → some avg10=1.80 full avg10=0.00  (<10, GO)
+cat /proc/pressure/memory     → some=0.00 full=0.00
+free -b (avail)               → 13 022 285 824  (≥ 4 GiB GO)
+df -B1 / (avail)              → 26 510 102 528  (≥ 25 Go GO)
+```
+
+Compilation + suite complète (une fois, règle CPU §3) :
+
+```
+flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 \
+  cargo check --locked -p oiran-api --tests -j 2
+  → Finished dev profile [unoptimized + debuginfo] in 11.83s
+  DURATION 12s, cpu some avg10 before=0.62 / after=1.93
+
+flock -w 900 /tmp/nsplus-heavy-build.lock timeout 15m nice -n 19 ionice -c3 \
+  cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2
+  → 202 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out ; 14.95 s
+  DURATION 34s, cpu some avg10 before=0.00 / after=0.23
+```
+
+12 runs ciblés 2.21.85 (règle #9 7015585561 reserve 2/2) :
+
+```
+for i in $(seq 1 12); do
+  flock -w 900 /tmp/nsplus-heavy-build.lock timeout 10m nice -n 19 ionice -c3 \
+    cargo test --locked -p oiran-api --lib -j 2 2_21_85 -- --test-threads=2
+done
+  → 12/12 passed, 0/12 failed
+  → test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 202 filtered out
+  → MAX cpu some avg10 pendant les 12 runs = 1.30 (bien sous le seuil 25)
+  DURATION 9s (compile cache chaud)
+```
+
+Audit `Cargo.lock` (inchangé par ce correctif — aucune nouvelle dépendance ajoutée) :
+
+```
+grep -c '^name = ' OIRAN/Cargo.lock       → 137
+grep -c '^name = ' OIRAN/vtap/Cargo.lock  → 53
+git diff OIRAN/Cargo.lock                  → (vide)
 ```
 
 ### Hors scope 2.21.85

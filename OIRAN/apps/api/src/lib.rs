@@ -3671,6 +3671,17 @@ pub(crate) struct FilterGeneration {
     /// HashMap et NE FAIT JAMAIS d'accès disque via
     /// `capture_manager.callflow(...)`.
     pub list_rows: Arc<std::collections::HashMap<(String, String), (Value, Value)>>,
+    /// 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2 "GC-survival") —
+    /// index secondaire `session_id → (prebuilt_summary, events_identities)`
+    /// construit atomiquement avec `list_rows` au moment du swap. La route
+    /// résout chaque ligne de page par `rows_by_session.get(session_id)`
+    /// sans jamais consulter `state.inner.capture_manager.datasets()` ni
+    /// `callflow(...)` : une génération READY continue donc à servir une
+    /// réponse identique même après GC des fichiers du dataset qui l'a
+    /// nourrie (préchauffage de la génération suivante échoué → `ready`
+    /// reste pointé sur `gen`). Les identités dynamiques (vault +
+    /// hydratation tshark) sont rejointes à la lecture comme avant.
+    pub rows_by_session: Arc<std::collections::HashMap<String, (Value, Value)>>,
     /// Lower-bound de la taille mémoire de la génération, exposée en
     /// trace `SESSIONS_FILTER_GENERATION_SWAP bytes_estimate=…`.
     pub bytes_estimate: u64,
@@ -3860,6 +3871,20 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
             })
             .unwrap_or_default();
         let list_rows_arc = Arc::new(list_rows_map);
+        // 2.21.85 — projection inverse `session_id → row` pour la condition
+        // 2. Chaque session_id n'apparaît qu'une fois dans `list_rows` (clé
+        // `(dataset_id, session_id)` et un session_id ne vit que dans un
+        // dataset à la fois), on peut collapse sans perte. Si un doublon
+        // survenait, on conserve la première entrée observée (deterministe
+        // dans l'ordre de l'iterator HashMap du build).
+        let mut rows_by_session_map: std::collections::HashMap<String, (Value, Value)> =
+            std::collections::HashMap::with_capacity(list_rows_arc.len());
+        for ((_dataset_id, session_id), row) in list_rows_arc.iter() {
+            rows_by_session_map
+                .entry(session_id.clone())
+                .or_insert_with(|| row.clone());
+        }
+        let rows_by_session_arc = Arc::new(rows_by_session_map);
         let bytes_filter = filter_index_arc.estimated_bytes();
         let bytes_journey = (list_rows_arc.len() * std::mem::size_of::<(String, String)>()) as u64
             + list_rows_arc
@@ -3898,6 +3923,7 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
             filter_index: filter_index_arc,
             journey_index: journey_index_arc,
             list_rows: list_rows_arc,
+            rows_by_session: rows_by_session_arc,
             bytes_estimate,
             session_count,
         });
@@ -5153,7 +5179,36 @@ fn sessions_filter_blocking(
     // session par id. Jamais d'ajout de clé — retourne None si
     // aucune source ne connaît l'id (session supprimée entre
     // l'index et la résolution).
+    // 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2) — si la
+    // génération READY est servie, on prend la ligne pré-rendue dans
+    // `gen.rows_by_session` AVANT toute lecture disque. Garantie
+    // GC-survival : l'index secondaire est Arc'd avec la génération,
+    // il survit à la suppression des fichiers du dataset. Les sources
+    // live (`state.inner.flows`, `capture_manager.datasets()` +
+    // `cached_live_list_row`, LTE evidence) restent accessibles pour
+    // les tests isolés (enforcement off) et les sessions absentes du
+    // snapshot (régression de corpus entre l'index et la lecture).
+    let resolve_from_generation = |session_id: &str| -> Option<Value> {
+        let gen = generation.as_ref()?;
+        let (prebuilt_summary, events_identities) = gen.rows_by_session.get(session_id)?;
+        let mut summary = prebuilt_summary.clone();
+        decorate_subscriber_summary_by_id(&mut summary, session_id, &journey_index);
+        if let Some(object) = summary.as_object_mut() {
+            let mut identities = identity_summary_for_session(&state, session_id);
+            if identities.is_null() {
+                schedule_identity_hydration(&state, session_id);
+                identities = events_identities.clone();
+            } else {
+                fill_missing_identities(&mut identities, events_identities);
+            }
+            object.insert("identities".into(), identities);
+        }
+        Some(summary)
+    };
     let resolve_summary = |session_id: &str| -> Option<Value> {
+        if let Some(from_gen) = resolve_from_generation(session_id) {
+            return Some(from_gen);
+        }
         if let Some(flow) = state.inner.flows.get(session_id) {
             let mut summary = session_summary(&state, flow);
             decorate_subscriber_summary(&mut summary, flow, &journey_index);
@@ -5449,8 +5504,24 @@ fn sessions_filter_blocking(
             }
         }
     } else {
+        // 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2) — si une
+        // génération READY est servie, on tire d'abord les lignes
+        // pré-rendues de `gen.rows_by_session` (Arc immuable, survit à
+        // un GC des fichiers du dataset qui l'a nourrie). On complète
+        // ensuite avec `state.inner.flows` qui est un BTreeMap en
+        // mémoire (dataset de référence construit à `AppState::load`,
+        // jamais GC'd) : ni l'un ni l'autre ne touche le disque.
+        // Les lignes live manquantes NE SONT lues du disque que si
+        // aucune génération n'est servie (fallback tests isolés).
+        for session_id in page_ids.iter() {
+            if let Some(summary) = resolve_from_generation(session_id) {
+                items_by_id.insert((*session_id).to_owned(), summary);
+            }
+        }
         for flow in state.inner.flows.values() {
-            if page_set.contains(flow.session_id.as_str()) {
+            if page_set.contains(flow.session_id.as_str())
+                && !items_by_id.contains_key(flow.session_id.as_str())
+            {
                 let mut summary = session_summary(&state, flow);
                 decorate_subscriber_summary(&mut summary, flow, &journey_index);
                 insert_list_identities(
@@ -5462,15 +5533,19 @@ fn sessions_filter_blocking(
                 items_by_id.insert(flow.session_id.clone(), summary);
             }
         }
-        for dataset in state.inner.capture_manager.datasets() {
-            for session_id in &dataset.session_ids {
-                if !page_set.contains(session_id.as_str()) {
-                    continue;
-                }
-                if let Some(summary) =
-                    cached_live_list_row(&state, &dataset, session_id, &journey_index)
-                {
-                    items_by_id.insert(session_id.clone(), summary);
+        if generation.is_none() {
+            for dataset in state.inner.capture_manager.datasets() {
+                for session_id in &dataset.session_ids {
+                    if !page_set.contains(session_id.as_str())
+                        || items_by_id.contains_key(session_id.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(summary) =
+                        cached_live_list_row(&state, &dataset, session_id, &journey_index)
+                    {
+                        items_by_id.insert(session_id.clone(), summary);
+                    }
                 }
             }
         }
@@ -14442,6 +14517,231 @@ mod tests {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         assert!(gen_header >= 1, "generation header absent or 0");
+    }
+
+    /// 2.21.85 (CLAUDE1, ordre #9 7016931409, condition 2 "GC-survival") —
+    /// publier N (le dataset continuous expose une session + son callflow),
+    /// préchauffer → `generation=N` capturé dans `generation_slot`, capturer la
+    /// réponse `before`. Puis supprimer le fichier callflow du dataset (= GC
+    /// des fichiers de N) et déclencher un préchauffage : `cached_live_list_row_base`
+    /// retourne `None` sur la session manquante, `stats.missing > 0`, `ready=false`,
+    /// aucun swap. La route doit continuer à répondre `200`, en-tête
+    /// `x-oiran-generation=N`, corps identique à `before` (modulo
+    /// `meta.stale_since_ms` qui augmente avec le temps écoulé) — preuve qu'elle
+    /// lit `gen.rows_by_session` et jamais `callflow(...)` disque.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_filter_serves_generation_after_file_gc_2_21_85() {
+        use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let capture_root_guard = AutoRemoveDir::new(
+            workspace
+                .join("runtime")
+                .join(format!("api-filter-gc-survival-{suffix}")),
+        );
+        let capture_root = capture_root_guard.as_pathbuf();
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        let generation_name = format!("generation-{}-0", epoch_seconds());
+        let callflows_dir = dataset_dir
+            .join("callflow-generations")
+            .join(&generation_name);
+        let pcap_dir = base.join("pcap");
+        fs::create_dir_all(&callflows_dir).unwrap();
+        fs::create_dir_all(&pcap_dir).unwrap();
+
+        let session_id = "5g-gc-survival-session";
+        let subscriber_pseudo = "sha256-gc-survival-subscriber";
+
+        let nas_event = json!({
+            "event_id":"evt-nas-registration",
+            "timestamp":"","timestamp_ns":"0","interface":"N1","protocol":"NAS-5GS-MM",
+            "message_name":"Registration Request","source_participant":"UE","destination_participant":"AMF",
+            "direction":"RAN_TO_CORE",
+            "decoded_ie_tree":[
+                {"name":"subscriber_pseudonym","value":subscriber_pseudo,"source":"session_identifiers","pseudonymized":true},
+            ],
+            "decoding_status":"DECODED","semantic_status":"EXACT",
+            "association":"SESSION","procedure_group":"5GMM Registration",
+            "packet_references":[{"source_file":"N1.pcap-stub","packet_number":1,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+            "capture_id":"sha256:continuous","decoder_name":"decoder-nas","decoder_version":"0.4.1",
+            "raw_payload_reference":"sha256:stub","errors":[]
+        });
+        let callflow = json!({
+            "callflow_id":format!("cf-{session_id}"),
+            "session_id":session_id,
+            "technology":"5G SA",
+            "start_timestamp":"","end_timestamp":"",
+            "participants":[],
+            "interfaces":["N1"],
+            "procedures":[],
+            "events":[nas_event],
+            "correlation_edges":[],
+            "correlation_status":{},
+            "decoder_versions":{"decoder-nas":"0.4.1"},
+            "schema_version":"1.5.0",
+            "capture_references":["sha256:continuous"],
+            "accounting":{"source_events":1,"session_events":1,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields":0
+        });
+        let callflow_path = callflows_dir.join(format!("{session_id}.json"));
+        fs::write(&callflow_path, serde_json::to_vec_pretty(&callflow).unwrap()).unwrap();
+        fs::write(callflows_dir.join(format!("{session_id}.html")), b"<html/>").unwrap();
+
+        let jsonl_path = dataset_dir.join("oiran_events.jsonl");
+        let mut jsonl = fs::File::create(&jsonl_path).unwrap();
+        let raw_event = json!({
+            "event_id":"evt-nas-registration","parent_event_id":null,
+            "capture_id":"sha256:continuous","capture_point_id":"N1",
+            "timestamp":{"seconds":1794673477i64,"nanoseconds":0u64,"raw_ticks":1794673477000000000u64,"display":"1794673477.000000000Z"},
+            "interface":"N1","protocol":"NAS-5GS-MM",
+            "message_name":"Registration Request","message_type":65,"procedure_code":null,
+            "source_endpoint":{"address":"10.77.1.1","port":0u16,"network_function":"UE"},
+            "destination_endpoint":{"address":"10.77.1.2","port":0u16,"network_function":"AMF"},
+            "direction":"RAN_TO_CORE",
+            "session_identifiers":[
+                {"name":"subscriber_pseudonym","value":subscriber_pseudo,"pseudonymized":true},
+            ],
+            "information_elements":[],
+            "decoding_status":"DECODED","decoder_name":"decoder-nas","decoder_version":"0.4.1",
+            "raw_payload_reference":"sha256:stub",
+            "packet_references":[{"source_file":"N1.pcap-stub","packet_number":1u64,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+            "errors":[],
+        });
+        writeln!(jsonl, "{}", serde_json::to_string(&raw_event).unwrap()).unwrap();
+        drop(jsonl);
+
+        let manifest = json!({
+            "dataset_id": CONTINUOUS_DATASET_ID,
+            "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous-lab-import/dataset",
+            "event_count": 1,
+            "session_ids": [session_id],
+            "decode_reports": {},
+            "checksums": {},
+            "state": "PARTIAL",
+            "callflows_path": format!("callflow-generations/{generation_name}"),
+        });
+        fs::write(
+            dataset_dir.join("dataset_manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let pseudonym_key_path = base.join(".oiran-pseudonym.key");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            pseudonym_key_path,
+        )
+        .unwrap();
+        manager
+            .recover_continuous_dataset_from_disk(&base)
+            .expect("recover continuous dataset from on-disk manifest");
+
+        let mut config = test_config(workspace, &format!("filter-gc-survival-{suffix}"));
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+        wait_for_compact_index_ready(&state, std::time::Duration::from_secs(10)).await;
+        install_session_filter_cache_prewarm(&state);
+
+        // Prewarm « publication N » sous la garde heavy_memory_enter : la
+        // route servira la génération ainsi créée.
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test-gc-survival-N");
+        }
+        let gen_n = state
+            .inner
+            .generation_slot
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|g| g.generation))
+            .expect("generation N must be ready after successful prewarm");
+        assert!(gen_n >= 1, "gen_n should be positive, got {gen_n}");
+
+        let app = router(state.clone(), None);
+        let request_body = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/filter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": 100}).to_string()))
+                .unwrap()
+        };
+        let before_response = app.clone().oneshot(request_body()).await.unwrap();
+        assert_eq!(before_response.status(), StatusCode::OK);
+        let before_gen = before_response
+            .headers()
+            .get("x-oiran-generation")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("x-oiran-generation header missing before GC");
+        assert_eq!(before_gen, gen_n);
+        let before_body = json_body(before_response).await;
+        let before_data = before_body["data"].clone();
+        assert!(
+            before_data
+                .as_array()
+                .map(|rows| rows.iter().any(|row| row["session_id"] == session_id))
+                .unwrap_or(false),
+            "pre-GC body must contain the published session, got {}",
+            before_body
+        );
+
+        // "GC des fichiers de N" : supprimer le fichier callflow + html.
+        fs::remove_file(&callflow_path).expect("remove callflow .json");
+        let _ = fs::remove_file(callflows_dir.join(format!("{session_id}.html")));
+        // Et vider le cache de signatures pour que cached_live_list_row_base
+        // ne couvre pas accidentellement la session (sinon test invalide).
+        state.inner.list_row_cache.lock().unwrap().clear();
+        // Préchauffage N+1 : la session est manquante côté disque, prewarm
+        // signale `missing > 0 → ready=false`. Aucun swap. `generation_slot`
+        // garde la génération N.
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test-gc-survival-Nplus1-fails");
+        }
+        let gen_after = state
+            .inner
+            .generation_slot
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|g| g.generation))
+            .expect("generation slot must still carry N after failed prewarm");
+        assert_eq!(
+            gen_after, gen_n,
+            "failed prewarm N+1 must not swap; expected gen_n={gen_n}, got {gen_after}"
+        );
+
+        // Requête après GC : 200, x-oiran-generation=N, data identique à avant.
+        let after_response = app.clone().oneshot(request_body()).await.unwrap();
+        assert_eq!(after_response.status(), StatusCode::OK);
+        let after_gen = after_response
+            .headers()
+            .get("x-oiran-generation")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("x-oiran-generation header missing after GC");
+        assert_eq!(after_gen, gen_n, "after GC must still serve generation N");
+        let after_body = json_body(after_response).await;
+        assert_eq!(
+            after_body["data"], before_data,
+            "data must be byte-identical after GC"
+        );
     }
 
     /// Une génération réellement vide devient READY comme les autres et
