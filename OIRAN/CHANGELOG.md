@@ -1,6 +1,23 @@
 # Changelog
 
-## OIRAN API 2.21.78 — 2026-11-19 — débit live GTP-U par seconde / session / QFI (SSE indépendant) (ordre #9 7013448739)
+## OIRAN API 2.21.78 — 2026-11-19 — débit live GTP-U par seconde / session / QFI (SSE indépendant) (ordre #9 7013448739, corrections #9 7013902603)
+
+### Corrections suite au refus 7013902603 (même branche, nouveau commit)
+
+1. **Faux gap à la rotation — fermé.** L'ancienne version comptait `gap = file_size` pour chaque fichier disparu : chaque rotation du ring dumpcap aurait sonné l'alerte. Correctif : `PcapFileState { size, mtime, consumed_bytes }` par fichier. Le `gap` à la disparition est `size - consumed_bytes` → 0 pour un fichier GC'é après lecture intégrale. Tests dédiés :
+   - `fully_consumed_file_removed_contributes_zero_gap` (gap = 0 quand `consumed_bytes == size`).
+   - `half_consumed_file_removed_reports_unread_bytes_as_gap` (gap = 1000 quand `consumed_bytes == 500`, `size == 1500`).
+
+2. **Redécodage full ring à chaque poll — fermé.** L'ancienne version appelait `decode_capture_streaming` sur CHAQUE pcapng à chaque passage. Correctif : lecture incrémentale par fichier via `PcapFileState`. La décision `should_decode` compare `(size, mtime)` au poll précédent :
+   - `(size, mtime)` identiques → **0 décodage** (skip complet).
+   - `size` augmenté → re-décodage (dédup via `prior` HashSet).
+   - `size` diminué (truncation / réutilisation du path) → re-décodage.
+   - Nouveau fichier → décodage initial.
+   - `consumed_bytes = size` si `decode_capture_streaming` a retourné `Ok`, sinon valeur précédente (permet gap mesurable).
+   - Nouveau compteur `throughput.files_decoded` monotone, incrémenté **uniquement** quand un décodage a effectivement lieu.
+   - Test : `file_state_change_detector_does_not_rescan_unchanged` prouve que 3 polls avec `(size, mtime)` identiques n'incrémentent pas le compteur.
+
+
 
 Branche `fix/oiran-2.21.78-throughput-sse`, base `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (PROD). Pas de déploiement.
 

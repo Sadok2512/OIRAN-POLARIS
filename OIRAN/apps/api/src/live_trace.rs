@@ -272,10 +272,16 @@ pub(crate) fn start_reader(state: AppState) {
     }
     tokio::spawn(async move {
         let mut seen = HashSet::new();
-        // 2.21.78 (ordre #9 7013448739 condition 1) — tailles des
-        // pcapng vues au poll précédent, par chemin. Si un fichier
-        // disparaît (rotation GC), on compte les octets perdus.
-        let mut known_sizes: HashMap<std::path::PathBuf, u64> = HashMap::new();
+        // 2.21.78 (ordre #9 7013902603 — correction après refus 7013448739) :
+        // état par fichier pour **lecture incrémentale**. `(size, mtime)`
+        // inchangé depuis le poll précédent → PAS redécodé (0 décodage).
+        // `consumed_bytes` = taille au dernier décodage OK, 0 si erreur.
+        // Un fichier disparu contribue `last_size - consumed_bytes` au
+        // gap (= 0 si entièrement consommé — pas d'alerte sur le GC du
+        // ring en régime normal).
+        let mut file_state: HashMap<std::path::PathBuf, crate::throughput::PcapFileState> =
+            HashMap::new();
+        // Compteur de décodages réels (utilisé par les tests).
         loop {
             {
                 let traces = state.inner.live_traces.traces.lock().unwrap();
@@ -299,13 +305,13 @@ pub(crate) fn start_reader(state: AppState) {
             {
                 let state2 = state.clone();
                 let mut prior = seen;
-                let mut sizes = known_sizes;
-                (seen, known_sizes) = tokio::task::spawn_blocking(move || {
+                let mut states = file_state;
+                (seen, file_state) = tokio::task::spawn_blocking(move || {
                     let key = match event_schema::PseudonymKey::load_or_generate(
                         &event_schema::PseudonymKey::resolve_default_path(),
                     ) {
                         Ok(k) => k,
-                        Err(_) => return (prior, sizes),
+                        Err(_) => return (prior, states),
                     };
                     for interface in [
                         "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
@@ -322,12 +328,10 @@ pub(crate) fn start_reader(state: AppState) {
                         let Ok(entries) = fs::read_dir(&dir) else {
                             continue;
                         };
-                        // 2.21.78 (condition 1) — énumère TOUS les pcapng
-                        // du répertoire, triés par mtime (ancien → récent).
-                        // La dédup via `prior` évite le re-traitement ;
-                        // décoder plusieurs fichiers garantit que le
-                        // queue du précédent est terminé AVANT le passage
-                        // au suivant.
+                        // 2.21.78 (correction 7013902603) — énumère tous les
+                        // pcapng, triés par mtime ancien → récent. La
+                        // décision de redécoder est prise PAR FICHIER selon
+                        // `(size, mtime)` vs `file_state`.
                         let mut paths: Vec<_> = entries
                             .flatten()
                             .map(|entry| entry.path())
@@ -338,58 +342,81 @@ pub(crate) fn start_reader(state: AppState) {
                         paths.sort_by_key(|path| {
                             path.metadata().and_then(|m| m.modified()).ok()
                         });
-                        // 2.21.78 (condition 1) — détecte les fichiers
-                        // précédemment vus qui ont DISPARU (rotation GC
-                        // ou purge disque). Chaque disparition compte
-                        // les octets non lus comme gap.
+                        // 2.21.78 (correction défaut 1) — détecte les fichiers
+                        // précédemment vus qui ont DISPARU. Le gap n'est
+                        // PAS la taille totale : c'est `last_size -
+                        // consumed_bytes`. Un fichier lu en entier et GC'é
+                        // par le ring dumpcap contribue 0 — pas d'alerte
+                        // sur le régime normal du ring.
                         let present: std::collections::HashSet<std::path::PathBuf> =
                             paths.iter().cloned().collect();
-                        let gone: Vec<_> = sizes
+                        let gone: Vec<_> = states
                             .keys()
                             .filter(|p| p.starts_with(&dir) && !present.contains(*p))
                             .cloned()
                             .collect();
                         for path in &gone {
-                            let size = sizes.remove(path).unwrap_or(0);
-                            if size > 0 {
-                                state2.inner.throughput.bump_bytes_gap(size);
+                            if let Some(file_state) = states.remove(path) {
+                                let gap = file_state
+                                    .size
+                                    .saturating_sub(file_state.consumed_bytes);
+                                if gap > 0 {
+                                    state2.inner.throughput.bump_bytes_gap(gap);
+                                }
                             }
                         }
                         for path in paths {
-                            // Mémorise la taille courante pour détecter
-                            // la disparition au poll suivant.
-                            if let Ok(meta) = path.metadata() {
-                                sizes.insert(path.clone(), meta.len());
+                            // 2.21.78 (correction défaut 2) — **lecture
+                            // incrémentale** : `(size, mtime)` inchangé
+                            // depuis le poll précédent ⇒ **0 décodage**.
+                            // Un fichier déjà consommé en entier (ring
+                            // récent, pas en écriture) n'est jamais
+                            // retouché.
+                            let meta = match path.metadata() {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let size = meta.len();
+                            let mtime = meta.modified().ok();
+                            let prev = states.get(&path).cloned();
+                            let should_decode = match &prev {
+                                Some(prev_state)
+                                    if prev_state.size == size && prev_state.mtime == mtime =>
+                                {
+                                    false // aucun changement → skip
+                                }
+                                Some(prev_state) if prev_state.consumed_bytes >= size => {
+                                    // Taille a diminué (rotation réutilisant
+                                    // un même path) : re-décoder.
+                                    true
+                                }
+                                _ => true, // nouveau fichier ou fichier qui a grandi.
+                            };
+                            if !should_decode {
+                                continue;
                             }
+                            state2.inner.throughput.bump_file_decoded();
                             let capture_id = format!(
                                 "sha256:{}",
                                 sha256_hex(path.to_string_lossy().as_bytes())
                             );
                             let config = oiran_decode::DecodeConfig {
-                                input: path,
+                                input: path.clone(),
                                 capture_id,
                                 interface: interface.into(),
                                 endpoints: HashMap::new(),
                             };
-                            // 2.18.10 (ANR2 #10 6902524402) — tri par
-                            // ordre canonique intra-capture avant routage.
                             let mut fresh = Vec::new();
-                            let _ = oiran_decode::decode_capture_streaming(
-                                &config,
-                                &key,
-                                |event| {
+                            let decode_result =
+                                oiran_decode::decode_capture_streaming(&config, &key, |event| {
                                     if prior.insert(event.event_id.clone()) {
                                         fresh.push(event);
                                     }
                                     Ok(())
-                                },
-                            );
+                                });
                             sort_by_capture_order(&mut fresh);
                             for event in &fresh {
                                 state2.inner.live_traces.route_normalized(event);
-                                // 2.21.78 — observe aussi pour le débit
-                                // live. Résolution TEID → session_id en
-                                // interne, fail-closed si inconnue.
                                 let session_id = crate::throughput::resolve_session_id_for_event(
                                     &state2, event,
                                 );
@@ -398,17 +425,30 @@ pub(crate) fn start_reader(state: AppState) {
                                     .throughput
                                     .observe_event(event, session_id.as_deref());
                             }
+                            // Marque les octets consommés : `size` si
+                            // decode OK, sinon la valeur précédente.
+                            let consumed_bytes = if decode_result.is_ok() {
+                                size
+                            } else {
+                                prev.map(|p| p.consumed_bytes).unwrap_or(0)
+                            };
+                            states.insert(
+                                path.clone(),
+                                crate::throughput::PcapFileState {
+                                    size,
+                                    mtime,
+                                    consumed_bytes,
+                                },
+                            );
                             if prior.len() > 200_000 {
                                 prior.clear();
                             }
                         }
                     }
-                    // Bornes sur `sizes` — on garde max 1024 fichiers,
-                    // au-delà on purge les plus vieux.
-                    if sizes.len() > 1024 {
-                        sizes.clear();
+                    if states.len() > 1024 {
+                        states.clear();
                     }
-                    (prior, sizes)
+                    (prior, states)
                 })
                 .await
                 .unwrap_or_default();
