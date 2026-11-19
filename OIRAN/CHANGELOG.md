@@ -1,5 +1,48 @@
 # Changelog
 
+## OIRAN API 2.21.77 + session-engine 0.5.29 — 2026-11-19 — capacité exacte du Vec<EventRecord> fusionné (levier 1/4, ordre #9 7008184610 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur 2.21.75 (`07d5d85`). Levier 1/4 du nouvel ordre : réduire l'anon de la fusion. **Cible VmHWM < 0,9 Go** (actuel 1,93 Go).
+
+### Pourquoi
+
+Mesure ANR1 (#10 7008057413, 2.21.75 cgroup exact, copie physique) :
+- À `01-80-merge-end` : 544 292 représentants, `events_capacity = 1 048 576` (croissance géométrique Vec::push jusqu'à la puissance de deux supérieure), `events_inline_bytes = 704 643 072 B` (capacity × 672 B).
+- **Sur-allocation** : `(1 048 576 − 544 292) × 672 = 338 878 848 B` = 622 B par représentant = **~17 %** de l'anon total.
+
+### Correctif 2.21.77
+
+- **Deux passes sur les runs spillés**, pas sur les shards originaux :
+  - **Passe 1** : merge « dry-run » qui compte les clés distinctes à travers tous les runs, sans accumuler d'event. I/O ≈ taille du stock spillé (dédupliqué intra-run, donc beaucoup plus petit que l'entrée JSONL). Zéro mémoire supplémentaire (readers seulement, chacun 1 SpilledRepresentative en vol).
+  - **Passe 2** : merge réel, précédé par `Vec::with_capacity(distinct_merged_count)`. Plus aucune croissance géométrique.
+- `flush_representative_run` retourne maintenant `(PathBuf, u64)` — le nombre de représentants écrits dans le run (distincts intra-run). `run_paths` passe en `Vec<(PathBuf, u64)>`.
+- Nouvelles sondes :
+  - `01-55-post-final-flush` porte en plus `total_run_items` (= Σ items sur tous les runs = borne supérieure du count fusionné).
+  - **`01-58-pre-merge-exact-count`** porte `distinct_merged_count` (exact), `total_run_items` (upper bound), `expected_events_inline_bytes` = `distinct_merged_count × size_of::<EventRecord>()`.
+  - `01-60-merge-start` porte en plus `events_capacity_target` (== `distinct_merged_count`).
+
+### Gain attendu
+
+Sur la mesure ANR1 : `events_capacity` devient 544 292 au lieu de 1 048 576. `events_inline_bytes` passe de 704 643 072 B à 365 764 224 B. **Économie : 338 878 848 B** (exactement l'arithmétique #10 7008184610). Lu directement par ANR1 dans la ligne `PUBLICATION_RSS_TRACE phase=01-80-merge-end …`.
+
+### Coût
+
+Une passe supplémentaire sur les runs spillés (pas sur les shards originaux). Lecture séquentielle de ~30 runs × ~70 MB = ~2 GB. À 500 MB/s SSD ≈ 4 s ajoutés au cycle de publication complète. Cost acceptable vs le gain mémoire.
+
+### Byte-identique
+
+Aucune donnée ni ordre touché. La passe 1 ne fait que lire et compter ; la passe 2 est identique à l'ancienne boucle de merge avec seulement `with_capacity` en plus. Tests existants passent, 12 runs à 0 échec :
+- `spilling_with_stages_matches_with_progress_byte_identical` + `spilling_with_stages_byte_identical_twelve_consecutive_runs` : 2/2 ok × 12 invocations.
+- `spilling_representatives_match_legacy_across_multiple_runs` : ok.
+- Tests complets : session-engine 54/54, live-probe 185/185, oiran-api 195/195.
+- Lock OK, 137 packages, 0 > 1.83.
+
+### Prochains leviers (ordre #9 7008184610)
+
+- 2.21.79 — `packet_reference_paths` internés (224 B/rep → cible via `Arc<str>` table).
+- 2.21.81 — `source_json` : audit des lecteurs post-phase 01, trim.
+- 2.21.83 — instrumentation des 689 Mo hors comptage (`malloc_info`/`mallinfo2` à 01-80 et 01-90).
+
 ## OIRAN API 2.21.75 + live-probe 0.6.30 + session-engine 0.5.28 — 2026-11-19 — comptage par champ à 01-80-merge-end (correction ordre #9 7007412446 §2 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur 2.21.73 (`0085d33`). Correction obligatoire du lot 2.21.69 : la mesure ANR1 (#10 7007328564, cgroup désormais exact grâce à 2.21.69) a prouvé que le pic anon n'est **pas** à `01-50-scan-end` (39 489 records en vol, anon 329 020 KiB) mais à `01-80-merge-end` sur le `Vec<EventRecord>` final : **544 292 représentants, anon 1 931 196 KiB**, soit +1 602 176 KiB pendant la fusion des 30 runs, ≈ 3,0 Ko par EventRecord fusionné. Le breakdown à 01-50 ne voyait que le dernier buffer in-flight.

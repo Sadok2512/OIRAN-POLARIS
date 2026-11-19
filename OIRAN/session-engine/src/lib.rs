@@ -1038,7 +1038,7 @@ fn flush_representative_run(
     staging_dir: &Path,
     run_index: usize,
     records: &mut Vec<SpilledRepresentative>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, u64), String> {
     records.sort_by(|left, right| {
         left.key
             .cmp(&right.key)
@@ -1048,6 +1048,7 @@ fn flush_representative_run(
     let file = fs::File::create(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut writer = BufWriter::new(file);
     let mut offset = 0usize;
+    let mut written: u64 = 0;
     while offset < records.len() {
         let key = records[offset].key.clone();
         let mut last = offset;
@@ -1056,6 +1057,7 @@ fn flush_representative_run(
         }
         serde_json::to_writer(&mut writer, &records[last]).map_err(|error| error.to_string())?;
         writer.write_all(b"\n").map_err(|error| error.to_string())?;
+        written = written.saturating_add(1);
         offset = last + 1;
     }
     let inner = writer.into_inner().map_err(|error| error.to_string())?;
@@ -1070,7 +1072,7 @@ fn flush_representative_run(
     advise_file_range_no_longer_needed(&inner, 0, 0);
     drop(inner);
     records.clear();
-    Ok(path)
+    Ok((path, written))
 }
 
 struct RepresentativeRunReader {
@@ -1168,7 +1170,12 @@ where
 
     let mut records = Vec::<SpilledRepresentative>::new();
     let mut retained_bytes = 0usize;
-    let mut run_paths = Vec::<PathBuf>::new();
+    // 2.21.77 (CLAUDE1, ordre #9 7008184610 §1) — runs typés avec
+    // le nombre de représentants écrits (distincts intra-run). La
+    // somme sur tous les runs = borne supérieure du count fusionné
+    // (la déduplication cross-run peut la réduire). Utilisée par
+    // la passe 1 de comptage exact qui suit.
+    let mut run_paths = Vec::<(PathBuf, u64)>::new();
     let mut source_event_count = 0usize;
     let mut ordinal = 0u64;
     for (shard_idx, path) in paths.iter().enumerate() {
@@ -1232,8 +1239,8 @@ where
                         ("source_event_count", source_event_count as u64),
                     ],
                 );
-                let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
-                run_paths.push(path);
+                let flushed = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
+                run_paths.push(flushed);
                 retained_bytes = 0;
                 stage(
                     "01-31-post-flush",
@@ -1330,20 +1337,68 @@ where
     }
     stage("01-50-scan-end", &scan_end_counts);
     if !records.is_empty() {
-        let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
-        run_paths.push(path);
+        let flushed = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
+        run_paths.push(flushed);
     }
+    let total_run_items: u64 = run_paths.iter().map(|(_, n)| *n).sum();
     stage(
         "01-55-post-final-flush",
         &[
             ("run_count", run_paths.len() as u64),
             ("source_event_count", source_event_count as u64),
+            ("total_run_items", total_run_items),
+        ],
+    );
+
+    // 2.21.77 (CLAUDE1, ordre #9 7008184610 §1) — passe 1 : compte
+    // exact des clés distinctes à travers les runs, pour dimensionner
+    // `Vec::with_capacity` au count fusionné REEL. ANR1 a mesuré
+    // (#10 7008057413) events_capacity=1 048 576 (puissance de deux
+    // suivant la croissance géométrique Vec::push) pour events.len()
+    // =544 292 → sur-alloc 338 878 848 octets. Une seule passe en
+    // plus sur les runs (I/O ≈ taille du stock spillé, pas des shards
+    // originaux ; chaque run a déjà dédupliqué intra-run, donc
+    // beaucoup moins de données que l'entrée). Pas de mémoire
+    // supplémentaire : on scanne sans accumuler.
+    let mut readers_pass1 = run_paths
+        .iter()
+        .map(|(path, _)| path.clone())
+        .map(RepresentativeRunReader::open)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut distinct_merged_count: u64 = 0;
+    loop {
+        let Some(next_key) = readers_pass1
+            .iter()
+            .filter_map(|reader| reader.current.as_ref().map(|record| record.key.as_str()))
+            .min()
+            .map(str::to_owned)
+        else {
+            break;
+        };
+        for reader in &mut readers_pass1 {
+            if reader.current.as_ref().is_some_and(|record| record.key == next_key) {
+                let _ = reader.current.take();
+                reader.advance()?;
+            }
+        }
+        distinct_merged_count = distinct_merged_count.saturating_add(1);
+    }
+    // Libère les fds de la passe 1 avant d'ouvrir la passe 2 (+ même
+    // libération de la mémoire SpilledRepresentative cachée dans
+    // `advance` qui a pu lire une dernière ligne).
+    drop(readers_pass1);
+    stage(
+        "01-58-pre-merge-exact-count",
+        &[
+            ("distinct_merged_count", distinct_merged_count),
+            ("total_run_items", total_run_items),
+            ("expected_events_inline_bytes", distinct_merged_count.saturating_mul(std::mem::size_of::<EventRecord>() as u64)),
         ],
     );
 
     let mut readers = run_paths
         .iter()
-        .cloned()
+        .map(|(path, _)| path.clone())
         .map(RepresentativeRunReader::open)
         .collect::<Result<Vec<_>, _>>()?;
     stage(
@@ -1351,9 +1406,10 @@ where
         &[
             ("run_count", run_paths.len() as u64),
             ("reader_count", readers.len() as u64),
+            ("events_capacity_target", distinct_merged_count),
         ],
     );
-    let mut events = Vec::<EventRecord>::new();
+    let mut events = Vec::<EventRecord>::with_capacity(distinct_merged_count as usize);
     let mut merged_count: u64 = 0;
     loop {
         let Some(next_key) = readers
@@ -1425,7 +1481,7 @@ where
     );
     progress(source_event_count, events.len());
 
-    for path in run_paths {
+    for (path, _) in run_paths {
         if let Ok(file) = fs::File::open(&path) {
             advise_file_range_no_longer_needed(&file, 0, 0);
         }
