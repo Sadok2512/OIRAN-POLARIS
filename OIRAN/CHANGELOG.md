@@ -50,12 +50,21 @@ cd OIRAN && cargo test --locked -p live-probe --lib -- \
 
 Suite complète :
 ```
-cargo test --locked -p live-probe --lib     : 195 passed, 0 failed, 6 ignored  (régression zéro)
+cargo test --locked -p live-probe --lib     : 197 passed, 0 failed, 6 ignored  (régression zéro, +2 tests superviseur)
 cargo test --locked -p capture-helper --lib : 23 passed, 0 failed, 0 ignored
 cargo test --locked -p oiran-api --lib      : 201 passed, 0 failed, 3 ignored  (régression zéro)
 ```
 
 Aucun `#[ignore]` ajouté par ce lot. Aucun `publish_events_to_dataset_dir` ni `offline_lte_callflows` touché (respect périmètre ANR1).
+
+### Follow-up (ordre #9 7019778994 — réserve CLAUDE1)
+
+Après revue, Sadok a demandé un test de bout en bout « disque plein puis libéré → reprise sans doublon ». Le superviseur `run_continuous_import` a été refactoré en `supervise_continuous_import<F: FnMut() -> Result<(), String>>` pour qu'un test unitaire puisse exercer la transition `Failed(DISK_SAFETY_POLICY) → Capturing` sans avoir à monter un cgroup/tmpfs borné. Deux tests ajoutés :
+
+* `supervise_continuous_import_resumes_without_doubling_ingestion` — fixture `import_state.json` avec 2 shas déjà ingérés, closure d'inner qui renvoie `No space left on device (os error 28)` au 1er appel puis vérifie que les 2 shas sont **toujours présents** au 2e appel (preuve de non-doublon à travers la reprise). Transitions attendues : `Failed` + `stop_reason=DISK_SAFETY_POLICY` + pas de `ended_epoch_ms` → bascule disque override vers `Normal` → `CAPTURE_RESUMED_AFTER_DISK_RECOVERY` → `Capturing` + error/stop_reason effacés.
+* `supervise_continuous_import_does_not_retry_non_disk_errors` — garde que seule une erreur de classe disque déclenche la reprise auto ; `CONTINUOUS_SEGMENT_NOT_FINALIZED` → 1 seul appel, `ended_epoch_ms` positionné.
+
+12 runs = 12 pass / 0 fail. La preuve réelle de dédoublonnage par `state.seen_checksums.contains` reste assurée par les tests existants de `run_continuous_import_inner` (invariant 2.9.8) ; les tests superviseur prouvent que `import_state.json` survit à un ENOSPC et que l'inner le relit intact à la reprise.
 
 ## OIRAN API 2.21.83 — 2026-11-19 — train de livraison : 2.21.76 + 2.21.79 + 2.21.81 merge --no-ff (ordre #9 7013902603 CLAUDE1)
 

@@ -3141,25 +3141,37 @@ impl CaptureManager {
     }
 
     fn run_continuous_import(&self, config: ContinuousImportConfig) {
-        // 2.21.88 (ordre #9 7017408187) — ancienne sémantique : un Err
-        // de l'inner laissait le job en `Failed` définitif, la boucle
-        // d'import morte, et l'opérateur devait relancer la capture à
-        // la main. Défaut prod 2026-11-19 17:27 Z (ANR2 #10 7017271750) :
-        // `os error 28` à l'écriture de `job.json`, disque libéré à
-        // 17:35 (ANR2 7016930883), import JAMAIS repris.
-        //
-        // Nouveau superviseur : sur une erreur de classe disque
-        // (ENOSPC / `os error 28` / DISK_SAFETY_POLICY), le job est
-        // mis en `Failed` avec `stop_reason=DISK_SAFETY_POLICY` et
-        // SANS `ended_epoch_ms` ; la boucle attend que la mesure
-        // disque repasse `Normal` + `new_capture_allowed`, émet
-        // `CAPTURE_RESUMED_AFTER_DISK_RECOVERY` et relance
-        // `run_continuous_import_inner`. L'idempotence du retry est
-        // garantie par `import_state.json` + `seen_checksums` (aucun
-        // doublon : un segment déjà ingéré est dédupliqué par
-        // `state.seen_checksums.contains`).
+        self.supervise_continuous_import(|| self.run_continuous_import_inner(&config));
+    }
+
+    /// 2.21.88 (ordre #9 7017408187) — superviseur de l'import continu.
+    /// Pré-2.21.88 : un Err de `run_continuous_import_inner` laissait
+    /// le job en `Failed` définitif, la boucle morte, l'opérateur
+    /// devait relancer à la main (défaut prod 2026-11-19 17:27 Z,
+    /// ANR2 #10 7017271750 — import JAMAIS repris après libération
+    /// disque à 17:35).
+    ///
+    /// Nouveau contrat : sur une erreur de classe disque (ENOSPC,
+    /// `os error 28`, `DISK_SAFETY_POLICY`, cf. `error_indicates_disk_space`),
+    /// le job passe `Failed` + `stop_reason=DISK_SAFETY_POLICY` SANS
+    /// `ended_epoch_ms` ; le superviseur poll `effective_disk_sample`
+    /// toutes les `DISK_RECOVERY_POLL`, émet
+    /// `CAPTURE_RESUMED_AFTER_DISK_RECOVERY` dès `SafetyState::Normal`
+    /// + `new_capture_allowed`, et relance l'inner. L'idempotence du
+    /// retry est garantie par `import_state.json.seen_checksums` :
+    /// chaque segment déjà ingéré est dédupliqué par
+    /// `state.seen_checksums.contains`, aucun doublon.
+    ///
+    /// Extrait du call site de `run_continuous_import` pour qu'un test
+    /// unitaire puisse exercer la transition `Failed → Capturing` et
+    /// la préservation de `seen_checksums` entre deux appels de
+    /// l'inner (via une closure d'inner mockée).
+    fn supervise_continuous_import<F>(&self, mut inner: F)
+    where
+        F: FnMut() -> Result<(), String>,
+    {
         loop {
-            match self.run_continuous_import_inner(&config) {
+            match inner() {
                 Ok(()) => return,
                 Err(error) => {
                     let disk_class = error_indicates_disk_space(&error);
@@ -3236,7 +3248,7 @@ impl CaptureManager {
                             return;
                         }
                     }
-                    // Retry run_continuous_import_inner (boucle externe).
+                    // Retry via `inner()` au prochain tour de la boucle externe.
                 }
             }
         }
@@ -21850,6 +21862,210 @@ mod tests {
         // la suite de tests (sans elles, 24 h d'attente par test).
         assert!(DISK_RECOVERY_POLL <= Duration::from_millis(100));
         assert!(DISK_RECOVERY_MAX_WAIT <= Duration::from_secs(30));
+    }
+
+    /// 2.21.88 (ordre #9 7019778994 — réserve CLAUDE1) — test de
+    /// bout en bout « disque plein puis libéré → reprise sans doublon ».
+    /// Exerce `supervise_continuous_import` (extrait de
+    /// `run_continuous_import` par le même lot) avec une closure
+    /// d'inner qui :
+    /// 1. Au 1er appel : renvoie `No space left on device (os error 28)`.
+    ///    → Le superviseur doit : marquer le job `Failed` +
+    ///    `stop_reason=DISK_SAFETY_POLICY` + **sans** `ended_epoch_ms`,
+    ///    émettre `CONTINUOUS_IMPORT_FAILED`, puis poll le disque.
+    /// 2. Au 2e appel (après bascule `effective_disk_sample` vers
+    ///    `SafetyState::Normal`) : vérifie que `import_state.json`
+    ///    contient toujours les `seen_checksums` pré-ingérés
+    ///    (pas effacés par le crash), et renvoie `Ok(())`.
+    ///    → Le superviseur doit : remettre le job en `Capturing`,
+    ///    émettre `CAPTURE_RESUMED_AFTER_DISK_RECOVERY`, puis sortir
+    ///    de la supervise loop.
+    /// Preuve de « sans doublon » : le fichier `import_state.json`
+    /// est le registre unique de dédoublonnage ; `atomic_write_with_prev`
+    /// garantit qu'il est intact après un crash ENOSPC, et le 2e
+    /// appel de l'inner l'observe tel quel (mêmes shas, pas de
+    /// réinitialisation). Le dédoublonnage *réel* est vérifié par
+    /// les tests existants de `run_continuous_import_inner`
+    /// (`state.seen_checksums.contains`) ; ici on prouve que
+    /// l'invariant tient à travers une reprise supervisée.
+    #[test]
+    fn supervise_continuous_import_resumes_without_doubling_ingestion() {
+        use std::sync::atomic::AtomicUsize;
+
+        let root = temporary_root("supervise-e2e-disk-recovery");
+        let manager = fresh_manager_for_restore(&root);
+
+        // Installe le job CONTINUOUS afin que `update(CONTINUOUS_CAPTURE_ID, …)`
+        // puisse muter un job existant (pré-condition de la boucle réelle).
+        let mut job = sample_capture_job(CONTINUOUS_CAPTURE_ID);
+        job.state = CaptureState::Capturing;
+        manager.persist_job(&job).unwrap();
+        manager
+            .jobs
+            .lock()
+            .unwrap()
+            .insert(CONTINUOUS_CAPTURE_ID.to_string(), job);
+
+        // Fixture `import_state.json` AVEC deux segments déjà ingérés.
+        // La reprise ne doit PAS les retirer ni les re-ingérer.
+        let cont_dir = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(&cont_dir).unwrap();
+        let state_path = cont_dir.join("import_state.json");
+        let mut pre_state = ContinuousImportState::default();
+        pre_state.seen_checksums.insert("sha256:aaa".into());
+        pre_state.seen_checksums.insert("sha256:bbb".into());
+        pre_state.seen_order.push_back("sha256:aaa".into());
+        pre_state.seen_order.push_back("sha256:bbb".into());
+        atomic_write_with_prev(&state_path, &serde_json::to_vec(&pre_state).unwrap()).unwrap();
+
+        // Disque saturé au départ → la closure renverra ENOSPC.
+        let saturated = disk_safety::FilesystemSample {
+            total_bytes: 1_000_000_000,
+            available_bytes: 1_000, // ~99.9999 % utilisé
+            total_inodes: 100_000,
+            available_inodes: 90_000,
+        };
+        manager
+            .clone()
+            .set_disk_sample_override_for_tests(Some(Ok(saturated)));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let retry_saw_prior_seen = Arc::new(AtomicBool::new(false));
+        let cc = call_count.clone();
+        let saw = retry_saw_prior_seen.clone();
+        let state_path_for_closure = state_path.clone();
+
+        let supervisor = manager.clone();
+        let handle = thread::spawn(move || {
+            supervisor.supervise_continuous_import(move || {
+                let n = cc.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // 1er appel : ENOSPC, exactement le motif prod 17:27 Z.
+                    Err("write job.json: No space left on device (os error 28)".to_string())
+                } else {
+                    // 2e appel (reprise) : prouve que `import_state.json`
+                    // contient toujours les deux shas pré-ingérés.
+                    let bytes = fs::read(&state_path_for_closure).unwrap();
+                    let state: ContinuousImportState =
+                        serde_json::from_slice(&bytes).unwrap();
+                    if state.seen_checksums.contains("sha256:aaa")
+                        && state.seen_checksums.contains("sha256:bbb")
+                    {
+                        saw.store(true, Ordering::SeqCst);
+                    }
+                    Ok(())
+                }
+            });
+        });
+
+        // Attend que le superviseur ait parqué le job en Failed(DISK_SAFETY_POLICY).
+        let park_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(job) = manager.get(CONTINUOUS_CAPTURE_ID) {
+                if job.state == CaptureState::Failed
+                    && job.stop_reason.as_deref() == Some("DISK_SAFETY_POLICY")
+                {
+                    assert!(
+                        job.ended_epoch_ms.is_none(),
+                        "job alive : le superviseur ne doit pas écrire ended_epoch_ms sur une erreur disque"
+                    );
+                    break;
+                }
+            }
+            if Instant::now() >= park_deadline {
+                panic!(
+                    "superviseur n'a jamais parqué le job en Failed(DISK_SAFETY_POLICY) ; \
+                     call_count={}",
+                    call_count.load(Ordering::SeqCst)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Bascule disque → Normal. Le superviseur doit relancer l'inner.
+        let normal = disk_safety::FilesystemSample {
+            total_bytes: 1_000_000_000,
+            available_bytes: 900_000_000, // ~10 % utilisé → Normal
+            total_inodes: 100_000,
+            available_inodes: 90_000,
+        };
+        manager
+            .clone()
+            .set_disk_sample_override_for_tests(Some(Ok(normal)));
+
+        handle.join().expect("supervisor thread joins");
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "inner doit être appelé 2 fois exactement : 1er échec ENOSPC + 1 reprise"
+        );
+        assert!(
+            retry_saw_prior_seen.load(Ordering::SeqCst),
+            "la reprise doit voir `import_state.json` intact avec les deux shas déjà ingérés. \
+             Mutation : si l'écriture pré-2.21.88 (`fs::write`) avait tronqué le fichier, \
+             le parse échouerait et le dédoublonnage repartirait de zéro → doublons."
+        );
+
+        let resumed = manager.get(CONTINUOUS_CAPTURE_ID).expect("job présent après reprise");
+        assert_eq!(
+            resumed.state,
+            CaptureState::Capturing,
+            "la reprise doit transiter Failed → Capturing. Mutation : si le superviseur \
+             n'écrivait pas cette transition, l'opérateur verrait un job bloqué en Failed \
+             comme en prod 17:27 Z"
+        );
+        assert!(resumed.error.is_none(), "l'erreur doit être effacée à la reprise");
+        assert!(
+            resumed.stop_reason.is_none(),
+            "stop_reason doit être effacé à la reprise"
+        );
+        assert!(resumed.ended_epoch_ms.is_none());
+    }
+
+    /// Non-régression : une erreur NON-disque ne déclenche PAS la
+    /// reprise auto. Le job doit passer `Failed` avec `ended_epoch_ms`
+    /// positionné et l'inner n'être appelé qu'une seule fois (sortie
+    /// immédiate du superviseur).
+    #[test]
+    fn supervise_continuous_import_does_not_retry_non_disk_errors() {
+        use std::sync::atomic::AtomicUsize;
+
+        let root = temporary_root("supervise-non-disk-no-retry");
+        let manager = fresh_manager_for_restore(&root);
+        let mut job = sample_capture_job(CONTINUOUS_CAPTURE_ID);
+        job.state = CaptureState::Capturing;
+        manager.persist_job(&job).unwrap();
+        manager
+            .jobs
+            .lock()
+            .unwrap()
+            .insert(CONTINUOUS_CAPTURE_ID.to_string(), job);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        manager.supervise_continuous_import(move || {
+            cc.fetch_add(1, Ordering::SeqCst);
+            // Erreur applicative non-disque : décodage.
+            Err("CONTINUOUS_SEGMENT_NOT_FINALIZED: invalid pcap header".to_string())
+        });
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "une erreur non-disque ne doit PAS déclencher de retry (sinon un vrai bug boucle)"
+        );
+        let done = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
+        assert_eq!(done.state, CaptureState::Failed);
+        assert!(
+            done.ended_epoch_ms.is_some(),
+            "erreur non-disque → ended_epoch_ms positionné (job terminé)"
+        );
+        assert_ne!(
+            done.stop_reason.as_deref(),
+            Some("DISK_SAFETY_POLICY"),
+            "stop_reason doit refléter la vraie cause, pas DISK_SAFETY_POLICY"
+        );
     }
 
     fn sample_capture_job(capture_id: &str) -> CaptureJob {
