@@ -1,5 +1,50 @@
 # Changelog
 
+## OIRAN API 2.21.68 + live-probe 0.6.25 — 2026-11-19 — indicateur `queue_occupancy_percent` honnête + quarantaine hors de `pending_segments` (ordre #9 7006248573)
+
+Branche `fix/oiran-2.21.68-queue-occupancy`, base `2468bfc` (`fix/oiran-2.21.64-merge`). Pas de déploiement, pas de force-push, aucun geste lab.
+
+### Audit préalable (#9 comment 7006320863)
+
+Posté AVANT code. Deux défauts identifiés sur la base de la table ANR2 prod 2.21.57 (#10 7005944378) :
+
+- **D1 — `queue_occupancy_percent` mesure le stock publié, pas la file** (`live-probe/src/lib.rs:4226-4228` et `4581-4584` pré-2.21.68).
+  Formule bug : `(bytes / max_owned_bytes * 100).min(100.0)` où `bytes = dataset + ring + work` → ratio sans sens géométrique (dividende somme de 3 surfaces, diviseur plafond d'1 seule). ANR2 prod : 6 411 368 483 / 1 140 850 688 = **562 %**, clampé à 100 % par `.min(100.0)` → indicateur figé, aucune garde ne pouvait s'en servir.
+- **D2 — Un segment quarantiné reste compté dans `pending_segments`** (`live-probe/src/lib.rs:3679-3682` pré-2.21.68).
+  La boucle de pré-validation saute bien le candidat quarantiné (`CONTINUOUS_SEGMENT_SKIPPED_QUARANTINED`), mais le compteur `pending` a déjà été publié sans filtrage. ANR2 : `pending_segments=1` figé sur un PCAPNG S6a tronqué (`s6a_…00035…pcapng`) à chaque cycle.
+
+### Correctif live-probe 0.6.25
+
+- **`CaptureMetrics` schéma** (rétrocompat JSON par `#[serde(default)]`) :
+  - **Redéfini** : `queue_occupancy_percent` = `(closed_not_ingested + importing_count) / MAX_INGESTED_SEGMENTS_PER_SCAN * 100`, capé à 100 % (vraie file).
+  - **Nouveau** : `owned_bytes_percent: Option<f64>` = `(dataset + ring + work) / max_owned_bytes * 100`, **SANS clamp** (la vérité, peut dépasser 100 %).
+  - **Nouveau** : `quarantined_segments: u64` + `quarantined_segment_paths: Vec<String>` (borné à 16).
+- **Correctif `pending_segments`** : le filtre devient `(!seen_checksums.contains(&checksum)) && (!is_segment_quarantined(path, size, &checksum))`. Les candidats quarantinés comptent dans `quarantined_segments`.
+- **Correctif `closed_not_ingested_segments`** : même filtre (un quarantiné n'est pas en attente d'ingestion).
+- **Correctif `pending_paths`** : idem, ne liste plus les paths quarantinés.
+- **Correctif `queue_occupancy_percent` au scan** : calculé à partir de `closed_not_ingested + importing_count` / `MAX_INGESTED_SEGMENTS_PER_SCAN`.
+- **Correctif `queue_occupancy_percent` à la publication** : = 0.0 (tout a été publié, file vide par construction).
+- **Correctif helper mode** : `storage_bytes / request.max_bytes * 100` → `owned_bytes_percent` (sans clamp) ; `queue_occupancy_percent` = 0.0 (pas de file en mode helper).
+- **Log `CONTINUOUS_PENDING_INVENTORY`** : ajoute `quarantined_segments` + `quarantined_paths` — ANR parse via journalctl.
+
+### Correctif oiran-api 2.21.68
+
+- **`/metrics`** (`apps/api/src/lib.rs`) :
+  - `capture_queue_utilization_percent` reste pour back-compat UI mais est désormais sourcé sur la VRAIE `queue_occupancy_percent` (0-100 %).
+  - **Ajout** `capture_owned_bytes_percent` (SANS clamp — l'opérateur voit 562 %).
+  - **Ajout** `quarantined_segments` + `quarantined_segment_paths`.
+
+### Tests de non-régression (aucun `#[ignore]` ajouté)
+
+- `tests::quarantined_segment_is_removed_from_pending_and_counted_in_quarantined_metrics` : fixture OIRAN_5G_PDU_SESSION_DATA_V1, tronque le N2 (3/5+7 octets), rotation.jsonl de fermeture, démarre la capture continue, attend la quarantaine, puis vérifie `(pending_segments=0, pending_fingerprints=0, closed_not_ingested_segments=0, quarantined_segments=1, quarantined_segment_paths contient le path tronqué, queue_occupancy_percent ≤ 100)`.
+- `tests::owned_bytes_percent_is_not_clamped_above_one_hundred` : unit test sans IO. Reproduit les chiffres ANR2 prod (`6_411_368_483 / 1_140_850_688 ≈ 562 %`), prouve la nouvelle formule, et compare avec l'ancien `.min(100.0)` pour prouver que la perte d'information est levée.
+
+### Écarts OUVERTS après 2.21.68
+
+- `MAX_INGESTED_SEGMENTS_PER_SCAN` est la capacité **actuelle** de la file (= 32). Si cette constante évolue, il faudra réajuster le calcul de `queue_occupancy_percent`. **OUVERT NON-BLOQUANT**.
+- Les 6 tests `#[ignore]` pré-existants dans `live-probe` ne sont pas touchés par ce lot (hors scope). **Signalé**.
+- Front p900 : les deux nouveaux champs `capture_owned_bytes_percent` et `quarantined_segments` sont exposés par `/metrics` mais le dashboard LiveMonitoring n'affiche pas encore de monitor dédié — **OUVERT**, UI côté claude.ai/web sera un lot séparé.
+
 ## OIRAN API 2.21.64 — 2026-11-19 — fusion HPACK/préchauffage et comptage callflow enrichi
 
 Upgrade **patch** sans déploiement, basé sur 2.21.62 (`8eeadf2`) et 2.21.63 (`68b3348`). 2.21.63 inclut déjà les lots filtre 2.21.56 et cache de lignes 2.21.61.

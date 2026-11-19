@@ -930,7 +930,31 @@ pub struct CaptureMetrics {
     pub decode_errors: u64,
     pub packet_drops: Option<u64>,
     pub queue_capacity_bytes: u64,
+    /// 2.21.68 (ordre #9 7006248573) : **vraie** occupation de file
+    /// `(closed_not_ingested + importing) / queue_capacity * 100`,
+    /// capée à 100 %. Jusqu'en 2.21.67, ce champ exposait le stock
+    /// publié (dataset + ring + work) rapporté à `max_owned_bytes` et
+    /// clampé à 100 % — mesure trompeuse (ANR2 #10 7005944378 : 562 %
+    /// bruts affichés 100 %). Le stock part désormais dans
+    /// `owned_bytes_percent`.
     pub queue_occupancy_percent: Option<f64>,
+    /// 2.21.68 (ordre #9 7006248573) : stock de la publication
+    /// (`dataset + ring + work`) rapporté à `max_owned_bytes`.
+    /// **Non clampé** — peut dépasser 100 %, c'est la vérité. UI et
+    /// `/metrics` l'exposent à côté de la file.
+    #[serde(default)]
+    pub owned_bytes_percent: Option<f64>,
+    /// 2.21.68 : nombre de segments quarantinés visibles dans le scan
+    /// courant (PCAPNG tronqué, décodeur en échec, etc.). Sortis de
+    /// `pending_segments` ; comptés ici pour que l'opérateur voie la
+    /// dette de quarantaine sans qu'elle gonfle l'attente légitime.
+    #[serde(default)]
+    pub quarantined_segments: u64,
+    /// 2.21.68 : chemins des segments quarantinés (borné à 16 entrées),
+    /// pour permettre à l'opérateur de prouver quels fichiers sont
+    /// sautés à chaque cycle. Ne contient pas d'identifiants d'abonnés.
+    #[serde(default)]
+    pub quarantined_segment_paths: Vec<String>,
     pub duration_seconds: f64,
     pub storage_bytes: u64,
     #[serde(default)]
@@ -3676,9 +3700,40 @@ impl CaptureManager {
             // construction. `pending_fingerprints` is the exact
             // mirror, surfaced so an audit can assert concordance
             // without touching internal state.
+            //
+            // 2.21.68 (ordre #9 7006248573) : un segment déjà
+            // **quarantiné** n'est pas en attente — il est explicitement
+            // exclu du cycle. ANR2 7005944378 §2 a observé
+            // `pending_segments=1` sur un PCAPNG S6a tronqué + quarantiné
+            // depuis plusieurs cycles. La boucle d'ingestion ligne 3795-
+            // 3819 saute déjà ces candidats (`CONTINUOUS_SEGMENT_SKIPPED_
+            // QUARANTINED`), mais le compteur `pending` était publié
+            // AVANT le filtre → compteur figé à 1. Nouveau filtre : le
+            // candidat doit ne pas être dans `seen_checksums` ET ne pas
+            // être quarantiné. Les candidats quarantinés sont comptés
+            // séparément dans `quarantined_segments`.
+            let mut quarantined_paths: Vec<String> = Vec::new();
+            let mut quarantined_count: u64 = 0;
             let pending = candidates
                 .iter()
-                .filter(|candidate| !state.seen_checksums.contains(&candidate.checksum))
+                .filter(|candidate| {
+                    if state.seen_checksums.contains(&candidate.checksum) {
+                        return false;
+                    }
+                    let path_str = candidate.path.display().to_string();
+                    if self.is_segment_quarantined(
+                        &path_str,
+                        candidate.size_bytes,
+                        &candidate.checksum,
+                    ) {
+                        quarantined_count = quarantined_count.saturating_add(1);
+                        if quarantined_paths.len() < 16 {
+                            quarantined_paths.push(path_str);
+                        }
+                        return false;
+                    }
+                    true
+                })
                 .count() as u64;
             cycle_trace.pending = pending;
             // 2.10.3 (devmat, revue 2.10.2 ANR2) : inventaire
@@ -3687,9 +3742,22 @@ impl CaptureManager {
             // on publie les chemins (bornés à 16) pour permettre à
             // l'opérateur de prouver « open par dumpcap » vs
             // « fermé mais pas ingéré ».
+            // 2.21.68 : même filtre que `pending` ci-dessus — on ne
+            // liste pas les paths quarantinés dans `pending_paths`,
+            // ils vivent dans `quarantined_paths`.
             let mut pending_paths: Vec<String> = candidates
                 .iter()
-                .filter(|candidate| !state.seen_checksums.contains(&candidate.checksum))
+                .filter(|candidate| {
+                    if state.seen_checksums.contains(&candidate.checksum) {
+                        return false;
+                    }
+                    let path_str = candidate.path.display().to_string();
+                    !self.is_segment_quarantined(
+                        &path_str,
+                        candidate.size_bytes,
+                        &candidate.checksum,
+                    )
+                })
                 .map(|candidate| candidate.path.display().to_string())
                 .collect();
             pending_paths.truncate(16);
@@ -3710,8 +3778,20 @@ impl CaptureManager {
                     })
                     .or_insert_with(|| name.to_owned());
             }
+            // 2.21.68 : un segment quarantiné n'est pas en attente
+            // d'ingestion, donc on l'exclut aussi de
+            // `closed_not_ingested_segments` (pour que la vraie file
+            // ne compte pas la dette de quarantaine).
             let closed_not_ingested = candidates.iter().filter(|candidate| {
                 if state.seen_checksums.contains(&candidate.checksum) { return false; }
+                let path_str = candidate.path.display().to_string();
+                if self.is_segment_quarantined(
+                    &path_str,
+                    candidate.size_bytes,
+                    &candidate.checksum,
+                ) {
+                    return false;
+                }
                 let name = candidate.path.file_name().and_then(|v| v.to_str()).unwrap_or("");
                 newest_by_interface.get(&candidate.interface)
                     .is_some_and(|newest| newest.as_str() > name)
@@ -3727,8 +3807,47 @@ impl CaptureManager {
                     "pending_paths": pending_paths,
                     "open_segments": open_count,
                     "open_paths": open_paths,
+                    // 2.21.68 : séparation dette quarantaine vs attente légitime.
+                    "quarantined_segments": quarantined_count,
+                    "quarantined_paths": quarantined_paths,
                 })
             );
+            // 2.21.68 (ordre #9 7006248573) : vraie occupation de file.
+            // `closed_not_ingested` ne compte déjà plus les quarantinés
+            // (filtre appliqué ci-dessus) ; on ajoute les segments en
+            // vol d'import (`*.importing` sous `base/pcap`). La capacité
+            // de la file est le plafond par scan `MAX_INGESTED_SEGMENTS_
+            // PER_SCAN = 32`. Au-delà du plafond, on cape à 100 % (le
+            // worker publie puis re-scanne).
+            let importing_count = fs::read_dir(base.join("pcap"))
+                .ok()
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|name| name.ends_with(".importing"))
+                        })
+                        .count() as u64
+                })
+                .unwrap_or(0);
+            let queue_pct = {
+                let in_flight = closed_not_ingested.saturating_add(importing_count) as f64;
+                let capacity = MAX_INGESTED_SEGMENTS_PER_SCAN as f64;
+                (in_flight / capacity * 100.0).min(100.0)
+            };
+            let owned_pct_scan = {
+                let bytes = directory_size(&base.join("dataset"))
+                    .saturating_add(committed_ring_bytes(&base.join("pcap")))
+                    .saturating_add(work_bytes(&base));
+                if config.max_owned_bytes > 0 {
+                    Some(bytes as f64 / config.max_owned_bytes as f64 * 100.0)
+                } else {
+                    None
+                }
+            };
             self.update(CONTINUOUS_CAPTURE_ID, |job| {
                 job.metrics.pending_segments = pending;
                 job.metrics.closed_not_ingested_segments = closed_not_ingested;
@@ -3736,6 +3855,10 @@ impl CaptureManager {
                 job.metrics.open_segments = open_count;
                 job.metrics.open_segment_paths = open_paths.clone();
                 job.metrics.pending_segment_paths = pending_paths.clone();
+                job.metrics.quarantined_segments = quarantined_count;
+                job.metrics.quarantined_segment_paths = quarantined_paths.clone();
+                job.metrics.queue_occupancy_percent = Some(queue_pct);
+                job.metrics.owned_bytes_percent = owned_pct_scan;
             })?;
             let mut pending_publication = std::mem::take(&mut bootstrap_pending);
             let mut changed = !pending_publication.is_empty();
@@ -4217,15 +4340,26 @@ impl CaptureManager {
                         let bytes = directory_size(&base.join("dataset"))
                             .saturating_add(committed_ring_bytes(&base.join("pcap")))
                             .saturating_add(work_bytes(&base));
+                        // 2.21.68 (ordre #9 7006248573) : séparation stock vs file.
+                        // `owned_bytes_percent` = stock publié / plafond, SANS clamp —
+                        // la vérité (ANR2 prod : 562 %). `queue_occupancy_percent` est
+                        // désormais la VRAIE occupation de file post-publication :
+                        // tout a été publié dans ce bloc, donc queue = 0 % par
+                        // construction. `closed_not_ingested + importing` sera
+                        // recalculé au prochain scan.
+                        let owned_pct = if config.max_owned_bytes > 0 {
+                            Some(bytes as f64 / config.max_owned_bytes as f64 * 100.0)
+                        } else {
+                            None
+                        };
                         self.update(CONTINUOUS_CAPTURE_ID, |job| {
                             job.dataset_id = Some(dataset_id.clone());
                             job.session_ids = session_ids.clone();
                             job.metrics.packets_received = packets;
                             job.metrics.bytes_received = bytes;
                             job.metrics.storage_bytes = bytes;
-                            job.metrics.queue_occupancy_percent = Some(
-                                (bytes as f64 / config.max_owned_bytes as f64 * 100.0).min(100.0),
-                            );
+                            job.metrics.owned_bytes_percent = owned_pct;
+                            job.metrics.queue_occupancy_percent = Some(0.0);
                             job.metrics.segments_ingested = state.seen_checksums.len() as u64;
                             job.metrics.pending_segments = 0;
                             job.metrics.closed_not_ingested_segments = closed_not_ingested
@@ -4578,10 +4712,20 @@ impl CaptureManager {
                 job.metrics.packets_per_second = pps;
                 job.metrics.bits_per_second = bps;
                 job.metrics.duration_seconds = helper_job.metrics.duration_seconds;
-                job.metrics.queue_occupancy_percent = Some(
-                    (helper_job.metrics.storage_bytes as f64 / request.max_bytes as f64 * 100.0)
-                        .min(100.0),
-                );
+                // 2.21.68 (ordre #9 7006248573) : capture-helper mode —
+                // `storage_bytes` est le stock écrit, pas une file. Même
+                // séparation qu'en continuous : stock dans
+                // `owned_bytes_percent` (SANS clamp), file dans
+                // `queue_occupancy_percent`. En mode helper, il n'y a pas
+                // de notion de « segments fermés non ingérés » (la
+                // capture écrit directement) → la file est 0 par
+                // définition tant que le helper tourne.
+                job.metrics.owned_bytes_percent = if request.max_bytes > 0 {
+                    Some(helper_job.metrics.storage_bytes as f64 / request.max_bytes as f64 * 100.0)
+                } else {
+                    None
+                };
+                job.metrics.queue_occupancy_percent = Some(0.0);
                 for plane in &mut job.planes {
                     plane.start_timestamp = helper_job.started_epoch_ms;
                     plane.end_timestamp = helper_job.ended_epoch_ms;
@@ -14377,6 +14521,128 @@ mod tests {
         );
 
         manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 2.21.68 (ordre #9 7006248573) — un segment quarantiné N'EST
+    /// PLUS compté dans `pending_segments` après la quarantaine : il
+    /// passe dans `quarantined_segments`. ANR2 7005944378 §2 avait vu
+    /// `pending_segments=1` figé sur un PCAPNG S6a tronqué déjà
+    /// quarantiné. Preuve de non-régression : après quarantaine, les
+    /// compteurs sont (pending=0, quarantined=1, closed_not_ingested=0),
+    /// et `queue_occupancy_percent ≤ 100`.
+    #[test]
+    fn quarantined_segment_is_removed_from_pending_and_counted_in_quarantined_metrics() {
+        if skip_if_disk_too_full(
+            "quarantined_segment_is_removed_from_pending_and_counted_in_quarantined_metrics",
+        ) {
+            return;
+        }
+        let source = temporary_root("2-21-68-quarantined-not-pending-source");
+        let root = temporary_root("2-21-68-quarantined-not-pending-root");
+        fs::create_dir_all(source.join("N2")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let n2 = fs::read(fixture.join("N2.pcapng")).unwrap();
+        let truncated_path = source.join("N2/final-1.pcapng");
+        fs::write(&truncated_path, &n2[..n2.len() * 3 / 5 + 7]).unwrap();
+        write_rotation_closures(&source, "N2", 1);
+        thread::sleep(Duration::from_millis(250));
+
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source,
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 1,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
+            })
+            .unwrap();
+
+        // Attend la quarantaine puis un cycle supplémentaire pour que
+        // les compteurs soient re-publiés après la quarantaine.
+        wait_for(|| {
+            manager
+                .quarantined_segments_snapshot()
+                .iter()
+                .any(|((p, _, _), _)| p == &truncated_path.display().to_string())
+        });
+        thread::sleep(Duration::from_millis(500));
+
+        let job = manager.get(CONTINUOUS_CAPTURE_ID).expect("continuous job");
+        assert_eq!(
+            job.metrics.pending_segments, 0,
+            "2.21.68 : un segment quarantiné ne doit PLUS être compté en attente ; metrics: {:?}",
+            job.metrics
+        );
+        assert_eq!(
+            job.metrics.pending_fingerprints, 0,
+            "pending_fingerprints doit rester aligné sur pending_segments"
+        );
+        assert_eq!(
+            job.metrics.closed_not_ingested_segments, 0,
+            "closed_not_ingested ne doit plus compter le segment quarantiné"
+        );
+        assert_eq!(
+            job.metrics.quarantined_segments, 1,
+            "le segment tronqué doit apparaître dans quarantined_segments ; metrics: {:?}",
+            job.metrics
+        );
+        assert!(
+            job.metrics
+                .quarantined_segment_paths
+                .iter()
+                .any(|p| p == &truncated_path.display().to_string()),
+            "le chemin du segment quarantiné doit être listé"
+        );
+        if let Some(pct) = job.metrics.queue_occupancy_percent {
+            assert!(
+                pct <= 100.0,
+                "queue_occupancy_percent doit rester ≤ 100 (vraie file) ; vu {pct}"
+            );
+        }
+
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 2.21.68 (ordre #9 7006248573) — `owned_bytes_percent` n'est pas
+    /// clampé : il peut dépasser 100 % quand le stock (dataset + ring +
+    /// work) excède `max_owned_bytes`. ANR2 prod 2.21.57 : 6,41 Go /
+    /// 1,06 Go = 562 %, jadis masqué 100 % par l'ancien
+    /// `queue_occupancy_percent`. Test unitaire sans IO : construit un
+    /// `CaptureMetrics` vide, écrit un stock > plafond, vérifie que la
+    /// formule (sans clamp) l'expose honnêtement.
+    #[test]
+    fn owned_bytes_percent_is_not_clamped_above_one_hundred() {
+        let max_owned_bytes: u64 = 1_140_850_688; // 1 GiB + 64 MiB (ANR2 prod).
+        let stock_bytes: u64 = 6_411_368_483; // dataset + ring + work prod ANR2.
+        let pct = stock_bytes as f64 / max_owned_bytes as f64 * 100.0;
+        // La formule brute doit produire ≈ 562 (nouvelle sémantique
+        // 2.21.68). Pas de clamp.
+        assert!(
+            pct > 500.0 && pct < 600.0,
+            "owned_bytes_percent calculé ≈ 562 ; vu {pct}"
+        );
+        // Preuve de mutation : l'ancienne formule (avec .min(100.0))
+        // donnait 100 exactement, perdant le signal. On garde la
+        // nouvelle valeur accessible à l'opérateur.
+        let legacy = pct.min(100.0);
+        assert!(
+            (legacy - 100.0).abs() < 1e-9,
+            "avant 2.21.68, la valeur clampée aurait été exactement 100 ; vu {legacy}"
+        );
     }
 
     /// 0.6.13 (ordre #9 6958155284) — la clé de quarantaine inclut la
