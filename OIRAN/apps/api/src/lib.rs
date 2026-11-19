@@ -7208,6 +7208,7 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
         Ok(Some(mut value)) => {
             // 2.15.3 — même réconciliation PFCP que /events (2.15.2), sur la
             // première page du callflow lue par le ladder p900.
+            let mut pfcp_siblings_added = 0usize;
             if cursor.is_none() {
                 let dataset_root = if flow_value_for(state, id).is_some() {
                     state.inner.reference_dataset_root.clone()
@@ -7220,7 +7221,34 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
                     dataset_root.as_deref(),
                     value.get_mut("events").and_then(Value::as_array_mut),
                 ) {
-                    let _ = read_time_patch::insert_pfcp_siblings_into_callflow(events, root);
+                    pfcp_siblings_added =
+                        read_time_patch::insert_pfcp_siblings_into_callflow(events, root)
+                            .unwrap_or_default();
+                }
+            }
+            // 2.21.64 — `read_callflow_page` calcule la pagination depuis le
+            // callflow persisté. La réconciliation PFCP ci-dessus peut ensuite
+            // enrichir la première page avec des siblings du JSONL brut. Les
+            // compteurs doivent décrire la liste effectivement servie : avant
+            // ce correctif, l'essai 7 renvoyait 72 events tout en annonçant
+            // `returned_events=67` et `total_events=67`.
+            if pfcp_siblings_added > 0 {
+                let returned_events = value
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or_default();
+                if let Some(pagination) = value
+                    .get_mut("pagination")
+                    .and_then(Value::as_object_mut)
+                {
+                    let total_events = pagination
+                        .get("total_events")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(returned_events.saturating_sub(pfcp_siblings_added) as u64)
+                        .saturating_add(pfcp_siblings_added as u64);
+                    pagination.insert("returned_events".into(), returned_events.into());
+                    pagination.insert("total_events".into(), total_events.into());
                 }
             }
             if let Some(events) = value.get_mut("events").and_then(Value::as_array_mut) {
@@ -10178,6 +10206,22 @@ mod tests {
         assert_eq!(events[0]["event_id"], request_id);
         assert_eq!(events[1]["event_id"], response_id);
         assert_eq!(events[2]["event_id"], modif_id);
+
+        // 2.21.64 — la route callflow enrichit elle aussi le JSON persisté.
+        // Les compteurs de pagination doivent inclure le sibling PFCP ajouté
+        // à la lecture, pas rester figés sur les deux events du fichier.
+        let callflow_response = router(state.clone(), None)
+            .oneshot(req(
+                &format!("/api/v1/sessions/{session_id}/callflow?limit=256"),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(callflow_response.status(), StatusCode::OK);
+        let callflow_body = json_body(callflow_response).await;
+        assert_eq!(callflow_body["data"]["events"].as_array().unwrap().len(), 3);
+        assert_eq!(callflow_body["data"]["pagination"]["returned_events"], 3);
+        assert_eq!(callflow_body["data"]["pagination"]["total_events"], 3);
     }
 
     /// 2.15.2 (ANR1 #10 6885876387, D3) — test de régression du FAIL

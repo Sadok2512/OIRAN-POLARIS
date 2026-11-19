@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.21.64 — 2026-11-19 — fusion HPACK/préchauffage et comptage callflow enrichi
+
+Upgrade **patch** sans déploiement, basé sur 2.21.62 (`8eeadf2`) et 2.21.63 (`68b3348`). 2.21.63 inclut déjà les lots filtre 2.21.56 et cache de lignes 2.21.61.
+
+- Fusionne le carry HPACK isolé de 2.21.62 avec le préchauffage borné après publication de 2.21.63.
+- Ferme l'écart de l'essai 7 : le callflow persisté porte 67 events, puis la réconciliation à la lecture ajoute cinq siblings PFCP N4 uniques depuis les shards. `pagination.returned_events` et `pagination.total_events` sont désormais recalculés après cet enrichissement et annoncent 72, comme la liste réellement servie.
+- Test de non-régression sur le chemin physique `CaptureManager` : un callflow persisté à deux events enrichi d'un sibling PFCP doit servir trois events et annoncer `returned_events=total_events=3`.
+
 ## OIRAN API 2.21.62 — 2026-11-18 — HPACK seul sur la production 2.21.57 (isolation de l'écart mémoire 2.21.59)
 
 Upgrade **patch**. 2.21.59 (fusion du lot du soir) a été retirée de la prod : `MemoryPeak` 3 987 660 800 contre 3 238 051 840 en 2.21.57 (ANR2 #10 6992115760). Pour isoler la cause, cette version ne fusionne **que** 2.21.58 (DEVMAT `1c61086`, carry HPACK ordonné par le ring, carry jetable hors ring) sur 2.21.57 (`c1f2798`). Le préchauffage des index de 2.21.56 n'y est **pas**. Conflits limités aux versions, au Cargo.lock et au CHANGELOG.
