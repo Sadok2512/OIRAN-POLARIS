@@ -1595,6 +1595,29 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
         "interface_count": hpack_items.len(),
         "by_interface": hpack_items,
     });
+    // 2.21.88 (ordre #9 7017408187) — expose les alertes de récupération
+    // d'état collectées par `recover_registry` au démarrage de la
+    // probe. Un `job.json` invalide récupéré depuis `.prev` apparaît
+    // sous `kind: "JOB_JSON_RECOVERED_FROM_PREV"` ; un job dont les
+    // deux versions sont perdues apparaît sous
+    // `kind: "JOB_JSON_UNRECOVERABLE"` — l'opérateur a alors la seule
+    // trace durable de l'écart. Vide si aucune corruption détectée.
+    let recovery_warnings = state.inner.capture_manager.recovery_warnings_snapshot();
+    let recovery_items: Vec<Value> = recovery_warnings
+        .iter()
+        .map(|warning| {
+            json!({
+                "capture_id": warning.capture_id,
+                "kind": warning.kind,
+                "detail": warning.detail,
+                "epoch_ms": warning.epoch_ms,
+            })
+        })
+        .collect();
+    data["recovery_warnings"] = json!({
+        "count": recovery_items.len(),
+        "items": recovery_items,
+    });
     ok(data)
 }
 

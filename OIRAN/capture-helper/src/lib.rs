@@ -10,7 +10,8 @@ use event_schema::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     mem,
     os::{
@@ -719,14 +720,19 @@ impl<B: CaptureBackend> CaptureService<B> {
     fn persist_job(&self, job: &HelperJob) -> Result<(), String> {
         let directory = self.inner.config.capture_root.join(&job.capture_id);
         fs::create_dir_all(&directory).map_err(io_error)?;
-        let temporary = directory.join("helper_job.json.tmp");
+        // 2.21.88 (ordre #9 7017408187) — écriture atomique durable :
+        // tmp (create_new + write + fsync) → rename → fsync du
+        // répertoire parent. Pré-2.21.88 utilisait `fs::write` + rename
+        // sans fsync : un ENOSPC entre `write` et `rename` pouvait
+        // laisser un tmp tronqué et un `helper_job.json` périmé, et
+        // un crash entre `rename` et la persistance de l'entrée de
+        // répertoire pouvait perdre l'écriture. Snapshot `.prev`
+        // (hard-link sur l'inode N-1) avant rename : coût 0 octet,
+        // le chargement robuste peut se replier dessus si le fichier
+        // principal est illisible.
         let destination = directory.join("helper_job.json");
-        fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(job).map_err(json_error)?,
-        )
-        .map_err(io_error)?;
-        fs::rename(temporary, destination).map_err(io_error)
+        let bytes = serde_json::to_vec_pretty(job).map_err(json_error)?;
+        atomic_write_with_prev(&destination, &bytes)
     }
 
     fn recover_jobs(&self) -> Result<(), String> {
@@ -738,8 +744,37 @@ impl<B: CaptureBackend> CaptureService<B> {
             if !path.is_file() {
                 continue;
             }
-            let mut job: HelperJob =
-                serde_json::from_slice(&fs::read(&path).map_err(io_error)?).map_err(json_error)?;
+            // 2.21.88 (ordre #9 7017408187) — repli sur `.prev` si le
+            // fichier principal est tronqué (défaut pré-2.21.88 :
+            // `fs::write` non atomique sur ENOSPC). Un helper_job
+            // totalement illisible est tracé en stderr plutôt que de
+            // bloquer la récupération des autres jobs.
+            let mut job = match load_helper_job_with_prev_fallback(&path) {
+                Ok((job, recovered_from_prev)) => {
+                    if recovered_from_prev {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "HELPER_JOB_JSON_RECOVERED_FROM_PREV",
+                                "capture_id": job.capture_id,
+                                "path": path.display().to_string(),
+                            })
+                        );
+                    }
+                    job
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "HELPER_JOB_JSON_UNRECOVERABLE",
+                            "path": path.display().to_string(),
+                            "error": error,
+                        })
+                    );
+                    continue;
+                }
+            };
             if job.state.active() {
                 job.state = HelperState::Failed;
                 job.ended_epoch_ms = Some(epoch_ms());
@@ -1319,6 +1354,105 @@ fn io_error(error: std::io::Error) -> String {
 
 fn json_error(error: serde_json::Error) -> String {
     error.to_string()
+}
+
+/// 2.21.88 (ordre #9 7017408187) — écriture atomique durable pour
+/// `helper_job.json`. Même contrat que le `atomic_write_with_prev`
+/// de live-probe : tmp fsync → hard-link `.prev` → rename → fsync
+/// répertoire. Un ENOSPC laisse l'ancien fichier intact ; un
+/// chargement robuste peut se replier sur `.prev`.
+fn atomic_write_with_prev(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("atomic output has no parent: {}", path.display()))?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "atomic output directory missing: {}",
+            parent.display()
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), epoch_ms()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+        file.write_all(bytes).map_err(io_error)?;
+        file.flush().map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        drop(file);
+        if path.is_file() {
+            let prev = prev_path_for(path);
+            let _ = fs::remove_file(&prev);
+            if let Err(error) = fs::hard_link(path, &prev) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "ATOMIC_WRITE_PREV_SNAPSHOT_SKIPPED",
+                        "path": path.display().to_string(),
+                        "error": error.to_string(),
+                    })
+                );
+            }
+        }
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("finalize {}: {error}", path.display()))?;
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn prev_path_for(path: &Path) -> PathBuf {
+    let mut buf: OsString = path.as_os_str().to_owned();
+    buf.push(".prev");
+    PathBuf::from(buf)
+}
+
+/// 2.21.88 — repli automatique sur `helper_job.json.prev` si le
+/// fichier principal est illisible (cas d'un `fs::write` interrompu
+/// par ENOSPC pré-2.21.88). Retourne `(job, recovered_from_prev)`.
+fn load_helper_job_with_prev_fallback(path: &Path) -> Result<(HelperJob, bool), String> {
+    let primary = fs::read(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice::<HelperJob>(&bytes).map_err(|error| {
+                format!("parse {}: {} ({} bytes)", path.display(), error, bytes.len())
+            })
+        });
+    match primary {
+        Ok(job) => Ok((job, false)),
+        Err(primary_error) => {
+            let prev = prev_path_for(path);
+            if !prev.is_file() {
+                return Err(format!(
+                    "{primary_error}; no `.prev` snapshot at {}",
+                    prev.display()
+                ));
+            }
+            let bytes = fs::read(&prev)
+                .map_err(|error| format!("{primary_error}; read {}: {error}", prev.display()))?;
+            let job: HelperJob = serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "{primary_error}; parse {}: {} ({} bytes)",
+                    prev.display(),
+                    error,
+                    bytes.len()
+                )
+            })?;
+            Ok((job, true))
+        }
+    }
 }
 
 #[cfg(test)]
