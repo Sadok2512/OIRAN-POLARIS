@@ -1,5 +1,31 @@
 # Changelog
 
+## OIRAN API 2.21.74 + live-probe 0.6.26 — 2026-11-19 — `/sessions/filter` 503 jusqu'aux caches READY (ordre #10 7009381757)
+
+Branche `fix/oiran-2.21.74-filter-ready-503`, base exacte `fix/oiran-2.21.72-train @ eaa21f0`. Aucun déploiement.
+
+### Audit et fenêtre fautive
+
+- `CaptureManager::publish_events_to_dataset_dir` libérait la garde lourde de publication en retournant le dataset ; `upsert_dataset` rendait ensuite la nouvelle génération visible ; l'observateur API reprenait seulement après cela une nouvelle garde exclusive pour préchauffer l'index de filtre et `ListRowCache`.
+- Dans cette fenêtre, `sessions_filter_blocking` pouvait obtenir une garde de lecture, observer la nouvelle génération avec les caches de l'ancienne, et répondre transitoirement `200 []`.
+- Le test 2.21.30 ne couvrait que la période où la garde de publication était encore tenue ; il ne couvrait pas l'intervalle après son relâchement et avant le préchauffage.
+- Audit de `c1f2798` (2.21.57) : le verrou pouvait déjà être relâché avant l'exposition de la génération et aucune invariance READY par génération n'existait. Le symptôme précis « caches de préchauffage incomplets » est apparu avec l'observateur post-publication ajouté ensuite ; la classe de défaut (visibilité sans état READY) était donc déjà présente en 2.21.57.
+
+### Correctif
+
+- `live-probe 0.6.26` garde désormais le verrou lourd exclusif pendant l'insertion de la génération et tout l'observateur synchrone : aucune route lourde ne peut entrer entre visibilité et préchauffage.
+- L'API mémorise explicitement la génération dont l'index de filtre et toutes les lignes sont READY. Sa signature inclut désormais le `commit_seq`, l'identifiant du dataset et son nombre de sessions, en plus des signatures de fichiers.
+- `/sessions/filter`, avec ou sans `time_window`, répond `503 HEAVY_WORK_IN_PROGRESS` et `Retry-After: 60` si la génération visible ne correspond pas à la génération READY. Un préchauffage incomplet (`deferred` ou `missing`) ne publie jamais READY.
+- Une génération publiée réellement vide est préchauffée, marquée READY, puis conserve `200` avec `data: []`.
+
+### Régression
+
+- `sessions_filter_answers_503_until_published_generation_caches_are_ready` : 503 avec/sans fenêtre pendant la reconstruction, puis 200 avec total et liste complète après READY.
+- `sessions_filter_ready_empty_generation_stays_200` : distinction explicite entre cache non prêt et génération réellement vide.
+- Validation finale : 12/12 runs ciblés sans échec ; API `199 passed, 0 failed, 3 ignored` ; live-probe `185 passed, 0 failed, 6 ignored` ; workspace complet vert ; vTAP `12 + 3 passed` après `cargo update -w` (0 package modifié) ; audit Rust 1.83 : workspace 137 packages et vTAP 33 packages, 0 violation.
+
+---
+
 ## OIRAN API 2.21.72 — 2026-11-19 — train de livraison : 2.21.66 + 2.21.68 + 2.21.70 merge --no-ff (ordre #9 7007412446)
 
 Train objectif « un seul déploiement après 2.21.64 ». Branche `fix/oiran-2.21.72-train`, base `2468bfc` (`fix/oiran-2.21.64-merge`). Trois merges `--no-ff` dans l'ordre chronologique :

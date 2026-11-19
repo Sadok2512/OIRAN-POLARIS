@@ -145,6 +145,12 @@ struct Inner {
     session_filter_signature: std::sync::Mutex<Option<Vec<String>>>,
     journey_index_cache: std::sync::Mutex<JourneyCache>,
     list_row_cache: std::sync::Mutex<ListRowCache>,
+    /// 2.21.74 — génération publiée dont l'index de filtre ET les lignes
+    /// de liste sont entièrement préchauffés. L'application du contrat est
+    /// activée par `install_session_filter_cache_prewarm`, avant l'ouverture
+    /// du listener ; les états construits isolément dans les tests gardent
+    /// le comportement historique tant que l'installation n'a pas eu lieu.
+    session_filter_cache_readiness: std::sync::Mutex<SessionFilterCacheReadiness>,
     /// 2.21.11 (défaut 2 #9 6930315055) — cache `/sessions/catalog`
     /// keyé par `(commit_seq, dataset_ids, scope_hash)`. Évite de
     /// reconstruire `protocol_tree` + `network_elements` à chaque
@@ -757,6 +763,9 @@ impl AppState {
                 session_filter_signature: std::sync::Mutex::new(None),
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
+                session_filter_cache_readiness: std::sync::Mutex::new(
+                    SessionFilterCacheReadiness::default(),
+                ),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -855,6 +864,9 @@ impl AppState {
                 session_filter_signature: std::sync::Mutex::new(None),
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
+                session_filter_cache_readiness: std::sync::Mutex::new(
+                    SessionFilterCacheReadiness::default(),
+                ),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -3562,6 +3574,19 @@ fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> V
 fn journey_signature(state: &AppState) -> Vec<String> {
     let mut signature = vec![format!("static:{}", state.inner.flows.len())];
     for dataset in state.inner.capture_manager.datasets() {
+        // 2.21.74 — le commit logique fait partie de la génération. Taille
+        // et mtime seules peuvent rester identiques lors d'une republication
+        // sub-seconde ; dans ce cas `/sessions/filter` ne doit surtout pas
+        // considérer les caches de la génération précédente comme READY.
+        signature.push(format!(
+            "dataset:{}:commit={}:sessions={}",
+            dataset.dataset_id,
+            state
+                .inner
+                .capture_manager
+                .dataset_commit_seq(&dataset.dataset_id),
+            dataset.session_ids.len()
+        ));
         for session_id in &dataset.session_ids {
             let file = state
                 .inner
@@ -3591,6 +3616,24 @@ type ListRowCacheSignature = (u64, u128, u64);
 type ListRowCache =
     std::collections::HashMap<(String, String), (ListRowCacheSignature, Value, Value)>;
 type JourneyCache = Option<(Vec<String>, std::sync::Arc<subscriber_journey::JourneyIndex>)>;
+
+#[derive(Default)]
+struct SessionFilterCacheReadiness {
+    enforced: bool,
+    ready_generation: Option<Vec<String>>,
+}
+
+fn session_filter_cache_is_ready(state: &AppState) -> bool {
+    let generation = journey_signature(state);
+    state
+        .inner
+        .session_filter_cache_readiness
+        .lock()
+        .map(|readiness| {
+            !readiness.enforced || readiness.ready_generation.as_ref() == Some(&generation)
+        })
+        .unwrap_or(false)
+}
 
 fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
     let audit = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
@@ -3713,10 +3756,18 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
     let _ = cached_journey_index(state);
     let journey_ready_ms = started.elapsed().as_millis();
     let list_rows = prewarm_live_list_row_cache_locked(state);
+    let ready = list_rows.deferred == 0 && list_rows.missing == 0;
+    if let Ok(mut readiness) = state.inner.session_filter_cache_readiness.lock() {
+        readiness.ready_generation = ready.then(|| journey_signature(state));
+    }
     eprintln!(
         "{}",
         json!({
-            "event": "SESSIONS_FILTER_PREWARM_READY",
+            "event": if ready {
+                "SESSIONS_FILTER_PREWARM_READY"
+            } else {
+                "SESSIONS_FILTER_PREWARM_INCOMPLETE"
+            },
             "trigger": trigger,
             "filter_ready_ms": filter_ready_ms,
             "journey_ready_ms": journey_ready_ms,
@@ -3795,6 +3846,10 @@ fn prewarm_live_list_row_cache_locked(state: &AppState) -> ListRowPrewarmStats {
 /// déjà le verrou au démarrage, l'observateur synchrone prend le relais à son
 /// `upsert_dataset`; le report est journalisé, jamais silencieux.
 pub fn install_session_filter_cache_prewarm(state: &AppState) {
+    if let Ok(mut readiness) = state.inner.session_filter_cache_readiness.lock() {
+        readiness.enforced = true;
+        readiness.ready_generation = None;
+    }
     let weak = Arc::downgrade(&state.inner);
     let runtime_handle = tokio::runtime::Handle::try_current().ok();
     state
@@ -3823,7 +3878,9 @@ pub fn install_session_filter_cache_prewarm(state: &AppState) {
             // le runtime capturé au démarrage rend les spawn d'index compacts
             // valides ; sans ceci Tokio panique hors réacteur.
             let _runtime_guard = runtime_handle.enter();
-            let _gate = state.inner.capture_manager.heavy_memory_enter();
+            // `CaptureManager::upsert_dataset` garde désormais l'écriture
+            // exclusive depuis l'exposition de la génération jusqu'à la fin
+            // de cet observateur. Une seconde prise ici serait un deadlock.
             prewarm_session_filter_caches_locked(&state, "publication");
         })));
 
@@ -4683,6 +4740,14 @@ fn sessions_filter_blocking(
         return heavy_work_in_progress();
     };
     audit_phase("heavy_gate");
+    // 2.21.74 — le verrou empêche une nouvelle génération de devenir
+    // visible pendant cette vérification. Si le préchauffage de l'index ou
+    // des lignes n'a pas validé exactement la génération publiée, répondre
+    // 503 : un `200 []` serait un faux résultat transitoire.
+    if !session_filter_cache_is_ready(&state) {
+        return heavy_work_in_progress();
+    }
+    audit_phase("cache_generation_ready");
     state.refresh_session_filter_index();
     audit_phase("refresh_filter_index");
     let journey_index = cached_journey_index(&state);
@@ -14036,6 +14101,88 @@ mod tests {
         }
         let free = app.oneshot(build()).await.unwrap();
         assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 2.21.74 (ordre #10 7009381757) — la fin du verrou de publication
+    /// ne suffit pas : tant que l'index ET les lignes de la génération
+    /// visible ne sont pas READY, avec ou sans fenêtre, le contrat est 503.
+    /// Une fois le préchauffage achevé la réponse 200 est complète. Mutation :
+    /// retirer le contrôle de génération rend les deux assertions 503 rouges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_filter_answers_503_until_published_generation_caches_are_ready() {
+        let state = operator_state();
+        install_session_filter_cache_prewarm(&state);
+        let (_, baseline) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert!(baseline["meta"]["total"].as_u64().unwrap_or(0) > 0);
+
+        state
+            .inner
+            .session_filter_cache_readiness
+            .lock()
+            .unwrap()
+            .ready_generation = None;
+        for body in [
+            json!({"limit": 100}),
+            json!({
+                "limit": 100,
+                "time_window": {"from": "0", "to": i128::MAX.to_string()}
+            }),
+        ] {
+            let app = router(state.clone(), None);
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sessions/filter")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+            let payload = json_body(response).await;
+            assert_eq!(payload["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test-reconstruction-complete");
+        }
+        let (status, complete) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(complete["meta"]["total"], baseline["meta"]["total"]);
+        let session_ids = |payload: &Value| {
+            payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["session_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(session_ids(&complete), session_ids(&baseline));
+    }
+
+    /// Une génération réellement vide devient READY comme les autres et
+    /// conserve le contrat historique `200 { data: [] }`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_filter_ready_empty_generation_stays_200() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut config = test_config(workspace, "filter-ready-empty");
+        config.reference_dataset_enabled = false;
+        config.capture_root = temporary_directory("filter-ready-empty-captures");
+        let state = AppState::load(config).unwrap();
+        install_session_filter_cache_prewarm(&state);
+
+        let (status, payload) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["meta"]["total"], 0);
+        assert!(payload["data"].as_array().unwrap().is_empty());
     }
 
     /// 2.21.30 — même pattern pour `GET /sessions/catalog/search`.

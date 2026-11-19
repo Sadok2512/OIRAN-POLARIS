@@ -7726,6 +7726,13 @@ impl CaptureManager {
 
     fn upsert_dataset(&self, dataset: LiveDataset, dataset_dir: &Path) -> Result<(), String> {
         validate_dataset_artifacts(&dataset, dataset_dir)?;
+        // 0.6.26 / OIRAN API 2.21.74 — la génération ne doit pas devenir
+        // visible entre la fin du verrou de publication et le début du
+        // préchauffage consommateur. Cette garde couvre donc atomiquement
+        // l'insertion et l'observateur synchrone. Les routes voient soit
+        // l'ancienne génération READY, soit un 503, jamais la nouvelle avec
+        // des caches incomplets.
+        let _generation_transition = self.heavy_memory_enter();
         {
             self.datasets
                 .lock()
