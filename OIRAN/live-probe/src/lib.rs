@@ -10845,10 +10845,17 @@ fn trace_publication_rss_detail(
         now_ms - publication_started_epoch_ms
     };
     // La source de vérité production est le memcg du service, pas une
-    // estimation applicative. Ce chemin exact est également imposé par la
-    // procédure de gate 2.11.12. Hors systemd (tests/dev), les champs valent 0.
-    const SERVICE_CGROUP: &str = "/sys/fs/cgroup/system.slice/oiran-api.service";
-    let memory_stat = fs::read_to_string(format!("{SERVICE_CGROUP}/memory.stat"))
+    // estimation applicative. 2.21.69 (CLAUDE1, ordre #9 7006855142 §1) :
+    // le chemin était écrit en dur `/sys/fs/cgroup/system.slice/oiran-api.service`.
+    // Toute unité systemd transitoire, tout `systemd-run --scope`, toute
+    // délégation (`Delegate=yes`), tout hiérarchie custom (dev lab,
+    // benchmark, nspawn, ...) donnait alors cgroup_*_kb = 0 → trace
+    // inutile pour la mesure. Résolution dynamique depuis
+    // `/proc/self/cgroup` (cgroup v2, ligne unique `0::<path>`).
+    // Fallback : chemin legacy, sûr parce que la lecture d'un path
+    // inexistant retombe sur 0 sans panique.
+    let service_cgroup = resolve_service_cgroup_path();
+    let memory_stat = fs::read_to_string(format!("{service_cgroup}/memory.stat"))
         .unwrap_or_default();
     let cgroup_value = |name: &str| {
         memory_stat
@@ -10862,13 +10869,13 @@ fn trace_publication_rss_detail(
             })
             .unwrap_or(0)
     };
-    let cgroup_peak_kb = fs::read_to_string(format!("{SERVICE_CGROUP}/memory.peak"))
+    let cgroup_peak_kb = fs::read_to_string(format!("{service_cgroup}/memory.peak"))
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(0)
         / 1024;
     eprintln!(
-        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} scanned_events={scanned_events} indexed_events={indexed_events} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={} cgroup_source={SERVICE_CGROUP} cgroup_anon_kb={} cgroup_file_kb={} cgroup_shmem_kb={} cgroup_peak_kb={cgroup_peak_kb}{extras_suffix}",
+        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} scanned_events={scanned_events} indexed_events={indexed_events} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={} cgroup_source={service_cgroup} cgroup_anon_kb={} cgroup_file_kb={} cgroup_shmem_kb={} cgroup_peak_kb={cgroup_peak_kb}{extras_suffix}",
         value("RssAnon"),
         value("RssFile"),
         value("VmRSS"),
@@ -10878,6 +10885,40 @@ fn trace_publication_rss_detail(
         cgroup_value("file") / 1024,
         cgroup_value("shmem") / 1024,
     );
+}
+
+/// 2.21.69 (CLAUDE1, ordre #9 7006855142 §1) — résolution du chemin
+/// cgroup v2 du processus courant via `/proc/self/cgroup`. En cgroup v2
+/// le fichier contient une unique ligne de la forme `0::<path>` où
+/// `<path>` est le chemin cgroup absolu depuis la racine. La racine
+/// filesystem est `/sys/fs/cgroup`. On concatène.
+///
+/// Fallback : si la lecture échoue ou si aucune ligne `0::` n'est
+/// trouvée (cas cgroup v1 pur, ou /proc absent), on retombe sur le
+/// chemin historique `/sys/fs/cgroup/system.slice/oiran-api.service`.
+/// Un chemin qui n'existe pas ne panique pas : `fs::read_to_string`
+/// renvoie une erreur, interceptée par `unwrap_or_default()` au call-site,
+/// et les champs `cgroup_*_kb` ressortent à 0 — exactement le comportement
+/// 2.21.67.
+fn resolve_service_cgroup_path() -> String {
+    const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+    let contents = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    parse_service_cgroup_path(&contents, CGROUP_ROOT)
+}
+
+/// Pure parse — testable sans toucher à `/proc`.
+fn parse_service_cgroup_path(proc_self_cgroup: &str, cgroup_root: &str) -> String {
+    for line in proc_self_cgroup.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            let trimmed = rest.trim();
+            if trimmed.is_empty() || trimmed == "/" {
+                return cgroup_root.to_string();
+            }
+            // `trimmed` commence par `/` par construction cgroup v2.
+            return format!("{cgroup_root}{trimmed}");
+        }
+    }
+    format!("{cgroup_root}/system.slice/oiran-api.service")
 }
 
 /// 2.7.23 + 2.7.27 + 2.9.18-fu3: streaming merge of one input source into the
@@ -12159,6 +12200,65 @@ pub fn vtap_out_dirs() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2.21.69 (CLAUDE1, ordre #9 7006855142 §1) — le parseur
+    /// `/proc/self/cgroup` doit produire un chemin exploitable par
+    /// `memory.stat` / `memory.peak` pour chaque forme réelle
+    /// observée en cgroup v2 : service systemd classique, unité
+    /// transitoire (`systemd-run --scope`), racine (`0::/`), slice
+    /// imbriquée. Fallback cgroup v1.
+    #[test]
+    fn parse_service_cgroup_path_resolves_every_cgroup_v2_shape() {
+        let root = "/sys/fs/cgroup";
+        // Cas production : unité systemd classique
+        assert_eq!(
+            parse_service_cgroup_path("0::/system.slice/oiran-api.service\n", root),
+            "/sys/fs/cgroup/system.slice/oiran-api.service"
+        );
+        // Unité transitoire (systemd-run --scope)
+        assert_eq!(
+            parse_service_cgroup_path(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-u123.scope\n",
+                root,
+            ),
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-u123.scope"
+        );
+        // Racine
+        assert_eq!(parse_service_cgroup_path("0::/\n", root), root);
+        assert_eq!(parse_service_cgroup_path("0::\n", root), root);
+        // Trailing newline / espace
+        assert_eq!(
+            parse_service_cgroup_path("0::/foo/bar\n", root),
+            "/sys/fs/cgroup/foo/bar"
+        );
+        // Cgroup v1 pur (plusieurs contrôleurs numérotés, pas de 0::)
+        // → fallback legacy pour garder le comportement 2.21.67 absent crash.
+        assert_eq!(
+            parse_service_cgroup_path(
+                "12:memory:/system.slice/oiran-api.service\n11:devices:/\n",
+                root,
+            ),
+            "/sys/fs/cgroup/system.slice/oiran-api.service"
+        );
+        // Entrée vide → fallback legacy.
+        assert_eq!(
+            parse_service_cgroup_path("", root),
+            "/sys/fs/cgroup/system.slice/oiran-api.service"
+        );
+    }
+
+    /// Smoke test : la résolution ne panique pas et produit un chemin
+    /// absolu sous `/sys/fs/cgroup`. Le chemin n'a pas besoin d'exister
+    /// pour que `trace_publication_rss_detail` fonctionne (les lectures
+    /// qui échouent retombent sur 0 dans la ligne de trace).
+    #[test]
+    fn resolve_service_cgroup_path_returns_absolute_under_cgroup_root() {
+        let path = resolve_service_cgroup_path();
+        assert!(
+            path.starts_with("/sys/fs/cgroup"),
+            "résolu hors de /sys/fs/cgroup : {path}"
+        );
+    }
 
     #[test]
     fn publication_spill_path_matches_legacy_fixture_end_to_end() {

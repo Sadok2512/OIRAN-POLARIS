@@ -1,5 +1,28 @@
 # Changelog
 
+## OIRAN API 2.21.69 + live-probe 0.6.27 — 2026-11-19 — cgroup via /proc/self/cgroup (étape 1/3, ordre #9 7006855142 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur 2.21.67 (`1840ebd`). Lot 2.21.69 étape 1 **poussée seule** selon l'ordre explicite du cœur (ANR1 en a besoin pour mesurer 2.21.67/2.21.69 juste).
+
+### Défaut corrigé
+
+Les sondes `PUBLICATION_RSS_TRACE phase=... cgroup_anon_kb=... cgroup_file_kb=... cgroup_peak_kb=...` lisaient en dur `/sys/fs/cgroup/system.slice/oiran-api.service`. Toute unité systemd transitoire (`systemd-run --scope`, benchmark, nspawn, délégation `Delegate=yes`, hiérarchie custom lab) retombait donc sur 0 → trace inutile pour la mesure, signalée par ANR1 dans #10 7006752946.
+
+### Correctif 2.21.69
+
+- Nouveau helper privé `live-probe::parse_service_cgroup_path(proc_contents, cgroup_root)` — pur, testable, qui lit la ligne unique `0::<path>` de cgroup v2 et préfixe avec la racine `/sys/fs/cgroup`. Racine `0::/` → `/sys/fs/cgroup`. Absence de ligne `0::` (cgroup v1, /proc inaccessible, buffer vide) → fallback vers le chemin legacy, qui retombe silencieusement sur 0 si inexistant (comportement 2.21.67 préservé).
+- `trace_publication_rss_detail` remplace `const SERVICE_CGROUP: &str = ...` par `let service_cgroup = resolve_service_cgroup_path();`. Les lectures `memory.stat` / `memory.peak` suivent le vrai cgroup du processus courant. Le champ `cgroup_source=...` de la trace reflète maintenant le chemin résolu dynamiquement.
+
+### Tests ajoutés
+
+- `parse_service_cgroup_path_resolves_every_cgroup_v2_shape` : couvre service systemd classique, unité transitoire profonde, racine `0::/`, racine `0::`, chemin avec saut de ligne, cgroup v1 pur (fallback legacy), entrée vide (fallback legacy).
+- `resolve_service_cgroup_path_returns_absolute_under_cgroup_root` : smoke test de non-panique + invariant chemin sous `/sys/fs/cgroup`.
+
+### Prochaines étapes (sur cette même branche, chaque étape = nouvelle version)
+
+- 2.21.71 — `posix_fadvise(POSIX_FADV_DONTNEED)` par blocs 64 Mo sur les shards lus en phase 01 (vise les 2,18 Go de `cgroup_file_kb`).
+- 2.21.73 — compte par champ de `publication_projection_field_bytes` sommé sur les représentants retenus à `01-50-scan-end`, plus `capacity()` vs `len()` des Vec/String principaux (chiffre les 3,55 Ko par représentant).
+
 ## OIRAN API 2.21.67 + live-probe 0.6.26 + session-engine 0.5.25 — 2026-11-19 — décomposition phase 01 (ordre #9 7006049224 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.64-merge` (`2468bfc`). Pivot décidé par le cœur après mesure réelle ANR2 (#10 7005944378) : le pic cgroup 2,98 GB en prod 2.21.57 est atteint **pendant la phase 01** (`load_paths_spilling_representatives_with_progress`), pas en phase 07/08 comme supposé initialement. La branche 2.21.65 (streaming callflows, levier A) reste sur sa branche sans push ultérieur ; son gain mesuré sur les sondes qu'elle avait ajoutées est ≈ 0.
