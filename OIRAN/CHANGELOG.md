@@ -1,5 +1,80 @@
 # Changelog
 
+## OIRAN API 2.21.83 — 2026-11-19 — train de livraison : 2.21.76 + 2.21.79 + 2.21.81 merge --no-ff (ordre #9 7013902603 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (= PROD). Branche `fix/oiran-2.21.83-train`. Numerology CLAUDE1 = impair. Train d'un seul déploiement pour poser trois lots indépendants et déjà revus individuellement :
+
+- **2.21.76** `be60037` (CLAUDE2) — confidentialité L2 + corrections data S : `POST /identities/lookup`, `GET /identities` → 410 Gone sans écho, audit sans clair, `unknown_bytes_s` (D-06), QFI dans `session_identifiers` (D-09). Base 29fe4e3. Ordre #9 7012275179.
+- **2.21.79** `d6bae4f` (CLAUDE1) — corrections voix sûres : jitter RTP en unités d'horloge (RFC 3551 §6 + `a=rtpmap` ; fail-closed sans clock_rate), pseudonyme SIP unifié avec NAS via `pseudonym_subscriber_digits` sur IMSI/MSISDN canoniques, règle `sip-pdu-ims-5qi1-vonr-exact` EXACT seulement si DNN=ims ET 5QI=1 concordent. Base 29fe4e3. Ordre #9 7012275179.
+- **2.21.81** `4901a18` (CLAUDE1) — carry HPACK enclenché dès la première rotation : `atomic_write` de `state` AVANT `process_continuous_capture_selected_at` dans `process_continuous_capture_inner`, mutation vérifiée (sans fix → chiffres ANR2 #10 7012038887 exactement reproduits). Base 29fe4e3. Ordre #9 7013285585.
+
+### Topologie des merges `--no-ff`
+
+```
+*   <merge> 2.21.81 (carry HPACK) into train 2.21.83
+|\
+| * 4901a18 fix(oiran-api 2.21.81, live-probe 0.6.27) …
+*   <merge> 2.21.79 (voix) into train 2.21.83
+|\
+| * d6bae4f fix(oiran-api 2.21.79, decoder-sip 0.2.0, decoder-rtp 0.2.0, correlation-engine 0.6.12, oiran-decode 0.8.2) …
+*   <merge> 2.21.76 (CLAUDE2) into train 2.21.83
+|\
+| * be60037 fix(oiran-api 2.21.76, decoder-gtpu 0.2.2) …
+* 29fe4e3   fix(api): gate session filters on ready generation  ← base PROD
+```
+
+### Conflits résolus
+
+| Fichier | Nature | Résolution |
+|---|---|---|
+| `OIRAN/apps/api/Cargo.toml` | 3 versions concurrentes | Version finale **2.21.83** (le train incrémente d'un numéro impair) |
+| `OIRAN/Cargo.lock` | 3 entrées `oiran-api v2.21.*` | `version = "2.21.83"` |
+| `OIRAN/CHANGELOG.md` | 3 en-têtes concurrents en tête de fichier | Ordre chronologique descendant conservé : 2.21.83 header train → 2.21.81 → 2.21.79 → 2.21.76 → 2.21.74 (base) → historique inchangé |
+
+Aucun autre conflit : chaque lot touche des surfaces disjointes (CLAUDE2 sur `apps/api/src/lib.rs` + `apps/api/src/live_trace.rs` + `decoder-gtpu` ; CLAUDE1 2.21.79 sur `decoder-sip` + `decoder-rtp` + `correlation-engine` + `oiran-decode` ; CLAUDE1 2.21.81 sur `live-probe/src/lib.rs`).
+
+### Versions finales
+
+```
+OIRAN/apps/api/Cargo.toml       : version = "2.21.83"
+OIRAN/live-probe/Cargo.toml     : version = "0.6.27"  (inchangé depuis 2.21.81)
+OIRAN/decoder-sip/Cargo.toml    : version = "0.2.0"   (inchangé depuis 2.21.79)
+OIRAN/decoder-rtp/Cargo.toml    : version = "0.2.0"   (inchangé depuis 2.21.79)
+OIRAN/correlation-engine/Cargo.toml : version = "0.6.12"  (inchangé depuis 2.21.79)
+OIRAN/oiran-decode/Cargo.toml   : version = "0.8.2"   (inchangé depuis 2.21.79)
+OIRAN/decoder-gtpu/Cargo.toml   : version = "0.2.2"   (inchangé depuis 2.21.76)
+```
+
+### Tests (12 runs des tests ajoutés par chaque lot)
+
+```
+cargo test --locked -p decoder-rtp     --lib → 9 passed; 0 failed
+cargo test --locked -p decoder-sip     --lib → 8 passed; 0 failed
+cargo test --locked -p correlation-engine --lib → 39 passed; 0 failed
+cargo test --locked -p decoder-gtpu    --lib → 6+1 passed; 0 failed
+cargo test --locked -p live-probe      --lib → 186 passed; 0 failed; 6 ignored (test 2.21.81 + 2.21.76 tous verts)
+cargo test --locked -p oiran-api       --lib → 202 passed; 0 failed; 3 ignored
+
+12 × cargo test --locked -p decoder-rtp --lib -j 2 jitter → 12 × 4 passed
+12 × cargo test --locked -p decoder-sip --lib -j 2 sip_subscriber → 12 × 1 passed
+12 × cargo test --locked -p correlation-engine --lib -j 2 vonr → 12 × 3 passed
+12 × cargo test --locked -p decoder-gtpu --lib qfi_is_propagated → 12 × 1 passed
+12 × cargo test --locked -p live-probe --lib restart_then_two_sbi → 12 × 1 passed
+
+(cd OIRAN/vtap && cargo update -w && cargo test --locked -j 2) → 12+3 passed; 0 failed
+python3 /tmp/audit.py OIRAN/Cargo.lock       → OK 137 packages, 0 > rust-version 1.83
+python3 /tmp/audit.py OIRAN/vtap/Cargo.lock  → OK  53 packages, 0 > rust-version 1.83
+```
+
+### Déploiement cible
+
+Un seul déploiement du train 2.21.83 pose en même temps :
+- Les trois corrections data CLAUDE2 (lookup POST + audit sans clair + unknown_bytes_s + QFI).
+- Les trois corrections voix CLAUDE1 (jitter unitaire + pseudo SIP=NAS + règle VoNR EXACT).
+- La correction HPACK CLAUDE1 (carry enclenché dès la 1ʳᵉ rotation).
+
+**Pas de déploiement.** 2.21.78 (débit SSE, CLAUDE2) **hors du train** jusqu'à correction revue.
+
 ## OIRAN API 2.21.81 + live-probe 0.6.27 — 2026-11-19 — carry HPACK enclenché dès la première rotation (ordre #9 7013285585 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (PROD). Écart OUVERT par ANR2 (#10 7012038887) : après déploiement `hpack_carry.connections_tracked=0, connections_resumed=0, off_ring_segments_decoded=2`.
