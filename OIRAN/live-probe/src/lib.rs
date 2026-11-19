@@ -4293,6 +4293,36 @@ impl CaptureManager {
                         "historical_segments_skipped": state.segments.len().saturating_sub(selected_files.len()),
                     })
                 );
+                // 2.21.81 (CLAUDE1, ordre #9 7013285585) — FIX du carry
+                // HPACK non enclenché. ANR2 (#10 7012038887) observait
+                // en prod `connections_tracked=0`, `connections_resumed=0`,
+                // `off_ring_segments_decoded=2` après un redémarrage, car
+                // `publish_events_to_dataset_dir` → `process_capture_into_selected`
+                // relisait `import_state.json` DEPUIS LE DISQUE (ligne 6241
+                // dans ce fichier) pour classer ring / hors-ring. Mais
+                // dans le même cycle de capture continu, `state.segments`
+                // vient d'être muté en mémoire (ligne 4200), et aucune
+                // persistance n'avait lieu AVANT le publish — seul
+                // `persist_published_checksums` (ligne 4335) écrivait
+                // après coup. Résultat : le nouveau segment était absent
+                // de `state.segments` côté disque au moment du classement,
+                // donc classé hors-ring, décodé sans carry, puis le
+                // checksum entré en `seen_checksums` au cycle suivant
+                // empêchait toute reprise en carry.
+                //
+                // Correctif : on persiste `state` (avec les segments
+                // fraîchement ingérés) AVANT le publish. `seen_checksums`
+                // reste inchangé ici ; il n'est muté qu'en cas de succès
+                // par `persist_published_checksums` juste après. Un crash
+                // entre ce write et la fin du publish laisse segments
+                // enregistrés sans seen_checksum → le prochain scan voit
+                // le candidat, le copy_verified sur une destination
+                // existante est idempotent (même checksum), et le cycle
+                // reprend. Aucune perte, aucune corruption.
+                atomic_write(
+                    &state_path,
+                    &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+                )?;
                 match self.process_continuous_capture_selected_at(
                     &base,
                     &interface_specs(),
@@ -14310,6 +14340,158 @@ mod tests {
             final_pending, 0,
             "pending_segments must reach 0; got {final_pending}"
         );
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 2.21.81 (CLAUDE1, ordre #9 7013285585) — redémarrage puis 2
+    /// rotations SBI : chaque segment nouvellement ingéré DOIT être
+    /// classé comme ring (= présent dans `import_state.json` au moment
+    /// où `process_capture_into_selected` lit le snapshot). Avant le
+    /// correctif 2.21.81, l'`atomic_write` de `state` était reporté à
+    /// `persist_published_checksums` (APRÈS le publish) ; le publish
+    /// lisait donc une version périmée de `state.json` et classait le
+    /// nouveau segment en « hors ring » (`off_ring_segments_decoded`
+    /// incrémentait, carry HPACK jamais enclenché).
+    ///
+    /// La preuve : après ingestion de 2 segments SBI dumpcap-style, la
+    /// metric `off_ring_segments_decoded` reste 0 pour SBI, et les
+    /// deux segments figurent bien dans l'`import_state.json` sur
+    /// disque avec leur `source_path` (= nom de fichier source
+    /// dumpcap) enregistré. Mutation : retirer l'`atomic_write` ajouté
+    /// avant `process_continuous_capture_selected_at` fait échouer la
+    /// seconde assertion (`off_ring_segments_decoded` passe à ≥ 1).
+    #[test]
+    fn restart_then_two_sbi_rotations_classify_both_as_ring_after_persist_before_publish() {
+        if skip_if_disk_too_full(
+            "restart_then_two_sbi_rotations_classify_both_as_ring_after_persist_before_publish",
+        ) {
+            return;
+        }
+        let source = temporary_root("sbi-restart-two-rotations-source");
+        let root = temporary_root("sbi-restart-two-rotations-owned");
+        fs::create_dir_all(source.join("SBI")).unwrap();
+
+        // Rotation 1 : pcap SBI dumpcap-style, bloc HPACK avec préface
+        // + literal headers (établit la table dynamique côté connexion).
+        let block1 = sbi_block1_preface_and_literal_headers(
+            b"/nnrf-nfm/v1/nf-instances/claude1-2-21-81-rot1",
+        );
+        let pcap1 = source.join("SBI/sbi_20261119T100000Z_00001_20261119100100.pcapng");
+        write_sbi_pcap(&pcap1, 51001, 7777, &block1);
+        write_rotation_closures(&source, "SBI", 1);
+        thread::sleep(Duration::from_millis(500));
+
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 256 * 1024,
+                max_segments: 8,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
+            })
+            .unwrap();
+
+        // Attente rotation 1 (segments_ingested >= 1).
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        let state_path = base.join("import_state.json");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Some(job) = manager.get(CONTINUOUS_CAPTURE_ID) {
+                if job.metrics.segments_ingested >= 1 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        // Preuve 1/3 : après rotation 1, state.json sur disque porte
+        // bien le segment avec son source_path dumpcap-style.
+        assert!(
+            state_path.is_file(),
+            "state.json doit exister après rotation 1"
+        );
+        let state1: ContinuousImportState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(
+            state1
+                .segments
+                .values()
+                .any(|segment| segment.source_path.contains("sbi_20261119T100000Z_00001_")),
+            "segment rotation 1 doit figurer dans state.segments (source_path dumpcap) ; got {:?}",
+            state1.segments.values().map(|s| &s.source_path).collect::<Vec<_>>()
+        );
+
+        // Rotation 2 : pcap SBI contigu (même run_id, seq=00002).
+        // Le bloc indexed-only référence la table dynamique bâtie par
+        // la rotation 1 → si le carry HPACK est enclenché, le decoder
+        // peut résoudre les indices sans table literal.
+        let block2 = sbi_block2_indexed_only(3);
+        let pcap2 = source.join("SBI/sbi_20261119T100000Z_00002_20261119100200.pcapng");
+        write_sbi_pcap(&pcap2, 51001, 7777, &block2);
+        write_rotation_closures(&source, "SBI", 1);
+
+        // Attente rotation 2 (segments_ingested >= 2).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Some(job) = manager.get(CONTINUOUS_CAPTURE_ID) {
+                if job.metrics.segments_ingested >= 2 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let final_job = manager.get(CONTINUOUS_CAPTURE_ID).expect("worker alive");
+        assert!(
+            final_job.metrics.segments_ingested >= 2,
+            "2 rotations ingested ; got {}",
+            final_job.metrics.segments_ingested
+        );
+
+        // Preuve 2/3 : state.json sur disque porte MAINTENANT les deux
+        // segments. L'`atomic_write` avant publish de 2.21.81 est le
+        // seul mécanisme qui écrit `state.segments` AVANT que
+        // `process_capture_into_selected` ne le relise pour classifier.
+        let state2: ContinuousImportState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let sources: Vec<&str> = state2
+            .segments
+            .values()
+            .map(|s| s.source_path.as_str())
+            .collect();
+        assert!(
+            sources.iter().any(|s| s.contains("00001_")),
+            "segment seq=00001 doit figurer dans state.segments ; got {sources:?}"
+        );
+        assert!(
+            sources.iter().any(|s| s.contains("00002_")),
+            "segment seq=00002 doit figurer dans state.segments ; got {sources:?}"
+        );
+
+        // Preuve 3/3 : AUCUN des deux segments SBI n'a été classé
+        // « hors ring ». Avant 2.21.81, les deux étaient hors ring.
+        let carry_metrics = manager.hpack_carry_metrics_snapshot();
+        let sbi_metrics = carry_metrics
+            .get("SBI")
+            .expect("SBI metrics snapshot doit exister après 2 rotations");
+        assert_eq!(
+            sbi_metrics.off_ring_segments_decoded,
+            0,
+            "après 2.21.81, 0 segment SBI classé hors ring ; got {} (carry métriques : {:?})",
+            sbi_metrics.off_ring_segments_decoded,
+            sbi_metrics
+        );
+
         manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
