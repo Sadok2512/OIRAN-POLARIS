@@ -63,6 +63,24 @@ pub(crate) struct LiveTrace {
     /// point de terminaison que celui appris : rejetés.
     #[serde(default)]
     gpdu_rejected_endpoint_mismatch: u64,
+    /// 2.21.113 (E3) — messages PFCP rattachés par la valeur du SEID
+    /// seule, faute de couple (nœud, SEID) connu : rattachement plus
+    /// faible, compté à part.
+    #[serde(default)]
+    pfcp_attached_seid_only: u64,
+    /// 2.21.113 (E4) — messages parents rattachés après coup, quand
+    /// leur enfant (qui porte l'identité) a été rattaché.
+    #[serde(default)]
+    parents_attached_after_child: u64,
+    /// 2.21.113 (E2) — messages rejetés alors qu'ils portent un
+    /// identifiant UE de l'abonné : l'autre identifiant est celui d'un
+    /// autre contexte UE.
+    #[serde(default)]
+    rejected_ue_id_mismatch: u64,
+    /// 2.21.113 (E3) — messages PFCP rejetés alors qu'ils portent une
+    /// valeur de SEID de l'abonné, vers un autre nœud.
+    #[serde(default)]
+    rejected_seid_endpoint_mismatch: u64,
     /// 2.21.105 (donnée ANR1 #10 7048928345, ordre #9 7048974175) —
     /// alimentation de la trace **par interface** : events décodés
     /// présentés à la trace (`seen`), écartés par le filtre
@@ -252,8 +270,10 @@ impl MatchKeys {
     pub fn iter(&self) -> impl Iterator<Item = &String> {
         self.0.iter()
     }
-    pub fn clear(&mut self) {
-        self.0.clear()
+    /// 2.21.113 — oublie les références d'event (`evt-…`) et garde les
+    /// identités de l'abonné (pseudonymes, chiffres amorcés).
+    pub fn forget_event_references(&mut self) {
+        self.0.retain(|key| !key.starts_with("evt-"));
     }
     pub fn len(&self) -> usize {
         self.0.len()
@@ -322,6 +342,13 @@ struct TraceState {
     /// enb_ue_s1ap_id et `association` = les deux adresses du lien
     /// SCTP. Rattachement EXACT, jamais par sous-chaîne.
     ue_ids: HashSet<(String, String, String)>,
+    /// 2.21.113 (E3) — couples (adresse du nœud destinataire, SEID)
+    /// appris sur la signalisation PFCP de l'abonné.
+    seid_endpoints: HashSet<(String, String)>,
+    /// 2.21.113 (E5) — tunnels appris par session de données
+    /// (`pdu_session_id`) : `(adresse si connue, TEID)`. Permet d'oublier
+    /// les tunnels de la seule session libérée.
+    session_tunnels: HashMap<String, HashSet<(Option<String>, String)>>,
     /// 2.21.105 — la trace attend son amorçage depuis le ring.
     needs_seed: bool,
     /// 2.21.105 — la trace est dans la passe d'amorçage en cours :
@@ -563,19 +590,62 @@ fn session_ids_named<'a>(value: &'a Value, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// 2.21.109 (ordre #9 7050201220) — identifiants UE de signalisation qui
-/// rattachent un message à l'abonné d'une trace, par égalité exacte.
-const UE_ID_NAMES: [&str; 4] = [
-    "amf_ue_ngap_id",
-    "ran_ue_ngap_id",
-    "mme_ue_s1ap_id",
-    "enb_ue_s1ap_id",
-];
-
 /// 2.21.109 — référence de contexte SM (SBI `smContextRef`) : propre à
 /// une session, allouée par le SMF. Rattachement exact, sans portée
 /// d'association (requêtes et réponses la portent dans les deux sens).
 const SM_CONTEXT_NAME: &str = "sm_context_reference";
+
+/// 2.21.113 (relecture CLAUDE2 #9 7050861203, E1/E2) — identifiants UE
+/// alloués par le cœur (uniques par AMF / MME) et par l'accès radio
+/// (uniques par gNB / eNB).
+const CORE_UE_ID_NAMES: [&str; 2] = ["amf_ue_ngap_id", "mme_ue_s1ap_id"];
+const RAN_UE_ID_NAMES: [&str; 2] = ["ran_ue_ngap_id", "enb_ue_s1ap_id"];
+
+/// 2.21.113 (E5) — nom de message sans espaces ni casse : les décodeurs
+/// NGAP/S1AP émettent `UEContextReleaseComplete`, le NAS
+/// `PDU Session Release Complete`.
+fn compact_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Libération du contexte UE : les identifiants UE de signalisation et
+/// les tunnels ne valent plus.
+fn is_ue_context_release(name: &str) -> bool {
+    matches!(compact_name(name).as_str(), "uecontextreleasecomplete" | "detachaccept")
+}
+
+/// Libération d'une session de données : ses tunnels et SEID ne valent
+/// plus ; l'UE reste enregistré, ses identifiants UE sont gardés.
+fn is_data_session_release(name: &str) -> bool {
+    matches!(
+        compact_name(name).as_str(),
+        "pdusessionreleasecomplete" | "deletesessionresponse"
+    )
+}
+
+/// 2.21.113 (E3) — couples (adresse du nœud, SEID) d'une IE F-SEID
+/// (`f_seid=0x…,v4=…,v6=…,ipv4=a.b.c.d`) : le SEID que ce nœud attend
+/// dans l'en-tête des messages qui lui sont adressés.
+fn parse_seid_pairs(ie_value: &str) -> Vec<(String, String)> {
+    let components: BTreeMap<&str, &str> = ie_value
+        .split(',')
+        .filter_map(|part| {
+            let (k, v) = part.split_once('=')?;
+            Some((k.trim(), v.trim()))
+        })
+        .collect();
+    let (Some(seid), Some(ip)) = (components.get("f_seid"), components.get("ipv4")) else {
+        return Vec::new();
+    };
+    let hex = seid.trim_start_matches("0x").trim_start_matches("0X");
+    match u64::from_str_radix(hex, 16) {
+        Ok(n) if n != 0 => vec![(event_schema::normalize_ip(ip), format!("0x{n:016x}"))],
+        _ => Vec::new(),
+    }
+}
 
 /// 2.21.109 — vrai pour un identifiant hexadécimal nul (`0x0…0`). Un
 /// SEID ou un TEID nul n'identifie aucune session : c'est la valeur de
@@ -639,6 +709,10 @@ pub(crate) struct LiveTraceRegistry {
     /// 2.21.109 — segments décodés pendant la dernière passe. En
     /// régime établi : un par plan actif, pas tout le ring.
     reader_files_decoded: AtomicU64,
+    /// 2.21.113 (E4) — derniers events de signalisation rejetés par au
+    /// moins une trace : un parent NGAP/S1AP passe avant son enfant NAS,
+    /// qui seul porte l'identité.
+    recent_rejected: Mutex<VecDeque<event_schema::NormalizedEvent>>,
 }
 
 impl LiveTraceRegistry {
@@ -652,6 +726,7 @@ impl LiveTraceRegistry {
             reader_io: Mutex::new(BTreeMap::new()),
             reader_files_tracked: AtomicU64::new(0),
             reader_files_decoded: AtomicU64::new(0),
+            recent_rejected: Mutex::new(VecDeque::new()),
         }
     }
     pub(crate) fn audit(&self, entry: Value) {
@@ -740,6 +815,15 @@ impl LiveTraceRegistry {
                 "rejected_interface_filter": trace.gpdu_rejected_interface_filter,
                 "attached_teid_only": trace.gpdu_attached_teid_only,
                 "rejected_endpoint_mismatch": trace.gpdu_rejected_endpoint_mismatch,
+            },
+            "pfcp": {"attached_seid_only": trace.pfcp_attached_seid_only},
+            "parents_attached_after_child": trace.parents_attached_after_child,
+            "rejects": {
+                "ue_id_mismatch": trace.rejected_ue_id_mismatch,
+                "seid_endpoint_mismatch": trace.rejected_seid_endpoint_mismatch,
+                "gpdu_endpoint_mismatch": trace.gpdu_rejected_endpoint_mismatch,
+                "gpdu_no_match": trace.gpdu_rejected_no_match,
+                "gpdu_interface_filter": trace.gpdu_rejected_interface_filter,
             },
             "interfaces": trace.feed,
             "seed": trace.seed,
@@ -888,13 +972,32 @@ impl LiveTraceRegistry {
     }
 
     fn route_event(&self, event: &event_schema::NormalizedEvent, seed_only: bool) {
+        self.route_event_for(event, seed_only, None);
+    }
+
+    /// `force_trace` : rattache l'event à cette seule trace sans refaire
+    /// le test de rattachement (2.21.113, E4 : parent rattaché après son
+    /// enfant).
+    fn route_event_for(
+        &self,
+        event: &event_schema::NormalizedEvent,
+        seed_only: bool,
+        force_trace: Option<&str>,
+    ) {
         // 2.21.103 (ordre #9 7046282778, défaut ANR2 #10 7045891820) — un
         // PFCP de niveau nœud (Heartbeat/Association/PFD/Node-Report) n'est
         // JAMAIS routé dans une trace abonné : ces messages n'ont pas de
         // portée session et polluent le flux SSE (99,92 % des 22 769 PFCP
         // observés par ANR2 sur une trace voix, rejoués via IE values
         // communes apprises).
-        if event.protocol.as_str() == "PFCP" && is_pfcp_node_message(&event.message_name) {
+        // 2.21.113 — aussi par type : le décodeur PFCP ne nomme que
+        // Heartbeat et Association Setup ; les autres messages de niveau
+        // nœud (types 1 à 15 : Association Update / Release, PFD
+        // Management, Node Report, …) sortent en « Unknown PFCP Message »
+        // et passaient le filtre par nom.
+        if event.protocol.as_str() == "PFCP"
+            && (is_pfcp_node_message(&event.message_name) || (1..50).contains(&event.message_type))
+        {
             return;
         }
         let value = serde_json::from_str(&event.to_json()).unwrap_or(Value::Null);
@@ -959,20 +1062,76 @@ impl LiveTraceRegistry {
                 format!("{b}|{a}")
             }
         };
-        let ev_ue_ids: Vec<(String, String, String)> = UE_ID_NAMES
-            .iter()
-            .flat_map(|name| {
-                session_ids_named(&value, name)
-                    .into_iter()
-                    .map(|v| ((*name).to_string(), v.to_string(), association.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .chain(
-                session_ids_named(&value, SM_CONTEXT_NAME)
-                    .into_iter()
-                    .map(|v| (SM_CONTEXT_NAME.to_string(), v.to_string(), String::new())),
-            )
+        // 2.21.113 (E1) — un identifiant alloué par le cœur est unique
+        // par AMF / MME : il est qualifié par l'adresse de ce nœud, pas
+        // par l'association, pour survivre à un changement de gNB.
+        let core_node = {
+            let is_core = |endpoint: &event_schema::Endpoint| {
+                matches!(endpoint.port, Some(38412) | Some(36412))
+                    || endpoint
+                        .network_function
+                        .as_deref()
+                        .map(str::to_ascii_lowercase)
+                        .is_some_and(|nf| nf.contains("amf") || nf.contains("mme"))
+            };
+            if is_core(&event.source_endpoint) {
+                event.source_endpoint.address.clone()
+            } else if is_core(&event.destination_endpoint) {
+                event.destination_endpoint.address.clone()
+            } else {
+                association.clone()
+            }
+        };
+        let ids_named = |names: &[&str], scope: &str| -> Vec<(String, String, String)> {
+            names
+                .iter()
+                .flat_map(|name| {
+                    session_ids_named(&value, name)
+                        .into_iter()
+                        .map(|v| ((*name).to_string(), v.to_string(), scope.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let ev_core_ids = ids_named(&CORE_UE_ID_NAMES, &core_node);
+        let ev_ran_ids = ids_named(&RAN_UE_ID_NAMES, &association);
+        let ev_sm_contexts: Vec<(String, String, String)> = session_ids_named(&value, SM_CONTEXT_NAME)
+            .into_iter()
+            .map(|v| (SM_CONTEXT_NAME.to_string(), v.to_string(), String::new()))
             .collect();
+        // 2.21.113 (E3) — SEID : couple (nœud destinataire, SEID
+        // d'en-tête) du message, et couples des IE F-SEID.
+        let is_pfcp = event.protocol.as_str() == "PFCP";
+        let ev_header_seid_pairs: Vec<(String, String)> = if is_pfcp {
+            ev_session_seids
+                .iter()
+                .map(|seid| {
+                    (
+                        event_schema::normalize_ip(&event.destination_endpoint.address),
+                        seid.clone(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ev_ie_seid_pairs: Vec<(String, String)> =
+            ev_ies.iter().flat_map(|v| parse_seid_pairs(v)).collect();
+        // 2.21.113 (E4) — références de l'event parent citées par l'event.
+        let ev_parent_ids: Vec<String> = value
+            .get("parent_event_id")
+            .and_then(Value::as_str)
+            .into_iter()
+            .chain(session_ids_named(&value, "parent_ngap_event_id"))
+            .chain(session_ids_named(&value, "parent_s1ap_event_id"))
+            .filter(|id| id.starts_with("evt-"))
+            .map(str::to_owned)
+            .collect();
+        let ev_pdu_session: Option<String> = session_ids_named(&value, "pdu_session_id")
+            .first()
+            .map(|v| v.to_string());
+        let mut parents_to_attach: Vec<(String, String)> = Vec::new();
+        let mut rejected_by_a_trace = false;
         let ev_pdu_address: Option<String> = ev_ies
             .iter()
             .find(|v| v.starts_with("type=") && v.contains(",address="))
@@ -993,13 +1152,16 @@ impl LiveTraceRegistry {
             wall_ms.saturating_sub(event_ms)
         };
         for state in traces.values_mut() {
+            if force_trace.is_some_and(|id| id != state.trace.trace_id) {
+                continue;
+            }
             if seed_only {
                 if !state.seeding {
                     continue;
                 }
                 state.trace.seed.events_scanned =
                     state.trace.seed.events_scanned.saturating_add(1);
-            } else {
+            } else if force_trace.is_none() {
                 let feed = state.trace.feed.entry(event.interface.clone()).or_default();
                 feed.seen = feed.seen.saturating_add(1);
                 feed.last_event_timestamp_s = Some(event.timestamp.seconds);
@@ -1045,10 +1207,22 @@ impl LiveTraceRegistry {
                 .iter()
                 .any(|pseudonym| tokens.contains(pseudonym));
             let match_keys = state.match_keys.iter().any(|known| tokens.contains(known));
-            let match_seid = ev_session_seids
+            // 2.21.113 (E3) — SMF et UPF allouent chacun leurs SEID : la
+            // valeur seule peut désigner la session d'un autre abonné.
+            // Rattachement par le couple (nœud, SEID) ; la valeur seule
+            // n'est admise que si aucun couple n'est connu pour elle.
+            let match_seid_pair = ev_header_seid_pairs
+                .iter()
+                .chain(ev_ie_seid_pairs.iter())
+                .any(|pair| state.seid_endpoints.contains(pair));
+            let match_seid_value_only = ev_session_seids
                 .iter()
                 .chain(ev_seids_ie.iter())
-                .any(|s| state.seids.contains(s));
+                .any(|s| {
+                    state.seids.contains(s)
+                        && !state.seid_endpoints.iter().any(|pair| &pair.1 == s)
+                });
+            let match_seid = match_seid_pair || match_seid_value_only;
             // 2.21.109 — un TEID seul ne rattache que si aucun couple
             // (adresse, TEID) n'est connu pour ce TEID : gNB et UPF
             // allouent leurs TEID chacun de leur côté, la même valeur
@@ -1072,8 +1246,34 @@ impl LiveTraceRegistry {
                 .iter()
                 .chain(gpdu_pairs.iter())
                 .any(|pair| state.tunnel_endpoints.contains(pair));
-            let match_ue_id = ev_ue_ids.iter().any(|id| state.ue_ids.contains(id));
-            let matched = match_pseudo
+            // 2.21.113 (E2) — identifiants UE : quand l'event porte
+            // l'identifiant du cœur ET celui de l'accès radio, le premier
+            // doit être celui de l'abonné, et le second aussi — sauf sur
+            // une association jamais vue pour cet abonné (changement de
+            // gNB). Un seul identifiant présent : il doit être connu.
+            let core_known = ev_core_ids.iter().any(|id| state.ue_ids.contains(id));
+            let ran_known = ev_ran_ids.iter().any(|id| state.ue_ids.contains(id));
+            let association_known = state.ue_ids.iter().any(|(name, _, scope)| {
+                RAN_UE_ID_NAMES.contains(&name.as_str()) && scope == &association
+            });
+            // Tant qu'aucun identifiant du cœur n'est appris pour l'abonné
+            // (premier message descendant après l'InitialUEMessage),
+            // l'identifiant radio connu suffit et fait apprendre l'autre.
+            let core_learned = state
+                .ue_ids
+                .iter()
+                .any(|(name, _, _)| CORE_UE_ID_NAMES.contains(&name.as_str()));
+            let match_ue_id = match (ev_core_ids.is_empty(), ev_ran_ids.is_empty()) {
+                (false, false) => {
+                    (core_known && (ran_known || !association_known))
+                        || (!core_learned && ran_known)
+                }
+                (false, true) => core_known,
+                (true, false) => ran_known,
+                (true, true) => false,
+            } || ev_sm_contexts.iter().any(|id| state.ue_ids.contains(id));
+            let matched = force_trace.is_some()
+                || match_pseudo
                 || match_keys
                 || match_seid
                 || match_teid
@@ -1098,7 +1298,44 @@ impl LiveTraceRegistry {
                             state.trace.gpdu_rejected_no_match.saturating_add(1);
                     }
                 }
+                rejected_by_a_trace = true;
+                if !seed_only {
+                    if core_known || ran_known {
+                        state.trace.rejected_ue_id_mismatch =
+                            state.trace.rejected_ue_id_mismatch.saturating_add(1);
+                    }
+                    let seid_value_known = ev_session_seids
+                        .iter()
+                        .chain(ev_seids_ie.iter())
+                        .any(|s| state.seids.contains(s));
+                    if is_pfcp && seid_value_known {
+                        state.trace.rejected_seid_endpoint_mismatch =
+                            state.trace.rejected_seid_endpoint_mismatch.saturating_add(1);
+                    }
+                }
                 continue;
+            }
+            if force_trace.is_some() {
+                state.trace.parents_attached_after_child =
+                    state.trace.parents_attached_after_child.saturating_add(1);
+            }
+            // 2.21.113 (E4) — le parent de cet event a pu être rejeté
+            // juste avant (il ne porte pas l'identité) : à rattacher.
+            if !seed_only {
+                for parent in &ev_parent_ids {
+                    if !state.match_keys.contains(parent) {
+                        parents_to_attach.push((state.trace.trace_id.clone(), parent.clone()));
+                    }
+                }
+            }
+            if is_pfcp
+                && !seed_only
+                && match_seid_value_only
+                && !match_seid_pair
+                && !(match_pseudo || match_keys || match_teid || match_tunnel)
+            {
+                state.trace.pfcp_attached_seid_only =
+                    state.trace.pfcp_attached_seid_only.saturating_add(1);
             }
             if is_gpdu {
                 state.trace.gpdu_attached = state.trace.gpdu_attached.saturating_add(1);
@@ -1157,8 +1394,15 @@ impl LiveTraceRegistry {
             // 2.21.109 — identifiants UE exacts, et référence de l'event
             // de signalisation routé : un event enfant (NAS porté par
             // NGAP/S1AP) cite son parent par `parent_*_event_id`.
-            for id in &ev_ue_ids {
+            for id in ev_core_ids
+                .iter()
+                .chain(ev_ran_ids.iter())
+                .chain(ev_sm_contexts.iter())
+            {
                 state.ue_ids.insert(id.clone());
+            }
+            for pair in ev_header_seid_pairs.iter().chain(ev_ie_seid_pairs.iter()) {
+                state.seid_endpoints.insert(pair.clone());
             }
             if event.protocol.as_str() != "GTP-U" && event.event_id.starts_with("evt-") {
                 state.match_keys.insert(event.event_id.clone());
@@ -1166,6 +1410,19 @@ impl LiveTraceRegistry {
             for pair in &ev_tunnel_pairs {
                 state.tunnel_endpoints.insert(pair.clone());
                 state.tunnel_teids.insert(pair.1.clone());
+            }
+            // 2.21.113 (E5) — tunnels de signalisation rangés par session
+            // de données quand l'event la nomme.
+            if event.protocol.as_str() != "GTP-U" {
+                if let Some(session) = ev_pdu_session.as_ref() {
+                    let entry = state.session_tunnels.entry(session.clone()).or_default();
+                    for pair in &ev_tunnel_pairs {
+                        entry.insert((Some(pair.0.clone()), pair.1.clone()));
+                    }
+                    for teid in ev_teids.iter().chain(ev_session_teids.iter()) {
+                        entry.insert((None, teid.clone()));
+                    }
+                }
             }
             // 2.21.109 (exigence cœur 7050392981 point 1) — un G-PDU
             // n'apprend aucun TEID : seule la signalisation de l'abonné
@@ -1198,26 +1455,63 @@ impl LiveTraceRegistry {
                     }
                 }
             }
-            if matches!(
-                event.message_name.as_str(),
-                "UE Context Release Complete"
-                    | "PDU Session Release Complete"
-                    | "Delete Session Response"
-                    | "Detach Accept"
-            ) {
-                state.match_keys.clear();
-                state.exposed_keys.clear();
-                // 2.21.103 — fin de session : la prochaine session (si la
-                // trace n'a pas expiré) a droit à un `ue_info` initial.
-                state.last_ue_info_signature = None;
-                // 2.21.90 défaut 2 — fin de session : on oublie aussi
-                // les tunnels/SEID appris, sinon un TEID/SEID réutilisé
-                // par un autre abonné serait routé à tort.
+            // 2.21.113 (E5) — deux fins distinctes. Avant, le nom testé
+            // (`UE Context Release Complete`, avec espaces) n'était celui
+            // d'aucun décodeur : la libération de contexte n'oubliait
+            // rien ; et la libération d'une session PDU oubliait les
+            // identifiants UE alors que l'UE reste enregistré.
+            let context_release = is_ue_context_release(&event.message_name);
+            let session_release = is_data_session_release(&event.message_name);
+            let released_tunnels = if session_release && !context_release {
+                ev_pdu_session
+                    .as_ref()
+                    .and_then(|session| state.session_tunnels.remove(session))
+            } else {
+                None
+            };
+            if let Some(tunnels) = released_tunnels {
+                // Libération d'UNE session de données dont les tunnels
+                // sont connus : eux seuls sont oubliés, les autres
+                // sessions de l'abonné (DNN internet et IMS, par exemple)
+                // gardent les leurs.
+                for (address, teid) in tunnels {
+                    let still_used = state
+                        .session_tunnels
+                        .values()
+                        .any(|others| others.iter().any(|(_, other)| other == &teid));
+                    if !still_used {
+                        state.tunnel_teids.remove(&teid);
+                    }
+                    if let Some(address) = address {
+                        state.tunnel_endpoints.remove(&(address, teid));
+                    }
+                }
+            } else if context_release || session_release {
+                // Fin du contexte, ou libération d'une session dont les
+                // tunnels ne sont pas rangés par session : tous les
+                // tunnels, SEID et IP UE sont oubliés ; un TEID/SEID
+                // réutilisé par un autre abonné serait routé à tort.
                 state.tunnel_teids.clear();
                 state.tunnel_endpoints.clear();
+                state.session_tunnels.clear();
                 state.seids.clear();
+                state.seid_endpoints.clear();
                 state.ue_ips.clear();
+            }
+            // Suppression d'une session PFCP : son SEID ne vaut plus.
+            if is_pfcp && compact_name(&event.message_name).ends_with("sessiondeletionresponse") {
+                for pair in &ev_header_seid_pairs {
+                    state.seid_endpoints.remove(pair);
+                    state.seids.remove(&pair.1);
+                }
+            }
+            if context_release {
+                // Fin du contexte UE : ses identifiants de signalisation
+                // et les références d'event ne valent plus. Les identités
+                // de l'abonné (pseudonymes, chiffres amorcés) sont
+                // gardées : elles rattachent sa prochaine procédure.
                 state.ue_ids.clear();
+                state.match_keys.forget_event_references();
             }
             if seed_only {
                 // Amorçage : l'état de rattachement est appris, rien
@@ -1352,8 +1646,37 @@ impl LiveTraceRegistry {
                 }
             }
         }
+        drop(traces);
+        if seed_only || force_trace.is_some() {
+            return;
+        }
+        // 2.21.113 (E4) — un event de signalisation rejeté est gardé un
+        // court moment : s'il est le parent d'un event rattaché ensuite,
+        // il est rattaché après coup à la trace de l'enfant.
+        let mut pending: Vec<(String, event_schema::NormalizedEvent)> = Vec::new();
+        {
+            let mut recent = self.recent_rejected.lock().unwrap();
+            for (trace_id, parent_id) in parents_to_attach {
+                if let Some(parent) = recent.iter().find(|e| e.event_id == parent_id) {
+                    pending.push((trace_id, parent.clone()));
+                }
+            }
+            if rejected_by_a_trace && event.protocol.as_str() != "GTP-U" {
+                recent.push_back(event.clone());
+                while recent.len() > RECENT_REJECTED_EVENTS {
+                    recent.pop_front();
+                }
+            }
+        }
+        for (trace_id, parent) in pending {
+            self.route_event_for(&parent, false, Some(&trace_id));
+        }
     }
 }
+
+/// 2.21.113 (E4) — nombre d'events de signalisation rejetés gardés pour
+/// un rattachement après coup du parent.
+const RECENT_REJECTED_EVENTS: usize = 64;
 
 /// 2.21.109 (ordre #9 7049845272) — variable d'environnement de repli :
 /// `1`/`true` remet le lecteur live en redécodage intégral de chaque
@@ -1987,6 +2310,10 @@ pub(crate) async fn create(
         gpdu_rejected_interface_filter: 0,
         gpdu_attached_teid_only: 0,
         gpdu_rejected_endpoint_mismatch: 0,
+        pfcp_attached_seid_only: 0,
+        parents_attached_after_child: 0,
+        rejected_ue_id_mismatch: 0,
+        rejected_seid_endpoint_mismatch: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
     };
@@ -2011,6 +2338,8 @@ pub(crate) async fn create(
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
             ue_ids: HashSet::new(),
+            seid_endpoints: HashSet::new(),
+            session_tunnels: HashMap::new(),
             // 2.21.105 — le lecteur relit le ring de signalisation
             // pour cette trace à sa prochaine passe.
             needs_seed: true,
@@ -2381,6 +2710,10 @@ mod tests {
                 gpdu_rejected_interface_filter: 0,
                 gpdu_attached_teid_only: 0,
                 gpdu_rejected_endpoint_mismatch: 0,
+                pfcp_attached_seid_only: 0,
+                parents_attached_after_child: 0,
+                rejected_ue_id_mismatch: 0,
+                rejected_seid_endpoint_mismatch: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
             },
@@ -2401,6 +2734,8 @@ mod tests {
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
             ue_ids: HashSet::new(),
+            seid_endpoints: HashSet::new(),
+            session_tunnels: HashMap::new(),
             needs_seed: true,
             seeding: false,
         }
@@ -3265,6 +3600,459 @@ mod tests {
         for absent in ["psn-ue-a", "UPLINK", "0101", "psn-ue"] {
             assert!(!tokens.contains(absent), "{absent} ne doit pas rattacher");
         }
+    }
+
+    /// Message NGAP synthétique entre un gNB et l'AMF (port 38412).
+    fn ngap_between(
+        gnb: &str,
+        uplink: bool,
+        message: &str,
+        packet: u64,
+        ids: Vec<(&str, &str)>,
+    ) -> event_schema::NormalizedEvent {
+        use event_schema::{Direction, Protocol};
+        let mut event = mk_event(
+            "N2",
+            Protocol::Ngap,
+            message,
+            packet,
+            if uplink { Direction::Uplink } else { Direction::Downlink },
+            ids,
+            vec![],
+        );
+        event.event_id = format!("evt-ngap-{packet:04}");
+        let amf = event_schema::Endpoint {
+            address: "10.77.21.20".into(),
+            port: Some(38412),
+            network_function: None,
+        };
+        let ran = event_schema::Endpoint {
+            address: gnb.into(),
+            port: Some(33_492),
+            network_function: None,
+        };
+        if uplink {
+            event.source_endpoint = ran;
+            event.destination_endpoint = amf;
+        } else {
+            event.source_endpoint = amf;
+            event.destination_endpoint = ran;
+        }
+        event
+    }
+
+    fn routed_ids(r: &LiveTraceRegistry) -> Vec<String> {
+        r.traces.lock().unwrap()["t"]
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn trace_on(pseudonym: &str) -> LiveTraceRegistry {
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec![pseudonym.into()]));
+        r
+    }
+
+    /// 2.21.113 (relecture CLAUDE2 #9 7050861203, E1) — handover avec
+    /// changement de gNB : `amf_ue_ngap_id` est unique par AMF, il
+    /// rattache les messages du nouveau gNB, qui portent un nouveau
+    /// `ran_ue_ngap_id` sur une autre association. Perdus à `33e544a`.
+    #[test]
+    fn handover_to_another_gnb_keeps_the_subscriber_attached_2_21_113() {
+        let r = trace_on("psn-ue-a");
+        let gnb1 = "10.77.11.13";
+        let gnb2 = "10.77.11.99";
+        r.route_normalized(&ngap_between(
+            gnb1,
+            false,
+            "InitialContextSetupRequest",
+            1,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        r.route_normalized(&ngap_between(
+            gnb2,
+            true,
+            "PathSwitchRequest",
+            2,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "77")],
+        ));
+        r.route_normalized(&ngap_between(
+            gnb2,
+            true,
+            "UplinkNASTransport",
+            3,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "77")],
+        ));
+        assert_eq!(
+            routed_ids(&r),
+            vec!["evt-ngap-0001", "evt-ngap-0002", "evt-ngap-0003"],
+            "les messages du nouveau gNB restent dans la trace"
+        );
+    }
+
+    /// 2.21.113 (E2) — un identifiant sur deux ne suffit pas : un message
+    /// qui porte le `ran_ue_ngap_id` de l'abonné avec un autre
+    /// `amf_ue_ngap_id`, ou l'inverse sur le même gNB, est celui d'un
+    /// autre UE. Les deux entraient à `33e544a`.
+    #[test]
+    fn one_ue_id_out_of_two_does_not_attach_another_ue_2_21_113() {
+        let r = trace_on("psn-ue-a");
+        let gnb = "10.77.11.13";
+        r.route_normalized(&ngap_between(
+            gnb,
+            false,
+            "InitialContextSetupRequest",
+            1,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        r.route_normalized(&ngap_between(
+            gnb,
+            false,
+            "DownlinkNASTransport",
+            2,
+            vec![("amf_ue_ngap_id", "99"), ("ran_ue_ngap_id", "21")],
+        ));
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "UplinkNASTransport",
+            3,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "55")],
+        ));
+        // Le dialogue de l'abonné, lui, continue d'être rattaché.
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "UplinkNASTransport",
+            4,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21")],
+        ));
+        assert_eq!(routed_ids(&r), vec!["evt-ngap-0001", "evt-ngap-0004"]);
+    }
+
+    /// 2.21.113 (E3) — PFCP : le SEID se compare avec le nœud qui le
+    /// reçoit. La même valeur vers un autre nœud est la session d'un
+    /// autre abonné ; elle entrait à `33e544a`.
+    #[test]
+    fn pfcp_seid_is_matched_with_its_receiving_node_2_21_113() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        let pfcp = |packet: u64, message: &str, node: &str, ids: Vec<(&'static str, &'static str)>| {
+            let mut event = mk_event("N4", Protocol::Pfcp, message, packet, Direction::Unknown, ids, vec![]);
+            event.event_id = format!("evt-pfcp-{packet:04}");
+            event.destination_endpoint.address = node.into();
+            event
+        };
+        r.route_normalized(&pfcp(
+            1,
+            "Session Modification Request",
+            "10.77.22.13",
+            vec![("seid", "0x0000000000000042"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        // Même valeur de SEID, autre nœud, sans pseudonyme : autre session.
+        r.route_normalized(&pfcp(
+            2,
+            "Session Report Request",
+            "10.77.22.99",
+            vec![("seid", "0x0000000000000042")],
+        ));
+        // Même nœud, même SEID : la session de l'abonné.
+        r.route_normalized(&pfcp(
+            3,
+            "Session Modification Request",
+            "10.77.22.13",
+            vec![("seid", "0x0000000000000042")],
+        ));
+        assert_eq!(routed_ids(&r), vec!["evt-pfcp-0001", "evt-pfcp-0003"]);
+        assert_eq!(r.traces.lock().unwrap()["t"].trace.pfcp_attached_seid_only, 0);
+    }
+
+    /// 2.21.113 (E4) — premier message NGAP : l'`InitialUEMessage` passe
+    /// avant son enfant NAS et ne porte que `ran_ue_ngap_id` ; l'enfant
+    /// porte le pseudonyme et cite son parent. Le parent, rejeté d'abord,
+    /// est rattaché quand l'enfant l'est. Perdu à `33e544a`.
+    #[test]
+    fn parent_rejected_before_its_child_is_attached_afterwards_2_21_113() {
+        let r = trace_on("psn-ue-a");
+        let gnb = "10.77.11.13";
+        let parent = ngap_between(gnb, true, "InitialUEMessage", 1, vec![("ran_ue_ngap_id", "21")]);
+        let mut child = ngap_between(
+            gnb,
+            true,
+            "Registration request",
+            1,
+            vec![
+                ("ran_ue_ngap_id", "21"),
+                ("subscriber_pseudonym", "psn-ue-a"),
+                ("parent_ngap_event_id", "evt-ngap-0001"),
+            ],
+        );
+        child.event_id = "evt-nas-0001".into();
+        // Un parent d'un autre UE, jamais suivi d'un enfant de l'abonné.
+        let mut stranger = ngap_between(gnb, true, "InitialUEMessage", 2, vec![("ran_ue_ngap_id", "22")]);
+        stranger.event_id = "evt-ngap-stranger".into();
+        r.route_normalized(&stranger);
+        r.route_normalized(&parent);
+        r.route_normalized(&child);
+        let mut routed = routed_ids(&r);
+        routed.sort();
+        assert_eq!(routed, vec!["evt-nas-0001", "evt-ngap-0001"]);
+        let traces = r.traces.lock().unwrap();
+        assert_eq!(traces["t"].trace.parents_attached_after_child, 1);
+        assert_eq!(traces["t"].trace.feed["N2"].attached, 2);
+    }
+
+    /// 2.21.113 (E5) — fins de session. La libération du contexte UE
+    /// (nom émis par les décodeurs : `UEContextReleaseComplete`) oublie
+    /// les identifiants UE et les tunnels, pas l'identité de l'abonné ;
+    /// la libération d'une session PDU oublie ses tunnels et SEID, pas
+    /// les identifiants UE (l'UE reste enregistré). À `33e544a` la
+    /// première ne se déclenchait jamais et la seconde vidait `ue_ids`.
+    #[test]
+    fn context_release_and_pdu_release_forget_the_right_things_2_21_113() {
+        let r = trace_on("psn-ue-a");
+        let gnb = "10.77.11.13";
+        let learn = |packet: u64| {
+            let mut event = ngap_between(
+                gnb,
+                false,
+                "PDUSessionResourceSetupRequest",
+                packet,
+                vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21"), ("subscriber_pseudonym", "psn-ue-a")],
+            );
+            event.information_elements = vec![event_schema::InformationElement {
+                id: None,
+                name: "PDUSessionResourceSetupRequestTransfer".into(),
+                length: 0,
+                value: Some("item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x0000a001".into()),
+                raw_sha256: None,
+                status: event_schema::DecodeStatus::Decoded,
+            }];
+            event
+        };
+        let snapshot = |r: &LiveTraceRegistry| {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            (t.ue_ids.len(), t.tunnel_teids.len(), t.match_keys.contains("psn-ue-a"))
+        };
+        r.route_normalized(&learn(1));
+        assert_eq!(snapshot(&r), (2, 1, true));
+        // Libération de session PDU : tunnels oubliés, identifiants gardés.
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "PDU Session Release Complete",
+            2,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21")],
+        ));
+        assert_eq!(snapshot(&r), (2, 0, true));
+        r.route_normalized(&learn(3));
+        assert_eq!(snapshot(&r), (2, 1, true));
+        // Libération du contexte UE : identifiants et tunnels oubliés,
+        // l'identité de l'abonné reste.
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "UEContextReleaseComplete",
+            4,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21")],
+        ));
+        assert_eq!(snapshot(&r), (0, 0, true));
+        // Les identifiants libérés, réutilisés par un autre UE, ne
+        // rattachent plus rien.
+        r.route_normalized(&ngap_between(
+            gnb,
+            false,
+            "DownlinkNASTransport",
+            5,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21")],
+        ));
+        assert_eq!(routed_ids(&r).len(), 4, "le message d'après libération n'entre pas");
+        assert!(is_ue_context_release("UE Context Release Complete"));
+        assert!(is_ue_context_release("UEContextReleaseComplete"));
+        assert!(!is_ue_context_release("UEContextReleaseCommand"));
+        assert!(is_data_session_release("PDU Session Release Complete"));
+        assert!(is_data_session_release("DeleteSessionResponse"), "nom émis par decoder-gtpv2c");
+    }
+
+    /// 2.21.113 (E5, exigence cœur #9 7050925249) — libération d'UNE
+    /// session PDU : seuls ses tunnels sont oubliés. L'abonné a deux
+    /// sessions (1 et 2) ; libérer la 2 laisse le trafic de la 1
+    /// rattaché et rejette celui de la 2.
+    #[test]
+    fn pdu_release_forgets_only_the_tunnels_of_that_session_2_21_113() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        let gnb = "10.77.11.13";
+        let setup = |packet: u64, session: &'static str, teid: &'static str| {
+            let mut event = ngap_between(
+                gnb,
+                false,
+                "PDUSessionResourceSetupRequest",
+                packet,
+                vec![
+                    ("amf_ue_ngap_id", "11"),
+                    ("ran_ue_ngap_id", "21"),
+                    ("subscriber_pseudonym", "psn-ue-a"),
+                    ("pdu_session_id", session),
+                ],
+            );
+            event.information_elements = vec![event_schema::InformationElement {
+                id: None,
+                name: "PDUSessionResourceSetupRequestTransfer".into(),
+                length: 0,
+                value: Some(format!(
+                    "item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul={teid}"
+                )),
+                raw_sha256: None,
+                status: event_schema::DecodeStatus::Decoded,
+            }];
+            event
+        };
+        let gpdu = |packet: u64, teid: &'static str| {
+            let mut event = mk_event(
+                "N3",
+                Protocol::Gtpu,
+                "G-PDU",
+                packet,
+                Direction::Uplink,
+                vec![("teid", teid)],
+                vec![],
+            );
+            event.destination_endpoint.address = "10.77.22.13".into();
+            event
+        };
+        r.route_normalized(&setup(1, "1", "0x0000a001"));
+        r.route_normalized(&setup(2, "2", "0x0000a002"));
+        r.route_normalized(&gpdu(3, "0x0000a001"));
+        r.route_normalized(&gpdu(4, "0x0000a002"));
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "PDU Session Release Complete",
+            5,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21"), ("pdu_session_id", "2")],
+        ));
+        r.route_normalized(&gpdu(6, "0x0000a001"));
+        r.route_normalized(&gpdu(7, "0x0000a002"));
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.gpdu_attached, 3, "session 1 toujours rattachée, session 2 oubliée");
+        assert_eq!(t.trace.gpdu_rejected_no_match, 1);
+        assert_eq!(t.ue_ids.len(), 2, "l'UE reste enregistré");
+    }
+
+    /// 2.21.113 (exigence cœur #9 7050925249) — les rejets par motif
+    /// sont lisibles dans `stats`, et un message PFCP de niveau nœud que
+    /// le décodeur ne nomme pas (« Unknown PFCP Message », type < 50)
+    /// n'entre pas dans la trace.
+    #[test]
+    fn rejects_are_counted_by_reason_and_unnamed_pfcp_node_messages_are_filtered_2_21_113() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        let gnb = "10.77.11.13";
+        r.route_normalized(&ngap_between(
+            gnb,
+            false,
+            "InitialContextSetupRequest",
+            1,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        r.route_normalized(&ngap_between(
+            gnb,
+            false,
+            "DownlinkNASTransport",
+            2,
+            vec![("amf_ue_ngap_id", "99"), ("ran_ue_ngap_id", "21")],
+        ));
+        let pfcp = |packet: u64, node: &str, message: &str, message_type: u32, ids: Vec<(&'static str, &'static str)>| {
+            let mut event = mk_event("N4", Protocol::Pfcp, message, packet, Direction::Unknown, ids, vec![]);
+            event.message_type = message_type;
+            event.destination_endpoint.address = node.into();
+            event
+        };
+        r.route_normalized(&pfcp(
+            3,
+            "10.77.22.13",
+            "PFCP Session Modification Request",
+            52,
+            vec![("seid", "0x0000000000000042"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        r.route_normalized(&pfcp(
+            4,
+            "10.77.22.99",
+            "PFCP Session Report Request",
+            56,
+            vec![("seid", "0x0000000000000042")],
+        ));
+        // Association Update (type 7) : niveau nœud, non nommé par le
+        // décodeur, et porteur du pseudonyme pour forcer le rattachement.
+        r.route_normalized(&pfcp(
+            5,
+            "10.77.22.13",
+            "Unknown PFCP Message",
+            7,
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.messages, 2, "le message de l'abonné sur N2 et celui sur N4");
+        let stats = r.stats_payload(&t.trace);
+        assert_eq!(stats["rejects"]["ue_id_mismatch"], 1);
+        assert_eq!(stats["rejects"]["seid_endpoint_mismatch"], 1);
+        assert_eq!(stats["pfcp"]["attached_seid_only"], 0);
+        assert!(!t.trace.feed.contains_key("N4") || t.trace.feed["N4"].seen == 2,
+            "le message de niveau nœud n'est pas présenté à la trace");
+    }
+
+    /// 2.21.113 — sur la capture N2 réelle du dépôt
+    /// (`OIRAN_5G_PDU_SESSION_DATA_V1`), routée en live : toute la
+    /// signalisation de l'abonné est rattachée, `InitialUEMessage`
+    /// compris (E4), et les deux messages de libération d'un AUTRE
+    /// contexte UE (autres identifiants NGAP) ne le sont pas (E2).
+    #[test]
+    fn real_n2_capture_attaches_the_whole_dialogue_and_nothing_else_2_21_113() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N2"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        sort_by_capture_order(&mut events);
+        let pseudonym = events
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let foreign: Vec<&str> = events
+            .iter()
+            .filter(|e| e.message_name.starts_with("UEContextRelease"))
+            .map(|e| e.event_id.as_str())
+            .collect();
+        assert_eq!(foreign.len(), 2, "deux messages d'un autre contexte UE dans le jeu");
+        let r = trace_on(&pseudonym);
+        for event in &events {
+            r.route_normalized(event);
+        }
+        let routed = routed_ids(&r);
+        assert!(foreign.iter().all(|id| !routed.iter().any(|r| r == id)));
+        assert_eq!(routed.len(), events.len() - 2, "tout le dialogue de l'abonné");
+        let initial = events
+            .iter()
+            .find(|e| e.message_name == "InitialUEMessage")
+            .unwrap();
+        assert!(routed.contains(&initial.event_id), "InitialUEMessage rattaché après son enfant");
+        assert!(r.traces.lock().unwrap()["t"].trace.parents_attached_after_child >= 1);
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
