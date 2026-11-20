@@ -951,8 +951,58 @@ pub fn load_jsonl<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String> {
             .map_err(|e| format!("line {}: invalid JSON: {e}", line_no + 1))?;
         events.push(parse_event(value).map_err(|e| format!("line {}: {e}", line_no + 1))?);
     }
+    // 2.21.102 (ordre #9 7045732954) — backfill `stable_event_key` à
+    // la LECTURE pour les events stockés qui ne la portent pas (dataset
+    // pré-2.21.91 ou JSONL émis avant event-schema 1.6.0). Même formule
+    // que `derive_stable_event_key`. Dérivation en ORDRE DE FICHIER
+    // (= ordre d'émission du décodeur live), avant `deterministic_sort`
+    // pour que les ordinaux coïncident avec ceux de la republication
+    // live.
+    backfill_stable_event_keys(&mut events);
     deterministic_sort(&mut events);
     Ok(events)
+}
+
+/// 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954) —
+/// renseigne `stable_event_key` pour chaque event dont le champ est
+/// vide, en conservant intacts ceux qui le portent déjà. Appelé par
+/// les lecteurs de JSONL stockés (`load_jsonl`, `load_jsonl_slim`,
+/// `load_path_streaming_index`) et par `apps/api::callflow` /
+/// `live-probe::callflow_page` pour patcher les callflows persistés
+/// AVANT 2.21.91 **sans réécriture disque**.
+///
+/// La formule et les champs sont identiques à
+/// [`event_schema::derive_stable_event_key`] :
+/// `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}`. L'ordinal est
+/// le rang 0-based dans l'ordre d'émission (= ordre des events dans
+/// `oiran_events.jsonl`, qui est l'ordre où le décodeur les a produits).
+/// Événement sans `packet_references` : clé laissée vide (écart
+/// déclaré OUVERT au caller).
+pub fn backfill_stable_event_keys(events: &mut [EventRecord]) {
+    let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
+    for event in events.iter_mut() {
+        if !event.stable_event_key.is_empty() {
+            continue;
+        }
+        let Some(packet) = event.packet_references.first() else {
+            continue;
+        };
+        let lookup = event_schema::packet_lookup_key(
+            &packet.source_file,
+            packet.interface_id,
+            packet.packet_number,
+            packet.byte_offset,
+        );
+        let ordinal = ordinals.entry(lookup).and_modify(|v| *v = v.saturating_add(1)).or_insert(0);
+        event.stable_event_key = event_schema::derive_stable_event_key(
+            &packet.source_file,
+            packet.interface_id,
+            packet.packet_number,
+            packet.byte_offset,
+            &event.protocol,
+            *ordinal,
+        );
+    }
 }
 
 pub fn load_path(path: &std::path::Path) -> Result<Vec<EventRecord>, String> {
@@ -1594,6 +1644,8 @@ pub fn load_jsonl_slim<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String
         }
         events.push(event);
     }
+    // 2.21.102 — même backfill que load_jsonl sur le chemin slim.
+    backfill_stable_event_keys(&mut events);
     deterministic_sort(&mut events);
     Ok(events)
 }

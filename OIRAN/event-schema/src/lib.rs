@@ -633,6 +633,88 @@ pub fn packet_lookup_key(
     )
 }
 
+/// 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954) — patche
+/// un objet callflow (serde_json `Value`) **en place** pour renseigner
+/// `stable_event_key` sur chaque event `events[*]` qui ne le porte
+/// pas. Respecte strictement la formule de [`derive_stable_event_key`]
+/// (`{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}`) avec l'ordinal
+/// 0-based dans l'ordre d'apparition des events dans l'array `events`
+/// (= ordre d'émission, si le producteur n'a pas re-trié).
+///
+/// Événement sans `packet_references` : skippé (écart déclaré OUVERT
+/// côté caller si besoin). Événement avec `stable_event_key` déjà
+/// non vide : laissé intact.
+///
+/// Retourne `(patched, skipped_no_packet_references)`.
+pub fn backfill_stable_event_keys_in_callflow(
+    value: &mut serde_json::Value,
+) -> (usize, usize) {
+    let Some(events) = value.get_mut("events").and_then(|v| v.as_array_mut()) else {
+        return (0, 0);
+    };
+    let mut ordinals = std::collections::BTreeMap::<String, u32>::new();
+    let mut patched = 0usize;
+    let mut skipped = 0usize;
+    for event in events.iter_mut() {
+        let Some(obj) = event.as_object_mut() else { continue };
+        if obj
+            .get("stable_event_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        {
+            continue;
+        }
+        let protocol = obj
+            .get("protocol")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let packet_opt = obj
+            .get("packet_references")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|p| p.as_object())
+            .map(|p| {
+                (
+                    p.get("source_file")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    p.get("interface_id")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as u32,
+                    p.get("packet_number")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    p.get("byte_offset")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                )
+            });
+        let Some((source_file, interface_id, packet_number, byte_offset)) = packet_opt else {
+            skipped += 1;
+            continue;
+        };
+        let lookup =
+            packet_lookup_key(&source_file, interface_id, packet_number, byte_offset);
+        let ordinal = *ordinals
+            .entry(lookup)
+            .and_modify(|v| *v = v.saturating_add(1))
+            .or_insert(0);
+        let key = derive_stable_event_key(
+            &source_file,
+            interface_id,
+            packet_number,
+            byte_offset,
+            &protocol,
+            ordinal,
+        );
+        obj.insert("stable_event_key".into(), serde_json::Value::String(key));
+        patched += 1;
+    }
+    (patched, skipped)
+}
+
 pub fn stable_hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in bytes {
@@ -1686,6 +1768,115 @@ mod tests {
         assert_ne!(a.stable_event_key, b.stable_event_key);
         assert!(a.stable_event_key.ends_with("|0"));
         assert!(b.stable_event_key.ends_with("|1"));
+    }
+
+    /// 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954) —
+    /// `backfill_stable_event_keys_in_callflow` patche en place les
+    /// events d'un callflow stocké SANS `stable_event_key`. La formule
+    /// est strictement celle de `derive_stable_event_key`, et l'ordinal
+    /// est 0-based dans l'ordre d'apparition des events.
+    #[test]
+    fn backfill_stable_event_keys_in_callflow_fills_missing_keys_in_order() {
+        let mut flow = serde_json::json!({
+            "session_id": "s1",
+            "events": [
+                {
+                    "event_id": "evt-ngap",
+                    "protocol": "NGAP",
+                    "packet_references": [{
+                        "source_file": "/ring/n2/N2.pcapng",
+                        "packet_number": 7u64,
+                        "byte_offset": 40u64,
+                        "interface_id": 0u32
+                    }]
+                },
+                // Même paquet → ordinal 1 (NAS enfant).
+                {
+                    "event_id": "evt-nas",
+                    "protocol": "NAS-5GS-MM",
+                    "packet_references": [{
+                        "source_file": "/ring/n2/N2.pcapng",
+                        "packet_number": 7u64,
+                        "byte_offset": 40u64,
+                        "interface_id": 0u32
+                    }]
+                },
+                // Paquet différent → ordinal 0.
+                {
+                    "event_id": "evt-ngap-release",
+                    "protocol": "NGAP",
+                    "packet_references": [{
+                        "source_file": "/ring/n2/N2.pcapng",
+                        "packet_number": 42u64,
+                        "byte_offset": 1024u64,
+                        "interface_id": 0u32
+                    }]
+                }
+            ]
+        });
+        let (patched, skipped) = backfill_stable_event_keys_in_callflow(&mut flow);
+        assert_eq!(patched, 3);
+        assert_eq!(skipped, 0);
+        let events = flow["events"].as_array().unwrap();
+        assert_eq!(events[0]["stable_event_key"], "N2.pcapng|0|7|40|NGAP|0");
+        assert_eq!(events[1]["stable_event_key"], "N2.pcapng|0|7|40|NAS-5GS-MM|1");
+        assert_eq!(events[2]["stable_event_key"], "N2.pcapng|0|42|1024|NGAP|0");
+    }
+
+    /// 2.21.102 — un event déjà porteur d'un `stable_event_key` non
+    /// vide est laissé intact (idempotent).
+    #[test]
+    fn backfill_stable_event_keys_in_callflow_preserves_existing_keys() {
+        let mut flow = serde_json::json!({
+            "events": [
+                {
+                    "event_id": "already-has-key",
+                    "stable_event_key": "explicit|0|1|0|NGAP|0",
+                    "protocol": "NGAP",
+                    "packet_references": [{
+                        "source_file": "x",
+                        "packet_number": 1u64,
+                        "byte_offset": 0u64,
+                        "interface_id": 0u32
+                    }]
+                }
+            ]
+        });
+        let (patched, skipped) = backfill_stable_event_keys_in_callflow(&mut flow);
+        assert_eq!(patched, 0);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            flow["events"][0]["stable_event_key"],
+            "explicit|0|1|0|NGAP|0"
+        );
+    }
+
+    /// 2.21.102 — un event sans `packet_references` est skippé
+    /// (compté dans `skipped`) et son champ reste absent — écart
+    /// à déclarer OUVERT côté caller si des events sans provenance
+    /// existent dans un dataset.
+    #[test]
+    fn backfill_stable_event_keys_in_callflow_skips_events_without_packet_references() {
+        let mut flow = serde_json::json!({
+            "events": [
+                {"event_id": "orphan", "protocol": "NGAP"},
+                {
+                    "event_id": "ok",
+                    "protocol": "NGAP",
+                    "packet_references": [{
+                        "source_file": "x",
+                        "packet_number": 1u64,
+                        "byte_offset": 0u64,
+                        "interface_id": 0u32
+                    }]
+                }
+            ]
+        });
+        let (patched, skipped) = backfill_stable_event_keys_in_callflow(&mut flow);
+        assert_eq!(patched, 1);
+        assert_eq!(skipped, 1);
+        assert!(flow["events"][0].get("stable_event_key").is_none());
+        assert_eq!(flow["events"][1]["stable_event_key"], "x|0|1|0|NGAP|0");
     }
 
     #[test]

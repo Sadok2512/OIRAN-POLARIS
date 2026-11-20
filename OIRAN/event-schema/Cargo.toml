@@ -1,9 +1,16 @@
 [package]
 name = "event-schema"
-version = "1.9.0"
+version = "1.10.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+# 2.21.102 (ordre #9 7045732954) — `backfill_stable_event_keys_in_callflow`
+# patche un `serde_json::Value`. L'ancien usage dev-only est conservé
+# côté tests ; la fonction est désormais utilisée par apps/api et
+# live-probe à la lecture des callflows persistés.
+serde_json = "1.0"
 
 [dev-dependencies]
 serde_json = "1.0"
