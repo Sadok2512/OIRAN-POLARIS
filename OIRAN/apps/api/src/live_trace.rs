@@ -1852,6 +1852,7 @@ mod tests {
         ) -> NormalizedEvent {
             NormalizedEvent {
                 event_id: format!("ev-{}-{packet}", interface.to_ascii_lowercase()),
+                stable_event_key: String::new(),
                 parent_event_id: None,
                 probe_id: "test".into(),
                 capture_point_id: interface.into(),
@@ -2044,6 +2045,7 @@ mod tests {
         ) -> NormalizedEvent {
             NormalizedEvent {
                 event_id: format!("ev-{packet}"),
+                stable_event_key: String::new(),
                 parent_event_id: None,
                 probe_id: "test".into(),
                 capture_point_id: interface.into(),
