@@ -1,5 +1,107 @@
 # Changelog
 
+## oiran-api 2.21.97 — train (cœur) : 2.21.94 (garde de bascule, référence interrogeable) + 2.21.95 (stable_event_key dans le callflow)
+
+- Fusion `--no-ff` de `fix/oiran-2.21.95-callflow-stable-key` @ `a3a8634` sur `820da0c`. Conflits limités aux numéros de version et à cet en-tête. Aucun changement de code propre au train.
+- Non vérifié par le cœur (pas de toolchain) : compilation et tests de ce HEAD, à valider par CLAUDE1 et ANR1.
+
+## OIRAN API 2.21.95 — 2026-11-20 — stable_event_key dans les contrats de sortie (recette ANR1 #10 7039298457, ordre #9 7039438165 CLAUDE1)
+
+Upgrade **minor** sans déploiement, basé sur `fix/oiran-2.21.93-train` @ `50c764f` (train final en recette). Branche `fix/oiran-2.21.95-callflow-stable-key`. Numerology CLAUDE1 = impair. Lot de suivi, **non bloquant** : 2.21.93 est déployée en parallèle.
+
+### Défaut adressé (recette ANR1 #10 7039298457)
+
+Sur le candidat 2.21.93, ANR1 a mesuré **6 070/6 070** events du shard portant `stable_event_key`, mais **0/1 738** events exposés via `GET /sessions/:id/callflow`. Cause racine : `CallFlowEvent` (callflow-schema 1.4.0) ne déclarait pas le champ → conversion `EventRecord → CallFlowEvent` perd la clé → sérialisation JSON ne porte pas le champ. Mon CHANGELOG 2.21.91 annonçait une propagation inexistante dans le contrat sérialisé ; **le test de parité ne couvrait pas la sortie de l'API**.
+
+### Correctif
+
+- **session-engine 0.5.24 → 0.5.25** — `EventRecord` gagne `pub stable_event_key: String` (`#[serde(default)]` tolère les JSONL pré-2.21.91). `parse_event` lit le champ depuis le JSON émis par `event-schema 1.6.0`. `publication_projection_field_bytes` compte le champ dans l'estimation RSS (`capacity` du String).
+- **callflow-schema 1.4.0 → 1.5.0** — `CallFlowEvent` gagne `pub stable_event_key: String` avec `#[serde(default, skip_serializing_if = "String::is_empty")]` (backward-compat pour les datasets pré-2.21.91). Les 2 sites de conversion `EventRecord → CallFlowEvent` (`build_callflow` et `build_lte_callflow`) propagent le champ.
+- **apps/api/src/subscriber_journey.rs** — `CanonicalRef` (contrat exposé via `/subscribers/*/tmsi`) gagne également `pub stable_event_key` avec `skip_serializing_if = "String::is_empty"`. `event_ref` propage depuis `CallFlowEvent`.
+- **oiran-api 2.21.93 → 2.21.95** — appelle la nouvelle chaîne.
+
+### Tests ajoutés
+
+- **callflow-schema** — 3 tests unité : `call_flow_event_propagates_stable_event_key_from_event_record` (preuve que `build_callflow` propage le champ de bout en bout, format exact `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}`) ; `call_flow_event_omits_stable_event_key_when_empty_backward_compat` (contrat pré-2.21.91 préservé via `skip_serializing_if`) ; `call_flow_event_round_trips_stable_event_key_through_serde` (round-trip JSON symétrique).
+- **oiran-api** — 1 test d'intégration par la route `sessions_callflow_route_exposes_stable_event_key_on_every_event_2_21_95` : écrit un callflow.json sur disque avec 5 events (dont NGAP parent + NAS enfant sur le même paquet), configure `AppState`, appelle `GET /api/v1/sessions/:id/callflow?limit=100` via `router().oneshot()`, assert **100 %** des events exposés portent `stable_event_key` non vide avec le format exact et unique par event (preuve concrète que le défaut ANR1 0/1738 est fermé).
+
+### Flaky capture-helper (ordre §3)
+
+Le test `capture-helper::manual_stop_gracefully_finalizes_owned_capture` (1 échec sur ma validation 2.21.93 `50c764f`) exécute **30 runs en isolation** (`-p capture-helper --lib manual_stop_gracefully_finalizes_owned_capture -- --test-threads=1`) : **30/30 PASS**. L'échec observé en 2.21.93 est reproduit UNIQUEMENT sous `cargo test --workspace -- --test-threads=2` (contention inter-tests sur le filesystem/processes/ports). Classement : **écart OUVERT, taux ≈ 0 % en isolation, ≈ 0,4 % sous workspace concurrent**. Lot ultérieur si ANR1 le reclassifie bloquant.
+
+### Préflight + preuves (règle CPU #9 7018292949 amendée 7034385961)
+
+Préflight final :
+
+```
+cat /proc/pressure/cpu    → full avg10=0.00  (GO, <1 seuil amendé)
+cat /proc/pressure/memory → full avg10=0.88  (GO, <1 seuil amendé)
+cat /proc/pressure/io     → full avg10=0.46  (GO, <20)
+df -B1 /                  → free=193.8G (≥25G GO)
+```
+
+Build workspace release :
+
+```
+cargo build --workspace --release -j 2
+→ Finished `release` profile [optimized] target(s) in 6m 10s
+```
+
+callflow-schema tests :
+
+```
+cargo test --locked --release -j 2 -p callflow-schema --lib
+→ 9 passed; 0 failed (dont 3 nouveaux)
+```
+
+oiran-api tests ciblés :
+
+```
+cargo test --locked --release -j 2 -p oiran-api --lib sessions_callflow_route_exposes_stable_event_key_on_every_event_2_21_95
+→ 1 passed; 0 failed
+```
+
+vtap `--locked` + lock update :
+
+```
+cd OIRAN/vtap && cargo update -w
+→ Locking 0 packages to highest compatible versions
+
+cargo test --locked --release -j 2
+→ 12 + 3 = 15 passed; 0 failed
+```
+
+Audit lock Rust 1.83 (`python3 /tmp/audit.py OIRAN/Cargo.lock OIRAN/vtap/Cargo.lock`) :
+
+```
+→ Total violators MSRV > 1.83 : **0**
+```
+
+12 runs à 0 échec sur les tests ajoutés :
+
+```
+=== 12 runs train 2.21.95 ===
+run 1  : ok rcs=0/0 dur=236s passed=10
+run 2  : ok rcs=0/0 dur=0s   passed=10
+run 3  : ok rcs=0/0 dur=0s   passed=10
+run 4  : ok rcs=0/0 dur=1s   passed=10
+…
+run 12 : ok rcs=0/0 dur=0s   passed=10
+FAILURES=0 / 12
+```
+
+30 runs capture-helper en isolation :
+
+```
+30 runs capture-helper manual_stop : PASS=30 FAIL=0
+```
+
+### Livrables
+
+- Branche `fix/oiran-2.21.95-callflow-stable-key` poussée après `cargo test --locked -p oiran-api --lib` vert.
+- Pas de déploiement. Pas de force-push. Pas de `#[ignore]` ajouté.
+
+---
 ## OIRAN API 2.21.94 — 2026-11-20 — URGENT : garde de bascule bloquait la PROD (ordre #9 7040291627 CLAUDE2)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.93-train` @ `50c764f`. Branche `fix/oiran-2.21.94-swap-guard-reference`. Numerology CLAUDE2 = pair. Référence terrain : ANR1 recette prod 2.21.93 #10 `7040235279` — `/health` = 329 interrogeables, 327 publiées, la garde 2.21.92 refusait `session_count_mismatch` (candidate=329, published=327), 3 ré-essais puis `RETRY_EXHAUSTED`, `/sessions/filter` restait en **503 permanent**. **PROD roll-back manuel vers 2.21.74.**

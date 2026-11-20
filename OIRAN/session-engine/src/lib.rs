@@ -25,6 +25,14 @@ pub struct PacketRef {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventRecord {
     pub event_id: String,
+    /// 2.21.95 (défaut recette #10 7039298457, ordre #9 7039438165) —
+    /// clé de corrélation live↔publi propagée depuis le JSONL d'events
+    /// (`NormalizedEvent::stable_event_key`, event-schema 1.6.0). Vide
+    /// → l'event provient d'un JSONL antérieur à 1.6.0. `serde(default)`
+    /// tolère les anciens formats (iso-comportement 2.21.93 pour les
+    /// datasets pré-2.21.91).
+    #[serde(default)]
+    pub stable_event_key: String,
     pub parent_event_id: Option<String>,
     pub capture_id: String,
     pub capture_point_id: String,
@@ -129,6 +137,10 @@ pub fn publication_projection_field_bytes(events: &[EventRecord]) -> BTreeMap<&'
     for event in events {
         for (key, value) in [
             ("event_id", &event.event_id),
+            // 2.21.95 — RSS accounting pour le champ ajouté. Taille ≈
+            // 4× celle de `event_id` (basename|iid|pkt|off|proto|ord)
+            // mais capacity peut être 0 pour les datasets pré-2.21.91.
+            ("stable_event_key", &event.stable_event_key),
             ("capture_id", &event.capture_id),
             ("capture_point_id", &event.capture_point_id),
             ("timestamp", &event.timestamp),
@@ -1691,6 +1703,15 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
     };
     Ok(EventRecord {
         event_id: string(&["event_id"])?,
+        // 2.21.95 — lit `stable_event_key` émis par event-schema 1.6.0.
+        // Absent (JSONL pré-2.21.91) → chaîne vide, préservée telle
+        // quelle dans la sortie (`skip_serializing_if = "String::is_empty"`
+        // côté CallFlowEvent).
+        stable_event_key: v
+            .get("stable_event_key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
         parent_event_id: v
             .get("parent_event_id")
             .and_then(Value::as_str)

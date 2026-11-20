@@ -1454,6 +1454,7 @@ mod tests {
     ) -> EventRecord {
         EventRecord {
             event_id: id.into(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             capture_id: "c".into(),
             capture_point_id: iface.into(),
