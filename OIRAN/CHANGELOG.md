@@ -1,5 +1,93 @@
 # Changelog
 
+## OIRAN API 2.21.94 — 2026-11-20 — URGENT : garde de bascule bloquait la PROD (ordre #9 7040291627 CLAUDE2)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.93-train` @ `50c764f`. Branche `fix/oiran-2.21.94-swap-guard-reference`. Numerology CLAUDE2 = pair. Référence terrain : ANR1 recette prod 2.21.93 #10 `7040235279` — `/health` = 329 interrogeables, 327 publiées, la garde 2.21.92 refusait `session_count_mismatch` (candidate=329, published=327), 3 ré-essais puis `RETRY_EXHAUSTED`, `/sessions/filter` restait en **503 permanent**. **PROD roll-back manuel vers 2.21.74.**
+
+### Cause de régression
+
+La référence `published_session_count_snapshot` (`lib.rs:4083`, cf. 2.21.92) suit `flows.len() OR continuous.session_ids.len()` : elle ne compte qu'un dataset à la fois. L'index des filtres (`SessionFilterIndex::from_flows` + `refresh_session_filter_index`) couvre l'UNION interrogeable (`queryable_session_ids(state)`, `lib.rs:4229` du train 2.21.93) = flows + datasets + lte_evidence. Avec un dataset continu de 327 + un autre dataset de 2, `queryable = 329 = session_count filter_index` mais `published = 327` ⇒ garde faux-positive.
+
+La recette locale (lot 2.21.92) n'exerçait qu'**un seul dataset** et ne pouvait pas observer la divergence. Spécification du cœur fautive, reconnue dans l'ordre `7040291627`.
+
+### Correctif (3 axes, ordre #9 7040291627)
+
+**1. Référence de la garde = `queryable_session_ids(state).len()`.** Même source que `/health.session_count` et que le `total` de `POST /sessions/filter`. L'ancien helper `published_session_count_snapshot` reste dans le code (dead en prod) pour le test historique qui prouve sa logique divergente.
+
+**2. Jamais de 503 permanent à cause de la garde.** Nouveau helper pur :
+```rust
+fn should_accept_with_mismatch(
+    candidate: u64, reference: u64, attempt: u32, previous_generation_exists: bool,
+) -> Option<&'static str> {
+    if candidate == 0 { return None; }                   // vide reste strict
+    if candidate == reference { return None; }            // pas d'écart
+    if !previous_generation_exists { return Some("no_previous_generation"); }
+    if attempt >= 3 { return Some("retries_exhausted"); }
+    None  // laisse les ré-essais travailler
+}
+```
+Deux cas déclenchent une **bascule avec avertissement** plutôt qu'un refus :
+  * `no_previous_generation` (first-boot ou post-rollback sans génération READY cachée) : évite 503 permanent.
+  * `retries_exhausted` (3 ré-essais sans convergence) : une liste à jour et signalée vaut mieux qu'une liste périmée indéfiniment.
+Event JSON `SESSIONS_FILTER_GENERATION_SWAP_ACCEPTED_WITH_MISMATCH` (trigger, reason, scenario, candidate, reference, epoch_ms). Fonction `record_swap_accepted_with_mismatch`.
+
+**3. Observabilité `/health`.** Nouveau champ `generation_swap_accepted_with_mismatch: Mutex<GenerationSwapAcceptedWithMismatchState>` (total, last_*, last_scenario). Exposé sous `data.sessions_filter_generation_swap_accepted_with_mismatch`.
+
+Dans `generation_swap_refused`, le champ `last_published_session_count` est renommé `last_reference_session_count` (shape /health alignée avec le nouveau libellé).
+
+Les règles de 2.21.92 restent strictes :
+  * `candidate == 0` ne bascule JAMAIS par `should_accept_with_mismatch` (le vide-après-non-vide garde `empty_after_nonempty_decision` avec confirmation par publication terminée, pas retry).
+  * verrou empoisonné (`*_lock_poisoned`) n'est pas retryable intra-process.
+
+### Tests ajoutés (6, cumul 15 pour la série 2.21.92+94)
+
+1. `should_accept_with_mismatch_matrix_2_21_94` — 7 cas : match exact, candidate=0×2 (strict, pas de 503 par ce chemin), no_previous_generation, attempt<3 vs attempt≥3.
+2. `reference_is_queryable_session_ids_not_published_2_21_94` — scénario (a) de l'ordre : état cohérent, `session_count == queryable_session_ids(state).len()`, 0 refus, 0 bascule-avec-avertissement.
+3. `accept_with_mismatch_no_previous_generation_never_503_2_21_94` — scénario (b) de l'ordre : first-boot avec écart ⇒ `ACCEPTED_WITH_MISMATCH` avec scenario `no_previous_generation`.
+4. `accept_with_mismatch_rejects_empty_candidate_2_21_94` — scénario (c) de l'ordre : candidate=0 contre reference=329 ⇒ `None` (pas de bascule), règle vide stricte préservée.
+5. `health_exposes_swap_accepted_with_mismatch_counter_2_21_94` — `/health.sessions_filter_generation_swap_accepted_with_mismatch` shape complète (total, last_*).
+6. `prewarm_consistent_state_swaps_without_refusal_2_21_92` adapté : `queryable_session_ids` au lieu de `published_session_count_snapshot` ; `generation_swap_accepted_with_mismatch.total == 0` ajouté.
+
+Les 9 tests existants 2.21.92 restent verts.
+
+### Scope et coordination #9/#10
+
+- Base `fix/oiran-2.21.93-train` @ `50c764f` (train accepté avec les correctifs 2.21.92 + 2.21.90 + 2.21.91). 2.21.94 est un hotfix par-dessus. CLAUDE1 (train) mergera `fix/oiran-2.21.94-swap-guard-reference` dans un nouveau train 2.21.95 (ou 2.21.96 pair, à l'arbitrage du cœur).
+- Lot touche uniquement `apps/api/src/lib.rs` + `CHANGELOG.md` + `Cargo.toml` + `Cargo.lock`. Zéro intersection avec 2.21.90 (`live_trace.rs`) ni 2.21.91 (`event-schema` + `live_trace.rs`).
+- Aucun bump de crate partagée. `OIRAN/vtap` non concerné.
+
+### Preuves (règle CPU + amendement #9 7034385961)
+
+Préflight final :
+```
+cat /proc/pressure/cpu    → some avg10=7.70 full avg10=0.00  (GO ; seuils amendés: cpu some<10, full<1)
+cat /proc/pressure/memory → full avg10=0.00  (GO ; seuil amendé mem full<1)
+free -b (avail)           → 8 267 116 544 (≥ 4 GiB GO)
+df -B1 / (avail)          → 207 290 023 936 (≥ 25 Go GO)
+lslocks nsplus-heavy      → tenu par PID 1550012 (CLAUDE1 train) au préflight, attente dans flock -w 900
+```
+
+12 runs tests `oiran-api --lib` sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2` :
+
+```
+Run  1 → 237 passed; 0 failed; 3 ignored; 16.75 s
+Run  2 → 237 passed; 0 failed; 3 ignored; 17.19 s
+Run  3 → 237 passed; 0 failed; 3 ignored; 16.42 s
+Run  4 → 237 passed; 0 failed; 3 ignored; 16.32 s
+Run  5 → 237 passed; 0 failed; 3 ignored; 16.26 s
+Run  6 → 237 passed; 0 failed; 3 ignored; 16.28 s
+Run  7 → 237 passed; 0 failed; 3 ignored; 16.11 s
+Run  8 → 237 passed; 0 failed; 3 ignored; 16.44 s
+Run  9 → 237 passed; 0 failed; 3 ignored; 16.08 s
+Run 10 → 237 passed; 0 failed; 3 ignored; 16.44 s
+Run 11 → 237 passed; 0 failed; 3 ignored; 15.95 s
+Run 12 → 237 passed; 0 failed; 3 ignored; 16.20 s
+```
+
+237 = 227 (train 2.21.93) + 10 ajoutés 2.21.94 (dont 6 nouveaux `_2_21_94` + 4 adaptations/compléments). 3 `ignored` historiques, aucun `#[ignore]` ajouté. cpu some avg10 pendant la boucle : before Run 1 = 9.12 ; after Run 12 = 3.90 ; jamais `cpu full > 0` ni `mem full > 0`. Durées très stables (15.95 – 17.19 s).
+
+Audit lock Rust 1.83 : `OIRAN/Cargo.lock` ligne 677 passée à `version = "2.21.94"` (seul changement). `cargo test --locked` passe ⇒ lock cohérent. OIRAN/vtap non concerné.
+
 ## OIRAN API 2.21.93 — 2026-11-20 — train de livraison : 2.21.89 + 2.21.92 + 2.21.90 + 2.21.91 merge --no-ff (ordre #9 7036719807 CLAUDE1)
 
 Upgrade **train** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.93-train`. Numerology CLAUDE1 = impair. Ordre d'empilage privilégié par le cœur (`7035807909` + `7036719807`) : correctif bloquant 2.21.92 AVANT les features 2.21.90 + 2.21.91. **Candidat unique de prod** (remplace 2.21.89 qui n'est plus déployé seul).
