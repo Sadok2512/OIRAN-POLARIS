@@ -1,5 +1,11 @@
 # Changelog
 
+## oiran-api 2.21.101 — 2026-11-20 — train final (cœur) : 2.21.97 + 2.21.98 (fuite `ue_info.keys`) + 2.21.99 (débit live)
+
+- Merge `--no-ff` de `fix/oiran-2.21.98-live-keys-leak` @ 922cf7f et de `fix/oiran-2.21.99-live-throughput` @ 5cfffa7 sur `fix/oiran-2.21.97-train` @ 37747ef.
+- Aucun code ajouté par le train ; conflits limités à la version et au CHANGELOG.
+- OUVERT, hors train : `stable_event_key` sur les données stockées (ordre #9 7044712668), lot 2.21.102.
+
 ## OIRAN API 2.21.99 — 2026-11-20 — débit live à 0 bucket en prod (défaut recette ANR1 #10 7043526474, ordre #9 7043914072, CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.97-train` @ `37747ef`. Branche `fix/oiran-2.21.99-live-throughput`. Numerology CLAUDE1 = impair. Coordination avec CLAUDE2 (2.21.98 identités clear-text) sur `live_trace.rs`.
