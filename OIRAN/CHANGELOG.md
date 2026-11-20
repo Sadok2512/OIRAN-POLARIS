@@ -17,6 +17,44 @@ Dans `start_reader` (`apps/api/src/live_trace.rs`), dès que `(size, mtime)` d'u
 5. **Repli sans redéploiement** : `OIRAN_LIVE_READER_FULL_REDECODE=1` (lu à chaque passe) remet tous les plans en redécodage intégral.
 6. **Mesure** : l'event SSE `stats` gagne `reader` = `resume_resets`, `full_redecode`, et par plan `bytes_decoded`, `bytes_file`, `incremental` pour la dernière passe ayant décodé quelque chose. Attendu sur N3 : octets décodés = croissance du segment, plus sa taille.
 
+### Second commit, même version (décision cœur #9 7050201220) — isolement de la trace et G-PDU hors `message`
+
+Recette 2.21.104 (ANR1 #10 7050183853) : débit live faux (UL 452 Mo, DL 425 Mo pour 13 Mo / 107 Mo applicatifs), 768 912 messages GTP-U et 568 Mo de SSE par trace.
+
+**Audit — la trace d'un abonné rattachait les autres UE** (`route_event`, détail #9 7050268858) :
+- toute valeur de `session_identifiers` non-IP de 3 caractères ou plus devenait une clé de rattachement, comparée par **sous-chaîne sur le JSON entier** de chaque event. Dès le premier message de l'abonné, `match_keys` contenait des valeurs communes : `plmn`, `tac`, `nr_cell_id`, `dnn`, `access_type`, puis `tunnel_direction` (`UPLINK` / `DOWNLINK`, aussi valeur du champ `direction` de tout event), `pfcp_sequence`, `sequence_number` ;
+- le SEID nul de l'en-tête d'un PFCP Session Establishment Request était appris comme SEID de l'abonné ;
+- un G-PDU était rattaché par TEID seul, sans l'adresse du point de terminaison.
+Reproduit par un test à deux UE dans la même cellule, en échec sur le code de `fb7b721` (les 4 messages et les 40 G-PDU du second UE entraient dans la trace) ; remplacé dans ce commit par le test à trois UE ci-dessous.
+
+**Audit — recomptage par le lecteur** (donnée ANR1 #10 7050464161 : 768 912 G-PDU émis pour 151 061 capturés, détail #9 7050532081) : depuis 2.21.78, `start_reader` vidait sa table des segments déjà lus dès qu'elle dépassait 1 024 entrées (`if states.len() > 1024 { states.clear(); }`). Le rattrapage du démarrage y inscrit tous les segments du ring, tous plans confondus : au-delà de 1 024 segments sur disque, la table était vidée à la fin de chaque passe, et la passe suivante redécodait **tout le ring** et reroutait chaque event. **Non prouvé** que le ring lab dépasse 1 024 segments (pas d'accès) ; l'importeur en annonçait 2 713 historiques. Ce vidage aurait aussi annulé la reprise à l'offset du premier commit.
+
+**Correctif du lecteur** : la table n'est plus vidée ; les segments disparus en sont retirés un par un, sa taille est bornée par le nombre de segments sur disque. `stats.reader` gagne `files_tracked` et `files_decoded_last_pass`. **Non testé** : cette boucle exige le volume lab ; preuve attendue en recette, un segment décodé par plan actif et non tout le ring.
+
+**Correctif du rattachement** (exigences cœur #9 7050392981) :
+1. **Plus aucun rattachement par sous-chaîne.** `event_tokens` extrait les valeurs typées d'un event (`session_identifiers[].value` ; `information_elements[].value` entière et ses champs `nom=valeur` ; `parent_event_id` ; chaînes de l'objet `sbi`) et le rattachement par pseudonyme ou par clé est une **égalité** sur ces valeurs. Preuve : `grep -n 'encoded\|\.contains(key)\|to_string().contains' apps/api/src/live_trace.rs` ne rend qu'une ligne, `self.0.contains(key)`, qui est l'appartenance à l'ensemble `MatchKeys` (égalité).
+2. `match_keys` n'apprend que les valeurs propres à l'abonné : `pseudonymized`, nom en `_pseudonym`, ou référence d'event `evt-…`. L'`event_id` de chaque event de signalisation routé est gardé, pour rattacher l'event enfant qui cite son parent (`parent_ngap_event_id`, `parent_s1ap_event_id`).
+3. Rattachement **exact et typé** par identifiants UE : `amf_ue_ngap_id`, `ran_ue_ngap_id`, `mme_ue_s1ap_id`, `enb_ue_s1ap_id`, qualifiés par l'association (les deux adresses du lien), et `sm_context_reference` (SBI). Oubliés en fin de session.
+4. SEID nul et TEID nul : jamais appris ni comparés.
+5. **TEID** : un event (G-PDU ou signalisation) est rattaché par le couple (adresse du point de terminaison, TEID). Le repli « TEID seul » n'est admis que pour un TEID appris sur la **signalisation de l'abonné** et pour lequel aucun couple n'est connu ; un G-PDU n'apprend plus aucun TEID. Compteurs : `gpdu.attached_teid_only` (repli), `gpdu.rejected_endpoint_mismatch` (TEID de l'abonné vers un autre point de terminaison), `gpdu.rejected_no_match`.
+6. **Un G-PDU n'est jamais émis en `message`** : il alimente les buckets de débit et les compteurs `gpdu.*` et `interfaces.N3`. `messages` ne le compte plus.
+
+**Tests** : `trace_isolation_three_ues_two_in_the_same_cell_2_21_109` (A et B même cellule, C ailleurs avec la même valeur de TEID UL que A ; une session PFCP chacun ; trace de A = 0 message et 0 octet de B et C, somme des buckets = octets de A par sens ; en échec sur `fb7b721`), `teid_only_fallback_is_limited_to_subscriber_signalling_and_counted_2_21_109`, `event_tokens_match_whole_typed_values_only_2_21_109`.
+
+**Le même motif ailleurs** : `git grep -n 'to_string().contains' -- OIRAN/apps/api/src` rend, hors tests, `lib.rs:6014` — la recherche de sessions par identité cherche le pseudonyme de l'abonné par sous-chaîne dans `decoded_ie_tree`. La clé y est un pseudonyme entier (jamais une valeur apprise), donc pas de rattachement croisé par valeur commune ; le motif reste une sous-chaîne sur JSON et n'est **pas corrigé ici** (OUVERT). Rien de tel dans `subscriber_journey.rs`, `session_filters.rs`, `live-probe`, `session-engine`, `correlation-engine`.
+
+**OUVERT** :
+- Non prouvé que ce défaut explique à lui seul les facteurs mesurés (34× UL, 4× DL, UL ≈ DL) : il faut la vérité N3 par sens et le nombre d'UE actifs pendant la fenêtre (ANR1).
+- Le classement UL/DL (pools UE du décodeur GTP-U) n'a pas été modifié ; piste (c) du cœur non instruite au-delà de la lecture du code.
+- `event_tokens` ne reconnaît un pseudonyme que comme valeur entière d'un champ typé ou d'un `nom=valeur` séparé par `,` `;` `&`. Un décodeur qui le noierait dans un autre format ne serait plus rattaché ; le bout-en-bout sur le jeu réel N2/N4/N3 du dépôt reste vert, les plans LTE, SBI et IMS ne sont couverts que par les tests synthétiques existants.
+- Un message de signalisation qui ne porte qu'un TEID dont le couple est connu (sans adresse, sans SEID, sans identifiant UE) n'est plus rattaché.
+- Deux AMF ou deux SMF qui alloueraient la même valeur d'identifiant : l'association qualifie les identifiants NGAP/S1AP, pas `sm_context_reference`.
+- Échantillon de G-PDU dans le callflow (1 par seconde et par sens) : proposé, non codé, à décider par le cœur.
+- `route_event` sérialise encore chaque event en JSON pour le rattachement, G-PDU compris : coût CPU par paquet non traité ici.
+- 5 PFCP sans clé à la lecture (session ancienne, 67/72) : par le code, `backfill_stable_event_keys_in_callflow` ne laisse une clé vide que pour un event sans `packet_references` ; le compte des events sautés est ignoré par l'appelant (`apps/api/src/lib.rs`). Non vérifié sur la donnée.
+
+**Tests mis à jour** (ils décrivaient le comportement fautif ou des trames irréalistes) : `match_keys_isolation_from_exposed_keys_2_21_98` (`pdu_session_id` n'est plus une clé), `session_nas_ngap_pfcp_gtpu_all_routed_in_order_2_21_90` (4 messages + 1 G-PDU rattaché), `gtpu_matched_via_match_teid_still_emits_throughput_buckets_2_21_99` et `gpdu_rejected_when_pdu_session_established_before_trace_2_21_105` (un G-PDU UL va vers l'adresse du tunnel UL), et trois tests de débit qui glissaient le pseudonyme dans `message_name` pour déclencher la sous-chaîne (`gtpu_unknown_direction_is_not_counted_as_downlink_2_21_76`, `flush_idle_emits_bucket_for_stalled_second_2_21_99`, `total_bytes_from_live_throughput_buckets_match_expected_exactly_2_21_99`) : leur tunnel est désormais connu de la trace.
+
 ### Mémoire
 
 En reprise, les ordinaux de `stable_event_key` d'un paquet sont oubliés dès le paquet suivant ; seul est gardé celui du paquet qui ouvre un flux RTP du tunnel (au plus un par flux), parce que l'event du flux en continue la numérotation.
