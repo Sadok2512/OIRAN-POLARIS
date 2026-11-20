@@ -64,11 +64,18 @@ fn execute() -> Result<(), String> {
     }
     let interface = interface.ok_or("--interface is required")?;
     let output = output.ok_or("--output is required")?;
+    let input_path = std::path::PathBuf::from(&input);
+    let stable_source_file = input_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_owned())
+        .unwrap_or_default();
     let decoded = decode_capture(&DecodeConfig {
-        input: input.into(),
+        input: input_path,
         capture_id,
         interface,
         endpoints,
+        stable_source_file,
     })?;
     write_jsonl_stamped(std::path::Path::new(&output), &decoded.events, append, &stamp)?;
     println!("capture_format={} packets={} events={} warnings={} transport_errors={} sctp_errors={} incomplete_sctp={} tcp_connections={} tcp_errors={} http2_frames={} http2_streams={} sbi_transactions={} output={}", decoded.report.capture_format, decoded.report.packets, decoded.report.events, decoded.report.warnings, decoded.report.transport_errors, decoded.report.sctp_errors, decoded.report.incomplete_sctp, decoded.report.tcp_connections, decoded.report.tcp_errors, decoded.report.http2_frames, decoded.report.http2_streams, decoded.report.sbi_transactions, output);

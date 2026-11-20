@@ -1233,6 +1233,7 @@ fn build_event(
     }
     let mut event = NormalizedEvent {
         event_id: String::new(),
+        stable_event_key: String::new(),
         parent_event_id: None,
         probe_id: "local-vprobe".into(),
         capture_point_id: interface.into(),
@@ -3741,6 +3742,7 @@ mod tests {
             let _ = (json, DecodeStatus::Decoded, Protocol::SbiHttp2);
             NormalizedEvent {
                 event_id: event_id.into(),
+                stable_event_key: String::new(),
                 parent_event_id: None,
                 probe_id: String::new(),
                 capture_point_id: "SBI".into(),

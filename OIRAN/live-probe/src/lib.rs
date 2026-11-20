@@ -4179,6 +4179,15 @@ impl CaptureManager {
                         capture_id: format!("sha256:{}", candidate.checksum),
                         interface: candidate.interface.clone(),
                         endpoints: endpoint_map(),
+                        // 2.21.91 (défaut #9 7033006772) — basename du
+                        // dumpcap ORIGINAL (pre-validation path lit la
+                        // source directement, pas la copie de staging).
+                        stable_source_file: candidate
+                            .path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_default(),
                     },
                     &pseudonym_key,
                     |_| Ok(()),
@@ -4337,6 +4346,17 @@ impl CaptureManager {
                         capture_id: format!("sha256:{}", candidate.checksum),
                         interface: candidate.interface.clone(),
                         endpoints: endpoint_map(),
+                        // 2.21.91 (défaut #9 7033006772) — basename du
+                        // dumpcap ORIGINAL (candidate.path, PAS destination
+                        // qui est la copie de staging renommée en
+                        // `{iface}.pcap-{hash16}.{ext}`). C'est la seule
+                        // valeur partagée avec le chemin live.
+                        stable_source_file: candidate
+                            .path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_default(),
                     },
                     &pseudonym_key,
                     |_| Ok(()),
@@ -6113,6 +6133,14 @@ impl CaptureManager {
                         capture_id: full_capture_id.clone(),
                         interface: interface.to_owned(),
                         endpoints: HashMap::new(),
+                        // 2.21.91 (défaut #9 7033006772) — hygiène :
+                        // `stable_event_key` est stampé via le basename
+                        // du fichier décodé ici (import frais).
+                        stable_source_file: on_disk_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_default(),
                     };
                     let capture_id_clone = full_capture_id.clone();
                     // 2.9.17-fu : intern du capture_id du
@@ -6641,6 +6669,12 @@ impl CaptureManager {
                         capture_id: capture_hash,
                         interface: interface.interface.clone(),
                         endpoints: endpoints.clone(),
+                        // 2.21.91 (défaut #9 7033006772) — hygiène.
+                        stable_source_file: path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_default(),
                     };
                     let mut sink = |event: NormalizedEvent| -> Result<(), String> {
                         // 2.9.5 (devmat #9 T1) : les keepalives (PFCP HB,
@@ -7030,6 +7064,12 @@ impl CaptureManager {
                         capture_id: capture_hash.clone(),
                         interface: "SBI".into(),
                         endpoints: endpoints.clone(),
+                        // 2.21.91 (défaut #9 7033006772) — hygiène vtap.
+                        stable_source_file: vtap_pcap
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_owned())
+                            .unwrap_or_default(),
                     },
                     &pseudonym_key,
                     |event| {
@@ -14869,6 +14909,7 @@ mod tests {
                 capture_id: "sha256:test".into(),
                 interface: "N2".into(),
                 endpoints: endpoint_map(),
+                stable_source_file: String::new(),
             },
             manager.pseudonym_key.as_ref(),
             |_| Ok(()),
@@ -19980,6 +20021,7 @@ mod tests {
     ) -> NormalizedEvent {
         NormalizedEvent {
             event_id: id.into(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             probe_id: "oiran-vprobe-local-01".into(),
             capture_point_id: interface.into(),

@@ -55,6 +55,7 @@ fn main() {
             capture_id: capture_id_for(&pcap),
             interface: iface.into(),
             endpoints: endpoints(),
+            stable_source_file: String::new(),
         })
         .expect("decode");
         println!("{iface}: {} events decoded", decode_output.events.len());

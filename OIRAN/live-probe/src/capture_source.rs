@@ -1210,6 +1210,7 @@ mod tests {
         };
         let event = NormalizedEvent {
             event_id: "evt-keep".into(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             probe_id: "oiran-vprobe-local-01".into(),
             capture_point_id: "N2".into(),

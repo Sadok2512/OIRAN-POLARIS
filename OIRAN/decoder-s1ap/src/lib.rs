@@ -862,6 +862,7 @@ impl ProtocolDecoder for S1apDecoder {
                 }
                 let mut event = NormalizedEvent {
                     event_id: String::new(),
+                    stable_event_key: String::new(),
                     parent_event_id: None,
                     probe_id: "oiran-vprobe-01".into(),
                     capture_point_id: input.interface.into(),
@@ -952,6 +953,7 @@ fn append_eps_nas_events(
     );
     let mut event = NormalizedEvent {
         event_id: String::new(),
+        stable_event_key: String::new(),
         parent_event_id: Some(parent_id.into()),
         probe_id: "oiran-vprobe-01".into(),
         capture_point_id: input.interface.into(),

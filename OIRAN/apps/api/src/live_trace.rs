@@ -210,7 +210,10 @@ impl LiveTraceRegistry {
             }
             state.next_id += 1;
             state.trace.messages += 1;
-            let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"decoded_ie_tree":value.get("information_elements"),"late":late});
+            // 2.21.91 (défaut #9 7033006772) — expose `stable_event_key`
+            // dans le payload SSE. Clé de corrélation live↔publi
+            // indépendante de `capture_id` (voir event-schema 1.6.0).
+            let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"stable_event_key":event.stable_event_key,"decoded_ie_tree":value.get("information_elements"),"late":late});
             let item = BufferedEvent {
                 id: state.next_id,
                 kind: "message".into(),
@@ -473,11 +476,24 @@ pub(crate) fn start_reader(state: AppState) {
                                 "sha256:{}",
                                 sha256_hex(path.to_string_lossy().as_bytes())
                             );
+                            // 2.21.91 (ordre #9 7033006772 défaut 3) — propage
+                            // le basename dumpcap ORIGINAL pour stamper
+                            // `stable_event_key`. Ici `path` EST le fichier
+                            // du ring dumpcap, donc son basename est la
+                            // valeur canonique attendue aussi côté publication
+                            // (même pcapng même basename, qu'il soit lu en
+                            // live ou après copie de staging).
+                            let stable_source_file = path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_owned())
+                                .unwrap_or_default();
                             let config = oiran_decode::DecodeConfig {
                                 input: path.clone(),
                                 capture_id,
                                 interface: interface.into(),
                                 endpoints: HashMap::new(),
+                                stable_source_file,
                             };
                             let mut fresh = Vec::new();
                             let decode_result =
@@ -1097,6 +1113,7 @@ mod tests {
             capture_id: format!("sha256:{}", "a".repeat(64)),
             interface: "N2".into(),
             endpoints: HashMap::new(),
+            stable_source_file: String::new(),
         };
         let key = event_schema::PseudonymKey::from_bytes([7; 32]);
         let mut partial = Vec::new();
@@ -1125,6 +1142,7 @@ mod tests {
             capture_id: format!("sha256:{}", "b".repeat(64)),
             interface: "N2".into(),
             endpoints: HashMap::new(),
+            stable_source_file: String::new(),
         };
         let key = event_schema::PseudonymKey::from_bytes([9; 32]);
         let mut events = Vec::new();
@@ -1161,6 +1179,7 @@ mod tests {
             capture_id: format!("sha256:{}", "d".repeat(64)),
             interface: "N2".into(),
             endpoints: HashMap::new(),
+            stable_source_file: String::new(),
         };
         let key = event_schema::PseudonymKey::from_bytes([9; 32]);
         let mut events = Vec::new();
@@ -1202,6 +1221,7 @@ mod tests {
             capture_id: format!("sha256:{}", "c".repeat(64)),
             interface: "N2".into(),
             endpoints: HashMap::new(),
+            stable_source_file: String::new(),
         };
         let key = event_schema::PseudonymKey::from_bytes([9; 32]);
         let mut events = Vec::new();
@@ -1417,6 +1437,7 @@ mod tests {
             };
             NormalizedEvent {
                 event_id: format!("evt-{direction:?}-{packet_number}"),
+                stable_event_key: String::new(),
                 parent_event_id: None,
                 probe_id: "test".into(),
                 capture_point_id: "N3".into(),

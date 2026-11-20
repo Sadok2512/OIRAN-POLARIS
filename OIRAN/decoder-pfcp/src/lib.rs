@@ -471,6 +471,7 @@ impl ProtocolDecoder for PfcpDecoder {
                 }
                 let mut event = NormalizedEvent {
                     event_id: String::new(),
+                    stable_event_key: String::new(),
                     parent_event_id: None,
                     probe_id: "oiran-vprobe-01".into(),
                     capture_point_id: input.interface.into(),

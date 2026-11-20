@@ -120,6 +120,18 @@ pub struct DecodeConfig {
     pub capture_id: String,
     pub interface: String,
     pub endpoints: HashMap<String, String>,
+    /// 2.21.91 (ordre #9 7033006772 défaut 3) — chemin dumpcap ORIGINAL
+    /// (celui produit par dumpcap dans le ring, avec son run_id et son
+    /// numéro de segment). Reste **identique** en live et en publication
+    /// même quand `input` diverge (le chemin de publication décode une
+    /// copie renommée pour des raisons opérationnelles, mais le basename
+    /// original reste la seule clé stable d'identité du pcapng).
+    ///
+    /// Utilisé par `oiran-decode::emit_events` pour stamper
+    /// `stable_event_key` via
+    /// [`event_schema::derive_stable_event_key`]. Vide → stamping
+    /// désactivé (tests synthétiques, examples historiques).
+    pub stable_source_file: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -286,7 +298,7 @@ where
                     if matches!(route, UdpRoute::ImsSip) {
                         register_sdp_flows_from_sip(&decoded, &mut rtp_aggregator);
                     }
-                    emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
+                    emit_events(decoded, config, &mut sink, &mut event_count, &mut sink_error);
                 } else if config.interface == "IMS" {
                     // 2.11.0 : paquet UDP IMS en dehors du port SIP 5060 → tenter
                     // RTP/RTCP sur un flux déjà enregistré par un SDP.
@@ -355,11 +367,7 @@ where
                         "S6a" => diameter.decode(&input).events,
                         _ => ngap.decode(&input).events,
                     };
-                    emit_events(
-                        decoded,
-                        &mut sink,
-                        &mut event_count,
-                        &mut sink_error,
+                    emit_events(decoded, config, &mut sink, &mut event_count, &mut sink_error,
                     );
                 }
             }
@@ -434,7 +442,10 @@ where
     // par paquet. L'agrégateur peut être vide si le dataset n'a vu
     // aucune SDP + RTP ; c'est le cas habituel hors IMS.
     let rtp_events = rtp_aggregator.finish(&config.capture_id, &config.interface);
-    for event in rtp_events {
+    for mut event in rtp_events {
+        // 2.21.91 (défaut #9 7033006772) — stamper `stable_event_key`
+        // sur les events RTP agrégés (émission hors `emit_events`).
+        event.assign_stable_event_key(&config.stable_source_file);
         if let Err(error) = sink(event) {
             return Err(error);
         }
@@ -458,6 +469,7 @@ where
 
 fn emit_events<F>(
     events: impl IntoIterator<Item = NormalizedEvent>,
+    config: &DecodeConfig,
     sink: &mut F,
     event_count: &mut usize,
     sink_error: &mut Option<String>,
@@ -467,12 +479,18 @@ fn emit_events<F>(
     if sink_error.is_some() {
         return;
     }
-    for event in events {
+    for mut event in events {
         if !event.has_complete_provenance() {
             *sink_error =
                 Some("decoder emitted an event without complete packet provenance".into());
             return;
         }
+        // 2.21.91 (ordre #9 7033006772 défaut 3) — stamp `stable_event_key`
+        // ici, point UNIQUE d'émission pour les chemins live ET publication.
+        // `config.stable_source_file` est non vide quand le caller l'a
+        // alimenté avec le basename dumpcap original ; vide → stamping
+        // sauté pour les tests synthétiques (invariant préservé).
+        event.assign_stable_event_key(&config.stable_source_file);
         if let Err(error) = sink(event) {
             *sink_error = Some(error);
             return;
@@ -522,7 +540,7 @@ fn emit_sbi_connections<F>(
         aggregate.incomplete_streams += report.incomplete_streams;
         aggregate.encrypted_connections += report.encrypted_connections;
         aggregate.errors.extend(report.errors);
-        emit_events(events, sink, event_count, sink_error);
+        emit_events(events, config, sink, event_count, sink_error);
     }
 }
 
@@ -593,11 +611,7 @@ where
                     raw_payload_reference: &raw,
                     pseudonym_key,
                 };
-                emit_events(
-                    decoder.decode(&input).events,
-                    sink,
-                    event_count,
-                    sink_error,
+                emit_events(decoder.decode(&input).events, config, sink, event_count, sink_error,
                 );
             }
         }
@@ -933,6 +947,7 @@ mod tests {
             capture_id: format!("sha256:{}", "0".repeat(64)),
             interface: "eth0".into(),
             endpoints: HashMap::new(),
+            stable_source_file: String::new(),
         };
         assert!(validate_config(&config).is_err());
     }
@@ -1047,6 +1062,7 @@ mod tests {
             capture_id: format!("sha256:{}", "0".repeat(64)),
             interface: "S6a".into(),
             endpoints: HashMap::new(),
+            stable_source_file: String::new(),
         };
         let key = PseudonymKey::from_bytes([0x33; 32]);
         let mut events = Vec::new();
@@ -1170,6 +1186,7 @@ mod tests {
             capture_id: format!("sha256:{}", "0".repeat(64)),
             interface: "S6a".into(),
             endpoints: HashMap::new(),
+            stable_source_file: String::new(),
         };
         let key = PseudonymKey::from_bytes([0x44; 32]);
         let mut events = Vec::new();
@@ -1221,6 +1238,7 @@ mod tests {
                 capture_id: format!("sha256:{}", "0".repeat(64)),
                 interface: interface.into(),
                 endpoints: HashMap::new(),
+                stable_source_file: String::new(),
             };
             assert!(validate_config(&config).is_ok(), "{interface}");
         }
@@ -1278,6 +1296,7 @@ mod tests {
             capture_id: format!("sha256:{}", "0".repeat(64)),
             interface: "N3".into(),
             endpoints: Default::default(),
+            stable_source_file: String::new(),
         };
         let mut events_a = Vec::new();
         let _ = decode_capture_streaming(&config, &key, |event| {
@@ -1341,6 +1360,7 @@ mod tests {
             capture_id: format!("sha256:{}", "a".repeat(64)),
             interface: "S1-U".into(),
             endpoints: Default::default(),
+            stable_source_file: String::new(),
         };
         let mut events_a = Vec::new();
         let _ = decode_capture_streaming(&config, &key, |e| {
@@ -1385,6 +1405,7 @@ mod tests {
     ) -> NormalizedEvent {
         NormalizedEvent {
             event_id: event_id.into(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             probe_id: "probe".into(),
             capture_point_id: "cp".into(),

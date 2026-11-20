@@ -1,5 +1,58 @@
 # Changelog
 
+## OIRAN API 2.21.91 — 2026-11-20 — stable_event_key live↔publi (ordre #9 7033006772 défaut 3, CLAUDE1)
+
+Upgrade **minor** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.91-stable-event-key`. Numerology CLAUDE1 = impair.
+
+### Défaut adressé (arbitrage #9 7033006772)
+
+**Défaut 3** — `event_id` live ≠ `event_id` publié (0/74 match). Divergence structurelle : le live hashe `sha256(chemin du pcapng)` comme `capture_id`, la publication hashe `sha256(contenu)` ; `assign_deterministic_id` mélange le `capture_id` dans sa material → aucun `event_id` commun pour le même paquet.
+
+**Design 3** (arbitrage CLAUDE1, Design 1 refusé — le fichier ring grossit tant qu'il est ouvert, `sha256(contenu)` est inaccessible côté live) :
+
+- nouveau champ `stable_event_key: String` dans `event_schema::NormalizedEvent` ;
+- fonction UNIQUE `event_schema::derive_stable_event_key(dumpcap_file_path, interface_id, packet_number, byte_offset) -> String` — encode `"{basename}|{iid}|{pkt}|{off}"` ;
+- `oiran-decode::DecodeConfig::stable_source_file: String` — propagé par l'appelant avec le **basename dumpcap ORIGINAL** (pas celui de la copie de staging publi) ;
+- `oiran-decode::emit_events` stampe `event.assign_stable_event_key(&config.stable_source_file)` à l'émission (chemin unique, décodeurs non touchés) ; émission RTP agrégée stampée de même ;
+- `event_id` reste inchangé (**zéro migration** côté consommateurs qui référencent déjà `event_id`).
+
+### Exposition
+
+- SSE — `apps/api/src/live_trace.rs:213` ajoute `"stable_event_key"` au payload `kind=message`.
+- Callflow — `live-probe::callflow_page` passe l'event JSON brut : `to_json_with_probe` émet toujours `"stable_event_key"` (même vide). Aucun changement de lecture.
+
+### Branchements concrets
+
+- `apps/api::live_trace::run_continuous_capture_poller` — `stable_source_file = path.file_name()` (ring dumpcap lu directement, basename canonique).
+- `live-probe::run_continuous` (pré-validation + publication) — `stable_source_file = candidate.path.file_name()` ; **jamais** `destination.file_name()` car la copie de staging est renommée `{iface}.pcap-{hash16}.{ext}`, ce qui n'est PAS le basename partagé avec le live.
+- Autres chemins offline (fresh-import, vtap) — stampent via basename de l'input (hygiène), aucun impact de parité attendu (ces chemins ne croisent pas le ring live).
+
+### Versions
+
+| Crate | Avant | Après | Nature |
+|---|---|---|---|
+| `event-schema` | 1.8.0 | **1.9.0** | minor — nouveau champ public + nouvelle fonction publique |
+| `event-schema::NormalizedEvent::SCHEMA_VERSION` | 1.5.1 | **1.6.0** | minor — champ additionnel émis en JSON (backward-compat lecture via tolérance `parse_event`) |
+| `oiran-decode` | 0.8.2 | **0.9.0** | minor — `DecodeConfig` gagne `stable_source_file` (structural) + stamping centralisé |
+| `live-probe` | 0.6.28 | **0.6.29** | patch — alimente `stable_source_file` dans tous les sites de décodage |
+| `oiran-api` | 2.21.89 | **2.21.91** | train — alimente `stable_source_file` côté live + expose `stable_event_key` dans SSE |
+
+### Tests ajoutés
+
+- `event-schema` — 6 tests unité sur `derive_stable_event_key` et `assign_stable_event_key` (basename strip, basename nu, divergence par packet/offset/iface, no-op si chemin vide, population depuis `packet_references[0]`, JSON émet toujours la clé même vide).
+- `oiran-decode` (test E2E `tests/stable_event_key_parity.rs`) — décode `OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng` deux fois : chemin LIVE (input = original, `stable_source_file = "N2.pcapng"`) vs chemin PUBLI (input = copie staging renommée, `stable_source_file = "N2.pcapng"`). Assertions : chaque event a un `stable_event_key` non vide ; parité stricte 100 % live↔publi ; `event_id` diverge (invariant de design).
+
+### Non-régression
+
+- `event-schema` test `to_json_reduces_size_by_at_least_30_percent_on_sbi_shape_with_10_refs` — modèle legacy reconstruit intègre `stable_event_key` dans la forme « before » pour mesure comparable ; réduction ≥ 30 % préservée.
+- `event-schema` test `to_json_omits_null_fields_and_empty_arrays_without_losing_required_keys` — assertion `"schema_version":"1.6.0"` mise à jour.
+
+### Préflight (règle CPU #9 7018292949)
+
+Voir rapport #9. CPU `some avg10` relevé avant chaque job lourd, pression surveillée par Monitor PSI, `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3` + `-j 2` systématiques.
+
+---
+
 ## OIRAN API 2.21.89 — 2026-11-19 — train de livraison : 2.21.87 + 2.21.88 merge --no-ff (ordre #9 7019778994 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.87-train` @ `592b0e3` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.89-train`. Numerology CLAUDE1 = impair. **Candidat unique de prod**, recetté ensuite par ANR2.

@@ -3376,6 +3376,7 @@ mod tests {
         ) -> NormalizedEvent {
             NormalizedEvent {
                 event_id: event_id.into(),
+                stable_event_key: String::new(),
                 parent_event_id: None,
                 probe_id: "oiran-vprobe-local-01".into(),
                 capture_point_id: interface.into(),
