@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 2.7.13: N6 captures both subscriber pools plus direct SIP signalling to
+# Kamailio. This keeps the existing internet capture and closes the IMS-lite
+# gap without widening the filter to unrelated traffic on br-oiran-n6.
 # 2.7.12: dumpcap is driven by its native `-b duration:<s>` rotation (see
 # capture-interface.sh). Because the dumpcap process never exits between
 # segments, we no longer get an exit-code / stderr-summary per rotation.
@@ -30,7 +33,7 @@ declare -a specs=(
   'br-oiran-n2|n2|sctp port 38412'
   'br-oiran-n3|n3|udp port 2152'
   'br-oiran-n4|n4|udp port 8805'
-  'br-oiran-n6|n6|net 10.46.0.0/16'
+  'br-oiran-n6|n6|(net 10.46.0.0/16 or net 10.47.0.0/16 or (host 10.77.24.20 and udp port 5060))'
   'br-oiran-sbi|sbi|tcp port 7777'
 )
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN capture 2.7.13 — 2026-11-20 — IMS/N6 coverage
+
+- `infrastructure/capture/capture-all.sh` preserves the existing
+  `10.46.0.0/16` N6 filter and adds the IMS subscriber pool
+  `10.47.0.0/16` plus direct SIP signalling to Kamailio
+  `10.77.24.20:5060/UDP`.
+- The filter remains bounded to the approved `br-oiran-n6` bridge; measured
+  campaign overhead is about 42–170 MiB/h while calls are active.
+- `test-capture-ims-filter.sh` prevents regressions back to the internet-only
+  filter.
+
 ## OIRAN API 2.19.1 — 2026-11-16 — Catalogue protocolaire + critères + fields + explorateur (minor)
 
 Cœur de la spec validée avec Sadok sur #10 : ANR1 a besoin d'un catalog protocolaire **construit depuis les events réels** (jamais une liste figée), des critères protocolaires combinables dans `/sessions/filter`, et des colonnes protocolaires dans `/sessions/columns`. 2.19.0 posait la base (catalog de filtres/colonnes + projection) ; 2.19.1 la complète.
