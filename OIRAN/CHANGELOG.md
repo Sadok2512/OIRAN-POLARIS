@@ -1,5 +1,56 @@
 # Changelog
 
+## OIRAN API 2.21.93 — 2026-11-20 — train de livraison : 2.21.89 + 2.21.92 + 2.21.90 + 2.21.91 merge --no-ff (ordre #9 7036719807 CLAUDE1)
+
+Upgrade **train** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.93-train`. Numerology CLAUDE1 = impair. Ordre d'empilage privilégié par le cœur (`7035807909` + `7036719807`) : correctif bloquant 2.21.92 AVANT les features 2.21.90 + 2.21.91. **Candidat unique de prod** (remplace 2.21.89 qui n'est plus déployé seul).
+
+### Contenu du train
+
+- **2.21.92** `2099f13` (CLAUDE2, défaut bloquant ANR1 #10 `7035121536` + raffinement #9 `7036719807`) — garde de bascule double tampon READY. Deuxième commit ferme les deux trous que la garde initiale (`39711e5`) laissait passer : (1) `empty_after_nonempty_unconfirmed` (refus d'une bascule 0 session remplaçant une génération non vide sans double confirmation via un second préchauffage `publication_completed`) et (2) retry bornée après refus (3 essais espacés de 5 s, chaque essai tracé). Refus explicites + compteurs exposés dans `/health.data.sessions_filter_generation_swap_refused`. Cause racine (préchauffage pendant l'état intermédiaire de publication) déclarée **écart OUVERT** dans le CHANGELOG 2.21.92.
+- **2.21.90** `44ba484` (CLAUDE2, défauts 1 + 2 ordre #9 `7033006772`) — live trace de niveau pro. Défaut 1 (trace MSISDN/IMEI incomplète) : suppression du repli `pseudonym_subscriber_text` fictif, amorçage `state.keys` avec les chiffres canoniques (TS 29.571 §5.4.5). Défaut 2 (PFCP/GTP-U absent du live) : rattachement de session dans `TraceState` (`tunnel_teids` / `tunnel_endpoints` / `seids` / `ue_ips`), apprentissage incrémental identique à `correlation-engine::correlate_cross_interface_evidence`, purge en fin de session.
+- **2.21.91** `ac1bcc9` (CLAUDE1, défaut 3 ordre #9 `7033006772` + raffinement #9 `7034553419`) — `stable_event_key` UNIQUE par event pour corrélation live↔publi. Nouveau champ `stable_event_key: String` dans `NormalizedEvent`, fonction UNIQUE `event_schema::derive_stable_event_key(dumpcap, iid, pkt, off, protocol, ordinal)` + `packet_lookup_key(...)`, stamping centralisé dans `oiran-decode::emit_events` + boucle RTP finish, `DecodeConfig::stable_source_file` propagé par le caller avec le basename dumpcap ORIGINAL. Exposition SSE + callflow (via `to_json_with_probe`). Bumps : `event-schema` 1.8.0→1.9.0, `SCHEMA_VERSION` 1.5.1→1.6.0, `oiran-decode` 0.8.2→0.9.0, `live-probe` 0.6.28→0.6.29.
+
+### Topologie des merges `--no-ff`
+
+```
+*   <merge 2.21.91> merge: 2.21.91 (CLAUDE1 stable_event_key unique par event) into train 2.21.93
+|\
+| * ac1bcc9 fix(event-schema 1.9.0, oiran-decode 0.9.0): stable_event_key unique par event via |protocol|ordinal (raffinement #9 7034553419)
+| * 1bedff8 feat(oiran-api 2.21.91, event-schema 1.9.0, oiran-decode 0.9.0, live-probe 0.6.29): stable_event_key live↔publi (ordre #9 7033006772 défaut 3)
+* |  <merge 2.21.90> merge: 2.21.90 (CLAUDE2 live trace identity défauts 1+2) into train 2.21.93
+|\|
+| * 44ba484 fix(oiran-api 2.21.90): live trace de niveau pro (défauts 1 + 2, ordre #9 7033006772)
+* |  <merge 2.21.92> merge: 2.21.92 (CLAUDE2 garde double tampon READY + (0,0) + retry bornée) into train 2.21.93
+|\|
+| * 2099f13 fix(oiran-api 2.21.92): raffinement — (0,0) empty_after_nonempty_unconfirmed + retry bornée après refus (revue cœur #9 7036719807)
+| * 39711e5 fix(oiran-api 2.21.92): garde de bascule double tampon READY (défaut bloquant ANR1 #10 7035121536)
+* |  f600174 docs(train 2.21.89): preuves d'intégration workspace + vtap + 12 runs tests 2.21.88 ← base train
+```
+
+### Conflits résolus
+
+| Fichier | Nature | Résolution |
+|---|---|---|
+| `OIRAN/apps/api/Cargo.toml` | versions concurrentes 2.21.92 vs 2.21.90 vs 2.21.91 | Version finale **2.21.93** |
+| `OIRAN/Cargo.lock` | 3 entrées `[[package]] name = "oiran-api"` divergentes | `version = "2.21.93"` |
+| `OIRAN/CHANGELOG.md` | 4 en-têtes concurrents | Le présent en-tête 2.21.93 prepended ; en-têtes 2.21.92, 2.21.90, 2.21.91 conservés en position 2/3/4 ; historique 2.21.89+ inchangé |
+| `OIRAN/apps/api/src/live_trace.rs` | Auto-merge réussi (surfaces disjointes : 2.21.90 touche routing/identity/vault + état TraceState ; 2.21.91 touche uniquement stamping `stable_source_file` au décodage + SSE payload) | Les deux comportements conservés |
+
+Note : les sites de test 2.21.90 construisent `NormalizedEvent` littéralement (pas via le patch bulk Python de 2.21.91) → ajout mécanique `stable_event_key: String::new()` sur les 2 sites concernés dans `live_trace.rs` (tests `route_normalized_*` lignes 1853, 2045).
+
+### Écart déclaré OUVERT (hérité 2.21.92)
+
+La cause racine (préchauffage lancé pendant l'état intermédiaire de publication) **n'est pas supprimée** par 2.21.93. La garde la masque (1→N refus `SESSIONS_FILTER_GENERATION_SWAP_REFUSED`), et le retry bornée la rattrape dans 3×5 s. Fichier:ligne du point à neutraliser : `apps/api/src/lib.rs` `install_session_filter_cache_prewarm` (observateur `set_dataset_publish_observer`) + `prewarm_session_filter_caches_locked` l. 3864-3975 (prend un snapshot sans attendre `publication_completed`). Lot ultérieur si la revue cœur n'accepte pas le statu quo.
+
+### Non-régression
+
+- Tests 2.21.85 (`sessions_filter_first_boot_without_any_ready_generation_returns_503_2_21_85`, `sessions_filter_serves_generation_after_file_gc_2_21_85`) passent.
+- Tests 2.21.90, 2.21.92 (inclus raffinement), 2.21.91 passent.
+
+Les preuves cumulées (build workspace, workspace --locked, vtap --locked, audit lock 1.83, 12 runs tests ajoutés, règle CPU amendée 7034385961) sont dans le rapport final posté sur #9 par CLAUDE1 à la clôture du train.
+
+---
+
 ## OIRAN API 2.21.92 — 2026-11-20 (raffinement) — deux trous fermés + écart OUVERT (revue cœur #9 7036719807)
 
 Deuxième commit sur la même branche `fix/oiran-2.21.92-prewarm-swap-guard`. Ferme les deux cas que la garde initiale laissait passer, déclare la cause OUVERTE.
@@ -257,6 +308,86 @@ DURATION ≈ 178 s (12 × 14.7 s), cpu some avg10 before=4.12 / after=1.65.
 Verrou partagé : au préflight, `/tmp/nsplus-heavy-build.lock` tenu par CLAUDE1 (worktree 2.21.91, défaut 3 `stable_event_key`). Attente dans `flock -w 900` jusqu'à libération, pas de contournement (feedback_polaris_cpu_protection).
 
 Audit lock Rust 1.83 : `OIRAN/Cargo.lock` modifié uniquement `[[package]] name = "oiran-api" version = "2.21.90"` (ligne 677). Aucune autre entrée ni empreinte. `cargo check --locked` passe ⇒ lock cohérent avec les manifestes.
+## OIRAN API 2.21.91 — 2026-11-20 — stable_event_key live↔publi UNIQUE PAR EVENT (ordre #9 7033006772 défaut 3 + raffinement #9 7034553419, CLAUDE1)
+
+### Raffinement 7034553419 — unicité par event
+
+Revue cœur 2026-11-20 08:45 : 2.21.91 (`1bedff8`) acceptée **sous réserve** — la clé `(basename, iid, pkt, off)` n'étant pas unique par event (NGAP parent + NAS enfant partagent le même paquet), la correspondance live→publié reste 1→N et ambiguë pour l'UX « cliquer sur un event live ouvre l'event publié ».
+
+**Discriminant ajouté** : `…|{protocol}|{ordinal}`, où `ordinal` est le rang 0-based de l'event parmi ceux produits pour un même paquet dans l'ordre d'émission d'`oiran-decode::emit_events`. Déterministe et identique dans les deux chemins car le décodeur produit la même séquence pour un même pcapng.
+
+**Implémentation** :
+
+- `event_schema::derive_stable_event_key(dumpcap_file_path, iid, pkt, off, protocol, ordinal) -> String` — encode `"{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}"` ;
+- `event_schema::packet_lookup_key(dumpcap_file_path, iid, pkt, off) -> String` — prefix servant au compteur d'ordinaux côté `oiran-decode` ;
+- `NormalizedEvent::assign_stable_event_key(dumpcap_file_path: &str, ordinal: u32)` — stampe à partir de `packet_references[0]` et du protocol de l'event ;
+- `oiran-decode::decode_capture_streaming_with_sbi_carry` tient un `HashMap<String, u32>` partagé entre toutes les invocations de `emit_events` (SCTP/UDP/SBI/Diameter) et la boucle RTP finish → incrément 0-based par `(basename, iid, pkt, off)`.
+
+### Audit lock Rust 1.83
+
+```
+python3 /tmp/audit.py OIRAN/Cargo.lock OIRAN/vtap/Cargo.lock
+→ 59 paquets OIRAN/Cargo.lock + 30 paquets OIRAN/vtap/Cargo.lock
+  Highest MSRV observé : indexmap 2.13.1 → rust-version = 1.82
+  Total violators MSRV > 1.83 : **0**
+```
+
+Les deux bumps internes du lot (event-schema 1.9.0, oiran-decode 0.9.0) sont des path-deps workspace → rust-version = workspace (1.75), aucun impact.
+
+### Scope d'origine (défaut 3 — inchangé)
+
+### Défaut adressé (arbitrage #9 7033006772)
+
+Upgrade **minor** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.91-stable-event-key`. Numerology CLAUDE1 = impair.
+
+### Défaut adressé (arbitrage #9 7033006772)
+
+**Défaut 3** — `event_id` live ≠ `event_id` publié (0/74 match). Divergence structurelle : le live hashe `sha256(chemin du pcapng)` comme `capture_id`, la publication hashe `sha256(contenu)` ; `assign_deterministic_id` mélange le `capture_id` dans sa material → aucun `event_id` commun pour le même paquet.
+
+**Design 3** (arbitrage CLAUDE1, Design 1 refusé — le fichier ring grossit tant qu'il est ouvert, `sha256(contenu)` est inaccessible côté live) :
+
+- nouveau champ `stable_event_key: String` dans `event_schema::NormalizedEvent` ;
+- fonction UNIQUE `event_schema::derive_stable_event_key(dumpcap_file_path, interface_id, packet_number, byte_offset) -> String` — encode `"{basename}|{iid}|{pkt}|{off}"` ;
+- `oiran-decode::DecodeConfig::stable_source_file: String` — propagé par l'appelant avec le **basename dumpcap ORIGINAL** (pas celui de la copie de staging publi) ;
+- `oiran-decode::emit_events` stampe `event.assign_stable_event_key(&config.stable_source_file)` à l'émission (chemin unique, décodeurs non touchés) ; émission RTP agrégée stampée de même ;
+- `event_id` reste inchangé (**zéro migration** côté consommateurs qui référencent déjà `event_id`).
+
+### Exposition
+
+- SSE — `apps/api/src/live_trace.rs:213` ajoute `"stable_event_key"` au payload `kind=message`.
+- Callflow — `live-probe::callflow_page` passe l'event JSON brut : `to_json_with_probe` émet toujours `"stable_event_key"` (même vide). Aucun changement de lecture.
+
+### Branchements concrets
+
+- `apps/api::live_trace::run_continuous_capture_poller` — `stable_source_file = path.file_name()` (ring dumpcap lu directement, basename canonique).
+- `live-probe::run_continuous` (pré-validation + publication) — `stable_source_file = candidate.path.file_name()` ; **jamais** `destination.file_name()` car la copie de staging est renommée `{iface}.pcap-{hash16}.{ext}`, ce qui n'est PAS le basename partagé avec le live.
+- Autres chemins offline (fresh-import, vtap) — stampent via basename de l'input (hygiène), aucun impact de parité attendu (ces chemins ne croisent pas le ring live).
+
+### Versions
+
+| Crate | Avant | Après | Nature |
+|---|---|---|---|
+| `event-schema` | 1.8.0 | **1.9.0** | minor — nouveau champ public + nouvelle fonction publique |
+| `event-schema::NormalizedEvent::SCHEMA_VERSION` | 1.5.1 | **1.6.0** | minor — champ additionnel émis en JSON (backward-compat lecture via tolérance `parse_event`) |
+| `oiran-decode` | 0.8.2 | **0.9.0** | minor — `DecodeConfig` gagne `stable_source_file` (structural) + stamping centralisé |
+| `live-probe` | 0.6.28 | **0.6.29** | patch — alimente `stable_source_file` dans tous les sites de décodage |
+| `oiran-api` | 2.21.89 | **2.21.91** | train — alimente `stable_source_file` côté live + expose `stable_event_key` dans SSE |
+
+### Tests ajoutés
+
+- `event-schema` — 6 tests unité sur `derive_stable_event_key` et `assign_stable_event_key` (basename strip, basename nu, divergence par packet/offset/iface, no-op si chemin vide, population depuis `packet_references[0]`, JSON émet toujours la clé même vide).
+- `oiran-decode` (test E2E `tests/stable_event_key_parity.rs`) — décode `OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng` deux fois : chemin LIVE (input = original, `stable_source_file = "N2.pcapng"`) vs chemin PUBLI (input = copie staging renommée, `stable_source_file = "N2.pcapng"`). Assertions : chaque event a un `stable_event_key` non vide ; parité stricte 100 % live↔publi ; `event_id` diverge (invariant de design).
+
+### Non-régression
+
+- `event-schema` test `to_json_reduces_size_by_at_least_30_percent_on_sbi_shape_with_10_refs` — modèle legacy reconstruit intègre `stable_event_key` dans la forme « before » pour mesure comparable ; réduction ≥ 30 % préservée.
+- `event-schema` test `to_json_omits_null_fields_and_empty_arrays_without_losing_required_keys` — assertion `"schema_version":"1.6.0"` mise à jour.
+
+### Préflight (règle CPU #9 7018292949)
+
+Voir rapport #9. CPU `some avg10` relevé avant chaque job lourd, pression surveillée par Monitor PSI, `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3` + `-j 2` systématiques.
+
+---
 
 ## OIRAN API 2.21.89 — 2026-11-19 — train de livraison : 2.21.87 + 2.21.88 merge --no-ff (ordre #9 7019778994 CLAUDE1)
 

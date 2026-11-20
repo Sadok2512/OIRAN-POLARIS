@@ -633,6 +633,7 @@ mod tests {
         }
         NormalizedEvent {
             event_id: format!("evt-{session_id_marker}-{second}-{direction:?}"),
+            stable_event_key: String::new(),
             parent_event_id: None,
             probe_id: "test".into(),
             capture_point_id: "N3".into(),

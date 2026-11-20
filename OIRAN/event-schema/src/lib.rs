@@ -269,6 +269,17 @@ pub struct ProbeStamp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedEvent {
     pub event_id: String,
+    /// 1.6.0 (POLARIS 2.21.91, ordre #9 7033006772 défaut 3) — clé de
+    /// corrélation live↔publié **indépendante** de `capture_id`. Live
+    /// hashe `sha256(path)`, publi hashe `sha256(contenu)` → `event_id`
+    /// divergent par construction sur le même pcapng. `stable_event_key`
+    /// est dérivé par [`derive_stable_event_key`] dans event-schema,
+    /// utilisée par les DEUX chemins (apps/api live_trace +
+    /// live-probe publication), à partir de
+    /// `(basename du fichier dumpcap ORIGINAL, interface_id,
+    /// packet_number, byte_offset)`. `event_id` reste inchangé
+    /// (zéro migration).
+    pub stable_event_key: String,
     pub parent_event_id: Option<String>,
     pub probe_id: String,
     pub capture_point_id: String,
@@ -308,7 +319,7 @@ impl NormalizedEvent {
     // Réduction mesurée ~45-60 % sur événements Sxab/SBI, format reste
     // backward-compatible (session-engine `parse_event` via serde
     // ignore_unknown_fields + unwrap_or tolère toutes les omissions).
-    pub const SCHEMA_VERSION: &'static str = "1.5.1";
+    pub const SCHEMA_VERSION: &'static str = "1.6.0";
     pub fn assign_deterministic_id(&mut self) {
         let mut material = format!(
             "{}|{}|{}|{}|{}",
@@ -326,6 +337,38 @@ impl NormalizedEvent {
             );
         }
         self.event_id = format!("evt-{:016x}", stable_hash(material.as_bytes()));
+    }
+
+    /// 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772 + raffinement #9
+    /// 7034553419) — stamp `stable_event_key` à partir de la première
+    /// `packet_reference` du caller, en ajoutant `(protocol, ordinal)`
+    /// pour garantir l'**unicité par event**. `ordinal` = rang (0-based)
+    /// de l'event parmi ceux produits pour un même paquet dans l'ordre
+    /// d'émission d'`oiran-decode::emit_events`. Le même décodeur
+    /// produit la même séquence en live et en publication → mêmes
+    /// ordinaux, mêmes clés. Si le caller ne fournit pas le chemin
+    /// dumpcap (`dumpcap_file_path` vide) ou si l'event n'a pas de
+    /// `packet_references`, le champ reste vide — invariant non
+    /// régressé pour les tests synthétiques.
+    pub fn assign_stable_event_key(
+        &mut self,
+        dumpcap_file_path: &str,
+        ordinal: u32,
+    ) {
+        if dumpcap_file_path.is_empty() {
+            return;
+        }
+        let Some(packet) = self.packet_references.first() else {
+            return;
+        };
+        self.stable_event_key = derive_stable_event_key(
+            dumpcap_file_path,
+            packet.interface_id,
+            packet.packet_number,
+            packet.byte_offset,
+            self.protocol.as_str(),
+            ordinal,
+        );
     }
     pub fn has_complete_provenance(&self) -> bool {
         !self.capture_id.is_empty()
@@ -392,8 +435,15 @@ impl NormalizedEvent {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let mut parts: Vec<String> = Vec::with_capacity(28);
+        let mut parts: Vec<String> = Vec::with_capacity(29);
         parts.push(format!("\"event_id\":\"{}\"", escape(&self.event_id)));
+        // 1.6.0 (POLARIS 2.21.91) — toujours émis, même vide, pour
+        // préserver la contrat de présence côté consommateurs SSE +
+        // callflow. Le champ sert de clé de corrélation live↔publié.
+        parts.push(format!(
+            "\"stable_event_key\":\"{}\"",
+            escape(&self.stable_event_key)
+        ));
         if let Some(parent) = self.parent_event_id.as_deref() {
             parts.push(format!("\"parent_event_id\":\"{}\"", escape(parent)));
         }
@@ -523,6 +573,64 @@ fn information_element_json(ie: &InformationElement) -> String {
 fn sbi_json(value: Option<&SbiMetadata>) -> String {
     let Some(v) = value else { return "null".into() };
     format!("{{\"tcp_connection_id\":\"{}\",\"http2_stream_id\":{},\"service\":{},\"operation\":{},\"http_method\":{},\"request_uri\":{},\"http_status\":{},\"consumer_nf\":{},\"producer_nf\":{},\"scp_transit\":{},\"transaction_duration_ns\":{}}}", escape(&v.tcp_connection_id), v.http2_stream_id, option_string(v.service.as_deref()), option_string(v.operation.as_deref()), option_string(v.http_method.as_deref()), option_string(v.request_uri.as_deref()), option_num(v.http_status), option_string(v.consumer_nf.as_deref()), option_string(v.producer_nf.as_deref()), v.scp_transit, option_num(v.transaction_duration_ns))
+}
+
+/// 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772 + raffinement #9
+/// 7034553419) — dérive la clé UNIQUE par event pour la corrélation
+/// live↔publié.
+///
+/// Fonction UNIQUE appelée par les deux chemins :
+///   * `apps/api::live_trace` (décodage du ring en live) ;
+///   * `live-probe` (décodage à la publication, qui travaille sur une
+///     COPIE renommée du pcapng mais reçoit le basename original via
+///     `DecodeConfig::stable_source_file`).
+///
+/// Encodage stable, unique par event :
+///   `"{basename}|{interface_id}|{packet_number}|{byte_offset}|{protocol}|{ordinal}"`.
+///
+/// `ordinal` discrimine les events qui partagent un même paquet
+/// (ex. NGAP parent + NAS enfant). Rang 0-based dans l'ordre
+/// d'émission d'`oiran-decode::emit_events` — déterministe et
+/// identique entre les deux chemins pour un même pcapng. Voir aussi
+/// [`packet_lookup_key`] pour le prefix servant à compter les events
+/// par paquet côté caller.
+pub fn derive_stable_event_key(
+    dumpcap_file_path: &str,
+    interface_id: u32,
+    packet_number: u64,
+    byte_offset: u64,
+    protocol: &str,
+    ordinal: u32,
+) -> String {
+    format!(
+        "{}|{}|{}",
+        packet_lookup_key(dumpcap_file_path, interface_id, packet_number, byte_offset),
+        protocol,
+        ordinal,
+    )
+}
+
+/// 1.6.0 (POLARIS 2.21.91, #9 7034553419) — prefix de `stable_event_key`
+/// tronqué à `(basename, iid, pkt, off)`. Utilisé par
+/// `oiran-decode::emit_events` comme clé d'index du compteur
+/// d'ordinaux : tous les events qui partagent ce prefix reçoivent des
+/// ordinaux 0, 1, 2, … dans leur ordre d'émission.
+pub fn packet_lookup_key(
+    dumpcap_file_path: &str,
+    interface_id: u32,
+    packet_number: u64,
+    byte_offset: u64,
+) -> String {
+    // basename = dernier segment après `/` ou `\\` ; si vide (ex. chemin
+    // se terminant par un slash), on retombe sur la chaîne originale.
+    let basename = dumpcap_file_path
+        .rsplit(|c: char| c == '/' || c == '\\')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(dumpcap_file_path);
+    format!(
+        "{}|{}|{}|{}",
+        basename, interface_id, packet_number, byte_offset
+    )
 }
 
 pub fn stable_hash(bytes: &[u8]) -> u64 {
@@ -1098,6 +1206,7 @@ mod tests {
     fn event() -> NormalizedEvent {
         NormalizedEvent {
             event_id: String::new(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             probe_id: "probe-1".into(),
             capture_point_id: "n2-bridge".into(),
@@ -1195,6 +1304,7 @@ mod tests {
     fn to_json_omits_null_fields_and_empty_arrays_without_losing_required_keys() {
         let e = NormalizedEvent {
             event_id: "evt-abc".into(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             probe_id: "probe-1".into(),
             capture_point_id: "n2-bridge".into(),
@@ -1292,7 +1402,7 @@ mod tests {
             "\"message_name\":\"N1N2MessageTransfer\"",
             "\"direction\":\"RAN_TO_CORE\"",
             "\"decoding_status\":\"DECODED\"",
-            "\"schema_version\":\"1.5.1\"",
+            "\"schema_version\":\"1.6.0\"",
             // présence même vide
             "\"session_identifiers\":[]",
             "\"information_elements\":[]",
@@ -1352,6 +1462,7 @@ mod tests {
             .collect::<Vec<_>>();
         let e = NormalizedEvent {
             event_id: "evt-sbi".into(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             probe_id: "oiran-vprobe-local-01".into(),
             capture_point_id: "sbi".into(),
@@ -1433,8 +1544,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let before = format!(
-            "{{\"event_id\":\"{}\",\"parent_event_id\":null,\"probe_id\":\"{}\",\"capture_point_id\":\"{}\",\"capture_id\":\"{}\",\"packet_references\":[{}],\"timestamp\":{{\"seconds\":{},\"nanoseconds\":{},\"raw_ticks\":{},\"resolution_base\":{},\"resolution_exponent\":{},\"display\":\"{}\"}},\"interface\":\"{}\",\"protocol\":\"{}\",\"message_name\":\"{}\",\"message_type\":{},\"procedure_code\":null,\"procedure\":null,\"security_state\":null,\"source_byte_offset\":null,\"source_endpoint\":{},\"destination_endpoint\":{},\"direction\":\"{}\",\"session_identifiers\":[],\"information_elements\":[{}],\"decoder_name\":\"{}\",\"decoder_version\":\"{}\",\"schema_version\":\"{}\",\"decoding_status\":\"{}\",\"errors\":[],\"raw_payload_reference\":\"{}\",\"evidence_references\":[],\"sbi\":null}}",
+            "{{\"event_id\":\"{}\",\"stable_event_key\":\"{}\",\"parent_event_id\":null,\"probe_id\":\"{}\",\"capture_point_id\":\"{}\",\"capture_id\":\"{}\",\"packet_references\":[{}],\"timestamp\":{{\"seconds\":{},\"nanoseconds\":{},\"raw_ticks\":{},\"resolution_base\":{},\"resolution_exponent\":{},\"display\":\"{}\"}},\"interface\":\"{}\",\"protocol\":\"{}\",\"message_name\":\"{}\",\"message_type\":{},\"procedure_code\":null,\"procedure\":null,\"security_state\":null,\"source_byte_offset\":null,\"source_endpoint\":{},\"destination_endpoint\":{},\"direction\":\"{}\",\"session_identifiers\":[],\"information_elements\":[{}],\"decoder_name\":\"{}\",\"decoder_version\":\"{}\",\"schema_version\":\"{}\",\"decoding_status\":\"{}\",\"errors\":[],\"raw_payload_reference\":\"{}\",\"evidence_references\":[],\"sbi\":null}}",
             escape(&e.event_id),
+            escape(&e.stable_event_key),
             escape(&e.probe_id),
             escape(&e.capture_point_id),
             escape(&e.capture_id),
@@ -1478,6 +1590,115 @@ mod tests {
         let _: serde_json::Value =
             serde_json::from_str(&after).expect("compact JSON must parse");
     }
+    // 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772 + raffinement #9 7034553419)
+    // — `derive_stable_event_key` est la fonction UNIQUE utilisée par les deux
+    // chemins (live + publication). Ces tests valident :
+    //   * basename extrait du chemin, indifférent au répertoire parent
+    //     (live = ring dir, publi = staging dir ; même fichier → même clé) ;
+    //   * encodage stable `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}` ;
+    //   * assign_stable_event_key no-op si chemin vide ou pas de ref ;
+    //   * `packet_lookup_key` est le préfixe qui regroupe les events d'un
+    //     même paquet (utilisé comme clé du compteur d'ordinaux côté
+    //     `oiran-decode::emit_events`).
+    #[test]
+    fn derive_stable_event_key_strips_parent_directory() {
+        let live_path = "/var/lib/oiran/ring/n3/n3_live_00032_20261120.pcapng";
+        let publish_path = "/tmp/base/staging/n3_live_00032_20261120.pcapng";
+        let a = derive_stable_event_key(live_path, 2, 42, 100, "NGAP", 0);
+        let b = derive_stable_event_key(publish_path, 2, 42, 100, "NGAP", 0);
+        assert_eq!(a, b, "basename identique → clé identique (live↔publi)");
+        assert_eq!(a, "n3_live_00032_20261120.pcapng|2|42|100|NGAP|0");
+    }
+
+    #[test]
+    fn derive_stable_event_key_bare_basename() {
+        // Caller qui fournit uniquement le basename (sans répertoire).
+        let key = derive_stable_event_key("ngap_00001.pcapng", 0, 1, 24, "NGAP", 0);
+        assert_eq!(key, "ngap_00001.pcapng|0|1|24|NGAP|0");
+    }
+
+    #[test]
+    fn derive_stable_event_key_different_packets_diverge() {
+        let base = "/x/f.pcapng";
+        assert_ne!(
+            derive_stable_event_key(base, 0, 1, 24, "NGAP", 0),
+            derive_stable_event_key(base, 0, 2, 24, "NGAP", 0)
+        );
+        assert_ne!(
+            derive_stable_event_key(base, 0, 1, 24, "NGAP", 0),
+            derive_stable_event_key(base, 0, 1, 48, "NGAP", 0)
+        );
+        assert_ne!(
+            derive_stable_event_key(base, 0, 1, 24, "NGAP", 0),
+            derive_stable_event_key(base, 1, 1, 24, "NGAP", 0)
+        );
+    }
+
+    #[test]
+    fn derive_stable_event_key_discriminates_siblings_via_protocol_and_ordinal() {
+        // NGAP parent et NAS enfant au même paquet : même prefix, mais
+        // la clé complète diffère grâce à `(protocol, ordinal)`.
+        let base = "/x/f.pcapng";
+        let parent = derive_stable_event_key(base, 0, 7, 40, "NGAP", 0);
+        let child = derive_stable_event_key(base, 0, 7, 40, "NAS-5GMM", 1);
+        assert_ne!(
+            parent, child,
+            "clé doit discriminer parent (NGAP|0) et enfant (NAS|1)"
+        );
+        assert!(parent.ends_with("|NGAP|0"));
+        assert!(child.ends_with("|NAS-5GMM|1"));
+    }
+
+    #[test]
+    fn packet_lookup_key_is_prefix_shared_by_same_packet_events() {
+        // Le prefix sert au compteur d'ordinaux côté oiran-decode : tous
+        // les events qui partagent ce prefix sont numérotés 0, 1, 2, …
+        let lookup = packet_lookup_key("/x/f.pcapng", 0, 7, 40);
+        let parent = derive_stable_event_key("/x/f.pcapng", 0, 7, 40, "NGAP", 0);
+        let child = derive_stable_event_key("/x/f.pcapng", 0, 7, 40, "NAS-5GMM", 1);
+        assert_eq!(lookup, "f.pcapng|0|7|40");
+        assert!(parent.starts_with(&lookup));
+        assert!(child.starts_with(&lookup));
+    }
+
+    #[test]
+    fn assign_stable_event_key_is_noop_on_empty_path() {
+        let mut e = event();
+        e.assign_stable_event_key("", 0);
+        assert!(e.stable_event_key.is_empty());
+    }
+
+    #[test]
+    fn assign_stable_event_key_populates_from_first_packet_reference() {
+        let mut e = event();
+        e.assign_stable_event_key("/ring/n2/n2_live_00007.pcapng", 0);
+        // event() fournit iid=2, pkt=7, off=40, protocol=NGAP.
+        assert_eq!(e.stable_event_key, "n2_live_00007.pcapng|2|7|40|NGAP|0");
+    }
+
+    #[test]
+    fn assign_stable_event_key_honours_ordinal() {
+        // Même paquet, deux events — 2e event stampé avec ordinal=1.
+        let mut a = event();
+        let mut b = event();
+        a.assign_stable_event_key("/ring/n2/f.pcapng", 0);
+        b.assign_stable_event_key("/ring/n2/f.pcapng", 1);
+        assert_ne!(a.stable_event_key, b.stable_event_key);
+        assert!(a.stable_event_key.ends_with("|0"));
+        assert!(b.stable_event_key.ends_with("|1"));
+    }
+
+    #[test]
+    fn stable_event_key_is_emitted_in_json_even_when_empty() {
+        let mut e = event();
+        e.assign_deterministic_id();
+        let out = e.to_json();
+        assert!(
+            out.contains("\"stable_event_key\":\"\""),
+            "champ présent même vide ; got: {out}"
+        );
+    }
+
     #[test]
     fn exact_timestamp_is_preserved() {
         let e = event();

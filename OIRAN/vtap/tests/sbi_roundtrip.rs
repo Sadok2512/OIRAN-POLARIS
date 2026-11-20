@@ -86,6 +86,7 @@ fn decode(path: &std::path::Path) -> oiran_decode::DecodeOutput {
             ("172.22.0.10".to_string(), "AMF".to_string()),
             ("172.22.0.12".to_string(), "NRF".to_string()),
         ]),
+        stable_source_file: String::new(),
     })
     .expect("decode vtap pcap")
 }
