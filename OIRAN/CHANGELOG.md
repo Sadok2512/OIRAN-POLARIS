@@ -1,5 +1,39 @@
 # Changelog
 
+## oiran-api 2.21.121 — 2026-11-20 — trace live : un couple côté cœur appris en PFCP finit avec sa session (relecture CLAUDE2 #9 7052103318, H1 ; ordres #9 7052116208 et 7052206763)
+
+Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.120 (lot B1) @ `a6a3448`. Branches `fix/oiran-2.21.121-trace-core-tunnel-seid` et `fix/oiran-2.21.121-train` (même SHA). Le numéro 2.21.120, d'abord prévu pour ce correctif, est celui du lot B1 (mise au point cœur #9 7052206763). Seul `apps/api/src/live_trace.rs` change.
+
+### Audit
+
+**H1 — régression d'isolement introduite par 2.21.119, étroite.** Un couple (UPF, TEID) appris sur un message qui ne nomme pas la session de données — le F-TEID d'un PDR PFCP — n'était rangé sous aucune session. La libération de la session n'oubliait donc rien ; puis la mise en veille le gardait, puisqu'il est côté cœur (G1). Il restait connu jusqu'au désenregistrement ou à l'expiration de la trace ; réattribué par l'UPF, il aurait rattaché le trafic d'un autre abonné. À `7e0b1bb` la mise en veille vidait tous les tunnels, ce qui bornait le cas.
+
+Sur le jeu réel du dépôt, c'est le chemin ordinaire du PFCP : les F-TEID côté cœur arrivent dans le `PFCP Session Establishment Response`, qui ne porte pas `pdu_session_id`.
+
+**Vérification demandée** : sur le jeu réel `OIRAN_5G_PDU_SESSION_DATA_V1`, le champ s'appelle bien `pdu_session_id` (valeur `1`) dans `session_identifiers` du `PDUSessionResourceSetupRequest` et du `PDUSessionResourceSetupResponse` NGAP, et d'un message NAS 5GMM. Aucun event PFCP ne le porte.
+
+### Correctif
+
+- Les couples côté cœur appris sur un message PFCP sont rangés sous le ou les SEID de ce message (en-tête et IE F-SEID). Au `PFCP Session Deletion Response`, les couples rangés sous son SEID sont oubliés, sauf ceux encore rangés sous une session de données ou sous un autre SEID.
+- Libération d'une session nommée sans tunnel rangé : les couples côté cœur qui ne sont rangés sous aucune autre session de données ni sous aucun SEID encore vivant sont oubliés (choix de l'isolement). Le compteur `session_releases_without_filed_tunnels` reste.
+
+### Échec avant, succès après
+
+`core_tunnel_learned_on_pfcp_only_does_not_outlive_its_session_2_21_121`, greffé sur le fichier de `d4aaedb` (une assertion sur le nouveau champ retirée) : **échec**, `left: 4, right: 1` sur RVD1. Sur le code corrigé : succès.
+
+### Test existant modifié
+
+`named_release_without_filed_tunnels_keeps_other_tunnels_and_is_counted_2_21_119` : son PFCP porte maintenant un SEID. Sans SEID, son couple est désormais oublié à la libération — c'est H1 ; le cas « gardé » qu'il vérifie est celui d'un couple rangé sous un SEID vivant.
+
+### OUVERT
+
+- Events synthétiques seulement pour H1.
+- Un couple côté cœur rangé sous un SEID vivant survit à la libération de la session de données nommée tant que le `Session Deletion Response` n'a pas été vu par la trace ; s'il ne l'est jamais (plan N4 filtré), il dure jusqu'au désenregistrement ou à l'expiration de la trace.
+
+### Tests
+
+`core_tunnel_learned_on_pfcp_only_does_not_outlive_its_session_2_21_121` : RVD1 (1 G-PDU rattaché sur 4), variante SEID (gardé à la libération et en veille, oublié au `Session Deletion Response`), RVD2 (couple appris sur le N2, oublié avec sa session).
+
 ## oiran-api 2.21.120, oiran-decode 0.11.0 — 2026-11-20 — lecteur live : reprise à l'offset sur les plans SCTP, lot B1 (design #9 7050841418, GO #9 7050925249)
 
 Upgrade **patch** sans déploiement, base 2.21.119 @ `d4aaedb`. Branche `fix/oiran-2.21.120-reader-resume-sctp`.

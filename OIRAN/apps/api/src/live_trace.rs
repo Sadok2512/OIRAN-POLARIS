@@ -359,6 +359,10 @@ struct TraceState {
     /// 2.21.119 (G2) — références de contexte SM apprises, `(référence,
     /// association)` → session de données quand l'event la nomme.
     sm_context_sessions: HashMap<(String, String), Option<String>>,
+    /// 2.21.121 (H1) — couples côté cœur appris sur un message PFCP,
+    /// rangés sous le ou les SEID de ce message : oubliés au
+    /// `Session Deletion Response` de la session PFCP.
+    seid_tunnels: HashMap<String, HashSet<(String, String)>>,
     /// 2.21.105 — la trace attend son amorçage depuis le ring.
     needs_seed: bool,
     /// 2.21.105 — la trace est dans la passe d'amorçage en cours :
@@ -702,6 +706,18 @@ fn parse_seid_pairs(ie_value: &str) -> Vec<(String, String)> {
     match u64::from_str_radix(hex, 16) {
         Ok(n) if n != 0 => vec![(event_schema::normalize_ip(ip), format!("0x{n:016x}"))],
         _ => Vec::new(),
+    }
+}
+
+/// 2.21.121 (H1) — oublie des couples (adresse, TEID) : du côté cœur, des
+/// couples connus, et leur TEID s'il ne désigne plus aucun couple connu.
+fn forget_tunnel_pairs(state: &mut TraceState, pairs: &[(String, String)]) {
+    for pair in pairs {
+        state.core_tunnel_endpoints.remove(pair);
+        state.tunnel_endpoints.remove(pair);
+        if !state.tunnel_endpoints.iter().any(|known| known.1 == pair.1) {
+            state.tunnel_teids.remove(&pair.1);
+        }
     }
 }
 
@@ -1501,6 +1517,19 @@ impl LiveTraceRegistry {
             for pair in &ev_core_tunnel_pairs {
                 state.core_tunnel_endpoints.insert(pair.clone());
             }
+            // 2.21.121 (relecture CLAUDE2 #9 7052103318, H1) — un couple
+            // côté cœur appris en PFCP ne nomme pas la session de
+            // données : il est rangé sous les SEID du message, pour
+            // finir avec la session PFCP.
+            if is_pfcp && !ev_core_tunnel_pairs.is_empty() {
+                for seid in ev_session_seids.iter().chain(ev_seids_ie.iter()) {
+                    state
+                        .seid_tunnels
+                        .entry(seid.clone())
+                        .or_default()
+                        .extend(ev_core_tunnel_pairs.iter().cloned());
+                }
+            }
             for (_, reference, scope) in &ev_sm_contexts {
                 let session = state
                     .sm_context_sessions
@@ -1642,6 +1671,36 @@ impl LiveTraceRegistry {
                         .session_releases_without_filed_tunnels
                         .saturating_add(1);
                 }
+                // 2.21.121 (H1) — choix de l'isolement : les couples côté
+                // cœur qui ne sont rangés sous aucune autre session de
+                // données ni sous aucun SEID encore vivant sont oubliés.
+                // Sinon ils survivraient à cette libération ET à la mise
+                // en veille (qui garde le côté cœur), jusqu'au
+                // désenregistrement ou à l'expiration de la trace ;
+                // réattribués par l'UPF, ils rattacheraient le trafic
+                // d'un autre abonné.
+                let filed: HashSet<(String, String)> = state
+                    .session_tunnels
+                    .values()
+                    .flatten()
+                    .filter_map(|(address, teid)| {
+                        address.as_ref().map(|address| (address.clone(), teid.clone()))
+                    })
+                    .chain(
+                        state
+                            .seid_tunnels
+                            .iter()
+                            .filter(|(seid, _)| state.seids.contains(*seid))
+                            .flat_map(|(_, pairs)| pairs.iter().cloned()),
+                    )
+                    .collect();
+                let orphans: Vec<(String, String)> = state
+                    .core_tunnel_endpoints
+                    .iter()
+                    .filter(|pair| !filed.contains(*pair))
+                    .cloned()
+                    .collect();
+                forget_tunnel_pairs(state, &orphans);
             } else if session_release || detach {
                 // Libération d'une session que l'event ne nomme pas, ou
                 // détachement : tous les tunnels du plan usager sont
@@ -1650,6 +1709,7 @@ impl LiveTraceRegistry {
                 state.tunnel_endpoints.clear();
                 state.session_tunnels.clear();
                 state.core_tunnel_endpoints.clear();
+                state.seid_tunnels.clear();
             }
             // 2.21.119 (G2) — une référence de contexte SM finit avec sa
             // session de données. Depuis 2.21.113 elle n'était plus
@@ -1691,12 +1751,35 @@ impl LiveTraceRegistry {
                 state.seid_endpoints.clear();
                 state.ue_ips.clear();
             }
-            // Suppression d'une session PFCP : son SEID ne vaut plus.
+            // Suppression d'une session PFCP : son SEID ne vaut plus, ni
+            // les couples côté cœur rangés sous lui (2.21.121, H1).
             if is_pfcp && compact_name(&event.message_name).ends_with("sessiondeletionresponse") {
                 for pair in &ev_header_seid_pairs {
                     state.seid_endpoints.remove(pair);
                     state.seids.remove(&pair.1);
                 }
+                let released: Vec<(String, String)> = ev_session_seids
+                    .iter()
+                    .chain(ev_seids_ie.iter())
+                    .filter_map(|seid| state.seid_tunnels.remove(seid))
+                    .flatten()
+                    .collect();
+                // Un couple encore rangé sous une session de données ou
+                // sous un autre SEID vivant est gardé.
+                let still_filed: HashSet<(String, String)> = state
+                    .session_tunnels
+                    .values()
+                    .flatten()
+                    .filter_map(|(address, teid)| {
+                        address.as_ref().map(|address| (address.clone(), teid.clone()))
+                    })
+                    .chain(state.seid_tunnels.values().flatten().cloned())
+                    .collect();
+                let released: Vec<(String, String)> = released
+                    .into_iter()
+                    .filter(|pair| !still_filed.contains(pair))
+                    .collect();
+                forget_tunnel_pairs(state, &released);
             }
             if context_release || detach {
                 // Identifiants UE NGAP / S1AP et références d'event : ne
@@ -2539,6 +2622,7 @@ pub(crate) async fn create(
             session_tunnels: HashMap::new(),
             core_tunnel_endpoints: HashSet::new(),
             sm_context_sessions: HashMap::new(),
+            seid_tunnels: HashMap::new(),
             // 2.21.105 — le lecteur relit le ring de signalisation
             // pour cette trace à sa prochaine passe.
             needs_seed: true,
@@ -2938,6 +3022,7 @@ mod tests {
             session_tunnels: HashMap::new(),
             core_tunnel_endpoints: HashSet::new(),
             sm_context_sessions: HashMap::new(),
+            seid_tunnels: HashMap::new(),
             needs_seed: true,
             seeding: false,
         }
@@ -4426,10 +4511,158 @@ mod tests {
         assert_eq!(t.trace.gpdu_rejected_no_match, 1, "le descendant d'avant la veille");
     }
 
+    /// 2.21.121 (relecture CLAUDE2 #9 7052103318, H1 ; sondes RVD1 et
+    /// RVD2) — un couple côté cœur appris seulement en PFCP ne survit ni
+    /// à la libération de la session ni à la mise en veille.
+    ///   RVD1 : couple appris sur un PFCP de l'abonné sans SEID vivant ;
+    ///   1 G-PDU ; libération de sa session ; 1 G-PDU ; mise en veille ;
+    ///   2 G-PDU d'un autre abonné sur le même couple → 1 seul rattaché.
+    ///   À `d4aaedb` : 4 rattachés.
+    ///   Variante SEID : couple rangé sous un SEID vivant → gardé à la
+    ///   libération de la session nommée, oublié au
+    ///   `Session Deletion Response`.
+    ///   RVD2 : couple appris sur le N2 avec son `pdu_session_id`,
+    ///   session libérée → oublié (déjà vert à `d4aaedb`).
+    #[test]
+    fn core_tunnel_learned_on_pfcp_only_does_not_outlive_its_session_2_21_121() {
+        use event_schema::{Direction, Protocol};
+        let gnb = "10.77.11.13";
+        let upf = "10.77.22.13";
+        let pfcp = |packet: u64, message: &str, node: &str, ids: Vec<(&'static str, &'static str)>, ie: Vec<(&'static str, &'static str)>| {
+            let mut event = mk_event("N4", Protocol::Pfcp, message, packet, Direction::Unknown, ids, ie);
+            event.event_id = format!("evt-pfcp-{packet:04}");
+            event.message_type = 51;
+            event.destination_endpoint.address = node.into();
+            event
+        };
+        let gpdu = |packet: u64| {
+            let mut event = mk_event(
+                "N3",
+                Protocol::Gtpu,
+                "G-PDU",
+                packet,
+                Direction::Uplink,
+                vec![("teid", "0x0000a001")],
+                vec![],
+            );
+            event.destination_endpoint.address = upf.into();
+            event
+        };
+        let release = |packet: u64, session: &'static str| {
+            ngap_between(
+                gnb,
+                true,
+                "PDU Session Release Complete",
+                packet,
+                vec![("subscriber_pseudonym", "psn-ue-a"), ("pdu_session_id", session)],
+            )
+        };
+        let idle = |packet: u64| {
+            ngap_between(
+                gnb,
+                true,
+                "UEContextReleaseComplete",
+                packet,
+                vec![("subscriber_pseudonym", "psn-ue-a")],
+            )
+        };
+        let f_teid = ("F-TEID", "teid=0x0000a001,v4=true,v6=false,ipv4=10.77.22.13");
+
+        // RVD1 — sans SEID.
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&pfcp(
+            1,
+            "PFCP Session Establishment Response",
+            "10.77.24.7",
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+            vec![f_teid],
+        ));
+        r.route_normalized(&gpdu(2));
+        r.route_normalized(&release(3, "1"));
+        r.route_normalized(&gpdu(4));
+        r.route_normalized(&idle(5));
+        r.route_normalized(&gpdu(6));
+        r.route_normalized(&gpdu(7));
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert_eq!(t.trace.gpdu_attached, 1, "RVD1 : seul le G-PDU d'avant la libération");
+            assert_eq!(t.trace.gpdu_rejected_no_match, 3);
+            assert_eq!(t.trace.session_releases_without_filed_tunnels, 1);
+            assert!(t.core_tunnel_endpoints.is_empty() && t.tunnel_endpoints.is_empty());
+        }
+
+        // Variante — couple rangé sous un SEID vivant.
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&pfcp(
+            1,
+            "PFCP Session Establishment Response",
+            "10.77.24.7",
+            vec![("seid", "0x0000000000000042"), ("subscriber_pseudonym", "psn-ue-a")],
+            vec![f_teid],
+        ));
+        r.route_normalized(&gpdu(2));
+        r.route_normalized(&release(3, "2"));
+        r.route_normalized(&gpdu(4));
+        assert_eq!(
+            r.traces.lock().unwrap()["t"].trace.gpdu_attached,
+            2,
+            "la session PFCP vit encore : le couple est gardé"
+        );
+        r.route_normalized(&idle(5));
+        r.route_normalized(&gpdu(6));
+        assert_eq!(r.traces.lock().unwrap()["t"].trace.gpdu_attached, 3, "gardé en veille");
+        r.route_normalized(&pfcp(
+            7,
+            "PFCP Session Deletion Response",
+            "10.77.24.7",
+            vec![("seid", "0x0000000000000042")],
+            vec![],
+        ));
+        r.route_normalized(&gpdu(8));
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert_eq!(t.trace.gpdu_attached, 3, "oublié à la suppression de la session PFCP");
+            assert!(t.core_tunnel_endpoints.is_empty() && t.seid_tunnels.is_empty());
+        }
+
+        // RVD2 — couple appris sur le N2 avec sa session.
+        let r = trace_on("psn-ue-a");
+        let mut setup = ngap_between(
+            gnb,
+            false,
+            "PDUSessionResourceSetupRequest",
+            1,
+            vec![("subscriber_pseudonym", "psn-ue-a"), ("pdu_session_id", "1")],
+        );
+        setup.information_elements = vec![event_schema::InformationElement {
+            id: None,
+            name: "Transfer".into(),
+            length: 0,
+            value: Some("item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x0000a001".into()),
+            raw_sha256: None,
+            status: event_schema::DecodeStatus::Decoded,
+        }];
+        r.route_normalized(&setup);
+        r.route_normalized(&gpdu(2));
+        r.route_normalized(&release(3, "1"));
+        r.route_normalized(&idle(4));
+        r.route_normalized(&gpdu(5));
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.gpdu_attached, 1, "RVD2");
+        assert_eq!(t.trace.gpdu_rejected_no_match, 1);
+        assert_eq!(t.trace.session_releases_without_filed_tunnels, 0);
+    }
+
     /// 2.21.119 (point mineur, ordre #9 7051758378) — libération d'une
     /// session NOMMÉE dont les tunnels ne sont pas rangés par session
     /// (appris par PFCP, sans `pdu_session_id`) : les tunnels de
     /// l'abonné ne sont pas vidés, et le cas est compté.
+    /// 2.21.121 (H1) — précisé : ne sont gardés que les couples rangés
+    /// sous un SEID encore vivant ; le PFCP de ce test porte donc un
+    /// SEID. Le cas sans SEID (oubli) est dans le test H1.
     #[test]
     fn named_release_without_filed_tunnels_keeps_other_tunnels_and_is_counted_2_21_119() {
         use event_schema::{Direction, Protocol};
@@ -4440,7 +4673,7 @@ mod tests {
             "PFCP Session Establishment Request",
             1,
             Direction::Unknown,
-            vec![("subscriber_pseudonym", "psn-ue-a")],
+            vec![("subscriber_pseudonym", "psn-ue-a"), ("seid", "0x0000000000000042")],
             vec![("F-TEID", "teid=0x0000a001,v4=true,v6=false,ipv4=10.77.22.13")],
         ));
         r.route_normalized(&ngap_between(
