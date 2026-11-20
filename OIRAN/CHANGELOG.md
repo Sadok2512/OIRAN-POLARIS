@@ -169,6 +169,94 @@ Audit lock Rust 1.83 : `OIRAN/Cargo.lock` ligne 677 passée à `version = "2.21.
 ### Écarts
 
 - **AUCUN écart non déclaré.** Verrou `nsplus-heavy-build.lock` libre au préflight, aucune contention observée pendant les 12 runs.
+## OIRAN API 2.21.90 — 2026-11-20 — live trace de niveau pro (défauts 1 + 2, ordre #9 7033006772 CLAUDE2)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174`. Branche `fix/oiran-2.21.90-live-trace-identity`. Numerology CLAUDE2 = pair. Référence terrain : ANR1 `LAB_UNLOCK` #9 `7021842930` (« N4 non rattaché dans le live » ; trace MSISDN = 9 events SBI ; trace IMEI = 0 event).
+
+### Défauts traités (arbitrage cœur 7033006772 CLAUDE2 = Option C x 2)
+
+**Défaut 1 — traces MSISDN/IMEI incomplètes (Option C).** Le repli `pseudonym_subscriber_text(key, value.as_bytes())` sur vault vide dérivait localement un pseudonyme qui ne match AUCUN event : les decoders utilisent des domains pseudonymiques distincts (`subscriber`, `gpsi-msisdn`, `pei-imei`, `pfcp-user-id`), qui divergent même pour un même abonné. Résultat ANR1 : seuls les quelques events SBI dont le `subscriber_pseudonym` SUPI corrélé a été appris par ailleurs étaient routés. Correctif :
+- Suppression du repli dans `create()` (fin de `pseudonym_subscriber_text` côté live_trace).
+- Vault vide → trace `armed=true`, `subscriber_pseudonyms=[]` (aucun pseudonyme fictif publié), s'arme (`armed=false`) à la première observation.
+- Amorçage de `state.keys` avec les **chiffres canoniques** de la saisie (strip TS 29.571 §5.4.5 des préfixes `imsi-`/`msisdn-`/`imei-`/`supi-`, conserve ≥ 5 digits). Couvre les cas EPS/SUCI null-scheme où l'identité remonte en clair (NAS Identity Response, Attach Request S1-MME) et le body SBI `Nudm_SDM gpsis` avant pseudonymisation.
+
+**Défaut 2 — PFCP/GTP-U absent du live (Option C, A refusée).** Nsmf-PDUSession ne porte pas de SEID (N4 uniquement). Rattachement de session **dans `TraceState`**, par abonné :
+- Nouveaux champs : `tunnel_teids: HashSet<String>` (hex normalisé `0x..`), `tunnel_endpoints: HashSet<(ip, teid)>`, `seids: HashSet<String>` (`0x{:016x}`), `ue_ips: HashSet<String>` (clair, interne au process ; jamais exposé via SSE/API/logs).
+- Match étendu dans `route_normalized` (OR) : `pseudo ∨ state.keys ∨ seid ∈ state.seids ∨ teid ∈ state.tunnel_teids ∨ (ip,teid) ∈ state.tunnel_endpoints`.
+- Apprentissage après routage : IE `PDU address` (NAS) → `state.ue_ips` + pseudonyme `pfcp-ue-ip` ajouté à `state.keys` (même domain que decoder-pfcp IE 93, permet de router PFCP Session Est. qui ne porte que l'UE IP pseudonymisée) ; tuples (ip, teid) via `parse_tunnel_pairs` (couvre NGAP n2SmInfo multipart + PFCP F-TEID IE 21 + PFCP Outer Header Creation IE 84 + legacy SBI `tunnel_endpoint_ip`/`gtp_teid`) ; SEID `seid`/`f_seid` ; TEID `teid`/`gtp_teid*`.
+- Règles EXACT, identiques au moteur de publication (`correlation-engine::tunnel_keys` + `directional_tunnel_components`), aucune heuristique temporelle.
+- Fin de session (`UE Context Release Complete`, `PDU Session Release Complete`, `Delete Session Response`, `Detach Accept`) : purge `state.keys + tunnel_teids + tunnel_endpoints + seids + ue_ips`, sinon un TEID/SEID réutilisé par un autre abonné serait routé à tort.
+
+### Tests ajoutés (4 nouveaux, 12 runs × 0 échec)
+
+- `imsi_and_msisdn_traces_route_the_same_event_set_2_21_90` — deux traces du même abonné (IMSI vs MSISDN) partageant le subscriber_pseudonym vault → même ensemble d'events routés. Prouve défaut 1.
+- `session_nas_ngap_pfcp_gtpu_all_routed_in_order_2_21_90` — session synthétique NAS Est. Accept → NGAP PDUSessionResourceSetupRequest (UL/DL F-TEID) → PFCP Est. Req (F-TEID) → PFCP Mod. Req (OHC + SEID) → GTP-U UL : 5/5 routés **dans l'ordre**, `tunnel_teids` + `tunnel_endpoints` + `seids` + `ue_ips` apprises. Prouve défaut 2.
+- `canonical_digits_strips_prefixes_and_keeps_ge5_digits_2_21_90` — règles TS 29.571 §5.4.5 (préfixes, ≥ 5 digits).
+- `parse_tunnel_pairs_covers_ngap_and_pfcp_formats_2_21_90` — 4 formats de decoders (NGAP multipart, PFCP F-TEID, PFCP OHC, SBI legacy), normalisation IP + TEID.
+- `parse_seids_normalises_to_16_hex_digits_2_21_90` — `0x1001` ↔ `0x0000000000001001` (stable entre decoders).
+
+### Rattachement avec le moteur de publication
+
+Les règles de match (N2↔N4↔N3) sont strictement celles de `correlation-engine::correlate_cross_interface_evidence` (NGAP n2SmInfo UL NG-U = PFCP Created-PDR F-TEID ⇒ EXACT) + `correlate_n4_n3` (PFCP F-TEID = GTP-U destination tunnel ⇒ EXACT). Seule différence : le live les applique **en incrémental** sur l'abonné déjà identifié, le batch de publication les applique sur l'ensemble du dataset. Aucune relaxation d'évidence.
+
+### Fichiers touchés
+
+- `OIRAN/apps/api/src/live_trace.rs` : +310 lignes (helpers `canonical_digits`, `ie_values`, `parse_tunnel_pairs`, `parse_teids`, `parse_seids`, `parse_pdu_address`, `session_ids_named`, `pseudonym_key` OnceLock ; champs `TraceState` ; refonte `route_normalized` ; refonte `create()` ; 5 tests).
+- `OIRAN/apps/api/Cargo.toml` : `version = "2.21.90"`.
+- `OIRAN/CHANGELOG.md` : ce bloc.
+
+### Scope
+
+- CLAUDE1 fait le défaut 3 (`stable_event_key`, 2.21.91) dans le même fichier en parallèle. Zones touchées 2.21.90 : helpers haut du module, champs `TraceState`, corps `route_normalized`, corps `create`, `state_with_initial_keys` dans tests. Pas d'intersection avec le hash d'event ID (défaut 3 publie un `stable_event_key` additionnel à côté de `event_id`).
+- Aucun bump de crate partagée (`event-schema`, `decoder-sbi`, `decoder-ngap`, `decoder-pfcp` inchangés) : les IE values textuelles consommées sont déjà émises par les decoders en 2.21.89. `OIRAN/vtap` non concerné (pas de bump partagé).
+
+### Preuves (règle CPU #9 7018292949)
+
+Préflight final :
+
+```
+cat /proc/pressure/cpu   → some avg10=0.41 full avg10=0.00  (GO)
+cat /proc/pressure/memory→ full avg10=0.00  (GO)
+free -b | awk /Mem/      → avail=9 670 590 464 (≥ 4 GiB GO)
+df -B1 / | tail -1       → avail=34 507 362 304 (≥ 25 Go GO)
+nproc                    → 10
+```
+
+Workspace check sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3` :
+
+```
+cargo check --locked --workspace --tests -j 2
+→ 0 error, warnings pré-existants uniquement (24 oiran-api, 11 live-probe, 2 session-engine, 1 decoder-ngap, idem pré-2.21.90).
+DURATION 55 s, cpu some avg10 before=0.22 / after=1.78.
+```
+
+Tests lib `oiran-api` 12 runs (règle « 12 runs à 0 échec pour les tests ajoutés » feedback_polaris_12_runs_for_concurrent_guard) :
+
+```
+for i in $(seq 1 12); do
+  flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 \
+    cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2
+done
+→ Run  1: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.31s
+→ Run  2: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.81s
+→ Run  3: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 15.02s
+→ Run  4: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.65s
+→ Run  5: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 15.04s
+→ Run  6: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.49s
+→ Run  7: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.77s
+→ Run  8: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.64s
+→ Run  9: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 13.64s
+→ Run 10: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.67s
+→ Run 11: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 14.15s
+→ Run 12: test result: ok. 222 passed; 0 failed; 3 ignored; finished in 15.01s
+DURATION ≈ 178 s (12 × 14.7 s), cpu some avg10 before=4.12 / after=1.65.
+```
+
+12/12 à 222 passed, 0 failed. 222 = 217 historiques (2.21.89) + 5 ajoutés 2.21.90. Les 3 `ignored` sont des tests réseau existants (non impactés). Aucun test n'est marqué `#[ignore]` par 2.21.90 (feedback_polaris_no_ignore_tests respecté).
+
+Verrou partagé : au préflight, `/tmp/nsplus-heavy-build.lock` tenu par CLAUDE1 (worktree 2.21.91, défaut 3 `stable_event_key`). Attente dans `flock -w 900` jusqu'à libération, pas de contournement (feedback_polaris_cpu_protection).
+
+Audit lock Rust 1.83 : `OIRAN/Cargo.lock` modifié uniquement `[[package]] name = "oiran-api" version = "2.21.90"` (ligne 677). Aucune autre entrée ni empreinte. `cargo check --locked` passe ⇒ lock cohérent avec les manifestes.
 
 ## OIRAN API 2.21.89 — 2026-11-19 — train de livraison : 2.21.87 + 2.21.88 merge --no-ff (ordre #9 7019778994 CLAUDE1)
 
@@ -547,7 +635,6 @@ git diff OIRAN/Cargo.lock                  → (vide)
 
 - `/sessions/:id/journey`, `/sessions/:id/callflow`, `/sessions` list : gardent le modèle actuel avec `heavy_memory_try_enter`. Lot ultérieur si ANR2 mesure une fenêtre 503 persistante sur ces routes.
 - Optimisation COW par-session pour réduire le pic +95 MB sur 10 000 sessions : lot ultérieur si `SESSIONS_FILTER_GENERATION_SWAP bytes_estimate` approche la borne memcg.
-=======
 ## OIRAN API 2.21.88 — 2026-11-19 — écriture atomique durable + reprise auto après récupération disque (ordre #9 7017408187 CLAUDE2)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.83-train` @ `4dcaa9f`. Branche `fix/oiran-2.21.88-atomic-state-resume`. Numerology CLAUDE2 = pair.

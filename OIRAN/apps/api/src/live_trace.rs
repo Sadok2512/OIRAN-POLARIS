@@ -7,11 +7,11 @@ use super::*;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::Infallible,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -67,7 +67,188 @@ struct TraceState {
     last_packet: HashMap<String, u64>,
     /// 2.18.6 — messages déjà émis (capture_id, packet_number, event_id).
     seen: HashSet<(String, u64, String)>,
+    /// 2.21.90 défaut 2 — TEID (hex normalisé `0x..`) appris depuis les
+    /// events routés. Permet de router un GTP-U/PFCP qui ne porte pas
+    /// de pseudonyme abonné mais un TEID connu.
+    tunnel_teids: HashSet<String>,
+    /// 2.21.90 défaut 2 — tuples (ip normalisée, teid hex) F-TEID
+    /// appris. Permet le match NGAP↔PFCP par tunnel endpoint.
+    tunnel_endpoints: HashSet<(String, String)>,
+    /// 2.21.90 défaut 2 — SEID (hex normalisé) appris depuis les events
+    /// PFCP routés de l'abonné. Un event PFCP futur portant ce SEID est
+    /// routé sans autre preuve.
+    seids: HashSet<String>,
+    /// 2.21.90 défaut 2 — IP UE (clair) apprises depuis NAS PDU Address.
+    /// Conservées en mémoire du process pour le routage ; ne sont jamais
+    /// exportées via SSE/API/logs (invariant privacy « pas d'IP UE en
+    /// clair hors identity vault »).
+    ue_ips: HashSet<String>,
 }
+/// 2.21.90 défaut 2 — clé HMAC partagée pour pseudonymiser l'IP UE
+/// apprise depuis NAS, dans le même domain que `decoder-pfcp` (IE 93),
+/// afin de router les PFCP Session Establishment qui ne portent que
+/// cette UE IP pseudonymisée. Chargée au plus une fois par process ;
+/// absence de clé ⇒ routage par (ip,teid)/SEID seulement.
+fn pseudonym_key() -> Option<&'static event_schema::PseudonymKey> {
+    static KEY: OnceLock<Option<event_schema::PseudonymKey>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        event_schema::PseudonymKey::load_or_generate(
+            &event_schema::PseudonymKey::resolve_default_path(),
+        )
+        .ok()
+    })
+    .as_ref()
+}
+
+/// 2.21.90 défaut 1 — chiffres canoniques d'une saisie clair-text IMSI/
+/// MSISDN/IMEI/SUPI/TMSI. Strippe le préfixe `imsi-/msisdn-/imei-/supi-`
+/// (TS 29.571 §5.4.5) puis ne conserve que les ASCII digits. Retourne
+/// `None` sous 5 chiffres (seuil `identity_vault::lookup_keys`, évite
+/// les collisions arbitraires dans `encoded.contains`). Utilisé pour
+/// amorcer `state.keys` : un event qui porte la valeur en clair dans
+/// n'importe quel IE (cas EPS/SUCI null-scheme) est routé.
+fn canonical_digits(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let without_prefix = trimmed
+        .strip_prefix("imsi-")
+        .or_else(|| trimmed.strip_prefix("IMSI-"))
+        .or_else(|| trimmed.strip_prefix("msisdn-"))
+        .or_else(|| trimmed.strip_prefix("MSISDN-"))
+        .or_else(|| trimmed.strip_prefix("imei-"))
+        .or_else(|| trimmed.strip_prefix("IMEI-"))
+        .or_else(|| trimmed.strip_prefix("imeisv-"))
+        .or_else(|| trimmed.strip_prefix("IMEISV-"))
+        .or_else(|| trimmed.strip_prefix("supi-"))
+        .or_else(|| trimmed.strip_prefix("SUPI-"))
+        .unwrap_or(trimmed);
+    let digits: String = without_prefix.chars().filter(char::is_ascii_digit).collect();
+    (digits.len() >= 5).then_some(digits)
+}
+
+/// 2.21.90 défaut 2 — itère les valeurs textuelles des IE d'un event
+/// déjà sérialisé en JSON. Chaque IE expose un champ `value` chaîné
+/// `key=value,key=value,…` (format produit par les decoders).
+fn ie_values(value: &Value) -> Vec<String> {
+    value
+        .get("information_elements")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|ie| ie.get("value").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
+/// 2.21.90 défaut 2 — tuples (ip, teid) extraits d'une IE `value`.
+/// Couvre les trois formats produits par decoder-* :
+///   * (`tunnel_endpoint_ip`, `gtp_teid`) — SBI/N4 legacy.
+///   * (`ipv4`, `teid`) — PFCP F-TEID IE 21 et Outer Header Creation IE 84.
+///   * (`item_*_tunnel_ip_ul|dl`, `item_*_gtp_teid_ul|dl`) — NGAP
+///     PDU Session Resource Setup multipart.
+/// Exactement les mêmes règles que `correlation-engine::tunnel_keys` +
+/// `directional_tunnel_components`. IP normalisée (strip `::ffff:`) et
+/// TEID normalisé (`event_schema::normalize_teid_hex`).
+fn parse_tunnel_pairs(ie_value: &str) -> Vec<(String, String)> {
+    let components: BTreeMap<&str, &str> = ie_value
+        .split(',')
+        .filter_map(|part| {
+            let (k, v) = part.split_once('=')?;
+            Some((k.trim(), v.trim()))
+        })
+        .collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (ip_name, teid_name) in [("tunnel_endpoint_ip", "gtp_teid"), ("ipv4", "teid")] {
+        if let (Some(ip), Some(teid)) = (components.get(ip_name), components.get(teid_name)) {
+            if let Some(nteid) = event_schema::normalize_teid_hex(teid) {
+                out.push((event_schema::normalize_ip(ip), nteid));
+            }
+        }
+    }
+    for direction in ["ul", "dl"] {
+        let ip_suf = format!("tunnel_ip_{direction}");
+        let teid_suf = format!("gtp_teid_{direction}");
+        for (ip_key, ip_val) in components.iter() {
+            let suffix_match = *ip_key == ip_suf.as_str()
+                || ip_key.ends_with(&format!("_{ip_suf}"));
+            if !suffix_match {
+                continue;
+            }
+            let prefix = ip_key.strip_suffix(ip_suf.as_str()).unwrap_or_default();
+            let teid_key = format!("{prefix}{teid_suf}");
+            if let Some(t) = components.get(teid_key.as_str()) {
+                if let Some(nteid) = event_schema::normalize_teid_hex(t) {
+                    out.push((event_schema::normalize_ip(ip_val), nteid));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 2.21.90 défaut 2 — tous les TEID (hex) présents dans une IE `value` :
+/// `teid=0x..`, `gtp_teid=0x..`, `gtp_teid_ul=..`, `gtp_teid_dl=..`,
+/// ou `item_*_gtp_teid_*=..`. Normalisation `normalize_teid_hex`.
+fn parse_teids(ie_value: &str) -> Vec<String> {
+    ie_value
+        .split(',')
+        .filter_map(|part| {
+            let (k, v) = part.split_once('=')?;
+            let key = k.trim();
+            let is_teid = key == "teid"
+                || key == "gtp_teid"
+                || key == "gtp_teid_ul"
+                || key == "gtp_teid_dl"
+                || key.ends_with("_gtp_teid")
+                || key.ends_with("_gtp_teid_ul")
+                || key.ends_with("_gtp_teid_dl");
+            if !is_teid {
+                return None;
+            }
+            event_schema::normalize_teid_hex(v.trim())
+        })
+        .collect()
+}
+
+/// 2.21.90 défaut 2 — tous les SEID (`seid=0x..`, `f_seid=0x..`) d'une
+/// IE value, normalisés `0x{:016x}`.
+fn parse_seids(ie_value: &str) -> Vec<String> {
+    ie_value
+        .split(',')
+        .filter_map(|part| {
+            let (k, v) = part.split_once('=')?;
+            let key = k.trim();
+            if key != "seid" && key != "f_seid" {
+                return None;
+            }
+            let hex = v.trim().trim_start_matches("0x").trim_start_matches("0X");
+            u64::from_str_radix(hex, 16).ok().map(|n| format!("0x{n:016x}"))
+        })
+        .collect()
+}
+
+/// 2.21.90 défaut 2 — IP UE extraite d'une IE NAS « PDU address »
+/// (`type=1,address=A.B.C.D`). Retour en forme clair IPv4, ou `None`.
+fn parse_pdu_address(ie_value: &str) -> Option<String> {
+    ie_value.split(',').find_map(|part| {
+        let (k, v) = part.split_once('=')?;
+        (k.trim() == "address").then(|| event_schema::normalize_ip(v.trim()))
+    })
+}
+
+/// 2.21.90 défaut 2 — valeurs des `session_identifiers` d'un event
+/// pour un `name` donné (ex. `"seid"`, `"teid"`).
+fn session_ids_named<'a>(value: &'a Value, name: &str) -> Vec<&'a str> {
+    value
+        .get("session_identifiers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| {
+            let n = id.get("name").and_then(Value::as_str)?;
+            (n == name).then(|| id.get("value").and_then(Value::as_str)).flatten()
+        })
+        .collect()
+}
+
 pub(crate) struct LiveTraceRegistry {
     traces: Mutex<HashMap<String, TraceState>>,
     reader_running: AtomicBool,
@@ -143,6 +324,29 @@ impl LiveTraceRegistry {
     fn route_normalized(&self, event: &event_schema::NormalizedEvent) {
         let value = serde_json::from_str(&event.to_json()).unwrap_or(Value::Null);
         let encoded = value.to_string();
+        // 2.21.90 défaut 2 — facts extraits une seule fois par event,
+        // puis consultés et pour le match (SEID/TEID/(ip,teid) déjà
+        // connus) et pour l'apprentissage après routage.
+        let ev_ies: Vec<String> = ie_values(&value);
+        let ev_tunnel_pairs: Vec<(String, String)> =
+            ev_ies.iter().flat_map(|v| parse_tunnel_pairs(v)).collect();
+        let ev_teids: Vec<String> = ev_ies.iter().flat_map(|v| parse_teids(v)).collect();
+        let ev_seids_ie: Vec<String> = ev_ies.iter().flat_map(|v| parse_seids(v)).collect();
+        let ev_session_seids: Vec<String> = session_ids_named(&value, "seid")
+            .into_iter()
+            .filter_map(|s| {
+                let hex = s.trim_start_matches("0x").trim_start_matches("0X");
+                u64::from_str_radix(hex, 16).ok().map(|n| format!("0x{n:016x}"))
+            })
+            .collect();
+        let ev_session_teids: Vec<String> = session_ids_named(&value, "teid")
+            .into_iter()
+            .filter_map(event_schema::normalize_teid_hex)
+            .collect();
+        let ev_pdu_address: Option<String> = ev_ies
+            .iter()
+            .find(|v| v.starts_with("type=") && v.contains(",address="))
+            .and_then(|v| parse_pdu_address(v));
         let mut traces = self.traces.lock().unwrap();
         Self::purge(&mut traces);
         for state in traces.values_mut() {
@@ -155,12 +359,31 @@ impl LiveTraceRegistry {
             {
                 continue;
             }
-            let matched = state
+            // 2.21.90 défaut 1 — match par pseudonymes vault et par
+            // chiffres canoniques amorcés / identifiants appris
+            // (`state.keys`). 2.21.90 défaut 2 — rattachement de
+            // session : un event PFCP/GTP-U qui ne porte pas le
+            // subscriber_pseudonym mais un SEID/TEID/(ip,teid) déjà
+            // appris pour l'abonné est routé (règle EXACT, pas de
+            // fenêtre temporelle).
+            let match_pseudo = state
                 .trace
                 .subscriber_pseudonyms
                 .iter()
-                .any(|key| encoded.contains(key))
-                || state.keys.iter().any(|key| encoded.contains(key));
+                .any(|key| encoded.contains(key));
+            let match_keys = state.keys.iter().any(|key| encoded.contains(key));
+            let match_seid = ev_session_seids
+                .iter()
+                .chain(ev_seids_ie.iter())
+                .any(|s| state.seids.contains(s));
+            let match_teid = ev_session_teids
+                .iter()
+                .chain(ev_teids.iter())
+                .any(|t| state.tunnel_teids.contains(t));
+            let match_tunnel = ev_tunnel_pairs
+                .iter()
+                .any(|pair| state.tunnel_endpoints.contains(pair));
+            let matched = match_pseudo || match_keys || match_seid || match_teid || match_tunnel;
             if !matched {
                 continue;
             }
@@ -174,6 +397,42 @@ impl LiveTraceRegistry {
                     }
                 }
             }
+            // 2.21.90 défaut 2 — apprentissage de session depuis l'event
+            // routé : IP UE (NAS), tuples (ip, teid) (NGAP n2SmInfo,
+            // PFCP F-TEID/Outer Header Creation), SEID (PFCP header +
+            // IE f_seid), TEID (GTP-U header + sous-IE). Cet état sert
+            // à router les events suivants de la même session sans
+            // dépendre d'un subscriber_pseudonym (qui diffère entre
+            // domaines pseudonymiques `subscriber`, `pfcp-user-id`,
+            // etc.).
+            for pair in &ev_tunnel_pairs {
+                state.tunnel_endpoints.insert(pair.clone());
+                state.tunnel_teids.insert(pair.1.clone());
+            }
+            for t in ev_teids.iter().chain(ev_session_teids.iter()) {
+                state.tunnel_teids.insert(t.clone());
+            }
+            for s in ev_seids_ie.iter().chain(ev_session_seids.iter()) {
+                state.seids.insert(s.clone());
+            }
+            if let Some(ip) = ev_pdu_address.as_deref() {
+                state.ue_ips.insert(ip.to_owned());
+                // Pseudonyme UE IP (domain `pfcp-ue-ip`) : correspond à
+                // `decoder-pfcp` IE 93. Un PFCP Session Establishment
+                // qui ne porte que cette UE IP pseudonymisée match via
+                // `state.keys` (`encoded.contains(pseudonym)`).
+                if let Some(key) = pseudonym_key() {
+                    if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                        let bytes: Vec<u8> = match addr {
+                            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+                        };
+                        state
+                            .keys
+                            .insert(event_schema::pseudonym(key, "pfcp-ue-ip", &bytes));
+                    }
+                }
+            }
             if matches!(
                 event.message_name.as_str(),
                 "UE Context Release Complete"
@@ -182,6 +441,13 @@ impl LiveTraceRegistry {
                     | "Detach Accept"
             ) {
                 state.keys.clear();
+                // 2.21.90 défaut 2 — fin de session : on oublie aussi
+                // les tunnels/SEID appris, sinon un TEID/SEID réutilisé
+                // par un autre abonné serait routé à tort.
+                state.tunnel_teids.clear();
+                state.tunnel_endpoints.clear();
+                state.seids.clear();
+                state.ue_ips.clear();
             }
             let packet = event
                 .packet_references
@@ -598,34 +864,36 @@ pub(crate) async fn create(
     if require_csrf(&state, &headers).is_err() {
         return require_csrf(&state, &headers).unwrap_err();
     }
-    let mut armed = false;
-    let pseudonyms = if input.key_type == "pseudonym" {
-        vec![input.value.trim().to_owned()]
+    // 2.21.90 défaut 1 (option C, ordre #9 7033006772) — on supprime
+    // le repli `pseudonym_subscriber_text` qui, sur vault vide, dérivait
+    // un pseudonyme local à partir des octets de la saisie clair-text.
+    // Ce pseudonyme ne matchait AUCUN event car les decoders utilisent
+    // des domains distincts (`subscriber`, `pfcp-user-id`, GPSI_MSISDN,
+    // PEI_IMEI, …) qui divergent même pour un même abonné. Résultat :
+    // les traces MSISDN/IMEI ne voyaient qu'une poignée d'events SBI
+    // (ceux dont le subscriber_pseudonym SUPI corrélé a été appris
+    // par ailleurs), et jamais la session complète.
+    //
+    // Nouveau comportement :
+    //  * key_type == `pseudonym` → pseudonyme exact fourni.
+    //  * key_type parmi `imsi`/`tmsi`/`s_tmsi`/`m_tmsi`/`imei`/`msisdn` :
+    //    - vault non vide → pseudonymes vault (identité canonique
+    //      corrélée via sessions déjà observées). `armed=false`.
+    //    - vault vide → trace `armed=true` sans pseudonyme ; routage
+    //      uniquement par `state.keys` amorcé avec les chiffres
+    //      canoniques et enrichi au fil des events (tunnels, SEID,
+    //      UE IP pseudonymisée). S'arme (armed=false) dès le premier
+    //      event routé.
+    let (pseudonyms, armed) = if input.key_type == "pseudonym" {
+        (vec![input.value.trim().to_owned()], false)
     } else {
         match state
             .inner
             .identity_vault
             .pseudonyms_for_value(input.value.trim())
         {
-            Ok(v) if !v.is_empty() => v,
-            Ok(_) => {
-                armed = true;
-                match event_schema::PseudonymKey::load_or_generate(
-                    &event_schema::PseudonymKey::resolve_default_path(),
-                ) {
-                    Ok(key) => vec![pseudonym_subscriber_text(
-                        &key,
-                        input.value.trim().as_bytes(),
-                    )],
-                    Err(_) => {
-                        return api_error(
-                            StatusCode::NOT_IMPLEMENTED,
-                            "PSEUDONYM_KEY_UNAVAILABLE",
-                            "identity trace cannot be armed",
-                        )
-                    }
-                }
-            }
+            Ok(v) if !v.is_empty() => (v, false),
+            Ok(_) => (Vec::new(), true),
             Err(_) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -635,6 +903,19 @@ pub(crate) async fn create(
             }
         }
     };
+    // 2.21.90 défaut 1 — amorçage de `state.keys` avec les chiffres
+    // canoniques de la saisie (TS 29.571 §5.4.5 strip de `imsi-`,
+    // `msisdn-`, `imei-`, `supi-` ; conserve ≥5 digits). Couvre les
+    // cas EPS/SUCI null-scheme où l'identité remonte **en clair** dans
+    // les premiers events (NAS Identity Response / Attach Request S1-MME)
+    // ainsi que le GPSI `msisdn-<E164>` observé dans le body SBI
+    // Nudm_SDM (champ `gpsis`) avant pseudonymisation côté decoder.
+    let mut initial_keys: HashSet<String> = HashSet::new();
+    if input.key_type != "pseudonym" {
+        if let Some(digits) = canonical_digits(input.value.trim()) {
+            initial_keys.insert(digits);
+        }
+    }
     let now = epoch_seconds();
     let digest = sha256_hex(format!("{}:{}:{}", now, input.key_type, input.value).as_bytes());
     let trace_id = format!("trace-{}", &digest[..16]);
@@ -668,13 +949,17 @@ pub(crate) async fn create(
             next_id: 0,
             events: VecDeque::new(),
             tx,
-            keys: HashSet::new(),
+            keys: initial_keys,
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
             unknown_bytes: 0,
             last_packet: HashMap::new(),
             seen: HashSet::new(),
+            tunnel_teids: HashSet::new(),
+            tunnel_endpoints: HashSet::new(),
+            seids: HashSet::new(),
+            ue_ips: HashSet::new(),
         },
     );
     drop(traces);
@@ -1013,12 +1298,20 @@ fn correlate_sessions_by_pseudonyms(state: &AppState, pseudos: &HashSet<String>)
 mod tests {
     use super::*;
     fn state(expires_at: u64, armed: bool, keys: Vec<String>) -> TraceState {
+        state_with_initial_keys(expires_at, armed, keys, HashSet::new())
+    }
+    fn state_with_initial_keys(
+        expires_at: u64,
+        armed: bool,
+        pseudos: Vec<String>,
+        initial_keys: HashSet<String>,
+    ) -> TraceState {
         let (tx, _) = broadcast::channel(MAX_EVENTS);
         TraceState {
             trace: LiveTrace {
                 trace_id: "t".into(),
                 key_type: "pseudonym".into(),
-                subscriber_pseudonyms: keys,
+                subscriber_pseudonyms: pseudos,
                 interfaces: vec![],
                 created_at: 0,
                 expires_at,
@@ -1031,13 +1324,17 @@ mod tests {
             next_id: 0,
             events: VecDeque::new(),
             tx,
-            keys: HashSet::new(),
+            keys: initial_keys,
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
             unknown_bytes: 0,
             last_packet: HashMap::new(),
             seen: HashSet::new(),
+            tunnel_teids: HashSet::new(),
+            tunnel_endpoints: HashSet::new(),
+            seids: HashSet::new(),
+            ue_ips: HashSet::new(),
         }
     }
     #[test]
@@ -1509,5 +1806,442 @@ mod tests {
         let serialized = entry.to_string();
         assert!(!serialized.contains("\"value\""));
         assert!(!serialized.contains("\"q\""));
+    }
+
+    /// 2.21.90 défaut 1 (ordre #9 7033006772) — deux traces du même
+    /// abonné (IMSI vs MSISDN) partageant le subscriber_pseudonym
+    /// renvoyé par le vault routent exactement le même ensemble
+    /// d'events, et `state.keys` amorcé avec les chiffres canoniques
+    /// permet en plus d'attraper les events qui ne portent que la
+    /// forme clear-text (cas EPS/SUCI null-scheme / GPSI de la SBI).
+    #[test]
+    fn imsi_and_msisdn_traces_route_the_same_event_set_2_21_90() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        fn event(
+            interface: &str,
+            protocol: Protocol,
+            message: &str,
+            packet: u64,
+            seconds: i64,
+            session_ids: Vec<(&str, &str)>,
+            ies: Vec<(&str, &str)>,
+        ) -> NormalizedEvent {
+            NormalizedEvent {
+                event_id: format!("ev-{}-{packet}", interface.to_ascii_lowercase()),
+                parent_event_id: None,
+                probe_id: "test".into(),
+                capture_point_id: interface.into(),
+                capture_id: "c".into(),
+                packet_references: vec![PacketReference {
+                    source_file: "x".into(),
+                    source_sha256: None,
+                    packet_number: packet,
+                    byte_offset: 0,
+                    interface_id: 0,
+                    link_type: None,
+                    sll2_protocol_type: None,
+                    sll2_reserved: None,
+                    sll2_interface_index: None,
+                    sll2_arphrd_type: None,
+                    sll2_packet_type: None,
+                    sll2_address_length: None,
+                    sll2_address: None,
+                    captured_length: 100,
+                    original_length: 100,
+                }],
+                timestamp: ExactTimestamp {
+                    seconds,
+                    nanoseconds: 0,
+                    raw_ticks: (seconds.max(0) as u64) * 1_000_000_000,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: interface.into(),
+                protocol,
+                message_name: message.into(),
+                message_type: 0,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "10.0.0.1".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "10.0.0.2".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction: Direction::Uplink,
+                session_identifiers: session_ids
+                    .into_iter()
+                    .map(|(n, v)| NamedValue {
+                        name: n.into(),
+                        value: v.into(),
+                        pseudonymized: n == "subscriber_pseudonym",
+                    })
+                    .collect(),
+                information_elements: ies
+                    .into_iter()
+                    .map(|(n, v)| InformationElement {
+                        id: None,
+                        name: n.into(),
+                        length: v.len() as u32,
+                        value: Some(v.into()),
+                        raw_sha256: None,
+                        status: DecodeStatus::Decoded,
+                    })
+                    .collect(),
+                decoder_name: "test".into(),
+                decoder_version: "0".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: "sha256:x".into(),
+                evidence_references: vec![EvidenceReference {
+                    state: EvidenceState::Exact,
+                    kind: "packet-provenance".into(),
+                    reference: "sha256:x".into(),
+                }],
+                sbi: None,
+            }
+        }
+        // L'identité canonique : vault a observé IMSI et MSISDN pour la
+        // même session → retourne le même subscriber_pseudonym SUPI.
+        let pseudo_supi = "psn-supi-abc".to_owned();
+        // Séquence SBI/NAS caractéristique d'un attach :
+        //  e1 (Nausf_UEAuthentication) porte subscriber_pseudonym seul,
+        //  e2 (N1N2MessageTransfer) porte subscriber_pseudonym +
+        //     msisdn_pseudonym (SMF publie GPSI et SUPI ensemble),
+        //  e3 (Nudm_SDM gpsis) ne porte que msisdn_pseudonym (réponse
+        //     Nudm au query gpsis, PAS de subscriber_pseudonym).
+        // Pour la trace MSISDN en 2.21.74, e3 n'était PAS routé (hash
+        // différent) ; en 2.21.90, l'apprentissage de msisdn_pseudonym
+        // depuis les session_identifiers de e2 (déjà routé par pseudo
+        // SUPI) permet de router e3 via `state.keys`.
+        let e1 = event(
+            "SBI",
+            Protocol::SbiHttp2,
+            "Nausf_UEAuthentication",
+            1,
+            10,
+            vec![("subscriber_pseudonym", pseudo_supi.as_str())],
+            vec![],
+        );
+        let e2 = event(
+            "SBI",
+            Protocol::SbiHttp2,
+            "N1N2MessageTransfer",
+            2,
+            10,
+            vec![
+                ("subscriber_pseudonym", pseudo_supi.as_str()),
+                ("msisdn_pseudonym", "psn-gpsi-msisdn-xyz"),
+            ],
+            vec![],
+        );
+        let e3 = event(
+            "SBI",
+            Protocol::SbiHttp2,
+            "Nudm_SDM_AmData",
+            3,
+            10,
+            vec![("msisdn_pseudonym", "psn-gpsi-msisdn-xyz")],
+            vec![],
+        );
+        // Trace « IMSI » (vault connaît l'IMSI → même pseudo SUPI).
+        let r_imsi = LiveTraceRegistry::new();
+        r_imsi.traces.lock().unwrap().insert(
+            "t".into(),
+            state_with_initial_keys(
+                u64::MAX,
+                false,
+                vec![pseudo_supi.clone()],
+                HashSet::from(["208930000000123".into()]),
+            ),
+        );
+        // Trace « MSISDN » : mêmes pseudos vault, chiffres canoniques
+        // différents (E.164). Doit router exactement les mêmes events.
+        let r_msisdn = LiveTraceRegistry::new();
+        r_msisdn.traces.lock().unwrap().insert(
+            "t".into(),
+            state_with_initial_keys(
+                u64::MAX,
+                false,
+                vec![pseudo_supi.clone()],
+                HashSet::from(["33612345678".into()]),
+            ),
+        );
+        for ev in [&e1, &e2, &e3] {
+            r_imsi.route_normalized(ev);
+            r_msisdn.route_normalized(ev);
+        }
+        let imsi_ids: Vec<String> = r_imsi.traces.lock().unwrap()["t"]
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+            .collect();
+        let msisdn_ids: Vec<String> = r_msisdn.traces.lock().unwrap()["t"]
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(imsi_ids, msisdn_ids, "IMSI et MSISDN doivent router le même set");
+        assert_eq!(
+            imsi_ids,
+            vec!["ev-sbi-1", "ev-sbi-2", "ev-sbi-3"],
+            "les 3 events de la session doivent être routés"
+        );
+    }
+
+    /// 2.21.90 défaut 2 (ordre #9 7033006772) — session synthétique
+    /// NAS → NGAP → PFCP Est → PFCP Mod → GTP-U : les 5 events sont
+    /// tous routés dans l'ordre, par rattachement de session
+    /// (UE IP + F-TEID + SEID), sans qu'aucune règle temporelle ne
+    /// soit utilisée. Preuve PFCP/GTP-U couverts côté live (défaut
+    /// ANR1 7021842930 : « N4 non rattaché dans le live »).
+    #[test]
+    fn session_nas_ngap_pfcp_gtpu_all_routed_in_order_2_21_90() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        fn ev(
+            interface: &str,
+            protocol: Protocol,
+            message: &str,
+            packet: u64,
+            session_ids: Vec<(&str, &str)>,
+            ies: Vec<(&str, &str)>,
+        ) -> NormalizedEvent {
+            NormalizedEvent {
+                event_id: format!("ev-{packet}"),
+                parent_event_id: None,
+                probe_id: "test".into(),
+                capture_point_id: interface.into(),
+                capture_id: "c".into(),
+                packet_references: vec![PacketReference {
+                    source_file: "x".into(),
+                    source_sha256: None,
+                    packet_number: packet,
+                    byte_offset: 0,
+                    interface_id: 0,
+                    link_type: None,
+                    sll2_protocol_type: None,
+                    sll2_reserved: None,
+                    sll2_interface_index: None,
+                    sll2_arphrd_type: None,
+                    sll2_packet_type: None,
+                    sll2_address_length: None,
+                    sll2_address: None,
+                    captured_length: 100,
+                    original_length: 100,
+                }],
+                timestamp: ExactTimestamp {
+                    seconds: 10,
+                    nanoseconds: packet as u32,
+                    raw_ticks: 10_000_000_000 + packet,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: interface.into(),
+                protocol,
+                message_name: message.into(),
+                message_type: 0,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "10.0.0.1".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "10.0.0.2".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction: Direction::Uplink,
+                session_identifiers: session_ids
+                    .into_iter()
+                    .map(|(n, v)| NamedValue {
+                        name: n.into(),
+                        value: v.into(),
+                        pseudonymized: n.ends_with("pseudonym"),
+                    })
+                    .collect(),
+                information_elements: ies
+                    .into_iter()
+                    .map(|(n, v)| InformationElement {
+                        id: None,
+                        name: n.into(),
+                        length: v.len() as u32,
+                        value: Some(v.into()),
+                        raw_sha256: None,
+                        status: DecodeStatus::Decoded,
+                    })
+                    .collect(),
+                decoder_name: "test".into(),
+                decoder_version: "0".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: "sha256:x".into(),
+                evidence_references: vec![EvidenceReference {
+                    state: EvidenceState::Exact,
+                    kind: "packet-provenance".into(),
+                    reference: "sha256:x".into(),
+                }],
+                sbi: None,
+            }
+        }
+        // 1) NAS PDU Session Establishment Accept (sur N1 transporté
+        //    via N2 NAS). Porte subscriber_pseudonym + IE "PDU address"
+        //    (IP UE clair).
+        let e_nas = ev(
+            "N2",
+            Protocol::Ngap,
+            "PDU Session Establishment Accept",
+            1,
+            vec![("subscriber_pseudonym", "psn-sub-xyz")],
+            vec![("PDU address", "type=1,address=10.45.0.7")],
+        );
+        // 2) NGAP PDUSessionResourceSetupRequest avec n2SmInfo
+        //    contenant UL/DL tunnels. Porte subscriber_pseudonym
+        //    aussi.
+        let e_ngap = ev(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            2,
+            vec![("subscriber_pseudonym", "psn-sub-xyz")],
+            vec![(
+                "PDUSessionResourceSetupRequestTransfer",
+                "item_0_tunnel_ip_ul=10.100.0.1,item_0_gtp_teid_ul=0x0000d4a6,item_0_tunnel_ip_dl=10.200.0.1,item_0_gtp_teid_dl=0x0000d4b7",
+            )],
+        );
+        // 3) PFCP Session Establishment Request : F-TEID matching UL
+        //    tunnel (ip=10.100.0.1, teid=0xd4a6) + SEID du header dans
+        //    session_identifiers. PAS de subscriber_pseudonym SUPI.
+        let e_pfcp_est = ev(
+            "N4",
+            Protocol::Pfcp,
+            "Session Establishment Request",
+            3,
+            vec![("seid", "0x0000000000001001")],
+            vec![("F-TEID", "teid=0x0000d4a6,v4=true,v6=false,ipv4=10.100.0.1")],
+        );
+        // 4) PFCP Session Modification Request : porte le SEID appris.
+        let e_pfcp_mod = ev(
+            "N4",
+            Protocol::Pfcp,
+            "Session Modification Request",
+            4,
+            vec![("seid", "0x0000000000001001")],
+            vec![(
+                "Outer Header Creation",
+                "outer_header_description=0x0100,teid=0x0000d4b7,ipv4=10.200.0.1",
+            )],
+        );
+        // 5) GTP-U UL (TEID = UL F-TEID appris).
+        let e_gtpu = ev(
+            "N3",
+            Protocol::Gtpu,
+            "G-PDU",
+            5,
+            vec![("teid", "0x0000d4a6")],
+            vec![],
+        );
+        let r = LiveTraceRegistry::new();
+        r.traces.lock().unwrap().insert(
+            "t".into(),
+            state(u64::MAX, false, vec!["psn-sub-xyz".into()]),
+        );
+        for e in [&e_nas, &e_ngap, &e_pfcp_est, &e_pfcp_mod, &e_gtpu] {
+            r.route_normalized(e);
+        }
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        let routed: Vec<String> = t
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            routed,
+            vec!["ev-1", "ev-2", "ev-3", "ev-4", "ev-5"],
+            "les 5 events doivent être routés dans l'ordre"
+        );
+        // Vérifie le rattachement appris : tunnel UL/DL, SEID.
+        assert!(t.tunnel_teids.contains("0xd4a6"));
+        assert!(t.tunnel_teids.contains("0xd4b7"));
+        assert!(t
+            .tunnel_endpoints
+            .contains(&("10.100.0.1".into(), "0xd4a6".into())));
+        assert!(t.seids.contains("0x0000000000001001"));
+        assert!(t.ue_ips.contains("10.45.0.7"));
+    }
+
+    /// 2.21.90 défaut 1 — `canonical_digits` strippe les préfixes TS
+    /// 29.571 §5.4.5 et conserve ≥5 digits.
+    #[test]
+    fn canonical_digits_strips_prefixes_and_keeps_ge5_digits_2_21_90() {
+        assert_eq!(
+            canonical_digits("imsi-208930000000123"),
+            Some("208930000000123".into())
+        );
+        assert_eq!(
+            canonical_digits("msisdn-33612345678"),
+            Some("33612345678".into())
+        );
+        assert_eq!(canonical_digits("imei-490154203237518"), Some("490154203237518".into()));
+        assert_eq!(canonical_digits("  33612345678  "), Some("33612345678".into()));
+        // Trop court → None (évite les collisions arbitraires).
+        assert_eq!(canonical_digits("1234"), None);
+        assert_eq!(canonical_digits(""), None);
+    }
+
+    /// 2.21.90 défaut 2 — `parse_tunnel_pairs` couvre les trois
+    /// formats de decoders et normalise IP + TEID (strip zero-padding).
+    #[test]
+    fn parse_tunnel_pairs_covers_ngap_and_pfcp_formats_2_21_90() {
+        // NGAP n2SmInfo multipart.
+        let pairs = parse_tunnel_pairs(
+            "item_0_tunnel_ip_ul=10.1.1.1,item_0_gtp_teid_ul=0x0000d4a6,item_0_tunnel_ip_dl=10.2.2.2,item_0_gtp_teid_dl=0x0000d4b7",
+        );
+        assert!(pairs.contains(&("10.1.1.1".into(), "0xd4a6".into())));
+        assert!(pairs.contains(&("10.2.2.2".into(), "0xd4b7".into())));
+        // PFCP F-TEID IE 21.
+        let pairs = parse_tunnel_pairs("teid=0x0000d4a6,v4=true,v6=false,ipv4=10.100.0.1");
+        assert!(pairs.contains(&("10.100.0.1".into(), "0xd4a6".into())));
+        // PFCP Outer Header Creation IE 84.
+        let pairs = parse_tunnel_pairs(
+            "outer_header_description=0x0100,teid=0x0000d4b7,ipv4=10.200.0.1",
+        );
+        assert!(pairs.contains(&("10.200.0.1".into(), "0xd4b7".into())));
+        // SBI legacy format (tunnel_endpoint_ip,gtp_teid).
+        let pairs = parse_tunnel_pairs("tunnel_endpoint_ip=10.9.9.9,gtp_teid=0xd4a6");
+        assert!(pairs.contains(&("10.9.9.9".into(), "0xd4a6".into())));
+    }
+
+    /// 2.21.90 défaut 2 — `parse_seids` normalise seid/f_seid en
+    /// `0x{:016x}` (comparaison stable entre decoders qui peuvent
+    /// publier `0x1001` vs `0x0000000000001001`).
+    #[test]
+    fn parse_seids_normalises_to_16_hex_digits_2_21_90() {
+        assert_eq!(parse_seids("seid=0x1001"), vec!["0x0000000000001001"]);
+        assert_eq!(
+            parse_seids("f_seid=0x1001,v4=true,v6=false,ipv4=10.0.0.1"),
+            vec!["0x0000000000001001"]
+        );
     }
 }
