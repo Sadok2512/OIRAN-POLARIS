@@ -306,6 +306,30 @@ where
                     if matches!(route, UdpRoute::ImsSip) {
                         register_sdp_flows_from_sip(&decoded, &mut rtp_aggregator);
                     }
+                    // 2.21.100 (ordre #9 7046402022 décision a, design CLAUDE1
+                    // #9 7012805654) — pour chaque G-PDU GTP-U (N3/S1-U/S5-U),
+                    // extraire l'inner IPv4+UDP et router SIP (port 5060) ou
+                    // RTP (autres ports, agrégateur) avec `interface="N3-IMS"`.
+                    // Permet de voir la voix VoNR portée en tunnel quand la
+                    // capture N6 directe est absente (défaut ANR1 #10 7045290646).
+                    // Marqueur `N3-IMS` distinct de `IMS` (plan P-CSCF externe)
+                    // pour que la publication puisse dédupliquer si les deux
+                    // captures voient le même message (priorité à la source,
+                    // voir CHANGELOG).
+                    if matches!(
+                        route,
+                        UdpRoute::N3Gtpu | UdpRoute::S1uGtpu | UdpRoute::S5uGtpu
+                    ) {
+                        route_inner_udp_after_gtpu(
+                            &packet,
+                            &view,
+                            config,
+                            &pseudonym_key,
+                            &sip,
+                            &mut rtp_aggregator,
+                            &mut decoded,
+                        );
+                    }
                     emit_events(decoded, config, &mut key_ordinals, &mut sink, &mut event_count, &mut sink_error);
                 } else if config.interface == "IMS" {
                     // 2.11.0 : paquet UDP IMS en dehors du port SIP 5060 → tenter
@@ -790,6 +814,90 @@ fn validate_config(config: &DecodeConfig) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// 2.21.100 (ordre #9 7046402022 décision a, design CLAUDE1 #9 7012805654) —
+/// pour un paquet G-PDU GTP-U, inspecte l'inner IPv4+UDP via
+/// [`decoder_gtpu::extract_inner_udp`] et route :
+///   * `source_port == 5060 || destination_port == 5060` ⇒ `SipDecoder::decode`
+///     sur le payload UDP inner avec `interface="N3-IMS"` ; les flux SDP
+///     éventuels sont enregistrés dans `rtp_aggregator`.
+///   * sinon ⇒ `rtp_aggregator.observe_rtp` + `observe_rtcp` sur les IP/ports
+///     inner (le flux doit déjà être annoncé par un SDP vu plus tôt, soit
+///     côté IMS externe, soit côté N3-IMS).
+///
+/// Les events SIP produits sont ajoutés à `decoded` pour `emit_events`.
+/// L'event GTP-U d'origine n'est pas touché (invariant « 1 event par paquet
+/// GTP-U »).
+#[allow(clippy::too_many_arguments)]
+fn route_inner_udp_after_gtpu(
+    packet: &CapturePacket,
+    view: &TransportView,
+    config: &DecodeConfig,
+    pseudonym_key: &PseudonymKey,
+    sip: &decoder_sip::SipDecoder,
+    rtp_aggregator: &mut decoder_rtp::RtpFlowAggregator,
+    decoded: &mut Vec<NormalizedEvent>,
+) {
+    let gtpu_payload = packet_payload_slice(packet, view);
+    let Some(inner) = decoder_gtpu::extract_inner_udp(gtpu_payload) else {
+        return;
+    };
+    let inner_start = inner.udp_payload_offset;
+    let inner_end = inner_start + inner.udp_payload_length;
+    if inner_end > gtpu_payload.len() {
+        return;
+    }
+    let inner_payload = &gtpu_payload[inner_start..inner_end];
+    let ts = &packet.metadata.timestamp;
+    let packet_ref = packet_reference(packet);
+    let arrival_ns = packet_arrival_ns(packet);
+    if inner.source_port == 5060 || inner.destination_port == 5060 {
+        let inner_references = [packet_ref];
+        let inner_raw = format!("sha256:{}", sha256_hex(inner_payload));
+        let inner_input = DecoderInput {
+            capture_id: &config.capture_id,
+            packet_references: &inner_references,
+            timestamp: ts,
+            interface: "N3-IMS",
+            source_endpoint: Endpoint {
+                address: inner.source_ip.clone(),
+                port: Some(inner.source_port),
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: inner.destination_ip.clone(),
+                port: Some(inner.destination_port),
+                network_function: None,
+            },
+            payload: inner_payload,
+            raw_payload_reference: &inner_raw,
+            pseudonym_key,
+        };
+        let sip_output = sip.decode(&inner_input);
+        if !sip_output.events.is_empty() {
+            register_sdp_flows_from_sip(&sip_output.events, rtp_aggregator);
+        }
+        decoded.extend(sip_output.events);
+    } else {
+        let _ = rtp_aggregator.observe_rtp(
+            &inner.source_ip,
+            inner.source_port,
+            &inner.destination_ip,
+            inner.destination_port,
+            inner_payload,
+            arrival_ns,
+            &packet_ref,
+            ts,
+        );
+        let _ = rtp_aggregator.observe_rtcp(
+            &inner.source_ip,
+            inner.source_port,
+            &inner.destination_ip,
+            inner.destination_port,
+            inner_payload,
+        );
+    }
 }
 
 fn decode_udp(
@@ -1562,6 +1670,199 @@ mod tests {
         assert_eq!(
             ordered,
             vec!["evt-e", "evt-c", "evt-a", "evt-b", "evt-z", "evt-d"]
+        );
+    }
+
+    /// 2.21.100 (défaut ANR1 #10 7045290646 point a, ordre #9 7046402022
+    /// décision a, design CLAUDE1 #9 7012805654) — fixture synthétique
+    /// SIP INVITE encapsulé en GTP-U(UDP 5060). `route_inner_udp_after_gtpu`
+    /// doit extraire l'inner UDP, invoquer `SipDecoder::decode`, et ajouter
+    /// un event SIP à `decoded` avec `interface == "N3-IMS"`.
+    #[test]
+    fn route_inner_udp_after_gtpu_emits_sip_event_from_tunnel_2_21_100() {
+        use capture_pcap::{CapturePacket, PacketMetadata, TransportView, TransportProtocol};
+        use decoder_sip::SipDecoder;
+        use decoder_rtp::RtpFlowAggregator;
+        use event_schema::ExactTimestamp;
+
+        // Payload SIP minimal (INVITE sans body, headers obligatoires).
+        let sip_invite: &[u8] = b"INVITE sip:callee@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.45.0.7:5060;branch=z9hG4bK1\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:alice@example.com>;tag=A\r\n\
+To: <sip:callee@example.com>\r\n\
+Call-ID: synthetic-2-21-100@oiran\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\
+\r\n";
+        // GTP-U header 8 bytes (version=1, pt=1, no flags, msg=0xff G-PDU, TEID=42).
+        let udp_length = (8 + sip_invite.len()) as u16;
+        let ip_total_len = (20 + udp_length as usize) as u16;
+        let gtpu_payload_len = ip_total_len as u16;
+        let mut pkt = vec![
+            0x30, 0xff,
+            (gtpu_payload_len >> 8) as u8, gtpu_payload_len as u8,
+            0x00, 0x00, 0x00, 0x2a,
+        ];
+        // Inner IPv4 header (20 bytes), protocol=17 UDP, src=10.45.0.7 (UE), dst=10.0.0.1.
+        pkt.extend_from_slice(&[
+            0x45, 0x00,
+            (ip_total_len >> 8) as u8, ip_total_len as u8,
+            0x00, 0x00, 0x00, 0x00,
+            0x40, 0x11,
+            0x00, 0x00,
+            10, 45, 0, 7,
+            10, 0, 0, 1,
+        ]);
+        // Inner UDP header + SIP payload.
+        pkt.extend_from_slice(&[
+            0x13, 0xc4, // src port 5060
+            0x30, 0x39, // dst port 12345
+            (udp_length >> 8) as u8, udp_length as u8,
+            0x00, 0x00, // checksum
+        ]);
+        pkt.extend_from_slice(sip_invite);
+
+        let packet = CapturePacket {
+            metadata: PacketMetadata {
+                capture_id: "sha256:synthetic".into(),
+                source_file: "synthetic.pcapng".into(),
+                packet_number: 1,
+                byte_offset: 0,
+                timestamp: ExactTimestamp {
+                    seconds: 10,
+                    nanoseconds: 0,
+                    raw_ticks: 10_000_000_000,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                captured_length: pkt.len() as u32,
+                original_length: pkt.len() as u32,
+                interface_id: 0,
+                link_type: 1,
+                sll2: None,
+                truncated: false,
+            },
+            data: pkt.clone(),
+        };
+        // La TransportView couvre tout `pkt` comme UDP payload.
+        let view = TransportView {
+            source_ip: "172.16.0.10".into(),
+            destination_ip: "172.16.0.20".into(),
+            protocol: TransportProtocol::Udp,
+            source_port: Some(2152),
+            destination_port: Some(2152),
+            payload_offset: 0,
+            payload_length: pkt.len(),
+        };
+        let config = DecodeConfig {
+            input: "unused.pcap".into(),
+            capture_id: "sha256:synthetic".into(),
+            interface: "N3".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: String::new(),
+        };
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let sip = SipDecoder;
+        let mut rtp = RtpFlowAggregator::new();
+        let mut decoded = Vec::new();
+        route_inner_udp_after_gtpu(&packet, &view, &config, &key, &sip, &mut rtp, &mut decoded);
+        assert!(
+            !decoded.is_empty(),
+            "l'inner SIP INVITE doit produire au moins un event"
+        );
+        let has_n3_ims_sip = decoded.iter().any(|ev| {
+            ev.interface == "N3-IMS" && ev.protocol.as_str() == "SIP"
+        });
+        assert!(
+            has_n3_ims_sip,
+            "un event SIP avec interface N3-IMS doit apparaître ; decoded={:?}",
+            decoded.iter().map(|e| (&e.interface, e.protocol.as_str(), &e.message_name)).collect::<Vec<_>>()
+        );
+    }
+
+    /// 2.21.100 — un paquet N3 GTP-U avec inner UDP non-SIP (ex. port
+    /// aléatoire sans SDP enregistré préalablement) ne produit AUCUN event
+    /// SIP (ni RTP, faute de flux annoncé). `decoded` reste vide.
+    #[test]
+    fn route_inner_udp_after_gtpu_without_sdp_flow_emits_nothing_2_21_100() {
+        use capture_pcap::{CapturePacket, PacketMetadata, TransportView, TransportProtocol};
+        use decoder_sip::SipDecoder;
+        use decoder_rtp::RtpFlowAggregator;
+        use event_schema::ExactTimestamp;
+        let payload: &[u8] = &[0u8; 160]; // payload RTP-like mais pas de SDP enregistré.
+        let udp_length = (8 + payload.len()) as u16;
+        let ip_total_len = (20 + udp_length as usize) as u16;
+        let gtpu_len = ip_total_len as u16;
+        let mut pkt = vec![
+            0x30, 0xff,
+            (gtpu_len >> 8) as u8, gtpu_len as u8,
+            0x00, 0x00, 0x00, 0x2a,
+        ];
+        pkt.extend_from_slice(&[
+            0x45, 0x00,
+            (ip_total_len >> 8) as u8, ip_total_len as u8,
+            0x00, 0x00, 0x00, 0x00,
+            0x40, 0x11,
+            0x00, 0x00,
+            10, 45, 0, 7,
+            10, 0, 0, 2,
+        ]);
+        pkt.extend_from_slice(&[
+            0x9c, 0x44, // src port 40004
+            0xc0, 0x12, // dst port 49170
+            (udp_length >> 8) as u8, udp_length as u8,
+            0x00, 0x00,
+        ]);
+        pkt.extend_from_slice(payload);
+
+        let packet = CapturePacket {
+            metadata: PacketMetadata {
+                capture_id: "sha256:synthetic".into(),
+                source_file: "synthetic.pcapng".into(),
+                packet_number: 2,
+                byte_offset: 0,
+                timestamp: ExactTimestamp {
+                    seconds: 10,
+                    nanoseconds: 0,
+                    raw_ticks: 10_000_000_000,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                captured_length: pkt.len() as u32,
+                original_length: pkt.len() as u32,
+                interface_id: 0,
+                link_type: 1,
+                sll2: None,
+                truncated: false,
+            },
+            data: pkt.clone(),
+        };
+        let view = TransportView {
+            source_ip: "172.16.0.10".into(),
+            destination_ip: "172.16.0.20".into(),
+            protocol: TransportProtocol::Udp,
+            source_port: Some(2152),
+            destination_port: Some(2152),
+            payload_offset: 0,
+            payload_length: pkt.len(),
+        };
+        let config = DecodeConfig {
+            input: "unused.pcap".into(),
+            capture_id: "sha256:synthetic".into(),
+            interface: "N3".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: String::new(),
+        };
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let sip = SipDecoder;
+        let mut rtp = RtpFlowAggregator::new();
+        let mut decoded = Vec::new();
+        route_inner_udp_after_gtpu(&packet, &view, &config, &key, &sip, &mut rtp, &mut decoded);
+        assert!(
+            decoded.is_empty(),
+            "aucun event ne doit sortir sans SDP enregistré ni SIP sur 5060 ; got {:?}",
+            decoded
         );
     }
 }

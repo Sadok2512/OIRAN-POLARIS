@@ -1,5 +1,97 @@
 # Changelog
 
+## OIRAN API 2.21.100 — 2026-11-20 — voix côté décodeur (défauts ANR1 #10 7045290646, ordre #9 7046402022 CLAUDE2)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.104-train` @ `068e9c1`. Branche `fix/oiran-2.21.100-voice-decode`. Numerology CLAUDE2 = pair. Bumps synchronisés : `oiran-api 2.21.100` (patch), `decoder-gtpu 0.2.3`, `decoder-rtp 0.2.1`, `oiran-decode 0.9.1`. Référence terrain : recette IMS-lite 1.0.1 (ANR1 7045290646) — 60 111 events live mais **SIP 0, RTP 0** ; V2b perte RTP négative (`tshark rtp,streams`) ; V3 seul le sens montant en N3.
+
+### Trois décisions du cœur (ordre #9 7046402022) traitées
+
+#### Décision (a) — SIP/RTP décodés dans le tunnel GTP-U N3 (design CLAUDE1 #9 7012805654)
+
+**Cause fichier:ligne.** `OIRAN/decoder-gtpu/src/lib.rs:120-130` annonçait `user-plane application payload is not decoded` ; `OIRAN/oiran-decode/src/lib.rs:282-292` route UDP par port externe (2152 ⇒ gtpu) sans recursion sur l'inner UDP. La voix IMS véhiculée en N3 (UE ↔ eNB/UPF) restait donc opaque.
+
+**Correctif, côté orchestrateur (pas dans `decoder-gtpu`).**
+  * Nouveau helper pur `pub fn decoder_gtpu::extract_inner_udp(packet_payload) -> Option<InnerUdpInfo>` (`decoder-gtpu/src/lib.rs`), structure `InnerUdpInfo { source_ip, destination_ip, source_port, destination_port, udp_payload_offset, udp_payload_length }`. `None` pour non-G-PDU / non-IPv4 / non-UDP / header tronqué.
+  * Dans `oiran-decode`, nouvelle fn `route_inner_udp_after_gtpu` appelée **après** `decode_udp(gtpu, …)` pour chaque paquet N3/S1-U/S5-U : extrait l'inner UDP, route vers `SipDecoder::decode` si port 5060 (avec `interface="N3-IMS"`) ou vers `RtpFlowAggregator::observe_rtp` / `observe_rtcp` sinon. Les events SIP produits sont enregistrés dans `register_sdp_flows_from_sip` pour que les RTP ultérieurs du même SDP matchent.
+
+**Marqueur `interface="N3-IMS"`** (distinct de `"IMS"`) permet à la publication de distinguer les deux sources quand N6 capture aussi 10.47/16.
+
+**Déduplication N3 ↔ N6 (réponse explicite du cœur).** Chaque event SIP issu du tunnel porte `interface="N3-IMS"`. Les events équivalents capturés sur N6 portent `interface="IMS"`. Côté correlation-engine / publication (hors périmètre 2.21.100), le callflow render devra dédupliquer sur `(call_id, cseq, from_tag, to_tag, direction)` en priorisant la source la plus proche du P-CSCF (IMS > N3-IMS pour un UA vers Kamailio ; N3-IMS > IMS pour un UA côté UE si le P-CSCF est externe). Le choix de priorité est à graver dans un lot ultérieur côté correlation-engine, avec ANR2 comme arbitre. Pour 2.21.100 (décodeur seul), les deux events coexistent : l'opérateur voit les 2, l'anomalie est visible par `interface`.
+
+#### Décision (b) — perte RTP `loss_apparent` signé + event journalisé
+
+**Cause fichier:ligne.** `OIRAN/decoder-rtp/src/lib.rs:372-383` : `loss = expected_packets.saturating_sub(state.packets)` ⇒ jamais négatif au type-level. Mais collision SSRC entre 2 branches (`FlowKey` partagé — impossible en pratique car la FlowKey inclut les 5-tuples IP/port) ou, surtout, un double-comptage silencieux masquait `loss=0` **à tort**.
+
+**Correctif.** Ajout du calcul `loss_apparent_i64: i64 = expected_packets as i128 - state.packets as i128` clampé `i64`. Si strictement < 0, journalisation JSON de l'event `RTP_LOSS_NEGATIVE_APPARENT` (ssrc, 5-tuple, expected, observed, loss_apparent, reason `candidate_collision_or_double_count`). Nouvelle IE `loss_apparent` à côté de `loss_count` (borné ≥ 0) dans chaque event RTP émis au `finish()`.
+
+Pour éviter la collision SSRC entre 2 branches à l'agrégation : rappel que la `FlowKey` inclut déjà `(source_ip, source_port, destination_ip, destination_port, ssrc)`. Le test `two_flows_same_ssrc_different_5tuples_are_distinct_flowkeys_2_21_100` prouve que 2 UE avec même SSRC produisent 2 events distincts (pas de double-comptage côté OIRAN — la perte négative `tshark rtp,streams` V2b était une pathologie de l'outil tshark, pas d'OIRAN).
+
+#### Décision (c) — pools UE lus depuis la configuration, 10.47/16 inclus
+
+**Cause fichier:ligne.** `OIRAN/decoder-gtpu/src/lib.rs:298-307` (avant 2.21.100) : `let is_ue = |address: &str| address.starts_with("10.45.") || address.starts_with("10.46.");` ⇒ une adresse UE en DNN IMS (`10.47/16`) tombait en `Direction::Unknown` ⇒ non comptée UL/DL ⇒ G-PDU manquants.
+
+**Correctif.** Nouveaux publics dans `decoder-gtpu` :
+  * `pub fn default_ue_ip_pools() -> Vec<String>` = `["10.45.", "10.46.", "10.47."]` (couvre les 3 DNN par défaut lab POLARIS, **y compris IMS 10.47/16**).
+  * `pub fn set_ue_ip_pools(pools: Vec<String>)` surcharge les défauts (configurable depuis `oiran-api` au boot).
+  * `pub fn is_ue_address(address: &str) -> bool` lit un static `OnceLock<RwLock<Vec<String>>>` initialisé par `set_ue_ip_pools` ou par les défauts.
+Le cas (c) **capture elle-même** reste **OUVERT côté lab** (SPAN N3 possiblement unidirectionnel ou absent côté DL N6) — à clôturer par ANR1.
+
+### Tests ajoutés (9 au total, 12 runs × 287 passed / 0 failed)
+
+**decoder-gtpu (4)** :
+  * `is_ue_address_covers_10_45_46_47_by_default_2_21_100`
+  * `set_ue_ip_pools_overrides_defaults_2_21_100`
+  * `extract_inner_udp_returns_ipv4_udp_descriptor_2_21_100`
+  * `extract_inner_udp_returns_none_on_mismatches_2_21_100` (4 cas négatifs : non-G-PDU, inner IPv6, inner TCP, UDP tronqué)
+
+**decoder-rtp (2)** :
+  * `two_flows_same_ssrc_different_5tuples_are_distinct_flowkeys_2_21_100` (prouve la non-régression de la FlowKey sur collision SSRC entre UE)
+  * `loss_apparent_ie_mirrors_loss_count_on_contiguous_flow_2_21_100` (présence de la nouvelle IE)
+
+**oiran-decode (2)** :
+  * `route_inner_udp_after_gtpu_emits_sip_event_from_tunnel_2_21_100` (fixture synthétique SIP INVITE dans G-PDU, event SIP produit avec `interface="N3-IMS"`)
+  * `route_inner_udp_after_gtpu_without_sdp_flow_emits_nothing_2_21_100` (sans SDP enregistré, aucun event)
+
+Fixtures synthétiques uniquement — **aucun pcap du lab avec identités**.
+
+### Preuves (règle CPU + amendement #9 7034385961)
+
+Préflight final :
+```
+cat /proc/pressure/cpu    → some avg10=0.20 full avg10=0.00  (GO)
+cat /proc/pressure/memory → full avg10=0.03  (GO ; seuil amendé <1)
+free -b (avail)           → 8 641 204 224 (≥ 4 GiB GO)
+df -B1 / (avail)          → 187 174 375 424 (≥ 25 Go GO)
+lslocks nsplus-heavy      → tenu par PID 2090550 au préflight, attente dans flock -w 900
+```
+
+12 runs tests `oiran-api + oiran-decode + decoder-gtpu + decoder-rtp --lib` sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 cargo test --locked ... -j 2 -- --test-threads=2` :
+
+```
+Run  1..12 → 11 (decoder-gtpu) + 11 (decoder-rtp) + 248 (oiran-api) + 17 (oiran-decode)
+            = 287 passed; 0 failed; 3 ignored ; 15.12 – 21.68 s par run (oiran-api)
+```
+
+287 = 11 (decoder-gtpu : 7 historiques + 4 ajoutés) + 11 (decoder-rtp : 9 historiques + 2 ajoutés) + 248 (oiran-api inchangé) + 17 (oiran-decode : 15 historiques + 2 ajoutés). 3 `ignored` historiques, aucun `#[ignore]` ajouté. cpu some avg10 pendant la boucle : before Run 1 = 1.21 ; after Run 12 = 3.18 ; jamais `cpu full > 0` ni `mem full > 0`.
+
+Audit lock Rust 1.83 : `OIRAN/Cargo.lock` 4 entrées modifiées (`oiran-api 2.21.100`, `decoder-gtpu 0.2.3`, `decoder-rtp 0.2.1`, `oiran-decode 0.9.1`). `cargo test --locked` passe ⇒ lock cohérent.
+
+**OIRAN/vtap `cargo update -w && cargo test --locked`** (règle feedback_polaris_vtap_lock_after_bump) :
+```
+Locking 3 packages to highest compatible versions
+    Updating decoder-gtpu v0.2.2 → v0.2.3
+    Updating decoder-rtp v0.2.0 → v0.2.1
+    Updating oiran-decode v0.9.0 → v0.9.1
+… Compiling decoder-gtpu v0.2.3 … decoder-rtp — pas dans deps directes de polaris-vtap — compilé via oiran-decode …
+cargo test --locked → 12 + 0 + 3 + 0 passed, 0 failed, 0 ignored.
+```
+
+### Scope et coordination #9
+
+- Base `fix/oiran-2.21.104-train` @ `068e9c1`. Zone touchée : `decoder-gtpu/src/lib.rs`, `decoder-rtp/src/lib.rs`, `oiran-decode/src/lib.rs`, et les 4 Cargo.toml + 2 Cargo.lock.
+- **CLAUDE1 lot 2.21.105 débit live** touche `live_trace.rs` + possiblement `throughput.rs` — zones disjointes de mon 2.21.100 (décodeur). Zéro intersection.
+- Coordination ANR2 : (c) capture N3 DL confirmée **OUVERT côté lab**, à clôturer par ANR1 (SPAN port ou DN mirror).
+
 ## oiran-api 2.21.104 — 2026-11-20 — train (cœur) : 2.21.101 + 2.21.102 (clé à la lecture) + 2.21.103 (volume SSE)
 
 - Merge `--no-ff` de `fix/oiran-2.21.102-stable-event-key-read-time` @ d8e607f et de `fix/oiran-2.21.103-sse-volume` @ 57308df sur `fix/oiran-2.21.101-train` @ 80d7527.

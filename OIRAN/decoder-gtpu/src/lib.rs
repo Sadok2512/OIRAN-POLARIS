@@ -8,8 +8,52 @@ use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
     PLUGIN_API_VERSION,
 };
+use std::sync::{OnceLock, RwLock};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 2.21.100 (défaut ANR1 #10 7045290646 point (c), ordre #9 7046402022
+/// décision c) — pools UE par défaut pour `infer_direction_from_inner_ipv4`.
+/// Couvre le DNN par défaut 5G `internet` (10.45/16), l'ancien pool LTE
+/// (10.46/16), **et** le DNN `ims` 10.47/16 (jusqu'à 2.21.100 non couvert ⇒
+/// trafic voix classé `Unknown` ⇒ non compté UL/DL ⇒ G-PDU manquants en live
+/// trace comme mesuré par ANR1).
+///
+/// L'opérateur d'un lab avec d'autres préfixes UE peut poser
+/// `set_ue_ip_pools(…)` avant tout décodage pour surcharger ces défauts.
+pub fn default_ue_ip_pools() -> Vec<String> {
+    vec!["10.45.".to_owned(), "10.46.".to_owned(), "10.47.".to_owned()]
+}
+
+static UE_IP_POOLS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+
+fn ue_ip_pools_cell() -> &'static RwLock<Vec<String>> {
+    UE_IP_POOLS.get_or_init(|| RwLock::new(default_ue_ip_pools()))
+}
+
+/// 2.21.100 — remplace la liste de préfixes IP considérés comme UE côté
+/// `infer_direction_from_inner_ipv4`. Appelé par l'orchestrateur
+/// (`oiran-api`, `oiran-decode::main`) au démarrage, à partir d'une config
+/// `decoder_gtpu_ue_ip_pools` (si présente). Les préfixes sont des chaînes
+/// `starts_with` (ex. `"10.45."`, `"10.47."`) — simple et déterministe.
+pub fn set_ue_ip_pools(pools: Vec<String>) {
+    if let Ok(mut lock) = ue_ip_pools_cell().write() {
+        *lock = pools;
+    }
+}
+
+/// 2.21.100 — true si `address` (IPv4 dotted-quad) commence par l'un des
+/// préfixes UE actuellement configurés (ou les défauts si `set_ue_ip_pools`
+/// n'a pas été appelé).
+pub fn is_ue_address(address: &str) -> bool {
+    if let Ok(pools) = ue_ip_pools_cell().read() {
+        pools.iter().any(|p| address.starts_with(p.as_str()))
+    } else {
+        default_ue_ip_pools()
+            .iter()
+            .any(|p| address.starts_with(p.as_str()))
+    }
+}
 #[derive(Default)]
 pub struct GtpuDecoder;
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,6 +327,84 @@ impl ProtocolDecoder for GtpuDecoder {
     }
 }
 
+/// 2.21.100 (ordre #9 7046402022 décision a, design CLAUDE1 #9 7012805654) —
+/// descripteur de l'inner UDP exposé pour que l'orchestrateur
+/// (`oiran-decode`) puisse router SIP/RTP vers leurs décodeurs sans
+/// dupliquer le parse GTP-U + inner IPv4 + inner UDP. Les offsets sont
+/// exprimés **dans le packet physique** (base = début du payload GTP-U
+/// passé à `extract_inner_udp`), pour que le caller fasse
+/// `packet_payload[udp_payload_offset..udp_payload_offset+udp_payload_length]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InnerUdpInfo {
+    pub source_ip: String,
+    pub destination_ip: String,
+    pub source_port: u16,
+    pub destination_port: u16,
+    /// Offset du payload UDP dans le packet complet (après GTP-U + IPv4 + UDP header).
+    pub udp_payload_offset: usize,
+    /// Longueur du payload UDP (= udp_length - 8).
+    pub udp_payload_length: usize,
+}
+
+/// 2.21.100 (ordre #9 7046402022 décision a) — inspecte un paquet G-PDU
+/// GTP-U et, si l'inner est IPv4 + UDP, retourne les ports + offsets pour
+/// que l'orchestrateur route SIP/RTP vers `SipDecoder` / `RtpFlowAggregator`.
+/// `None` si :
+///   * le paquet n'est pas un G-PDU valide,
+///   * message_type != 255,
+///   * l'inner n'est pas IPv4,
+///   * l'inner IPv4 protocol != 17 (UDP),
+///   * l'inner UDP header est tronqué.
+///
+/// La fonction est strictement locale (pas d'allocations lourdes, pas
+/// d'effet de bord) et peut être appelée pour chaque paquet du pipeline.
+pub fn extract_inner_udp(packet_payload: &[u8]) -> Option<InnerUdpInfo> {
+    let header = parse(packet_payload).ok()?;
+    if header.message_type != 255 {
+        return None;
+    }
+    let inner_start = header.payload_offset;
+    let inner_end = inner_start + header.payload_length;
+    if inner_end > packet_payload.len() {
+        return None;
+    }
+    let inner = &packet_payload[inner_start..inner_end];
+    // Inner IPv4 header.
+    if inner.len() < 20 || inner[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = usize::from(inner[0] & 0x0f) * 4;
+    if ihl < 20 || ihl > inner.len() {
+        return None;
+    }
+    let protocol = inner[9];
+    if protocol != 17 {
+        return None; // non-UDP inner (ICMP, TCP, …) : hors scope 2.21.100.
+    }
+    let source_ip = format!("{}.{}.{}.{}", inner[12], inner[13], inner[14], inner[15]);
+    let destination_ip = format!("{}.{}.{}.{}", inner[16], inner[17], inner[18], inner[19]);
+    // Inner UDP header (8 bytes).
+    if inner.len() < ihl + 8 {
+        return None;
+    }
+    let source_port = u16::from_be_bytes([inner[ihl], inner[ihl + 1]]);
+    let destination_port = u16::from_be_bytes([inner[ihl + 2], inner[ihl + 3]]);
+    let udp_length = u16::from_be_bytes([inner[ihl + 4], inner[ihl + 5]]) as usize;
+    if udp_length < 8 || ihl + udp_length > inner.len() {
+        return None;
+    }
+    let udp_payload_offset_in_inner = ihl + 8;
+    let udp_payload_length = udp_length - 8;
+    Some(InnerUdpInfo {
+        source_ip,
+        destination_ip,
+        source_port,
+        destination_port,
+        udp_payload_offset: inner_start + udp_payload_offset_in_inner,
+        udp_payload_length,
+    })
+}
+
 fn inner_ipv4_addresses(payload: &[u8]) -> Option<(String, String)> {
     if payload.len() < 20 || payload[0] >> 4 != 4 {
         return None;
@@ -296,11 +418,12 @@ fn inner_ipv4_addresses(payload: &[u8]) -> Option<(String, String)> {
 }
 
 fn infer_direction_from_inner_ipv4(source: &str, destination: &str) -> Direction {
-    // POLARIS assigns LTE and 5G UE addresses from these two lab pools.
-    // Only a unique UE-side match is accepted; ambiguous/private traffic is
-    // left UNKNOWN instead of being guessed.
-    let is_ue = |address: &str| address.starts_with("10.45.") || address.starts_with("10.46.");
-    match (is_ue(source), is_ue(destination)) {
+    // 2.21.100 (ordre #9 7046402022 décision c) — pools UE lus depuis la
+    // configuration (static OnceLock<RwLock<Vec<String>>> partagé), défaut
+    // 10.45/16 + 10.46/16 + **10.47/16** (DNN IMS). Un futur lab avec
+    // d'autres préfixes peut appeler `decoder_gtpu::set_ue_ip_pools` au boot.
+    // Seul un match unique côté UE est accepté ; ambigu ⇒ Unknown.
+    match (is_ue_address(source), is_ue_address(destination)) {
         (true, false) => Direction::Uplink,
         (false, true) => Direction::Downlink,
         _ => Direction::Unknown,
@@ -536,5 +659,109 @@ mod tests {
             .expect("QFI doit être présent dans session_identifiers");
         assert_eq!(qfi.value, "9");
         assert!(!qfi.pseudonymized, "QFI n'est pas une identité, pas pseudo");
+    }
+
+    /// 2.21.100 (défaut ANR1 #10 7045290646 point c, ordre #9 7046402022
+    /// décision c) — `is_ue_address` par défaut couvre 10.45/10.46/10.47
+    /// (ajout 10.47/16 pour couvrir le DNN IMS, non reconnu avant 2.21.100).
+    #[test]
+    fn is_ue_address_covers_10_45_46_47_by_default_2_21_100() {
+        // Reset aux défauts (test parallèle : le static peut avoir été
+        // modifié par un autre test, on reset explicitement).
+        set_ue_ip_pools(default_ue_ip_pools());
+        assert!(is_ue_address("10.45.0.1"));
+        assert!(is_ue_address("10.46.1.42"));
+        assert!(is_ue_address("10.47.0.7"), "DNN IMS 10.47/16 doit être reconnu");
+        assert!(!is_ue_address("10.48.0.1"));
+        assert!(!is_ue_address("8.8.8.8"));
+        assert!(!is_ue_address(""));
+    }
+
+    /// 2.21.100 — `set_ue_ip_pools` permet à l'opérateur de surcharger les
+    /// préfixes par défaut (configuration lab).
+    #[test]
+    fn set_ue_ip_pools_overrides_defaults_2_21_100() {
+        set_ue_ip_pools(vec!["172.16.".into()]);
+        assert!(is_ue_address("172.16.0.1"));
+        assert!(!is_ue_address("10.45.0.1"), "10.45 n'est plus dans le pool après override");
+        // Restaurer défauts pour les autres tests.
+        set_ue_ip_pools(default_ue_ip_pools());
+    }
+
+    /// 2.21.100 (ordre #9 7046402022 décision a, design CLAUDE1 #9 7012805654) —
+    /// `extract_inner_udp` retourne `Some` pour un G-PDU IPv4+UDP valide,
+    /// avec src/dst IPs + ports + offset/length UDP payload correctement
+    /// calculés.
+    #[test]
+    fn extract_inner_udp_returns_ipv4_udp_descriptor_2_21_100() {
+        // G-PDU GTP-U minimal (header 8 bytes, version 1, pt=1, no flags),
+        // TEID = 0x00000042, puis IPv4 (ihl=5, protocol=17 UDP), puis UDP
+        // (src_port=5060, dst_port=12345, len=8+4=12), puis 4 bytes de
+        // payload "INVI".
+        let mut pkt = vec![
+            0x30, 0xff, // version/pt/flags, msg_type=G-PDU
+            0x00, 0x20, // declared payload length = 32 (28 IP + 4 pad)
+            0x00, 0x00, 0x00, 0x42, // TEID
+        ];
+        // Inner IPv4 header (20 bytes).
+        pkt.extend_from_slice(&[
+            0x45, 0x00, // version/ihl + ToS
+            0x00, 0x20, // total length 32
+            0x00, 0x00, 0x00, 0x00, // id + flags
+            0x40, 0x11, // TTL + protocol=17 (UDP)
+            0x00, 0x00, // checksum
+            10, 45, 0, 7, // src = 10.45.0.7 (UE)
+            10, 0, 0, 1, // dst = 10.0.0.1
+        ]);
+        // Inner UDP header + 4-byte payload.
+        pkt.extend_from_slice(&[
+            0x13, 0xc4, // src port 5060
+            0x30, 0x39, // dst port 12345
+            0x00, 0x0c, // length 12 (8 + 4)
+            0x00, 0x00, // checksum
+            b'I', b'N', b'V', b'I', // payload
+        ]);
+        let info = extract_inner_udp(&pkt).expect("inner UDP must be extracted");
+        assert_eq!(info.source_ip, "10.45.0.7");
+        assert_eq!(info.destination_ip, "10.0.0.1");
+        assert_eq!(info.source_port, 5060);
+        assert_eq!(info.destination_port, 12345);
+        assert_eq!(info.udp_payload_length, 4);
+        // Offset = 8 (GTP-U header) + 20 (IPv4) + 8 (UDP) = 36.
+        assert_eq!(info.udp_payload_offset, 36);
+        assert_eq!(&pkt[info.udp_payload_offset..info.udp_payload_offset + info.udp_payload_length], b"INVI");
+    }
+
+    /// 2.21.100 — `extract_inner_udp` retourne `None` pour :
+    /// (1) message_type != 255 (G-PDU), (2) inner non-IPv4, (3) inner
+    /// non-UDP, (4) header UDP tronqué.
+    #[test]
+    fn extract_inner_udp_returns_none_on_mismatches_2_21_100() {
+        // (1) Echo Request (message_type = 1) — pas G-PDU.
+        let echo = vec![
+            0x30, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(extract_inner_udp(&echo), None);
+        // (2) G-PDU avec inner IPv6 (v=6).
+        let mut ipv6 = vec![0x30, 0xff, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01];
+        ipv6.extend_from_slice(&[0x60, 0, 0, 0, 0, 0, 59, 64]); // v=6, next header=59 (no next)
+        ipv6.extend_from_slice(&[0; 32]); // 32 bytes to reach declared length of 20
+        assert_eq!(extract_inner_udp(&ipv6), None);
+        // (3) G-PDU avec inner IPv4 TCP (protocol=6).
+        let mut tcp = vec![0x30, 0xff, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01];
+        tcp.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06,
+            0x00, 0x00, 10, 45, 0, 7, 10, 0, 0, 1,
+        ]);
+        assert_eq!(extract_inner_udp(&tcp), None);
+        // (4) G-PDU IPv4 UDP mais header UDP tronqué (seulement 4 bytes au lieu de 8).
+        let mut truncated = vec![0x30, 0xff, 0x00, 0x18, 0x00, 0x00, 0x00, 0x01];
+        truncated.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11,
+            0x00, 0x00, 10, 45, 0, 7, 10, 0, 0, 1,
+        ]);
+        truncated.extend_from_slice(&[0x13, 0xc4, 0x30, 0x39]); // seulement 4 bytes UDP
+        assert_eq!(extract_inner_udp(&truncated), None);
     }
 }
