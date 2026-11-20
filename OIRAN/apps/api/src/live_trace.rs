@@ -295,6 +295,66 @@ impl LiveTraceRegistry {
         let now = epoch_seconds();
         map.retain(|_, state| state.trace.expires_at > now);
     }
+
+    /// 2.21.99 (défaut recette prod #10 7043526474, ordre #9 7043914072) —
+    /// flush périodique des buckets de débit. Avant 2.21.99, un bucket
+    /// n'était émis **que** sur transition de `event.timestamp.seconds`
+    /// (`route_normalized` l. 494-531). Conséquence prod : si le poll
+    /// du ring voit N packets GTP-U avec le même `seconds`, puis plus
+    /// aucun événement, les octets restent dans `state.{ul,dl,unknown}_bytes`
+    /// **sans jamais émettre**. ANR1 mesure : 107 Mo DL + 13 Mo UL,
+    /// **0 bucket** sur deux traces live (9 min), alors que 2.21.74
+    /// produisait 168 échantillons.
+    ///
+    /// Appelé par `start_reader` à chaque tick (750 ms). Pour chaque
+    /// trace active : si des octets sont accumulés (`throughput_second
+    /// != 0 && (ul|dl|unknown) > 0`) et que le dernier bucket a plus
+    /// d'une seconde (= on a franchi au moins une seconde wall-clock),
+    /// émettre le bucket. L'event-driven path de `route_normalized`
+    /// garde son rôle quand les événements arrivent en continu.
+    pub(crate) fn flush_idle_throughput_buckets(&self) {
+        let now = epoch_seconds();
+        let mut traces = self.traces.lock().unwrap();
+        Self::purge(&mut traces);
+        for state in traces.values_mut() {
+            if state.throughput_second == 0 {
+                continue;
+            }
+            let has_bytes =
+                state.ul_bytes > 0 || state.dl_bytes > 0 || state.unknown_bytes > 0;
+            if !has_bytes {
+                continue;
+            }
+            // Flush si la seconde du dernier event GTP-U est strictement
+            // passée (wall-clock strictement > throughput_second).
+            if now <= state.throughput_second {
+                continue;
+            }
+            state.next_id += 1;
+            let rate = BufferedEvent {
+                id: state.next_id,
+                kind: "throughput".into(),
+                payload: json!({
+                    "second": state.throughput_second,
+                    "ul_bytes_s": state.ul_bytes,
+                    "dl_bytes_s": state.dl_bytes,
+                    "unknown_bytes_s": state.unknown_bytes,
+                    "capture_id": Value::Null,
+                    "packet_number": Value::Null,
+                    "flush": "idle",
+                }),
+            };
+            state.events.push_back(rate.clone());
+            let _ = state.tx.send(rate);
+            state.ul_bytes = 0;
+            state.dl_bytes = 0;
+            state.unknown_bytes = 0;
+            state.throughput_second = 0;
+            while state.events.len() > MAX_EVENTS {
+                state.events.pop_front();
+            }
+        }
+    }
     #[cfg(test)]
     pub(crate) fn append(&self, trace_id: &str, kind: &str, payload: Value) -> bool {
         let mut traces = self.traces.lock().unwrap();
@@ -825,6 +885,11 @@ pub(crate) fn start_reader(state: AppState) {
             // 2.21.78 — tick régulier du registre de débit : émet un
             // bucket zéro après IDLE_FLUSH_INTERVAL_S de silence.
             state.inner.throughput.tick();
+            // 2.21.99 (défaut recette prod #10 7043526474) — flush
+            // périodique des buckets de débit du flux live trace.
+            // Complète l'émission event-driven de `route_normalized`
+            // quand les events GTP-U cessent dans la même seconde.
+            state.inner.live_traces.flush_idle_throughput_buckets();
             tokio::time::sleep(Duration::from_millis(750)).await;
         }
     });
@@ -1803,6 +1868,527 @@ mod tests {
         assert_eq!(
             throughput.payload["unknown_bytes_s"], 100,
             "un event UNKNOWN doit alimenter unknown_bytes_s, PAS dl_bytes_s"
+        );
+    }
+
+    /// 2.21.99 (défaut recette prod #10 7043526474, ordre #9 7043914072) —
+    /// répro **du défaut mesuré en prod** : 0 bucket de débit live
+    /// malgré 107 Mo de trafic GTP-U sur N3. Scénario modélisé :
+    ///   1. une trace est créée pour `psn-prod` ;
+    ///   2. un NGAP `PDUSessionResourceSetupRequest` arrive AVEC
+    ///      `subscriber_pseudonym=psn-prod` et une IE qui porte les
+    ///      F-TEID UL/DL → `match_pseudo` fire, state.tunnel_teids
+    ///      apprend les TEID (2.21.90 défaut 2) ;
+    ///   3. N GTP-U N3 arrivent **sans subscriber_pseudonym** (cas
+    ///      réel : décodeur-gtpu n'injecte que `teid`,
+    ///      `tunnel_endpoint_ip`, `tunnel_direction`, QFI, inner IPs —
+    ///      pas de pseudonyme abonné). Match via `match_teid` 2.21.90.
+    ///   4. le MÊME `second` sur les 3 premiers GTP-U, puis seconde
+    ///      suivante sur les 3 suivants → une bascule de second,
+    ///      donc exactement **UN** bucket doit être émis.
+    ///
+    /// Si le test reproduit 0 bucket, la cause est dans la chaîne
+    /// `match_teid → route_normalized → throughput emission`.
+    #[test]
+    fn gtpu_matched_via_match_teid_still_emits_throughput_buckets_2_21_99() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec!["psn-prod".into()]));
+
+        let packet_ref = |number: u64, original: u32| PacketReference {
+            source_file: "n3.pcapng".into(),
+            source_sha256: None,
+            packet_number: number,
+            byte_offset: 0,
+            interface_id: 0,
+            link_type: None,
+            sll2_protocol_type: None,
+            sll2_reserved: None,
+            sll2_interface_index: None,
+            sll2_arphrd_type: None,
+            sll2_packet_type: None,
+            sll2_address_length: None,
+            sll2_address: None,
+            captured_length: original,
+            original_length: original,
+        };
+        let ts = |seconds: i64| ExactTimestamp {
+            seconds,
+            nanoseconds: 0,
+            raw_ticks: (seconds.max(0) as u64) * 1_000_000_000,
+            resolution_base: 10,
+            resolution_exponent: 9,
+        };
+
+        // Étape 1 — NGAP PDUSessionResourceSetupRequest avec pseudo + F-TEID.
+        // Les tunnel pairs sont dans l'IE `tunnel_pairs` selon le format
+        // `item_0_tunnel_ip_ul=10.77.11.13,item_0_gtp_teid_ul=0xf1240001,
+        //  item_0_tunnel_ip_dl=10.77.22.13,item_0_gtp_teid_dl=0xf1240002`.
+        let ngap = NormalizedEvent {
+            event_id: "evt-ngap-setup".into(),
+            stable_event_key: String::new(),
+            parent_event_id: None,
+            probe_id: "test".into(),
+            capture_point_id: "N2".into(),
+            capture_id: "cap-n2".into(),
+            packet_references: vec![packet_ref(1, 1_200)],
+            timestamp: ts(1_795_000_000),
+            interface: "N2".into(),
+            protocol: Protocol::Ngap,
+            message_name: "PDUSessionResourceSetupRequest".into(),
+            message_type: 29,
+            procedure_code: Some(29),
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.77.21.11".into(),
+                port: None,
+                network_function: Some("AMF".into()),
+            },
+            destination_endpoint: Endpoint {
+                address: "10.77.21.20".into(),
+                port: None,
+                network_function: Some("gNB".into()),
+            },
+            direction: Direction::CoreToRan,
+            // subscriber_pseudonym dans les IE value → match_pseudo fire.
+            session_identifiers: vec![NamedValue {
+                name: "subscriber_pseudonym".into(),
+                value: "psn-prod".into(),
+                pseudonymized: true,
+            }],
+            information_elements: vec![InformationElement {
+                id: Some(19),
+                name: "PDUSessionResourceSetupListSUReq".into(),
+                length: 60,
+                value: Some(
+                    "item_0_tunnel_ip_ul=10.77.11.13,item_0_gtp_teid_ul=0xf1240001,\
+                     item_0_tunnel_ip_dl=10.77.22.13,item_0_gtp_teid_dl=0xf1240002"
+                        .into(),
+                ),
+                raw_sha256: Some("sha256:ngap-setup".into()),
+                status: DecodeStatus::Decoded,
+            }],
+            decoder_name: "decoder-ngap".into(),
+            decoder_version: "0.6.3".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: "sha256:ngap".into(),
+            evidence_references: vec![EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: "sha256:ngap".into(),
+            }],
+            sbi: None,
+        };
+        r.route_normalized(&ngap);
+
+        // Étape 2 — vérifier que l'apprentissage TEID a eu lieu.
+        {
+            let traces = r.traces.lock().unwrap();
+            let s = traces.get("t").unwrap();
+            assert!(
+                s.tunnel_teids
+                    .iter()
+                    .any(|t| t.ends_with("f1240001")),
+                "UL TEID doit être appris depuis NGAP (actuels : {:?})",
+                s.tunnel_teids
+            );
+            assert!(
+                s.tunnel_teids
+                    .iter()
+                    .any(|t| t.ends_with("f1240002")),
+                "DL TEID doit être appris depuis NGAP"
+            );
+        }
+
+        // Étape 3 — 6 GTP-U UL/DL, PAS de subscriber_pseudonym (comme
+        // en prod : decoder-gtpu n'en injecte jamais). session_identifiers
+        // porte `teid` qui matche state.tunnel_teids via `match_teid`.
+        let gtpu = |packet: u64, seconds: i64, direction: Direction, teid_hex: &str, bytes: u32| {
+            NormalizedEvent {
+                event_id: format!("evt-gtpu-{packet}"),
+                stable_event_key: String::new(),
+                parent_event_id: None,
+                probe_id: "test".into(),
+                capture_point_id: "N3".into(),
+                capture_id: "cap-n3".into(),
+                packet_references: vec![packet_ref(packet, bytes)],
+                timestamp: ts(seconds),
+                interface: "N3".into(),
+                protocol: Protocol::Gtpu,
+                message_name: "GTP-U".into(),
+                message_type: 255,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "10.77.11.13".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "10.77.22.13".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction,
+                session_identifiers: vec![
+                    NamedValue {
+                        name: "teid".into(),
+                        value: teid_hex.into(),
+                        pseudonymized: false,
+                    },
+                    NamedValue {
+                        name: "tunnel_endpoint_ip".into(),
+                        value: "10.77.22.13".into(),
+                        pseudonymized: false,
+                    },
+                ],
+                information_elements: vec![],
+                decoder_name: "decoder-gtpu".into(),
+                decoder_version: "0.2.2".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: format!("sha256:gtpu-{packet}"),
+                evidence_references: vec![EvidenceReference {
+                    state: EvidenceState::Exact,
+                    kind: "packet-provenance".into(),
+                    reference: format!("sha256:gtpu-{packet}"),
+                }],
+                sbi: None,
+            }
+        };
+        // Seconde 1_795_000_100 : 3 events = 2 UL + 1 DL, total 1500+1500+1500 = 4500 par bucket.
+        r.route_normalized(&gtpu(10, 1_795_000_100, Direction::Uplink, "0xf1240001", 1_500));
+        r.route_normalized(&gtpu(11, 1_795_000_100, Direction::Uplink, "0xf1240001", 1_500));
+        r.route_normalized(&gtpu(12, 1_795_000_100, Direction::Downlink, "0xf1240002", 1_500));
+        // Seconde 1_795_000_101 : 3 events, déclenche le flush de la seconde 100.
+        r.route_normalized(&gtpu(13, 1_795_000_101, Direction::Downlink, "0xf1240002", 1_500));
+        r.route_normalized(&gtpu(14, 1_795_000_101, Direction::Downlink, "0xf1240002", 1_500));
+        r.route_normalized(&gtpu(15, 1_795_000_101, Direction::Uplink, "0xf1240001", 1_500));
+
+        let traces = r.traces.lock().unwrap();
+        let s = traces.get("t").unwrap();
+        let buckets: Vec<_> = s
+            .events
+            .iter()
+            .filter(|e| e.kind == "throughput")
+            .collect();
+        assert!(
+            !buckets.is_empty(),
+            "AU MOINS UN bucket attendu après transition de second (défaut prod reproduit si 0)"
+        );
+        let first = buckets[0];
+        assert_eq!(first.payload["second"], 1_795_000_100);
+        assert_eq!(
+            first.payload["ul_bytes_s"], 3_000,
+            "2 UL × 1500 = 3000 octets accumulés sur la seconde 100"
+        );
+        assert_eq!(
+            first.payload["dl_bytes_s"], 1_500,
+            "1 DL × 1500 = 1500 octets accumulés sur la seconde 100"
+        );
+        // 6 events × 1500 = 9000 octets au total — les events de la
+        // seconde 101 sont encore accumulés, non flushés.
+        let total_from_buckets: u64 = buckets
+            .iter()
+            .map(|b| {
+                b.payload["ul_bytes_s"].as_u64().unwrap_or(0)
+                    + b.payload["dl_bytes_s"].as_u64().unwrap_or(0)
+                    + b.payload["unknown_bytes_s"].as_u64().unwrap_or(0)
+            })
+            .sum();
+        // bucket flushé = seconde 100 (3 events × 1500 = 4500).
+        assert_eq!(
+            total_from_buckets, 4_500,
+            "buckets doivent totaliser les 3 events de la seconde 100 avant transition"
+        );
+    }
+
+    /// 2.21.99 (défaut recette prod #10 7043526474) — `flush_idle_throughput_buckets`
+    /// émet un bucket pour les octets accumulés quand le second
+    /// wall-clock a dépassé `state.throughput_second`, même si plus
+    /// aucun event GTP-U n'arrive.
+    ///
+    /// Scénario : 3 events GTP-U UL arrivent sur la seconde `t` pendant
+    /// la même trace, **puis rien**. Sans le flush idle, les 3 × 1500 B
+    /// restent dans `state.ul_bytes` et aucun bucket n'est émis
+    /// (route_normalized attend un event ultérieur sur une seconde
+    /// différente). Avec le flush idle, dès que l'horloge wall-clock
+    /// dépasse `t`, le bucket est émis.
+    #[test]
+    fn flush_idle_emits_bucket_for_stalled_second_2_21_99() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec!["psn-stalled".into()]));
+
+        // 3 events GTP-U sur la même seconde, dans le passé wall-clock
+        // (now > throughput_second est garanti avec un timestamp = 1).
+        let gtpu_event = |packet: u64| NormalizedEvent {
+            event_id: format!("evt-gtpu-{packet}"),
+            stable_event_key: String::new(),
+            parent_event_id: None,
+            probe_id: "test".into(),
+            capture_point_id: "N3".into(),
+            capture_id: "cap".into(),
+            packet_references: vec![PacketReference {
+                source_file: "x".into(),
+                source_sha256: None,
+                packet_number: packet,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 1_500,
+                original_length: 1_500,
+            }],
+            timestamp: ExactTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+                raw_ticks: 1_000_000_000,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "N3".into(),
+            protocol: Protocol::Gtpu,
+            // Pseudo est présent dans message_name pour que match_pseudo
+            // fire (le reste du JSON encodé doit contenir `psn-stalled`).
+            message_name: "GTP-U psn-stalled".into(),
+            message_type: 255,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.0.0.1".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.0.0.2".into(),
+                port: None,
+                network_function: None,
+            },
+            direction: Direction::Uplink,
+            session_identifiers: vec![NamedValue {
+                name: "teid".into(),
+                value: "0xabcd0001".into(),
+                pseudonymized: false,
+            }],
+            information_elements: vec![],
+            decoder_name: "decoder-gtpu".into(),
+            decoder_version: "0.2.2".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: format!("sha256:gtpu-{packet}"),
+            evidence_references: vec![EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: format!("sha256:gtpu-{packet}"),
+            }],
+            sbi: None,
+        };
+        r.route_normalized(&gtpu_event(10));
+        r.route_normalized(&gtpu_event(11));
+        r.route_normalized(&gtpu_event(12));
+        // Avant le flush idle : 0 bucket, 3 × 1500 = 4500 octets
+        // accumulés dans ul_bytes.
+        {
+            let traces = r.traces.lock().unwrap();
+            let s = traces.get("t").unwrap();
+            let buckets: Vec<_> = s.events.iter().filter(|e| e.kind == "throughput").collect();
+            assert!(
+                buckets.is_empty(),
+                "pas encore de bucket (tous events sur seconde=1)"
+            );
+            assert_eq!(s.ul_bytes, 4_500);
+            assert_eq!(s.throughput_second, 1);
+        }
+        // Flush idle : wall-clock now >> throughput_second=1 → bucket émis.
+        r.flush_idle_throughput_buckets();
+        let traces = r.traces.lock().unwrap();
+        let s = traces.get("t").unwrap();
+        let buckets: Vec<_> = s.events.iter().filter(|e| e.kind == "throughput").collect();
+        assert_eq!(
+            buckets.len(),
+            1,
+            "flush idle doit émettre exactement 1 bucket pour la seconde stagnante"
+        );
+        assert_eq!(buckets[0].payload["second"], 1);
+        assert_eq!(buckets[0].payload["ul_bytes_s"], 4_500);
+        assert_eq!(buckets[0].payload["flush"], "idle");
+        // state reset après flush : la seconde suivante peut
+        // recommencer à accumuler sans prolonger.
+        assert_eq!(s.throughput_second, 0);
+        assert_eq!(s.ul_bytes, 0);
+    }
+
+    /// 2.21.99 — preuve de **totalisation bit-identique** sur N octets
+    /// GTP-U connus (objectif de l'ordre : « les buckets du flux live
+    /// totalisent **exactement** N, par sens »). 10 events UL × 1200 B
+    /// + 7 events DL × 1500 B répartis sur 3 secondes, puis flush idle.
+    /// Résultat attendu : total(ul_bytes_s) = 12_000, total(dl_bytes_s)
+    /// = 10_500.
+    #[test]
+    fn total_bytes_from_live_throughput_buckets_match_expected_exactly_2_21_99() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec!["psn-total".into()]));
+        let make = |packet: u64, seconds: i64, direction: Direction, bytes: u32| {
+            NormalizedEvent {
+                event_id: format!("evt-gtpu-{packet}"),
+                stable_event_key: String::new(),
+                parent_event_id: None,
+                probe_id: "test".into(),
+                capture_point_id: "N3".into(),
+                capture_id: "cap".into(),
+                packet_references: vec![PacketReference {
+                    source_file: "x".into(),
+                    source_sha256: None,
+                    packet_number: packet,
+                    byte_offset: 0,
+                    interface_id: 0,
+                    link_type: None,
+                    sll2_protocol_type: None,
+                    sll2_reserved: None,
+                    sll2_interface_index: None,
+                    sll2_arphrd_type: None,
+                    sll2_packet_type: None,
+                    sll2_address_length: None,
+                    sll2_address: None,
+                    captured_length: bytes,
+                    original_length: bytes,
+                }],
+                timestamp: ExactTimestamp {
+                    seconds,
+                    nanoseconds: 0,
+                    raw_ticks: (seconds.max(0) as u64) * 1_000_000_000,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: "N3".into(),
+                protocol: Protocol::Gtpu,
+                message_name: "GTP-U psn-total".into(),
+                message_type: 255,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "10.0.0.1".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "10.0.0.2".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction,
+                session_identifiers: vec![NamedValue {
+                    name: "teid".into(),
+                    value: "0xabcd0001".into(),
+                    pseudonymized: false,
+                }],
+                information_elements: vec![],
+                decoder_name: "decoder-gtpu".into(),
+                decoder_version: "0.2.2".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: format!("sha256:gtpu-{packet}"),
+                evidence_references: vec![EvidenceReference {
+                    state: EvidenceState::Exact,
+                    kind: "packet-provenance".into(),
+                    reference: format!("sha256:gtpu-{packet}"),
+                }],
+                sbi: None,
+            }
+        };
+        let mut pkt = 10u64;
+        // Seconde 100 : 4 UL + 2 DL.
+        for _ in 0..4 {
+            r.route_normalized(&make(pkt, 100, Direction::Uplink, 1_200));
+            pkt += 1;
+        }
+        for _ in 0..2 {
+            r.route_normalized(&make(pkt, 100, Direction::Downlink, 1_500));
+            pkt += 1;
+        }
+        // Seconde 101 : 3 UL + 3 DL → flush bucket seconde 100.
+        for _ in 0..3 {
+            r.route_normalized(&make(pkt, 101, Direction::Uplink, 1_200));
+            pkt += 1;
+        }
+        for _ in 0..3 {
+            r.route_normalized(&make(pkt, 101, Direction::Downlink, 1_500));
+            pkt += 1;
+        }
+        // Seconde 102 : 3 UL + 2 DL → flush bucket seconde 101.
+        for _ in 0..3 {
+            r.route_normalized(&make(pkt, 102, Direction::Uplink, 1_200));
+            pkt += 1;
+        }
+        for _ in 0..2 {
+            r.route_normalized(&make(pkt, 102, Direction::Downlink, 1_500));
+            pkt += 1;
+        }
+        // Flush idle : wall-clock now >> 102 → bucket seconde 102 émis.
+        r.flush_idle_throughput_buckets();
+
+        let traces = r.traces.lock().unwrap();
+        let s = traces.get("t").unwrap();
+        let buckets: Vec<_> = s.events.iter().filter(|e| e.kind == "throughput").collect();
+        // 3 secondes de trafic → 3 buckets (dont 1 flushé en idle).
+        assert_eq!(buckets.len(), 3, "3 secondes de trafic, 3 buckets");
+        // Totalisation stricte :
+        //   UL = (4 + 3 + 3) × 1200 = 12 000
+        //   DL = (2 + 3 + 2) × 1500 = 10 500
+        let (total_ul, total_dl): (u64, u64) = buckets
+            .iter()
+            .map(|b| {
+                (
+                    b.payload["ul_bytes_s"].as_u64().unwrap_or(0),
+                    b.payload["dl_bytes_s"].as_u64().unwrap_or(0),
+                )
+            })
+            .fold((0, 0), |(a, b), (u, d)| (a + u, b + d));
+        assert_eq!(total_ul, 12_000, "total UL = (4+3+3)×1200");
+        assert_eq!(total_dl, 10_500, "total DL = (2+3+2)×1500");
+        assert_eq!(
+            total_ul + total_dl,
+            22_500,
+            "total trafic GTP-U sans perte à travers les buckets live"
         );
     }
 
