@@ -381,6 +381,26 @@ impl RtpFlowAggregator {
                 _ => state.packets,
             };
             let loss = expected_packets.saturating_sub(state.packets);
+            // 2.21.100 (ordre #9 7046402022 décision b) — `loss_apparent`
+            // conserve le signe. `loss` (ex-`loss_count`) reste borné ≥ 0
+            // pour l'opérateur ; `loss_apparent` = `expected - observed`
+            // signé rend visible une collision de SSRC ou un double
+            // comptage (strictement < 0). Jamais masqué, toujours signalé.
+            let expected_i128 = expected_packets as i128;
+            let observed_i128 = state.packets as i128;
+            let loss_apparent_i64: i64 = (expected_i128 - observed_i128)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            if loss_apparent_i64 < 0 {
+                // 2.21.100 (ordre #9 7046402022 décision b) — journal JSON
+                // manuel pour éviter une dépendance transitoire à
+                // `serde_json` depuis decoder-rtp. Tous les champs sont
+                // numériques ou ASCII déjà échappés par les décodeurs amont
+                // (ssrc hex, IPv4 dotted-quad, u16 ports).
+                eprintln!(
+                    "{{\"event\":\"RTP_LOSS_NEGATIVE_APPARENT\",\"capture_id\":\"{}\",\"interface\":\"{}\",\"ssrc\":\"0x{:08x}\",\"source_ip\":\"{}\",\"source_port\":{},\"destination_ip\":\"{}\",\"destination_port\":{},\"expected_packets\":{},\"observed_packets\":{},\"loss_apparent\":{},\"reason\":\"candidate_collision_or_double_count\"}}",
+                    capture_id, interface, ssrc, source_ip, source_port, destination_ip, destination_port, expected_packets, state.packets, loss_apparent_i64
+                );
+            }
             // 2.21.79 — conversion ticks RTP → ns pour l'émission. Si
             // l'horloge est inconnue, `jitter_ns` sort en `null` + une
             // raison `jitter_null_reason` dans l'IE suivant.
@@ -425,6 +445,18 @@ impl RtpFlowAggregator {
                     name: "loss_count".into(),
                     length: 8,
                     value: Some(loss.to_string()),
+                    raw_sha256: None,
+                    status: DecodeStatus::Decoded,
+                },
+                // 2.21.100 (ordre #9 7046402022 décision b) — `loss_apparent`
+                // signé en plus de `loss_count` borné. Strictement < 0 ⇒
+                // collision SSRC / double comptage ; event JSON
+                // `RTP_LOSS_NEGATIVE_APPARENT` journalisé.
+                InformationElement {
+                    id: None,
+                    name: "loss_apparent".into(),
+                    length: 8,
+                    value: Some(loss_apparent_i64.to_string()),
                     raw_sha256: None,
                     status: DecodeStatus::Decoded,
                 },
@@ -1028,5 +1060,112 @@ mod tests {
             .find(|ie| ie.name == "jitter_clock_rate_hz")
             .unwrap();
         assert_eq!(rate_ie.value.as_deref(), Some("16000"));
+    }
+
+    /// 2.21.100 (défaut ANR1 V2b #10 7045290646, ordre #9 7046402022
+    /// décision b) — deux flux de même SSRC mais 5-tuples distincts
+    /// produisent **deux `FlowKey` séparés** (= deux events, deux pertes
+    /// indépendantes). Le problème V2b observé par `tshark rtp,streams`
+    /// (agrégation unique sur le SSRC seul) ne se reproduit pas côté
+    /// OIRAN : la FlowKey inclut (source_ip, source_port, destination_ip,
+    /// destination_port, ssrc).
+    #[test]
+    fn two_flows_same_ssrc_different_5tuples_are_distinct_flowkeys_2_21_100() {
+        let mut agg = RtpFlowAggregator::new();
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.0.0.2".into(),
+            port: 49170,
+            call_id: "cid-ue-A".into(),
+            payload_type: Some(0),
+            clock_rate_hz: None,
+        });
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.0.0.3".into(),
+            port: 49172,
+            call_id: "cid-ue-B".into(),
+            payload_type: Some(0),
+            clock_rate_hz: None,
+        });
+        // Flux A : SSRC=0xdeadbeef, 3 paquets contigus (0,1,2), aucune perte.
+        for (idx, seq) in [0u16, 1, 2].iter().enumerate() {
+            let pkt = rtp_packet(0, *seq, 100 + *seq as u32 * 160, 0xdeadbeef, &[0xaa; 160]);
+            agg.observe_rtp(
+                "10.0.0.1", 40000, "10.0.0.2", 49170,
+                &pkt, 1_000_000 * idx as u64,
+                &pr(1 + idx as u64), &ts(1_000_000 * idx as u64),
+            );
+        }
+        // Flux B : MÊME SSRC=0xdeadbeef mais 5-tuple différent, 5 paquets
+        // contigus (0..4) — pas de collision, 2 FlowKey distincts.
+        for (idx, seq) in [0u16, 1, 2, 3, 4].iter().enumerate() {
+            let pkt = rtp_packet(0, *seq, 200 + *seq as u32 * 160, 0xdeadbeef, &[0xbb; 160]);
+            agg.observe_rtp(
+                "10.0.0.4", 40002, "10.0.0.3", 49172,
+                &pkt, 2_000_000 * idx as u64,
+                &pr(10 + idx as u64), &ts(2_000_000 * idx as u64),
+            );
+        }
+        let events = agg.finish("sha256:cap", "IMS");
+        assert_eq!(events.len(), 2, "2 flux (même SSRC, 5-tuple différents) ⇒ 2 events");
+        for ev in &events {
+            let loss_count: i64 = ev
+                .information_elements
+                .iter()
+                .find(|ie| ie.name == "loss_count")
+                .and_then(|ie| ie.value.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            let loss_apparent: i64 = ev
+                .information_elements
+                .iter()
+                .find(|ie| ie.name == "loss_apparent")
+                .and_then(|ie| ie.value.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-9999);
+            assert_eq!(loss_count, 0, "flux contigu ⇒ loss_count=0");
+            assert_eq!(loss_apparent, 0, "flux contigu ⇒ loss_apparent=0");
+        }
+    }
+
+    /// 2.21.100 — `loss_apparent` est signé et exposé en IE à côté de
+    /// `loss_count`. Les gaps réels donnent les deux positifs égaux ; une
+    /// collision hypothétique (expected < observed) donnerait
+    /// `loss_apparent < 0` + event JSON `RTP_LOSS_NEGATIVE_APPARENT`. Ce
+    /// test prouve la présence de l'IE et la cohérence loss_count vs
+    /// loss_apparent sur un cas normal.
+    #[test]
+    fn loss_apparent_ie_mirrors_loss_count_on_contiguous_flow_2_21_100() {
+        let mut agg = RtpFlowAggregator::new();
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.0.0.2".into(),
+            port: 49170,
+            call_id: "cid-test".into(),
+            payload_type: Some(0),
+            clock_rate_hz: None,
+        });
+        // Send seq 0..4 (5 packets contigus) = 0 loss.
+        for (idx, seq) in [0u16, 1, 2, 3, 4].iter().enumerate() {
+            let pkt = rtp_packet(0, *seq, 100 + *seq as u32 * 160, 0xcafebabe, &[0xcc; 160]);
+            agg.observe_rtp(
+                "10.0.0.1", 40000, "10.0.0.2", 49170,
+                &pkt, 1_000_000 * idx as u64,
+                &pr(1 + idx as u64), &ts(1_000_000 * idx as u64),
+            );
+        }
+        let events = agg.finish("sha256:cap", "IMS");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        let loss_count_ie = ev
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "loss_count")
+            .expect("loss_count doit exister");
+        let loss_apparent_ie = ev
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "loss_apparent")
+            .expect("loss_apparent doit exister (nouvelle IE 2.21.100)");
+        assert_eq!(loss_count_ie.value.as_deref(), Some("0"));
+        assert_eq!(loss_apparent_ie.value.as_deref(), Some("0"));
     }
 }
