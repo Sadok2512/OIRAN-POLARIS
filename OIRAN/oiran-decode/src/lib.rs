@@ -68,6 +68,27 @@ enum UdpRoute {
     ImsSip,
 }
 
+/// 2.21.107 — plans de capture dont l'UDP hors SIP est présenté à
+/// l'agrégateur RTP/RTCP : le plan IMS et le plan N6.
+fn carries_ims_media(interface: &str) -> bool {
+    matches!(interface, "IMS" | "N6")
+}
+
+/// 2.21.107 — interface logique des events SIP/RTP d'un plan de
+/// capture. Un message IMS capturé sur N6 est publié `interface="IMS"`,
+/// la seule que `correlation-engine` compte pour la voix. Les events
+/// `N3-IMS` (SIP extrait du tunnel GTP-U, 2.21.100) gardent leur
+/// marqueur propre et ne sont pas comptés : pas de double comptage
+/// entre N3 et N6. Le plan d'origine reste lisible dans
+/// `packet_references[].source_file` (`N6.pcap-…`).
+fn ims_event_interface(interface: &str) -> &str {
+    if interface == "N6" {
+        "IMS"
+    } else {
+        interface
+    }
+}
+
 fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option<UdpRoute> {
     let has_port = |port| source_port == port || destination_port == port;
     match interface {
@@ -83,6 +104,10 @@ fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option
         "Sxab" if has_port(8805) => Some(UdpRoute::SxabPfcp),
         // 2.11.0 : IMS SIP.
         "IMS" if has_port(SIP_DEFAULT_PORT) => Some(UdpRoute::ImsSip),
+        // 2.21.107 (ordre #9 7049222982) — le plan N6 (IP UE en clair
+        // côté DN) porte la signalisation IMS quand le P-CSCF est joint
+        // par N6 : même route que le plan IMS.
+        "N6" if has_port(SIP_DEFAULT_PORT) => Some(UdpRoute::ImsSip),
         _ => None,
     }
 }
@@ -307,7 +332,7 @@ where
                         register_sdp_flows_from_sip(&decoded, &mut rtp_aggregator);
                     }
                     emit_events(decoded, config, &mut key_ordinals, &mut sink, &mut event_count, &mut sink_error);
-                } else if config.interface == "IMS" {
+                } else if carries_ims_media(&config.interface) {
                     // 2.11.0 : paquet UDP IMS en dehors du port SIP 5060 → tenter
                     // RTP/RTCP sur un flux déjà enregistré par un SDP.
                     let src_ip = view.source_ip.as_str();
@@ -453,7 +478,8 @@ where
     // 2.11.0 : émet UN event par flux RTP agrégé — jamais un event
     // par paquet. L'agrégateur peut être vide si le dataset n'a vu
     // aucune SDP + RTP ; c'est le cas habituel hors IMS.
-    let rtp_events = rtp_aggregator.finish(&config.capture_id, &config.interface);
+    let rtp_events =
+        rtp_aggregator.finish(&config.capture_id, ims_event_interface(&config.interface));
     for mut event in rtp_events {
         // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — stamper
         // `stable_event_key` unique par event (RTP agrégé partage le
@@ -776,17 +802,18 @@ fn validate_config(config: &DecodeConfig) -> Result<(), String> {
         config.interface.as_str(),
         // 2.9.1 (#9): the LTE core planes join the 5G-SA allowlist so
         // `decode_capture_streaming` routes them to the existing
-        // decoders (GTP-U, GTPv2-C, PFCP, Diameter). N6 remains out —
-        // it carries user-data only and no OIRAN decoder emits events
-        // from it today; the live-probe counts it separately
-        // (`CONTINUOUS_PLANE_COUNTED_NO_DECODER`).
+        // decoders (GTP-U, GTPv2-C, PFCP, Diameter). N6 est resté
+        // exclu jusqu'à 2.21.106 ; accepté depuis 2.21.107 (route IMS).
         "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11"
             | "S5-C" | "S5-U" | "S6a" | "Sxab"
             // 2.11.0 : plane IMS (SIP/RTP) ajoutée en 13ᵉ interface.
             | "IMS"
+            // 2.21.107 : plan N6, décodé par la route IMS (SIP/RTP).
+            | "N6"
     ) {
         return Err(
-            "interface must be N2, N3, N4, SBI, S1-MME, S1-U, S11, S5-C, S5-U, S6a, Sxab or IMS".into(),
+            "interface must be N2, N3, N4, N6, SBI, S1-MME, S1-U, S11, S5-C, S5-U, S6a, Sxab or IMS"
+                .into(),
         );
     }
     Ok(())
@@ -984,6 +1011,97 @@ fn packet_reference(packet: &CapturePacket) -> PacketReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2.21.107 — pcap classique (Ethernet) d'un seul datagramme UDP.
+    fn single_udp_pcap(path: &std::path::Path, src_port: u16, dst_port: u16, payload: &[u8]) {
+        let udp_len = (8 + payload.len()) as u16;
+        let ip_len = 20 + udp_len;
+        let mut frame = vec![0u8; 12];
+        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(&[0x45, 0x00]);
+        frame.extend_from_slice(&ip_len.to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+        frame.extend_from_slice(&[10, 47, 0, 2]);
+        frame.extend_from_slice(&[10, 77, 24, 20]);
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&udp_len.to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(payload);
+        let mut file = Vec::new();
+        file.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+        file.extend_from_slice(&2u16.to_le_bytes());
+        file.extend_from_slice(&4u16.to_le_bytes());
+        file.extend_from_slice(&[0u8; 8]);
+        file.extend_from_slice(&65_535u32.to_le_bytes());
+        file.extend_from_slice(&1u32.to_le_bytes());
+        file.extend_from_slice(&1_795_200_000u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        file.extend_from_slice(&frame);
+        std::fs::write(path, file).unwrap();
+    }
+
+    /// 2.21.107 (ordre #9 7049222982) — un REGISTER SIP capturé sur le
+    /// plan N6 est décodé et publié `interface="IMS"`, à l'identique du
+    /// même datagramme capturé sur le plan IMS (même nom de message,
+    /// même référence de payload). Avant 2.21.107 : `N6` refusé par
+    /// `validate_config`.
+    #[test]
+    fn n6_plane_decodes_sip_as_ims_interface_2_21_107() {
+        let register: &[u8] = b"REGISTER sip:ims.example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.47.0.2:5060;branch=z9hG4bKn6\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:user@example.invalid>;tag=n6\r\n\
+To: <sip:user@example.invalid>\r\n\
+Call-ID: synthetic-2-21-107@oiran\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\
+\r\n";
+        let path = std::env::temp_dir().join(format!(
+            "oiran-n6-sip-{}-{:?}.pcap",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        single_udp_pcap(&path, 5060, 5060, register);
+        let key = PseudonymKey::from_bytes([9; 32]);
+        let decode = |interface: &str| {
+            let config = DecodeConfig {
+                input: path.clone(),
+                capture_id: format!("sha256:{}", "d".repeat(64)),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: String::new(),
+            };
+            let mut events = Vec::new();
+            decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .unwrap();
+            events
+        };
+        let from_n6 = decode("N6");
+        let from_ims = decode("IMS");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(from_n6.len(), 1, "un event SIP depuis N6");
+        assert_eq!(from_ims.len(), 1);
+        assert_eq!(from_n6[0].interface, "IMS");
+        assert_eq!(from_n6[0].protocol.as_str(), "SIP");
+        assert_eq!(from_n6[0].message_name, from_ims[0].message_name);
+        assert_eq!(
+            from_n6[0].raw_payload_reference,
+            from_ims[0].raw_payload_reference
+        );
+        // Le reste du trafic N6 (données UE hors SIP) n'émet rien.
+        single_udp_pcap(&path, 40_000, 443, b"not sip, not rtp");
+        assert!(decode("N6").is_empty());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ims_event_interface("N6"), "IMS");
+        assert_eq!(ims_event_interface("N3"), "N3");
+        assert!(carries_ims_media("N6") && carries_ims_media("IMS") && !carries_ims_media("N3"));
+    }
 
     #[test]
     fn rejects_non_allowlisted_interface() {

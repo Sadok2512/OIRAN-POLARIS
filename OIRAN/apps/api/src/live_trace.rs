@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::Infallible,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::Duration,
@@ -39,6 +39,178 @@ pub(crate) struct LiveTrace {
     /// dernier émis pour la même capture (inversion intra-capture).
     #[serde(default)]
     out_of_order: u64,
+    /// 2.21.105 (défaut recette prod G3 #10 7047592953, ordre #9 7047782479) —
+    /// télémétrie de rattachement des events GTP-U à la trace. Un
+    /// garde silencieux ne garde rien : 0 bucket doit être lisible
+    /// comme `gpdu_seen=0` (alimentation) ou `gpdu_seen>0 &&
+    /// gpdu_attached=0` (rattachement). Les 3 compteurs ci-dessous
+    /// permettent le diagnostic, d'abord par trace, sans attendre de
+    /// nouveau debug en prod.
+    #[serde(default)]
+    gpdu_seen: u64,
+    #[serde(default)]
+    gpdu_attached: u64,
+    #[serde(default)]
+    gpdu_rejected_no_match: u64,
+    #[serde(default)]
+    gpdu_rejected_interface_filter: u64,
+    /// 2.21.105 (donnée ANR1 #10 7048928345, ordre #9 7048974175) —
+    /// alimentation de la trace **par interface** : events décodés
+    /// présentés à la trace (`seen`), écartés par le filtre
+    /// `interfaces` (`filtered`), rattachés (`attached`), horodatage du
+    /// dernier event et retard mesuré à son routage. Une trace « SBI
+    /// seulement » se lit ici : `N2.seen>0 && N2.attached==0`
+    /// (rattachement) ou `N2` absent (aucun event décodé).
+    #[serde(default)]
+    feed: BTreeMap<String, InterfaceFeed>,
+    /// 2.21.105 — résultat de l'apprentissage sans émission depuis le
+    /// ring de signalisation à l'ouverture de la trace.
+    #[serde(default)]
+    seed: SeedStats,
+}
+
+/// 2.21.105 — compteurs d'alimentation d'une trace pour une interface.
+#[derive(Clone, Default, Serialize, Debug, PartialEq)]
+pub(crate) struct InterfaceFeed {
+    seen: u64,
+    filtered: u64,
+    attached: u64,
+    /// Horodatage capture du dernier event présenté (secondes epoch).
+    last_event_timestamp_s: Option<i64>,
+    last_event_timestamp_ns: Option<u32>,
+    /// `horloge murale au routage − horodatage capture` du dernier
+    /// event, en ms. Signé : une horloge sonde en avance donne < 0.
+    last_event_lag_ms: Option<i64>,
+    /// Plus grand retard observé sur cette interface depuis l'ouverture.
+    max_event_lag_ms: Option<i64>,
+}
+
+/// 2.21.105 — bilan de l'apprentissage depuis le ring (`seed_from_ring`).
+#[derive(Clone, Default, Serialize, Debug, PartialEq)]
+pub(crate) struct SeedStats {
+    /// `false` tant que le lecteur n'a pas terminé la passe.
+    done: bool,
+    files: u64,
+    bytes: u64,
+    events_scanned: u64,
+    events_learned: u64,
+    /// `true` si au moins un fichier du ring a été laissé de côté par
+    /// le plafond d'octets par interface.
+    truncated: bool,
+}
+
+/// 2.21.105 — interfaces de signalisation relues à l'ouverture d'une
+/// trace, dans l'ordre de dépendance : N2/S1-MME portent l'identité
+/// et les tunnels, N4/S11/S5-C/Sxab s'y rattachent par tunnel, IP UE
+/// pseudonymisée ou SEID. N3/S1-U/S5-U (plan usager, volumineux) et
+/// SBI (porte l'identité dans chaque requête) ne sont jamais relus.
+const SEED_INTERFACES: [&str; 6] = ["N2", "S1-MME", "N4", "S11", "S5-C", "Sxab"];
+/// 2.21.105 — plafond d'octets relus par interface pour un amorçage.
+const SEED_MAX_BYTES_PER_INTERFACE: u64 = 64 * 1024 * 1024;
+/// 2.21.105 — période d'émission de l'event SSE `stats`.
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Nom du sous-répertoire du ring pour une interface.
+fn ring_directory(interface: &str) -> String {
+    match interface {
+        "S1-MME" => "s1mme".into(),
+        "S1-U" => "s1u".into(),
+        "S5-C" => "s5c".into(),
+        "S5-U" => "s5u".into(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+/// 2.21.105 — choisit les fichiers du ring à relire pour l'amorçage :
+/// les plus récents d'abord tant que le plafond tient, rendus du plus
+/// ancien au plus récent (l'apprentissage suit l'ordre chronologique).
+/// Retourne `(fichiers, tronqué)`.
+fn select_seed_files(
+    mut files: Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>)>,
+    budget: u64,
+) -> (Vec<(std::path::PathBuf, u64)>, bool) {
+    files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    let mut truncated = false;
+    for (path, size, _) in files.into_iter().rev() {
+        if total.saturating_add(size) > budget {
+            truncated = true;
+            break;
+        }
+        total = total.saturating_add(size);
+        selected.push((path, size));
+    }
+    selected.reverse();
+    (selected, truncated)
+}
+
+/// 2.21.105 — bilan d'une passe d'amorçage, toutes interfaces.
+#[derive(Default, Debug, PartialEq)]
+pub(crate) struct SeedReport {
+    files: u64,
+    bytes: u64,
+    truncated: bool,
+}
+
+/// 2.21.105 (ordre #9 7048974175) — relit le ring de signalisation et
+/// présente chaque event aux traces en cours d'amorçage, **sans rien
+/// émettre**. Cause traitée : une trace n'apprenait le contexte d'un
+/// abonné (identifiants NGAP, IP UE, TEID, SEID) que sur des messages
+/// décodés après son ouverture ; une session établie avant restait
+/// invisible sur NAS/NGAP/PFCP/GTP-U, seul le SBI (identité dans
+/// chaque requête) passait.
+fn seed_from_ring(
+    root: &std::path::Path,
+    key: &event_schema::PseudonymKey,
+    registry: &LiveTraceRegistry,
+) -> SeedReport {
+    let mut report = SeedReport::default();
+    for interface in SEED_INTERFACES {
+        let dir = root.join(ring_directory(interface));
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let files: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("pcapng"))
+            .filter_map(|path| {
+                let meta = path.metadata().ok()?;
+                Some((path, meta.len(), meta.modified().ok()))
+            })
+            .collect();
+        let (selected, truncated) = select_seed_files(files, SEED_MAX_BYTES_PER_INTERFACE);
+        report.truncated |= truncated;
+        for (path, size) in selected {
+            let config = oiran_decode::DecodeConfig {
+                input: path.clone(),
+                capture_id: format!("sha256:{}", sha256_hex(path.to_string_lossy().as_bytes())),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_owned())
+                    .unwrap_or_default(),
+            };
+            let mut events = Vec::new();
+            // Un fichier en cours d'écriture se termine par un bloc
+            // partiel : les events complets sont gardés, l'erreur de
+            // fin de fichier est attendue.
+            let _ = oiran_decode::decode_capture_streaming(&config, key, |event| {
+                events.push(event);
+                Ok(())
+            });
+            sort_by_capture_order(&mut events);
+            for event in &events {
+                registry.learn_from_ring(event);
+            }
+            report.files += 1;
+            report.bytes = report.bytes.saturating_add(size);
+        }
+    }
+    report
 }
 
 #[derive(Clone)]
@@ -135,6 +307,11 @@ struct TraceState {
     /// exportées via SSE/API/logs (invariant privacy « pas d'IP UE en
     /// clair hors identity vault »).
     ue_ips: HashSet<String>,
+    /// 2.21.105 — la trace attend son amorçage depuis le ring.
+    needs_seed: bool,
+    /// 2.21.105 — la trace est dans la passe d'amorçage en cours :
+    /// seule cible de `learn_from_ring`.
+    seeding: bool,
 }
 /// 2.21.90 défaut 2 — clé HMAC partagée pour pseudonymiser l'IP UE
 /// apprise depuis NAS, dans le même domain que `decoder-pfcp` (IE 93),
@@ -331,6 +508,11 @@ pub(crate) struct LiveTraceRegistry {
     traces: Mutex<HashMap<String, TraceState>>,
     reader_running: AtomicBool,
     audit: Mutex<VecDeque<Value>>,
+    /// 2.21.105 — durée (ms) de la dernière passe complète du lecteur
+    /// sur toutes les interfaces. Le lecteur est une boucle unique et
+    /// séquentielle : cette durée est le retard qu'une interface
+    /// volumineuse (N3) impose aux suivantes et au tour d'après.
+    reader_pass_ms: AtomicU64,
 }
 
 impl LiveTraceRegistry {
@@ -339,6 +521,7 @@ impl LiveTraceRegistry {
             traces: Mutex::new(HashMap::new()),
             reader_running: AtomicBool::new(false),
             audit: Mutex::new(VecDeque::new()),
+            reader_pass_ms: AtomicU64::new(0),
         }
     }
     pub(crate) fn audit(&self, entry: Value) {
@@ -372,6 +555,78 @@ impl LiveTraceRegistry {
     fn purge(map: &mut HashMap<String, TraceState>) {
         let now = epoch_seconds();
         map.retain(|_, state| state.trace.expires_at > now);
+    }
+
+    /// 2.21.105 — ouvre une passe d'amorçage : les traces en attente
+    /// passent en `seeding`. Une trace créée pendant la passe garde
+    /// `needs_seed` et sera amorcée à la passe suivante. Retourne
+    /// `true` si au moins une trace est à amorcer.
+    pub(crate) fn begin_seed(&self) -> bool {
+        let mut traces = self.traces.lock().unwrap();
+        let mut any = false;
+        for state in traces.values_mut() {
+            if state.needs_seed {
+                state.needs_seed = false;
+                state.seeding = true;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// 2.21.105 — clôt la passe d'amorçage et publie son bilan dans
+    /// l'état de chaque trace amorcée.
+    pub(crate) fn finish_seed(&self, report: &SeedReport) {
+        let mut traces = self.traces.lock().unwrap();
+        for state in traces.values_mut() {
+            if state.seeding {
+                state.seeding = false;
+                state.trace.seed.done = true;
+                state.trace.seed.files = report.files;
+                state.trace.seed.bytes = report.bytes;
+                state.trace.seed.truncated = report.truncated;
+            }
+        }
+    }
+
+    /// 2.21.105 — contenu de l'event SSE `stats` d'une trace. Aucune
+    /// identité : des compteurs, des noms d'interface, des horodatages.
+    fn stats_payload(&self, trace: &LiveTrace) -> Value {
+        json!({
+            "wall_clock_s": epoch_seconds(),
+            "reader_pass_ms": self.reader_pass_ms.load(Ordering::Relaxed),
+            "messages": trace.messages,
+            "gpdu": {
+                "seen": trace.gpdu_seen,
+                "attached": trace.gpdu_attached,
+                "rejected_no_match": trace.gpdu_rejected_no_match,
+                "rejected_interface_filter": trace.gpdu_rejected_interface_filter,
+            },
+            "interfaces": trace.feed,
+            "seed": trace.seed,
+        })
+    }
+
+    /// 2.21.105 — diffuse un event SSE `stats` à chaque trace. Diffusé
+    /// aux abonnés connectés seulement, jamais mis dans le tampon de
+    /// replay : il ne doit pas en chasser des messages, et le dernier
+    /// état reste lisible par `GET /live/traces`.
+    pub(crate) fn emit_stats(&self) {
+        let mut traces = self.traces.lock().unwrap();
+        Self::purge(&mut traces);
+        for state in traces.values_mut() {
+            state.next_id += 1;
+            let payload = self.stats_payload(&state.trace);
+            let _ = state.tx.send(BufferedEvent {
+                id: state.next_id,
+                kind: "stats".into(),
+                payload,
+            });
+        }
+    }
+
+    pub(crate) fn set_reader_pass_ms(&self, value: u64) {
+        self.reader_pass_ms.store(value, Ordering::Relaxed);
     }
 
     /// 2.21.99 (défaut recette prod #10 7043526474, ordre #9 7043914072) —
@@ -460,6 +715,20 @@ impl LiveTraceRegistry {
     }
 
     fn route_normalized(&self, event: &event_schema::NormalizedEvent) {
+        self.route_event(event, false);
+    }
+
+    /// 2.21.105 — présente un event relu depuis le ring aux traces en
+    /// cours d'amorçage : même règle de rattachement et même
+    /// apprentissage que `route_normalized`, **aucune émission**, aucun
+    /// compteur de message. Le filtre `interfaces` de la trace ne
+    /// s'applique pas : une trace filtrée sur N3 a besoin des TEID
+    /// portés par N2/N4.
+    fn learn_from_ring(&self, event: &event_schema::NormalizedEvent) {
+        self.route_event(event, true);
+    }
+
+    fn route_event(&self, event: &event_schema::NormalizedEvent, seed_only: bool) {
         // 2.21.103 (ordre #9 7046282778, défaut ANR2 #10 7045891820) — un
         // PFCP de niveau nœud (Heartbeat/Association/PFD/Node-Report) n'est
         // JAMAIS routé dans une trace abonné : ces messages n'ont pas de
@@ -496,15 +765,58 @@ impl LiveTraceRegistry {
             .and_then(|v| parse_pdu_address(v));
         let mut traces = self.traces.lock().unwrap();
         Self::purge(&mut traces);
+        let is_gpdu = !seed_only && event.protocol.as_str() == "GTP-U";
+        let lag_ms = {
+            let wall_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let event_ms = event
+                .timestamp
+                .seconds
+                .saturating_mul(1_000)
+                .saturating_add(i64::from(event.timestamp.nanoseconds / 1_000_000));
+            wall_ms.saturating_sub(event_ms)
+        };
         for state in traces.values_mut() {
-            if !state.trace.interfaces.is_empty()
+            if seed_only {
+                if !state.seeding {
+                    continue;
+                }
+                state.trace.seed.events_scanned =
+                    state.trace.seed.events_scanned.saturating_add(1);
+            } else {
+                let feed = state.trace.feed.entry(event.interface.clone()).or_default();
+                feed.seen = feed.seen.saturating_add(1);
+                feed.last_event_timestamp_s = Some(event.timestamp.seconds);
+                feed.last_event_timestamp_ns = Some(event.timestamp.nanoseconds);
+                feed.last_event_lag_ms = Some(lag_ms);
+                feed.max_event_lag_ms =
+                    Some(feed.max_event_lag_ms.map_or(lag_ms, |prior| prior.max(lag_ms)));
+            }
+            if !seed_only
+                && !state.trace.interfaces.is_empty()
                 && !state
                     .trace
                     .interfaces
                     .iter()
                     .any(|item| item.eq_ignore_ascii_case(&event.interface))
             {
+                // 2.21.105 — compte pour diagnostic. Un event GTP-U sur
+                // une interface non-filtrée est un signal fort que le
+                // trace a été créé avec une liste d'interfaces qui
+                // exclut la data-plane (ex. "N2" seulement, pas "N3").
+                if is_gpdu {
+                    state.trace.gpdu_rejected_interface_filter =
+                        state.trace.gpdu_rejected_interface_filter.saturating_add(1);
+                }
+                if let Some(feed) = state.trace.feed.get_mut(&event.interface) {
+                    feed.filtered = feed.filtered.saturating_add(1);
+                }
                 continue;
+            }
+            if is_gpdu {
+                state.trace.gpdu_seen = state.trace.gpdu_seen.saturating_add(1);
             }
             // 2.21.90 défaut 1 — match par pseudonymes vault et par
             // chiffres canoniques amorcés / identifiants appris
@@ -532,9 +844,27 @@ impl LiveTraceRegistry {
                 .any(|pair| state.tunnel_endpoints.contains(pair));
             let matched = match_pseudo || match_keys || match_seid || match_teid || match_tunnel;
             if !matched {
+                // 2.21.105 — un G-PDU qui arrive APRÈS la trace mais
+                // dont le TEID / UE IP n'a pas été appris (parce que
+                // la session PDU était déjà établie avant l'ouverture
+                // de la trace) termine ici. Compteur exposé via
+                // `/live/traces/:id` pour que l'opérateur voie 0
+                // bucket = N rejets rattachement, pas 0 vu.
+                if is_gpdu {
+                    state.trace.gpdu_rejected_no_match =
+                        state.trace.gpdu_rejected_no_match.saturating_add(1);
+                }
                 continue;
             }
-            state.trace.armed = false;
+            if is_gpdu {
+                state.trace.gpdu_attached = state.trace.gpdu_attached.saturating_add(1);
+            }
+            if !seed_only {
+                if let Some(feed) = state.trace.feed.get_mut(&event.interface) {
+                    feed.attached = feed.attached.saturating_add(1);
+                }
+                state.trace.armed = false;
+            }
             if let Some(ids) = value.get("session_identifiers").and_then(Value::as_array) {
                 for id in ids {
                     let Some(v) = id.get("value").and_then(Value::as_str) else {
@@ -617,6 +947,13 @@ impl LiveTraceRegistry {
                 state.seids.clear();
                 state.ue_ips.clear();
             }
+            if seed_only {
+                // Amorçage : l'état de rattachement est appris, rien
+                // n'est émis ni compté comme message.
+                state.trace.seed.events_learned =
+                    state.trace.seed.events_learned.saturating_add(1);
+                continue;
+            }
             let packet = event
                 .packet_references
                 .first()
@@ -647,7 +984,7 @@ impl LiveTraceRegistry {
             // 2.21.91 (défaut #9 7033006772) — expose `stable_event_key`
             // dans le payload SSE. Clé de corrélation live↔publi
             // indépendante de `capture_id` (voir event-schema 1.6.0).
-            let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"stable_event_key":event.stable_event_key,"decoded_ie_tree":value.get("information_elements"),"late":late});
+            let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"stable_event_key":event.stable_event_key,"timestamp":{"seconds":event.timestamp.seconds,"nanoseconds":event.timestamp.nanoseconds},"decoded_ie_tree":value.get("information_elements"),"late":late});
             let item = BufferedEvent {
                 id: state.next_id,
                 kind: "message".into(),
@@ -779,6 +1116,8 @@ pub(crate) fn start_reader(state: AppState) {
         // décodage). Le débit commence « maintenant ». Si false, le
         // premier passage décode normalement (régime nominal).
         let mut initial_catchup_done = false;
+        // 2.21.105 — dernier envoi de l'event SSE `stats`.
+        let mut last_stats: Option<std::time::Instant> = None;
         loop {
             {
                 let traces = state.inner.live_traces.traces.lock().unwrap();
@@ -803,6 +1142,7 @@ pub(crate) fn start_reader(state: AppState) {
                 let state2 = state.clone();
                 let mut states = file_state;
                 let catchup = !initial_catchup_done;
+                let pass_started = std::time::Instant::now();
                 file_state = tokio::task::spawn_blocking(move || {
                     let key = match event_schema::PseudonymKey::load_or_generate(
                         &event_schema::PseudonymKey::resolve_default_path(),
@@ -810,18 +1150,22 @@ pub(crate) fn start_reader(state: AppState) {
                         Ok(k) => k,
                         Err(_) => return states,
                     };
+                    // 2.21.105 (ordre #9 7048974175) — amorçage des
+                    // traces ouvertes depuis la passe précédente : le
+                    // ring de signalisation est relu sans émission
+                    // AVANT le routage live de cette passe.
+                    if state2.inner.live_traces.begin_seed() {
+                        let report = seed_from_ring(&root, &key, &state2.inner.live_traces);
+                        state2.inner.live_traces.finish_seed(&report);
+                    }
                     for interface in [
                         "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
                         "S6a", "IMS",
+                        // 2.21.107 (ordre #9 7049222982) — plan N6 : SIP
+                        // et RTP IMS, publiés `interface="IMS"`.
+                        "N6",
                     ] {
-                        let directory = match interface {
-                            "S1-MME" => "s1mme",
-                            "S1-U" => "s1u",
-                            "S5-C" => "s5c",
-                            "S5-U" => "s5u",
-                            other => other,
-                        };
-                        let dir = root.join(directory.to_ascii_lowercase());
+                        let dir = root.join(ring_directory(interface));
                         let Ok(entries) = fs::read_dir(&dir) else {
                             continue;
                         };
@@ -1007,6 +1351,10 @@ pub(crate) fn start_reader(state: AppState) {
                 .await
                 .unwrap_or_default();
                 initial_catchup_done = true;
+                state
+                    .inner
+                    .live_traces
+                    .set_reader_pass_ms(pass_started.elapsed().as_millis() as u64);
             }
             // 2.21.78 — tick régulier du registre de débit : émet un
             // bucket zéro après IDLE_FLUSH_INTERVAL_S de silence.
@@ -1016,6 +1364,12 @@ pub(crate) fn start_reader(state: AppState) {
             // Complète l'émission event-driven de `route_normalized`
             // quand les events GTP-U cessent dans la même seconde.
             state.inner.live_traces.flush_idle_throughput_buckets();
+            // 2.21.105 — event SSE `stats` toutes les `STATS_INTERVAL` :
+            // « 0 bucket » se lit comme « 0 vu » ou « N vus, 0 rattaché ».
+            if last_stats.map_or(true, |at| at.elapsed() >= STATS_INTERVAL) {
+                state.inner.live_traces.emit_stats();
+                last_stats = Some(std::time::Instant::now());
+            }
             tokio::time::sleep(Duration::from_millis(750)).await;
         }
     });
@@ -1149,6 +1503,12 @@ pub(crate) async fn create(
         markers: 0,
         duplicates_dropped: 0,
         out_of_order: 0,
+        gpdu_seen: 0,
+        gpdu_attached: 0,
+        gpdu_rejected_no_match: 0,
+        gpdu_rejected_interface_filter: 0,
+        feed: BTreeMap::new(),
+        seed: SeedStats::default(),
     };
     traces.insert(
         trace_id.clone(),
@@ -1170,6 +1530,10 @@ pub(crate) async fn create(
             tunnel_endpoints: HashSet::new(),
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
+            // 2.21.105 — le lecteur relit le ring de signalisation
+            // pour cette trace à sa prochaine passe.
+            needs_seed: true,
+            seeding: false,
         },
     );
     drop(traces);
@@ -1530,6 +1894,12 @@ mod tests {
                 markers: 0,
                 duplicates_dropped: 0,
                 out_of_order: 0,
+                gpdu_seen: 0,
+                gpdu_attached: 0,
+                gpdu_rejected_no_match: 0,
+                gpdu_rejected_interface_filter: 0,
+                feed: BTreeMap::new(),
+                seed: SeedStats::default(),
             },
             next_id: 0,
             events: VecDeque::new(),
@@ -1547,8 +1917,467 @@ mod tests {
             tunnel_endpoints: HashSet::new(),
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
+            needs_seed: true,
+            seeding: false,
         }
     }
+    /// 2.21.105 (défaut recette prod G3 #10 7047592953, ordre #9 7047782479) —
+    /// reproduit le FAIL G3 en prod : 0 bucket pour 28 870 trames
+    /// GTP-U sur N3. Modélise H1 (rattachement raté) :
+    ///   1. une trace est créée pour `psn-prod` ;
+    ///   2. des G-PDU N3 arrivent **sans subscriber_pseudonym** et
+    ///      avec un TEID qui n'a JAMAIS été vu par la trace parce
+    ///      que la session PDU a été établie AVANT la trace ;
+    ///   3. `route_normalized` ne matche aucun G-PDU ; les compteurs
+    ///      2.21.105 (`gpdu_seen`, `gpdu_rejected_no_match`) le
+    ///      montrent : `seen > 0 && attached == 0 && rejected_no_match > 0`.
+    /// **AVANT fix** : 0 bucket (H1 reproduit).
+    /// **APRÈS seed** (via `seed_trace_from_events`) depuis le callflow
+    /// publié qui porte les TEID : les G-PDU matchent, buckets > 0,
+    /// total octets exact.
+    #[test]
+    fn gpdu_rejected_when_pdu_session_established_before_trace_2_21_105() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec!["psn-prod".into()]));
+
+        let gpdu = |packet: u64, seconds: i64, dir: Direction, bytes: u32| NormalizedEvent {
+            event_id: format!("evt-gtpu-{packet}"),
+            stable_event_key: String::new(),
+            parent_event_id: None,
+            probe_id: "test".into(),
+            capture_point_id: "N3".into(),
+            capture_id: "cap-n3".into(),
+            packet_references: vec![PacketReference {
+                source_file: "n3.pcapng".into(),
+                source_sha256: None,
+                packet_number: packet,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: bytes,
+                original_length: bytes,
+            }],
+            timestamp: ExactTimestamp {
+                seconds,
+                nanoseconds: 0,
+                raw_ticks: (seconds.max(0) as u64) * 1_000_000_000,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "N3".into(),
+            protocol: Protocol::Gtpu,
+            message_name: "GTP-U".into(),
+            message_type: 255,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.77.11.13".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.77.22.13".into(),
+                port: None,
+                network_function: None,
+            },
+            direction: dir,
+            session_identifiers: vec![NamedValue {
+                name: "teid".into(),
+                value: "0xf1240001".into(),
+                pseudonymized: false,
+            }],
+            information_elements: vec![],
+            decoder_name: "decoder-gtpu".into(),
+            decoder_version: "0.2.2".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: format!("sha256:gtpu-{packet}"),
+            evidence_references: vec![EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: format!("sha256:gtpu-{packet}"),
+            }],
+            sbi: None,
+        };
+
+        // Phase 1 — AVANT fix : route 6 G-PDU sur 2 secondes, aucun
+        // match, 0 bucket, compteurs attestent `seen>0 attached=0`.
+        for pkt in 10..16 {
+            r.route_normalized(&gpdu(
+                pkt,
+                if pkt < 13 { 1_795_200_000 } else { 1_795_200_001 },
+                if pkt % 2 == 0 { Direction::Uplink } else { Direction::Downlink },
+                1_500,
+            ));
+        }
+        {
+            let traces = r.traces.lock().unwrap();
+            let s = traces.get("t").unwrap();
+            assert_eq!(s.trace.gpdu_seen, 6, "6 G-PDU doivent être vus");
+            assert_eq!(s.trace.gpdu_attached, 0, "aucun rattaché (H1 reproduit)");
+            assert_eq!(s.trace.gpdu_rejected_no_match, 6, "6 rejets rattachement");
+            let buckets: Vec<_> = s.events.iter().filter(|e| e.kind == "throughput").collect();
+            assert!(
+                buckets.is_empty(),
+                "FAIL G3 prod reproduit : 0 bucket pour {} G-PDU vus",
+                s.trace.gpdu_seen
+            );
+        }
+
+        // Phase 2 — amorçage : la signalisation d'AVANT l'ouverture
+        // (NGAP PDU Session Resource Setup portant le pseudonyme et
+        // les tunnels, puis PFCP Session Establishment rattaché par
+        // tunnel) est relue depuis le ring, sans émission.
+        let signalling = |interface: &str,
+                          protocol: Protocol,
+                          message: &str,
+                          packet: u64,
+                          ids: Vec<(&str, &str)>,
+                          ie: (&str, &str)| {
+            let mut event = gpdu(packet, 1_795_199_000, Direction::Uplink, 200);
+            event.event_id = format!("evt-sig-{packet}");
+            event.interface = interface.into();
+            event.capture_id = format!("cap-{interface}");
+            event.protocol = protocol;
+            event.message_name = message.into();
+            event.session_identifiers = ids
+                .into_iter()
+                .map(|(n, v)| NamedValue {
+                    name: n.into(),
+                    value: v.into(),
+                    pseudonymized: n.ends_with("pseudonym"),
+                })
+                .collect();
+            event.information_elements = vec![event_schema::InformationElement {
+                id: None,
+                name: ie.0.into(),
+                length: ie.1.len() as u32,
+                value: Some(ie.1.into()),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            }];
+            event
+        };
+        let ngap_setup = signalling(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            1,
+            vec![("subscriber_pseudonym", "psn-prod")],
+            (
+                "PDUSessionResourceSetupRequestTransfer",
+                "item_0_tunnel_ip_ul=10.77.11.13,item_0_gtp_teid_ul=0xf1240001,item_0_tunnel_ip_dl=10.77.22.13,item_0_gtp_teid_dl=0xf1240002",
+            ),
+        );
+        let pfcp_establishment = signalling(
+            "N4",
+            Protocol::Pfcp,
+            "Session Establishment Request",
+            2,
+            vec![("seid", "0x0000000000001001")],
+            ("F-TEID", "teid=0xf1240001,v4=true,v6=false,ipv4=10.77.11.13"),
+        );
+        assert!(r.begin_seed(), "la trace attend son amorçage");
+        r.learn_from_ring(&ngap_setup);
+        r.learn_from_ring(&pfcp_establishment);
+        r.finish_seed(&SeedReport {
+            files: 2,
+            bytes: 400,
+            truncated: false,
+        });
+        assert!(!r.begin_seed(), "une trace n'est amorcée qu'une fois");
+        {
+            let traces = r.traces.lock().unwrap();
+            let s = traces.get("t").unwrap();
+            assert_eq!(s.trace.seed.events_scanned, 2);
+            assert_eq!(s.trace.seed.events_learned, 2);
+            assert!(s.trace.seed.done);
+            assert_eq!(s.trace.messages, 0, "l'amorçage n'émet aucun message");
+            assert!(s.events.is_empty(), "l'amorçage ne met rien dans le tampon SSE");
+            assert!(s.tunnel_teids.contains("0xf1240001"), "TEID UL appris");
+            assert!(s.tunnel_teids.contains("0xf1240002"), "TEID DL appris");
+            assert!(s.seids.contains("0x0000000000001001"), "SEID appris par tunnel");
+            assert!(
+                !s.trace.feed.contains_key("N2") && !s.trace.feed.contains_key("N4"),
+                "l'amorçage ne compte pas comme alimentation live"
+            );
+        }
+
+        // Phase 3 — G-PDU des deux sens sur 3 secondes : UL sur le TEID
+        // UL, DL sur le TEID DL. Tous rattachés, somme des buckets =
+        // octets injectés, à l'octet près.
+        let mut injected = 0u64;
+        for pkt in 20..32u64 {
+            let uplink = pkt % 2 == 0;
+            let bytes = if uplink { 1_200 } else { 1_500 };
+            let mut event = gpdu(
+                pkt,
+                1_795_200_010 + ((pkt - 20) / 4) as i64,
+                if uplink { Direction::Uplink } else { Direction::Downlink },
+                bytes,
+            );
+            event.session_identifiers[0].value =
+                if uplink { "0xf1240001".into() } else { "0xf1240002".into() };
+            injected += u64::from(bytes);
+            r.route_normalized(&event);
+        }
+        r.flush_idle_throughput_buckets();
+        let traces = r.traces.lock().unwrap();
+        let s = traces.get("t").unwrap();
+        assert_eq!(s.trace.gpdu_attached, 12, "12 G-PDU rattachés après amorçage");
+        assert_eq!(s.trace.gpdu_rejected_no_match, 6, "les rejets d'avant restent comptés");
+        let buckets: Vec<_> = s.events.iter().filter(|e| e.kind == "throughput").collect();
+        assert_eq!(buckets.len(), 3, "un bucket par seconde de trafic");
+        let sum = |field: &str| -> u64 {
+            buckets.iter().map(|b| b.payload[field].as_u64().unwrap_or(0)).sum()
+        };
+        assert_eq!(sum("ul_bytes_s"), 6 * 1_200);
+        assert_eq!(sum("dl_bytes_s"), 6 * 1_500);
+        assert_eq!(sum("unknown_bytes_s"), 0);
+        assert_eq!(
+            sum("ul_bytes_s") + sum("dl_bytes_s"),
+            injected,
+            "somme des buckets = octets injectés"
+        );
+        // Compteurs par interface et contrat `stats`.
+        let n3 = &s.trace.feed["N3"];
+        assert_eq!((n3.seen, n3.attached, n3.filtered), (18, 12, 0));
+        assert_eq!(n3.last_event_timestamp_s, Some(1_795_200_012));
+        assert!(n3.last_event_lag_ms.is_some() && n3.max_event_lag_ms >= n3.last_event_lag_ms);
+        let stats = r.stats_payload(&s.trace);
+        assert_eq!(stats["gpdu"]["seen"], 18);
+        assert_eq!(stats["gpdu"]["attached"], 12);
+        assert_eq!(stats["gpdu"]["rejected_no_match"], 6);
+        assert_eq!(stats["interfaces"]["N3"]["seen"], 18);
+        assert_eq!(stats["seed"]["events_learned"], 2);
+        assert!(stats["reader_pass_ms"].is_u64() && stats["wall_clock_s"].is_u64());
+        // Chaque message porte l'horodatage de capture.
+        let message = s.events.iter().find(|e| e.kind == "message").unwrap();
+        assert_eq!(message.payload["timestamp"]["seconds"], 1_795_200_010i64);
+        assert_eq!(message.payload["timestamp"]["nanoseconds"], 0);
+    }
+
+    /// 2.21.105 — une trace créée PENDANT une passe d'amorçage n'est
+    /// ni la cible de cette passe ni marquée amorcée : elle le sera à
+    /// la passe suivante.
+    #[test]
+    fn trace_created_during_seed_pass_waits_for_next_pass_2_21_105() {
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("a".into(), state(u64::MAX, false, vec!["psn-a".into()]));
+        assert!(r.begin_seed());
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("b".into(), state(u64::MAX, false, vec!["psn-b".into()]));
+        r.finish_seed(&SeedReport::default());
+        {
+            let traces = r.traces.lock().unwrap();
+            assert!(traces["a"].trace.seed.done);
+            assert!(!traces["b"].trace.seed.done);
+            assert!(traces["b"].needs_seed);
+        }
+        assert!(r.begin_seed(), "la trace b est amorcée à la passe suivante");
+    }
+
+    /// 2.21.105 — choix des fichiers relus : les plus récents tant que
+    /// le plafond tient, rendus du plus ancien au plus récent ; le
+    /// dépassement est signalé, jamais silencieux.
+    #[test]
+    fn select_seed_files_keeps_newest_within_budget_oldest_first_2_21_105() {
+        use std::time::{Duration as D, UNIX_EPOCH as E};
+        let file = |name: &str, size: u64, at: u64| {
+            (std::path::PathBuf::from(name), size, Some(E + D::from_secs(at)))
+        };
+        let files = vec![file("c", 40, 30), file("a", 50, 10), file("b", 40, 20)];
+        let (selected, truncated) = select_seed_files(files.clone(), 100);
+        assert_eq!(
+            selected,
+            vec![
+                (std::path::PathBuf::from("b"), 40),
+                (std::path::PathBuf::from("c"), 40)
+            ]
+        );
+        assert!(truncated, "le fichier a (le plus ancien) est laissé de côté");
+        let (all, truncated) = select_seed_files(files, 130);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].0, std::path::PathBuf::from("a"));
+        assert!(!truncated);
+        let (none, truncated) = select_seed_files(vec![file("x", 200, 1)], 100);
+        assert!(none.is_empty() && truncated);
+    }
+
+    /// 2.21.105 — le filtre `interfaces` de la trace se lit dans les
+    /// compteurs (`filtered`), et ne bloque pas l'amorçage.
+    #[test]
+    fn interface_filter_is_counted_and_bypassed_by_seed_2_21_105() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let decode = |interface: &str| {
+            let config = oiran_decode::DecodeConfig {
+                input: source.join(format!("{interface}.pcapng")),
+                capture_id: format!("sha256:{}", "b".repeat(64)),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: String::new(),
+            };
+            let mut events = Vec::new();
+            oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .unwrap();
+            sort_by_capture_order(&mut events);
+            events
+        };
+        let n2 = decode("N2");
+        assert!(!n2.is_empty());
+        let r = LiveTraceRegistry::new();
+        let mut trace = state(u64::MAX, false, vec!["psn-none".into()]);
+        trace.trace.interfaces = vec!["N3".into()];
+        r.traces.lock().unwrap().insert("t".into(), trace);
+        for event in &n2 {
+            r.route_normalized(event);
+        }
+        assert!(r.begin_seed());
+        for event in &n2 {
+            r.learn_from_ring(event);
+        }
+        let traces = r.traces.lock().unwrap();
+        let s = &traces["t"];
+        let feed = &s.trace.feed["N2"];
+        assert_eq!(feed.seen, n2.len() as u64);
+        assert_eq!(feed.filtered, n2.len() as u64);
+        assert_eq!(feed.attached, 0);
+        assert_eq!(
+            s.trace.seed.events_scanned,
+            n2.len() as u64,
+            "l'amorçage voit N2 malgré le filtre N3"
+        );
+    }
+
+    /// 2.21.105 — bout en bout sur le ring : la signalisation N2 + N4
+    /// du jeu `OIRAN_5G_PDU_SESSION_DATA_V1` est posée dans un ring
+    /// AVANT l'ouverture de la trace ; `seed_from_ring` la relit ; les
+    /// G-PDU N3 décodés ensuite sont rattachés et la somme des buckets
+    /// égale les octets des G-PDU décodés. Sans amorçage : 0 rattaché.
+    #[test]
+    fn seed_from_ring_attaches_gpdu_of_a_session_older_than_the_trace_2_21_105() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let root = std::env::temp_dir().join(format!(
+            "oiran-seed-ring-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for plane in ["n2", "n4", "n3"] {
+            fs::create_dir_all(root.join(plane)).unwrap();
+            fs::copy(
+                source.join(format!("{}.pcapng", plane.to_ascii_uppercase())),
+                root.join(plane).join(format!("{plane}_00001.pcapng")),
+            )
+            .unwrap();
+        }
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let decode = |plane: &str, interface: &str| {
+            let config = oiran_decode::DecodeConfig {
+                input: root.join(plane).join(format!("{plane}_00001.pcapng")),
+                capture_id: format!("sha256:{}", "c".repeat(64)),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: String::new(),
+            };
+            let mut events = Vec::new();
+            oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .unwrap();
+            sort_by_capture_order(&mut events);
+            events
+        };
+        // Le pseudonyme abonné est celui que le décodeur pose sur N2.
+        let pseudonym = decode("n2", "N2")
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .expect("le jeu N2 porte un subscriber_pseudonym");
+        let gpdus: Vec<_> = decode("n3", "N3")
+            .into_iter()
+            .filter(|e| e.protocol.as_str() == "GTP-U")
+            .collect();
+        assert!(!gpdus.is_empty(), "le jeu N3 porte des G-PDU");
+        let injected: u64 = gpdus
+            .iter()
+            .map(|e| u64::from(e.packet_references[0].original_length))
+            .sum();
+
+        let run = |seed: bool| {
+            let r = LiveTraceRegistry::new();
+            r.traces
+                .lock()
+                .unwrap()
+                .insert("t".into(), state(u64::MAX, false, vec![pseudonym.clone()]));
+            let mut report = SeedReport::default();
+            if seed {
+                assert!(r.begin_seed());
+                report = seed_from_ring(&root, &key, &r);
+                r.finish_seed(&report);
+            }
+            for event in &gpdus {
+                r.route_normalized(event);
+            }
+            r.flush_idle_throughput_buckets();
+            let traces = r.traces.lock().unwrap();
+            let s = &traces["t"];
+            let total: u64 = s
+                .events
+                .iter()
+                .filter(|e| e.kind == "throughput")
+                .map(|b| {
+                    ["ul_bytes_s", "dl_bytes_s", "unknown_bytes_s"]
+                        .iter()
+                        .map(|f| b.payload[*f].as_u64().unwrap_or(0))
+                        .sum::<u64>()
+                })
+                .sum();
+            (s.trace.gpdu_seen, s.trace.gpdu_attached, total, report, s.trace.seed.clone())
+        };
+        let (seen, attached, total, _, _) = run(false);
+        assert_eq!(seen, gpdus.len() as u64);
+        assert_eq!((attached, total), (0, 0), "sans amorçage : N vus, 0 rattaché, 0 bucket");
+        let (seen, attached, total, report, seed) = run(true);
+        assert_eq!(report.files, 2, "N2 et N4 relus, jamais N3");
+        assert!(!report.truncated);
+        assert!(seed.done && seed.events_learned > 0);
+        assert_eq!(seen, gpdus.len() as u64);
+        assert_eq!(attached, gpdus.len() as u64, "tous les G-PDU rattachés après amorçage");
+        assert_eq!(total, injected, "somme des buckets = octets des G-PDU");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn bounded_buffer() {
         let r = LiveTraceRegistry::new();

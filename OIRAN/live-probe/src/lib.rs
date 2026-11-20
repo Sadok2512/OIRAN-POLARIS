@@ -4541,7 +4541,7 @@ impl CaptureManager {
                 )?;
                 match self.process_continuous_capture_selected_at(
                     &base,
-                    &interface_specs(),
+                    &import_interface_specs(),
                     config.max_owned_bytes,
                     &selected_files,
                     publication_started_epoch_ms,
@@ -9011,9 +9011,9 @@ pub fn interface_specs() -> Vec<CaptureInterface> {
     // `oiran_events.jsonl` line → the symptom
     // `rg -c 'sha256:<checksum>' dataset/oiran_events.jsonl == 0`
     // on every LTE checksum of the import state. Returning the full
-    // 11-decoder-backed set fixes the symptom at the root. N6 stays
-    // out because no decoder handles it (2.9.1 already counts it in
-    // `plane_counts` and logs `CONTINUOUS_PLANE_NOT_ALLOWLISTED`).
+    // 11-decoder-backed set fixes the symptom at the root. N6 reste
+    // hors de CETTE liste (interfaces capturables) ; depuis 2.21.107
+    // l'import continu le parcourt via `import_interface_specs()`.
     vec![
         spec(
             "N2",
@@ -12004,7 +12004,7 @@ fn directory_size(directory: &Path) -> u64 {
 ///   * `n2`      → `N2`
 ///   * `n3`      → `N3`
 ///   * `n4`      → `N4`
-///   * `n6`      → `N6`      (no decoder today; counted, 0 events)
+///   * `n6`      → `N6`      (2.21.107 : route IMS, events `interface="IMS"`)
 ///   * `s11`     → `S11`
 ///   * `s1mme`   → `S1-MME`
 ///   * `s1u`     → `S1-U`
@@ -12016,17 +12016,36 @@ fn directory_size(directory: &Path) -> u64 {
 /// 2.9.1: the canonical interface strings with an OIRAN decoder on
 /// the import pipeline today. Must stay in sync with
 /// `validate_config` at `oiran-decode/src/lib.rs:455-470`.
-/// `N6` is deliberately excluded — it carries user-plane data only
-/// and the OIRAN stack emits no events from it. The live-probe
-/// counts it, logs `CONTINUOUS_PLANE_NOT_ALLOWLISTED {path, plane}`
-/// once per path, and skips ingestion.
+/// `N6` : exclu jusqu'à 2.21.106 (journal
+/// `CONTINUOUS_PLANE_NOT_ALLOWLISTED`), importé depuis 2.21.107 — seuls
+/// le SIP (UDP 5060) et le RTP négocié par SDP y produisent des events.
 fn interface_has_decoder(interface: &str) -> bool {
     matches!(
         interface,
         "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11" | "S5-C" | "S5-U" | "S6a" | "Sxab"
         // 2.11.0 (devmat) : plane IMS (SIP + RTP) ajoutée en 13ᵉ.
         | "IMS"
+        // 2.21.107 (ordre #9 7049222982) : N6 décodé par la route IMS
+        // d'`oiran-decode` (SIP/RTP publiés `interface="IMS"`).
+        | "N6"
     )
+}
+
+/// 2.21.107 (ordre #9 7049222982) — interfaces parcourues par l'import
+/// continu : celles de `interface_specs()` plus N6. N6 n'est **pas**
+/// ajouté à `interface_specs()`, qui définit aussi les interfaces
+/// capturables par l'API de capture : ouvrir l'import d'un plan déjà
+/// capturé par le lab n'élargit pas ce que la sonde peut capturer.
+pub fn import_interface_specs() -> Vec<CaptureInterface> {
+    let mut specs = interface_specs();
+    specs.push(spec(
+        "N6",
+        "br-oiran-n6",
+        "SIP / UDP + RTP (SDP-negotiated) / UDP",
+        "POLARIS N6 Docker bridge",
+        "udp port 5060",
+    ));
+    specs
 }
 
 fn canonical_interface_for_plane(plane: &str) -> Option<&'static str> {
@@ -16568,6 +16587,67 @@ mod tests {
         );
     }
 
+    /// 2.21.107 (ordre #9 7049222982) — l'import continu décode un
+    /// segment N6 : le REGISTER SIP qu'il porte est publié
+    /// `interface="IMS"`. Avec la liste d'avant 2.21.107
+    /// (`interface_specs()`, sans N6) le même segment ne produit rien.
+    #[test]
+    fn continuous_import_decodes_n6_sip_as_ims_2_21_107() {
+        fn sip_register_frame() -> Vec<u8> {
+            let payload: &[u8] = b"REGISTER sip:ims.example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.47.0.2:5060;branch=z9hG4bKn6\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:user@example.invalid>;tag=n6\r\n\
+To: <sip:user@example.invalid>\r\n\
+Call-ID: synthetic-2-21-107@oiran\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\
+\r\n";
+            let udp_len = (8 + payload.len()) as u16;
+            let ip_len = 20 + udp_len;
+            let mut frame = vec![0u8; 12];
+            frame.extend_from_slice(&[0x08, 0x00, 0x45, 0x00]);
+            frame.extend_from_slice(&ip_len.to_be_bytes());
+            frame.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0, 10, 47, 0, 2, 10, 77, 24, 20]);
+            frame.extend_from_slice(&5060u16.to_be_bytes());
+            frame.extend_from_slice(&5060u16.to_be_bytes());
+            frame.extend_from_slice(&udp_len.to_be_bytes());
+            frame.extend_from_slice(&[0, 0]);
+            frame.extend_from_slice(payload);
+            frame
+        }
+        let sip_ims_events = |specs: &[CaptureInterface], label: &str| {
+            let root = temporary_root(label);
+            let manager = CaptureManager::with_pseudonym_key_path(
+                root.clone(),
+                false,
+                root.join(".oiran-pseudonym.key"),
+            )
+            .unwrap();
+            let base = root.join(CONTINUOUS_CAPTURE_ID);
+            fs::create_dir_all(base.join("pcap")).unwrap();
+            write_pcap_at(
+                &base.join("pcap/N6.pcap-live.pcap"),
+                (epoch_ms() / 1000) as u32,
+                &[sip_register_frame()],
+            );
+            let result = manager.process_continuous_capture(&base, specs, 128 * 1024 * 1024);
+            let events = load_dataset_events(&base.join("dataset")).unwrap_or_default();
+            let count = events
+                .iter()
+                .filter(|event| event.interface == "IMS" && event.protocol == "SIP")
+                .count();
+            (result.map(|dataset| dataset.event_count), count)
+        };
+        let (before, before_sip) = sip_ims_events(&interface_specs(), "n6-import-before");
+        assert_eq!(before_sip, 0, "sans N6 dans la liste : aucun event ({before:?})");
+        let (after, after_sip) = sip_ims_events(&import_interface_specs(), "n6-import-after");
+        assert_eq!(after, Ok(1), "le segment N6 produit un event");
+        assert_eq!(after_sip, 1, "publié interface=IMS, protocole SIP");
+        assert!(import_interface_specs().iter().any(|spec| spec.interface == "N6"));
+        assert!(!interface_specs().iter().any(|spec| spec.interface == "N6"));
+    }
+
     #[test]
     fn production_pipeline_decodes_three_pcap_gpdus_into_three_bound_pdu_callflows() {
         let root = temporary_root("runtime-pcap-e2e");
@@ -18181,7 +18261,7 @@ mod tests {
         // (2.8.3 contract). Write one rotation record per plane with
         // a decoder; the test is not concerned with eligibility for
         // the undecoded ones.
-        for plane in ["N2", "N3", "N4", "S11", "S1-MME", "S1-U", "S5-C", "S5-U", "S6a", "SBI", "Sxab"] {
+        for plane in ["N2", "N3", "N4", "N6", "S11", "S1-MME", "S1-U", "S5-C", "S5-U", "S6a", "SBI", "Sxab"] {
             write_rotation_closures(&root, plane, 1);
         }
         let mut cache = SourceSegmentsCache::new();
@@ -18193,7 +18273,7 @@ mod tests {
             &mut cache,
         )
         .unwrap();
-        // 11 decoder-backed planes + N6 + UNKNOWN = 13 entries.
+        // 12 decoder-backed planes (N6 depuis 2.21.107) + UNKNOWN = 13 entries.
         for plane in [
             "N2", "N3", "N4", "N6", "S11", "S1-MME", "S1-U", "S5-C", "S5-U", "S6a", "SBI", "Sxab",
             "UNKNOWN",
@@ -18217,7 +18297,8 @@ mod tests {
                     .to_owned()
             })
             .collect();
-        assert!(unknown_dirs.contains("n6"), "N6 must surface as unknown: {unknown_dirs:?}");
+        // 2.21.107 : N6 a un décodeur (route IMS), il n'est plus écarté.
+        assert!(!unknown_dirs.contains("n6"), "N6 must be importable: {unknown_dirs:?}");
         assert!(
             unknown_dirs.contains("unknown-plane"),
             "fully-unknown directory must surface: {unknown_dirs:?}"

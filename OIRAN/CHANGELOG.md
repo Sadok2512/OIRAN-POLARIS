@@ -1,5 +1,72 @@
 # Changelog
 
+## oiran-api 2.21.107, oiran-decode 0.9.2, live-probe 0.6.31 — 2026-11-20 — plan N6 ouvert à l'import continu et à la trace live (ordre #9 7049222982)
+
+Upgrade **patch** sans déploiement, même branche `fix/oiran-2.21.105-live-throughput-attach`, au-dessus de 2.21.105 @ `44dd5c8`. 2.21.106 est réservée au train du cœur. `oiran-decode` passe à 0.9.2 parce que 2.21.100 (CLAUDE2) prend 0.9.1.
+
+### Audit
+
+- N6 était exclu à trois endroits, tous codés en dur : `live-probe` `interface_has_decoder` (journal `CONTINUOUS_PLANE_NOT_ALLOWLISTED`), `oiran-decode` `validate_config`, et la liste d'interfaces du lecteur live (`apps/api/src/live_trace.rs`).
+- La capture N6 du lab (ANR2 #10 7049148190) porte les réseaux UE et le SIP UDP 5060 vers le P-CSCF.
+
+### Changement
+
+1. `oiran-decode` : `N6` accepté ; SIP UDP 5060 décodé par la route IMS, RTP/RTCP présenté à l'agrégateur par SDP. Les events sont publiés **`interface="IMS"`** (`ims_event_interface`). Le reste du trafic N6 n'émet aucun event.
+2. `live-probe` : `interface_has_decoder` accepte `N6` ; l'import continu parcourt `import_interface_specs()` = `interface_specs()` + N6. **`interface_specs()` est inchangé** : N6 ne devient pas une interface capturable par l'API de capture.
+3. `oiran-api` : le lecteur live lit aussi `n6/`.
+
+### Double comptage avec `N3-IMS`
+
+Règle : seule `interface == "IMS"` est comptée par `correlation-engine` pour la voix. Le SIP capturé sur N6 est `IMS` ; le SIP extrait du tunnel GTP-U par 2.21.100 est `N3-IMS` et reste une preuve tunnel, non comptée. Vérifié par un test dans `correlation-engine` (test seul, pas de changement de code ni de version de ce crate).
+
+**OUVERT** :
+- Affichage : un même message peut apparaître deux fois dans un callflow (une ligne `N3-IMS`, une ligne `IMS`). La fusion d'affichage relève de la règle de dédup proposée par CLAUDE2 (2.21.100), pas de ce lot.
+- Si un lab capture à la fois un bridge `ims/` et `n6/` portant les mêmes paquets, les deux sont publiés `IMS` et seraient comptés deux fois. Le lab actuel n'a pas de répertoire `ims/` (inventaire ANR2 : 12 plans, sans `ims`). Non traité.
+- Le plan d'origine d'un event `IMS` issu de N6 ne se lit que dans `packet_references[].source_file` (`N6.pcap-…`) ; `capture_point_id` vaut `IMS`.
+- Non vérifié sur une capture N6 réelle : tests sur trames synthétiques. Fusion avec 2.21.100 non faite ici : conflits attendus dans `oiran-decode/src/lib.rs` (route UDP), versions et lock.
+
+### Tests
+
+- `oiran-decode` `n6_plane_decodes_sip_as_ims_interface_2_21_107` : REGISTER sur N6 → 1 event `IMS`/`SIP`, identique au même datagramme sur le plan IMS ; UDP non SIP → 0 event.
+- `live-probe` `continuous_import_decodes_n6_sip_as_ims_2_21_107` : segment `N6.pcap-…` importé → 1 event `IMS`/`SIP` ; avec la liste d'avant, 0. `source_segments_counts_every_plane_and_surfaces_undecoded_paths` mis à jour : N6 n'est plus écarté.
+- `correlation-engine` `n3_ims_twin_of_an_n6_sip_event_is_not_counted_twice_2_21_107` : INVITE vu en `IMS` et en `N3-IMS` → 1 arête SIP↔N4, 1 arête RTP↔SIP.
+
+## oiran-api 2.21.105 — 2026-11-20 — trace live : session établie avant l'ouverture, compteurs par interface, horodatage SSE (G3 FAIL prod ANR1 #10 7047592953 ; ordres #9 7047782479, 7048974175, 7049222982)
+
+Upgrade **patch** sans déploiement, base `fix/oiran-2.21.104-train` @ `068e9c1`. Branche `fix/oiran-2.21.105-live-throughput-attach`. Seul `oiran-api` change.
+
+### Audit (code @ 068e9c1, détail #9 7049283898)
+
+- Fait prod : 0 bucket pour 28 870 trames GTP-U ; les deux SSE de la recette ne portent que du `SBI / SBI-HTTP2` (4 856 messages, ANR1 #10 7048928345).
+- La liste blanche des plans de l'import continu (`live-probe/src/lib.rs` `interface_has_decoder`) est codée en dur et contient N2, N3, N4 ; seul N6 en est exclu. Elle ne change pas au redémarrage.
+- L'import continu n'alimente pas la trace : `route_normalized` n'a qu'un appelant, le lecteur de `live_trace.rs` (`start_reader`), qui lit le ring dumpcap lui-même, en une boucle unique et séquentielle (N2, N4, N3, SBI, …), sans file par interface.
+- **Cause** : un event n'est rattaché à une trace que s'il porte le pseudonyme abonné ou une clé apprise sur un event déjà routé dans cette trace (identifiants NGAP, IP UE, TEID, SEID). Le décodeur est sans état entre fichiers et, au démarrage du lecteur, tous les segments du ring sauf le plus récent sont marqués consommés sans décodage. Une session établie **avant** l'ouverture de la trace n'est donc rattachable sur aucun plan, sauf SBI qui porte l'identité dans chaque requête. Le correctif 2.21.99 (émission des buckets) ne pouvait rien y changer : aucun G-PDU n'était rattaché.
+- **OUVERT** : que ce scénario soit bien celui de la recette 18:12–18:20Z n'est pas prouvé (pas d'accès au ring lab, rotation du ring hors dépôt). Les compteurs ci-dessous le diront à la prochaine recette.
+
+### Correctif
+
+1. **Amorçage depuis le ring** (`seed_from_ring`, `begin_seed` / `learn_from_ring` / `finish_seed`). À la première passe du lecteur qui suit l'ouverture d'une trace, le ring de signalisation (N2, S1-MME, N4, S11, S5-C, Sxab, dans cet ordre) est relu et présenté à cette trace en **apprentissage sans émission** : même règle de rattachement que le live, aucun message, aucun compteur de message. Plafond 64 Mio par plan, segments les plus récents d'abord, relus du plus ancien au plus récent ; un dépassement est signalé (`seed.truncated`). N3/S1-U/S5-U et SBI ne sont jamais relus. Le filtre `interfaces` de la trace ne s'applique pas à l'amorçage. Une trace créée pendant une passe d'amorçage est amorcée à la passe suivante.
+2. **Compteurs par trace**, dans `GET /live/traces` et dans un nouvel event SSE **`stats`** toutes les 5 s (diffusé aux abonnés connectés, hors tampon de replay) :
+   - `interfaces.<plan>` : `seen`, `filtered`, `attached`, `last_event_timestamp_s/_ns`, `last_event_lag_ms` (horloge murale au routage − horodatage de capture), `max_event_lag_ms` ;
+   - `gpdu` : `seen`, `attached`, `rejected_no_match`, `rejected_interface_filter` ;
+   - `seed` : `done`, `files`, `bytes`, `events_scanned`, `events_learned`, `truncated` ;
+   - `reader_pass_ms` : durée de la dernière passe du lecteur sur tous les plans, soit le retard qu'un plan volumineux impose aux autres ; `wall_clock_s`.
+   « 0 bucket » se lit désormais comme « 0 vu » (plan absent ou `seen=0`) ou « N vus, 0 rattaché ».
+3. **Contrat SSE** : chaque `message` porte `timestamp: {seconds, nanoseconds}` (horodatage de capture). Ajouts seulement, aucun champ retiré.
+
+### Tests (`live_trace::tests`, suffixe `_2_21_105`)
+
+- `gpdu_rejected_when_pdu_session_established_before_trace` : NGAP PDU Session Resource Setup + PFCP Session Establishment d'avant l'ouverture ; sans amorçage 6 G-PDU vus, 0 rattaché, 0 bucket ; après amorçage 12 G-PDU des deux sens rattachés, 3 buckets, somme UL + DL = octets injectés ; `stats` et `timestamp` vérifiés.
+- `seed_from_ring_attaches_gpdu_of_a_session_older_than_the_trace` : bout en bout sur le jeu `OIRAN_5G_PDU_SESSION_DATA_V1` posé dans un ring ; sans amorçage 0 rattaché, avec amorçage tous les G-PDU N3 rattachés et somme des buckets = octets des G-PDU.
+- `trace_created_during_seed_pass_waits_for_next_pass`, `select_seed_files_keeps_newest_within_budget_oldest_first`, `interface_filter_is_counted_and_bypassed_by_seed`.
+
+### Limites déclarées (OUVERT)
+
+- Une session dont la signalisation a quitté le ring, ou dépasse 64 Mio par plan, reste non rattachable ; `seed.truncated` et `gpdu.rejected_no_match` le montrent.
+- Le lecteur redécode en entier chaque segment modifié à chaque passe (pas de reprise à l'offset) : non corrigé ici, désormais mesuré par `reader_pass_ms`.
+- Une trace filtrée sur un plan (`interfaces`) n'apprend pas en live depuis les autres plans ; seul l'amorçage contourne le filtre.
+- N6 : non ouvert dans cette version, lot suivant sur la même branche.
+
 ## oiran-api 2.21.104 — 2026-11-20 — train (cœur) : 2.21.101 + 2.21.102 (clé à la lecture) + 2.21.103 (volume SSE)
 
 - Merge `--no-ff` de `fix/oiran-2.21.102-stable-event-key-read-time` @ d8e607f et de `fix/oiran-2.21.103-sse-volume` @ 57308df sur `fix/oiran-2.21.101-train` @ 80d7527.

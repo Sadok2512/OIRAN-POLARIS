@@ -3629,6 +3629,54 @@ mod tests {
         assert!(interfaces.contains("N4"));
     }
 
+    /// 2.21.107 (ordre #9 7049222982) — pas de double comptage N3 ↔ N6.
+    /// Le même INVITE vu deux fois, sur N6 (`interface="IMS"`) et dans
+    /// le tunnel GTP-U (`interface="N3-IMS"`, 2.21.100), ne produit
+    /// qu'UNE arête SIP↔N4 et UNE arête RTP↔SIP : seule l'interface
+    /// `IMS` est comptée, `N3-IMS` reste une preuve tunnel.
+    #[test]
+    fn n3_ims_twin_of_an_n6_sip_event_is_not_counted_twice_2_21_107() {
+        let hash = "sha256:ue-ip-pseudo-n6";
+        let call_id = "call-n6-001";
+        let sip = |id: &str, interface: &str, packet: u64| {
+            e(
+                id,
+                interface,
+                "SIP",
+                "INVITE",
+                packet,
+                &[("sip_call_id", call_id)],
+                json!([{"name":"sdp.c_ue_ip_pseudonym","value":hash}]),
+            )
+        };
+        let pfcp = e(
+            "pfcp-1",
+            "N4",
+            "PFCP",
+            "Session Establishment Request",
+            3,
+            &[("pfcp_sequence", "2210")],
+            json!([{"name":"ue_ip","value":hash}]),
+        );
+        let rtp = |id: &str, interface: &str, packet: u64| {
+            e(id, interface, "RTP", "RTP flow", packet, &[("sip_call_id", call_id)], json!([]))
+        };
+        let edges = correlate_cross_interface_evidence(&[
+            sip("sip-n6", "IMS", 1),
+            sip("sip-n3", "N3-IMS", 2),
+            pfcp,
+            rtp("rtp-n6", "IMS", 4),
+            rtp("rtp-n3", "N3", 5),
+        ]);
+        let count = |rule: &str| edges.iter().filter(|e| e.rule_id == rule).count();
+        assert_eq!(count("sip-pfcp-ue-ipv4-pseudonym-match"), 1, "{edges:?}");
+        assert_eq!(count("rtp-sip-call-id-match"), 1, "{edges:?}");
+        assert!(
+            edges.iter().all(|e| e.source_interface != "N3-IMS" && e.target_interface != "N3-IMS"),
+            "aucune arête ne compte le jumeau N3-IMS : {edges:?}"
+        );
+    }
+
     /// 2.17.0 (ANR1 #10 E2E 5G) — la règle `rtp-sip-call-id-match`
     /// doit produire une arête EXACT quand un event SIP et un event
     /// RTP partagent `sip_call_id` + capture_scope.
