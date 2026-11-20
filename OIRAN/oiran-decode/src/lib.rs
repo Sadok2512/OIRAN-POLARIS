@@ -81,13 +81,26 @@ fn carries_ims_media(interface: &str) -> bool {
 /// marqueur propre et ne sont pas comptés : pas de double comptage
 /// entre N3 et N6. Le plan d'origine reste lisible dans
 /// `packet_references[].source_file` (`N6.pcap-…`).
+///
+/// 2.21.110 (ordre #9 7049845272) — sur un plan tunnel (`N3`, `S1-U`,
+/// `S5-U`) l'agrégateur RTP n'est nourri que par
+/// `route_inner_udp_after_gtpu` : ses flux sont du média extrait du
+/// tunnel, publiés `N3-IMS` comme le SIP du même tunnel (même preuve,
+/// même marqueur). Avant 2.21.110 ils sortaient `interface="N3"`. Les
+/// events GTP-U eux-mêmes ne passent pas par cette fonction et gardent
+/// l'interface du plan.
 fn ims_event_interface(interface: &str) -> &str {
-    if interface == "N6" {
-        "IMS"
-    } else {
-        interface
+    match interface {
+        "N6" => "IMS",
+        "N3" | "S1-U" | "S5-U" => TUNNEL_IMS_INTERFACE,
+        other => other,
     }
 }
+
+/// Marqueur des events SIP et RTP extraits d'un tunnel GTP-U (2.21.100,
+/// 2.21.110) : preuve de la voix portée en tunnel, non comptée par
+/// `correlation-engine`.
+const TUNNEL_IMS_INTERFACE: &str = "N3-IMS";
 
 fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option<UdpRoute> {
     let has_port = |port| source_port == port || destination_port == port;
@@ -886,7 +899,7 @@ fn route_inner_udp_after_gtpu(
             capture_id: &config.capture_id,
             packet_references: &inner_references,
             timestamp: ts,
-            interface: "N3-IMS",
+            interface: TUNNEL_IMS_INTERFACE,
             source_endpoint: Endpoint {
                 address: inner.source_ip.clone(),
                 port: Some(inner.source_port),
@@ -1207,7 +1220,8 @@ Content-Length: 0\r\n\
         assert!(decode("N6").is_empty());
         let _ = std::fs::remove_file(&path);
         assert_eq!(ims_event_interface("N6"), "IMS");
-        assert_eq!(ims_event_interface("N3"), "N3");
+        // 2.21.110 : le média d'un plan tunnel est publié `N3-IMS`.
+        assert_eq!(ims_event_interface("N3"), "N3-IMS");
         assert!(carries_ims_media("N6") && carries_ims_media("IMS") && !carries_ims_media("N3"));
     }
 
@@ -1982,5 +1996,347 @@ Content-Length: 0\r\n\
             "aucun event ne doit sortir sans SDP enregistré ni SIP sur 5060 ; got {:?}",
             decoded
         );
+    }
+
+    /// 2.21.108 contre-vérification (ordre #9 7049622543) — test croisé :
+    /// un même INVITE (même Call-ID) apparaît dans deux plans :
+    ///   * paquet N3 GTP-U encapsulant SIP ⇒ event `interface="N3-IMS"`
+    ///     (route `route_inner_udp_after_gtpu`, décision 2.21.100 (a)).
+    ///   * paquet N6 UDP 5060 SIP ⇒ event `interface="IMS"`
+    ///     (route `ImsSip`, décision 2.21.107 CLAUDE1).
+    /// Les 2 events coexistent en données brutes avec le MÊME `Call-ID`
+    /// (clé de dédup documentée dans CHANGELOG 2.21.100 §règle de dédup) ;
+    /// la dédup est à graver côté `correlation-engine` dans un lot futur.
+    /// Comptage voix logique = 1 call (prouvé par call_id identique).
+    #[test]
+    fn cross_plane_n3_and_n6_invite_same_call_id_coexist_2_21_108() {
+        use capture_pcap::{CapturePacket, PacketMetadata, TransportView, TransportProtocol};
+        use decoder_sip::SipDecoder;
+        use decoder_rtp::RtpFlowAggregator;
+        use event_schema::ExactTimestamp;
+
+        let call_id = "cross-n3-n6-2-21-108@oiran";
+        let sip_invite = format!(
+            "INVITE sip:callee@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.45.0.7:5060;branch=z9hG4bK1\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:alice@example.com>;tag=A\r\n\
+To: <sip:callee@example.com>\r\n\
+Call-ID: {call_id}\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\
+\r\n"
+        );
+        let sip_bytes = sip_invite.as_bytes();
+
+        // === Plan N3 (tunnel GTP-U) ===
+        let udp_length = (8 + sip_bytes.len()) as u16;
+        let ip_total_len = (20 + udp_length as usize) as u16;
+        let gtpu_payload_len = ip_total_len as u16;
+        let mut n3_pkt = vec![
+            0x30, 0xff,
+            (gtpu_payload_len >> 8) as u8, gtpu_payload_len as u8,
+            0x00, 0x00, 0x00, 0x2a,
+        ];
+        n3_pkt.extend_from_slice(&[
+            0x45, 0x00,
+            (ip_total_len >> 8) as u8, ip_total_len as u8,
+            0x00, 0x00, 0x00, 0x00,
+            0x40, 0x11,
+            0x00, 0x00,
+            10, 45, 0, 7,
+            10, 0, 0, 1,
+        ]);
+        n3_pkt.extend_from_slice(&[
+            0x13, 0xc4,
+            0x30, 0x39,
+            (udp_length >> 8) as u8, udp_length as u8,
+            0x00, 0x00,
+        ]);
+        n3_pkt.extend_from_slice(sip_bytes);
+
+        let n3_packet = CapturePacket {
+            metadata: PacketMetadata {
+                capture_id: "sha256:synthetic-n3".into(),
+                source_file: "N3.pcapng".into(),
+                packet_number: 1,
+                byte_offset: 0,
+                timestamp: ExactTimestamp {
+                    seconds: 10,
+                    nanoseconds: 0,
+                    raw_ticks: 10_000_000_000,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                captured_length: n3_pkt.len() as u32,
+                original_length: n3_pkt.len() as u32,
+                interface_id: 0,
+                link_type: 1,
+                sll2: None,
+                truncated: false,
+            },
+            data: n3_pkt.clone(),
+        };
+        let n3_view = TransportView {
+            source_ip: "172.16.0.10".into(),
+            destination_ip: "172.16.0.20".into(),
+            protocol: TransportProtocol::Udp,
+            source_port: Some(2152),
+            destination_port: Some(2152),
+            payload_offset: 0,
+            payload_length: n3_pkt.len(),
+        };
+        let config_n3 = DecodeConfig {
+            input: "unused.pcap".into(),
+            capture_id: "sha256:synthetic-n3".into(),
+            interface: "N3".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: String::new(),
+        };
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let sip = SipDecoder;
+        let mut rtp = RtpFlowAggregator::new();
+        let mut decoded_n3 = Vec::new();
+        route_inner_udp_after_gtpu(&n3_packet, &n3_view, &config_n3, &key, &sip, &mut rtp, &mut decoded_n3);
+        let n3_ims_event = decoded_n3
+            .iter()
+            .find(|ev| ev.interface == "N3-IMS" && ev.protocol.as_str() == "SIP")
+            .expect("event SIP N3-IMS doit exister depuis le tunnel");
+
+        // === Plan N6 (SIP direct sur UDP 5060) ===
+        // Même SIP payload, directement en DecoderInput interface "IMS"
+        // (c'est ce que fait `oiran-decode` sur une route `UdpRoute::ImsSip`
+        // depuis `N6` ou `IMS` en 2.21.107).
+        let n6_raw = format!("sha256:{}", sha256_hex(sip_bytes));
+        let n6_refs = [PacketReference {
+            source_file: "N6.pcap-synthetic".into(),
+            source_sha256: None,
+            packet_number: 1,
+            byte_offset: 0,
+            interface_id: 0,
+            link_type: None,
+            sll2_protocol_type: None,
+            sll2_reserved: None,
+            sll2_interface_index: None,
+            sll2_arphrd_type: None,
+            sll2_packet_type: None,
+            sll2_address_length: None,
+            sll2_address: None,
+            captured_length: sip_bytes.len() as u32,
+            original_length: sip_bytes.len() as u32,
+        }];
+        let n6_input = DecoderInput {
+            capture_id: "sha256:synthetic-n6",
+            packet_references: &n6_refs,
+            timestamp: &ExactTimestamp {
+                seconds: 10,
+                nanoseconds: 100,
+                raw_ticks: 10_000_000_100,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "IMS",
+            source_endpoint: Endpoint {
+                address: "10.47.0.7".into(),
+                port: Some(5060),
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.47.0.1".into(),
+                port: Some(5060),
+                network_function: None,
+            },
+            payload: sip_bytes,
+            raw_payload_reference: &n6_raw,
+            pseudonym_key: &key,
+        };
+        let n6_output = sip.decode(&n6_input);
+        let n6_ims_event = n6_output
+            .events
+            .iter()
+            .find(|ev| ev.interface == "IMS" && ev.protocol.as_str() == "SIP")
+            .expect("event SIP IMS doit exister depuis N6");
+
+        // Coexistence : 2 events, 2 plans distincts.
+        assert_eq!(n3_ims_event.interface, "N3-IMS");
+        assert_eq!(n6_ims_event.interface, "IMS");
+
+        // Clé de dédup documentée : call_id identique sur les 2 events.
+        // (Côté correlation-engine, la dédup graverait la priorité ; ici
+        // on prouve que la clé est **extractible** et identique des 2 côtés.)
+        let extract_call_id = |ev: &NormalizedEvent| -> Option<String> {
+            ev.information_elements
+                .iter()
+                .find(|ie| ie.name.eq_ignore_ascii_case("call-id"))
+                .and_then(|ie| ie.value.clone())
+                .or_else(|| {
+                    ev.session_identifiers
+                        .iter()
+                        .find(|id| id.name.eq_ignore_ascii_case("sip_call_id"))
+                        .map(|id| id.value.clone())
+                })
+        };
+        let n3_call_id = extract_call_id(n3_ims_event)
+            .expect("call_id doit être extractible depuis l'event N3-IMS");
+        let n6_call_id = extract_call_id(n6_ims_event)
+            .expect("call_id doit être extractible depuis l'event IMS");
+        assert_eq!(
+            n3_call_id, n6_call_id,
+            "clé de dédup (call_id) doit être identique sur les 2 plans (preuve pour correlation-engine)"
+        );
+
+        // Comptage voix logique (= 1 call unique, dédoublonnée hors
+        // décodeur par la règle correlation-engine à graver) :
+        let unique_call_ids: std::collections::HashSet<String> =
+            [n3_call_id, n6_call_id].into_iter().collect();
+        assert_eq!(
+            unique_call_ids.len(),
+            1,
+            "comptage voix logique = 1 call (même call_id, 2 plans)"
+        );
+    }
+
+    /// 2.21.110 — pcap classique (Ethernet) de G-PDU : IP/UDP 2152 externe,
+    /// en-tête GTP-U de 8 octets (TEID 0x2a), IPv4/UDP interne.
+    /// `inner` = (ip source, port source, ip destination, port destination,
+    /// payload UDP interne).
+    fn gpdu_pcap(path: &std::path::Path, inner: &[([u8; 4], u16, [u8; 4], u16, Vec<u8>)]) {
+        let mut file = Vec::new();
+        file.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+        file.extend_from_slice(&2u16.to_le_bytes());
+        file.extend_from_slice(&4u16.to_le_bytes());
+        file.extend_from_slice(&[0u8; 8]);
+        file.extend_from_slice(&65_535u32.to_le_bytes());
+        file.extend_from_slice(&1u32.to_le_bytes());
+        for (index, (src, sport, dst, dport, payload)) in inner.iter().enumerate() {
+            let inner_udp_len = (8 + payload.len()) as u16;
+            let inner_ip_len = 20 + inner_udp_len;
+            let outer_udp_len = 8 + 8 + inner_ip_len;
+            let outer_ip_len = 20 + outer_udp_len;
+            let mut frame = vec![0u8; 12];
+            frame.extend_from_slice(&[0x08, 0x00]);
+            frame.extend_from_slice(&[0x45, 0x00]);
+            frame.extend_from_slice(&outer_ip_len.to_be_bytes());
+            frame.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+            frame.extend_from_slice(&[172, 16, 0, 10]);
+            frame.extend_from_slice(&[172, 16, 0, 20]);
+            frame.extend_from_slice(&2152u16.to_be_bytes());
+            frame.extend_from_slice(&2152u16.to_be_bytes());
+            frame.extend_from_slice(&outer_udp_len.to_be_bytes());
+            frame.extend_from_slice(&[0, 0]);
+            frame.extend_from_slice(&[0x30, 0xff]);
+            frame.extend_from_slice(&inner_ip_len.to_be_bytes());
+            frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x2a]);
+            frame.extend_from_slice(&[0x45, 0x00]);
+            frame.extend_from_slice(&inner_ip_len.to_be_bytes());
+            frame.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+            frame.extend_from_slice(src);
+            frame.extend_from_slice(dst);
+            frame.extend_from_slice(&sport.to_be_bytes());
+            frame.extend_from_slice(&dport.to_be_bytes());
+            frame.extend_from_slice(&inner_udp_len.to_be_bytes());
+            frame.extend_from_slice(&[0, 0]);
+            frame.extend_from_slice(payload);
+            file.extend_from_slice(&(1_795_200_000u32 + index as u32).to_le_bytes());
+            file.extend_from_slice(&0u32.to_le_bytes());
+            file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            file.extend_from_slice(&frame);
+        }
+        std::fs::write(path, file).unwrap();
+    }
+
+    /// 2.21.110 (ordre #9 7049845272) — un appel porté dans le tunnel
+    /// GTP-U : INVITE + SDP puis RTP du flux annoncé. Décodage de bout en
+    /// bout (`decode_capture_streaming`) sur les trois plans tunnel :
+    ///   * le SIP sort `N3-IMS` (2.21.100) ;
+    ///   * le flux RTP sort `N3-IMS` aussi, avec le même Call-ID — avant
+    ///     2.21.110 il sortait avec l'interface du plan (`N3`) ;
+    ///   * aucun event SIP ou RTP ne porte l'interface du plan ;
+    ///   * les events GTP-U gardent l'interface du plan.
+    #[test]
+    fn tunnel_rtp_flow_is_published_n3_ims_like_tunnel_sip_2_21_110() {
+        let call_id = "tunnel-rtp-2-21-110@oiran";
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 10.45.0.7\r\n\
+s=-\r\n\
+c=IN IP4 10.45.0.7\r\n\
+t=0 0\r\n\
+m=audio 40004 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+        let invite = format!(
+            "INVITE sip:callee@example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.45.0.7:5060;branch=z9hG4bK110\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:caller@example.invalid>;tag=A\r\n\
+To: <sip:callee@example.invalid>\r\n\
+Call-ID: {call_id}\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\
+\r\n{sdp}",
+            sdp.len()
+        );
+        let ue = [10, 45, 0, 7];
+        let peer = [10, 0, 0, 2];
+        let mut inner = vec![(ue, 5060u16, [10, 0, 0, 1], 5060u16, invite.into_bytes())];
+        for seq in 0u16..4 {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&(100 + seq).to_be_bytes());
+            rtp.extend_from_slice(&(160 * seq as u32).to_be_bytes());
+            rtp.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xd5; 160]);
+            inner.push((ue, 40_004, peer, 49_170, rtp));
+        }
+        let path = std::env::temp_dir().join(format!(
+            "oiran-tunnel-rtp-{}-{:?}.pcap",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        gpdu_pcap(&path, &inner);
+        let key = PseudonymKey::from_bytes([9; 32]);
+        for plane in ["N3", "S1-U", "S5-U"] {
+            let config = DecodeConfig {
+                input: path.clone(),
+                capture_id: format!("sha256:{}", "e".repeat(64)),
+                interface: plane.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: String::new(),
+            };
+            let mut events = Vec::new();
+            decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .unwrap();
+            let call_id_of = |event: &NormalizedEvent| {
+                event
+                    .session_identifiers
+                    .iter()
+                    .find(|id| id.name == "sip_call_id")
+                    .map(|id| id.value.clone())
+            };
+            let sip: Vec<_> = events.iter().filter(|e| e.protocol.as_str() == "SIP").collect();
+            let rtp: Vec<_> = events.iter().filter(|e| e.protocol.as_str() == "RTP").collect();
+            let gtpu: Vec<_> = events.iter().filter(|e| e.protocol.as_str() == "GTP-U").collect();
+            assert_eq!(sip.len(), 1, "{plane} : un event SIP ; events={events:?}");
+            assert_eq!(rtp.len(), 1, "{plane} : un event de flux RTP ; events={events:?}");
+            assert_eq!(sip[0].interface, "N3-IMS", "{plane}");
+            assert_eq!(rtp[0].interface, "N3-IMS", "{plane} : RTP du tunnel = même marqueur que le SIP");
+            assert_eq!(rtp[0].capture_point_id, "N3-IMS", "{plane}");
+            assert_eq!(rtp[0].message_name, "RTP Flow");
+            assert_eq!(call_id_of(rtp[0]).as_deref(), Some(call_id), "{plane}");
+            assert_eq!(call_id_of(sip[0]), call_id_of(rtp[0]), "{plane}");
+            assert!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e.protocol.as_str(), "SIP" | "RTP"))
+                    .all(|e| e.interface != plane),
+                "{plane} : aucun event voix ne porte l'interface du plan"
+            );
+            assert_eq!(gtpu.len(), inner.len(), "{plane} : un event GTP-U par G-PDU");
+            assert!(gtpu.iter().all(|e| e.interface == plane), "{plane} : GTP-U inchangé");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.110, oiran-decode 0.9.4 — 2026-11-20 — le RTP extrait du tunnel GTP-U est publié `N3-IMS`, comme son SIP (ordre #9 7049845272, écart relevé par CLAUDE1)
+
+Upgrade **patch** sans déploiement, branche `fix/oiran-2.21.110-tunnel-rtp-n3-ims`, base train `fix/oiran-2.21.108-train` @ `fb7b721`. 2.21.109 est le lot A de CLAUDE1 (reprise à l'offset), non contenu ici.
+
+### Audit
+
+- 2.21.100 route le SIP du tunnel avec `interface="N3-IMS"` (`route_inner_udp_after_gtpu`), mais le flux RTP du même tunnel est émis à la fin du décodage par `rtp_aggregator.finish(capture_id, ims_event_interface(config.interface))`, et `ims_event_interface("N3")` rendait `"N3"`. Un même appel sortait donc en deux marqueurs : SIP `N3-IMS`, RTP `N3`.
+- Sur un plan tunnel (`N3`, `S1-U`, `S5-U`), l'agrégateur RTP n'est nourri que par `route_inner_udp_after_gtpu` (`carries_ims_media` ne vaut que pour `IMS` et `N6`) : tout flux qu'il émet sur ces plans vient du tunnel.
+
+### Changement
+
+- `oiran-decode` `ims_event_interface` : `N3`, `S1-U`, `S5-U` → `N3-IMS` ; `N6` → `IMS` (inchangé) ; autres plans inchangés. Le marqueur est une constante unique `TUNNEL_IMS_INTERFACE`, utilisée aussi par la route SIP du tunnel.
+- Effet : l'event `RTP Flow` d'un plan tunnel porte `interface="N3-IMS"` et `capture_point_id="N3-IMS"`. Les events GTP-U gardent l'interface du plan. Aucun autre crate modifié.
+- Comptage voix inchangé : `correlation-engine` ne compte le RTP que pour `interface == "IMS"` ; le RTP du tunnel n'était pas compté en `N3` et ne l'est pas en `N3-IMS` (preuve tunnel, non comptée).
+
+### OUVERT
+
+- Les events RTP de tunnel déjà publiés restent `interface="N3"` : pas de patch à la lecture dans ce lot, pas de redécodage planifié. Aucun n'a été observé en prod à ce jour (non mesuré ici).
+- Fusion avec 2.21.109 (CLAUDE1) non faite ici. Conflits attendus : versions (`oiran-decode` 0.10.0 côté 2.21.109 contre 0.9.4 ici), CHANGELOG, locks. Le corps de `ims_event_interface` n'est pas touché par 2.21.109, qui l'appelle depuis `emit_rtp_flows` : le correctif s'y applique sans autre changement. L'OUVERT de 2.21.109 « pas d'event RTP N3 en live avant rotation » vise ces mêmes events, désormais `N3-IMS`.
+- Dédup d'affichage N3-IMS / IMS : toujours OUVERT (règle proposée dans 2.21.100, non codée).
+- Non vérifié sur une capture réelle de voix en tunnel : trames synthétiques.
+
+### Tests
+
+- `oiran-decode` `tunnel_rtp_flow_is_published_n3_ims_like_tunnel_sip_2_21_110` : pcap de 5 G-PDU (INVITE + SDP, puis 4 RTP du flux annoncé), décodé de bout en bout sur `N3`, `S1-U`, `S5-U` → 1 SIP `N3-IMS`, 1 `RTP Flow` `N3-IMS` de même Call-ID, aucun event voix à l'interface du plan, 5 GTP-U à l'interface du plan. Sans le correctif : échec (`left: "N3"`, `right: "N3-IMS"`).
+- `oiran-decode` `cross_plane_n3_and_n6_invite_same_call_id_coexist_2_21_108` (contre-vérification du train, ordre #9 7049622543) : même INVITE dans le tunnel N3 et sur le plan IMS/N6 → 1 event `N3-IMS` + 1 event `IMS`, même Call-ID. Le comptage à 1 par `correlation-engine` est prouvé par `n3_ims_twin_of_an_n6_sip_event_is_not_counted_twice_2_21_107` (CLAUDE1), pas par ce test.
+- `n6_plane_decodes_sip_as_ims_interface_2_21_107` : assertion `ims_event_interface("N3")` mise à jour (`N3-IMS`).
+
 ## oiran-api 2.21.108 — 2026-11-20 — train (cœur) : 2.21.104 + 2.21.105 (rattachement de la trace live) + 2.21.107 (N6) + 2.21.100 (voix décodeur)
 
 - Merge `--no-ff` de `fix/oiran-2.21.105-live-throughput-attach` @ 477dfda et de `fix/oiran-2.21.100-voice-decode` @ f0b218b sur `fix/oiran-2.21.104-train` @ 068e9c1.

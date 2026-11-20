@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",
