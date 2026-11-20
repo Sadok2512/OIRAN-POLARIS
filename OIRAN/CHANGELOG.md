@@ -1,5 +1,31 @@
 # Changelog
 
+## OIRAN API 2.21.99 — 2026-11-20 — débit live à 0 bucket en prod (défaut recette ANR1 #10 7043526474, ordre #9 7043914072, CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.97-train` @ `37747ef`. Branche `fix/oiran-2.21.99-live-throughput`. Numerology CLAUDE1 = impair. Coordination avec CLAUDE2 (2.21.98 identités clear-text) sur `live_trace.rs`.
+
+### Défaut adressé
+
+Trafic applicatif prouvé (UL 13 107 200 o, DL 107 479 040 o, N3 capturé), mais **0 bucket de débit** dans les deux flux de la live trace (9 min). Sur 2.21.74, le même test donnait **168 échantillons**.
+
+### Cause (lecture `apps/api/src/live_trace.rs @ 37747ef`)
+
+`route_normalized` l. 494-531 émet un bucket **uniquement sur transition de `event.timestamp.seconds`** entre deux GTP-U successifs. Si le reader poll un lot de GTP-U sur la même seconde `t`, puis plus aucun GTP-U n'arrive dans la fenêtre de poll, les octets restent dans `state.{ul,dl,unknown}_bytes` **sans jamais émettre**. Le test de reproduction `gtpu_matched_via_match_teid_still_emits_throughput_buckets_2_21_99` prouve que `match_teid` (2.21.90) route bien les events GTP-U — la régression N'EST PAS dans le routing.
+
+### Correctif
+
+- `LiveTraceRegistry::flush_idle_throughput_buckets()` (nouvelle méthode) : pour chaque trace active, si des octets sont accumulés et que `wall-clock now > state.throughput_second`, émet le bucket avec `"flush":"idle"` et reset `ul/dl/unknown_bytes` + `throughput_second`.
+- `start_reader` appelle `flush_idle_throughput_buckets()` à chaque tick (750 ms), en plus de `throughput.tick()`.
+- Event-driven path (route_normalized l. 494-531) inchangé.
+
+### Tests ajoutés (3) et commande ANR1 pour rejeu (gate ±2 %)
+
+Voir commit `b60a940` et rapport #9.
+
+Preuves : workspace 879 passed / 0 failed ; vtap 15/0 ; 12/12 runs à 0 échec ; audit lock Rust 1.83 **0 violation**.
+
+---
+
 ## oiran-api 2.21.97 — train (cœur) : 2.21.94 (garde de bascule, référence interrogeable) + 2.21.95 (stable_event_key dans le callflow)
 
 - Fusion `--no-ff` de `fix/oiran-2.21.95-callflow-stable-key` @ `a3a8634` sur `820da0c`. Conflits limités aux numéros de version et à cet en-tête. Aucun changement de code propre au train.
