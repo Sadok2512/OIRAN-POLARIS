@@ -1,5 +1,43 @@
 # Changelog
 
+## oiran-api 2.21.124 — 2026-11-20 — trace live : isolement sur capture réelle à cinq abonnés — pseudonymes d'équipement jamais appris, PFCP de la session rattaché après coup (recette lab 2.21.114, ordre #9 7052731132)
+
+Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.123 @ `d9295a4` (refonte testable du lecteur, elle-même un commit au-dessus de `8b0dcae`). Branches `fix/oiran-2.21.124-trace-equipment-identity` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change. L'ordre #9 7052903849 nomme ce correctif « 2.21.123, un commit au-dessus de `8b0dcae` » ; le numéro 2.21.123 était déjà pris par la refonte du lecteur, poussée avant cet ordre.
+
+### Audit — l'isolement n'était pas fermé sur données réelles
+
+Recette lab 2.21.114 : deux UE simultanés, trace de A → pseudonyme de B présent, tout le trafic de B rattaché. Le dépôt contient une capture réelle à plusieurs abonnés, `benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap` : Open5GS + UERANSIM, cinq abonnés, un seul gNB, mêmes AMF / SMF / UPF, NGAP + SBI + PFCP fusionnés.
+
+Le test `five_real_subscribers_on_one_gnb_each_trace_holds_only_its_subscriber_2_21_124` **échoue à `8b0dcae` (2.21.122)** : la trace du premier abonné rattache l'`InitialContextSetupRequest` du second, puis toute la signalisation des quatre autres.
+
+**Cause** : `decoder-ngap` émet l'IE 34 MaskedIMEISV sous le libellé `subscriber_pseudonym=psn-…` et le promeut en identifiant de session `subscriber_pseudonym`. Un IMEISV masqué est commun aux terminaux d'un même modèle et identique pour tous les UE d'un simulateur ; la trace l'apprenait comme pseudonyme de son abonné, et l'`InitialContextSetupRequest` de tout autre UE du même modèle était rattaché, puis ses identifiants NGAP, ses tunnels, son trafic. `decoder-sbi` porte de même `imei_pseudonym` / `imeisv_pseudonym` en identifiants de session. Antérieur à cette série ; aucun test synthétique ne portait d'IMEISV.
+
+**Second constat du même test, de complétude** : sur les quatre messages PFCP d'un abonné, un seul entrait dans la trace. Dans la séquence réelle, l'établissement PFCP précède le message N2 qui fait connaître les tunnels.
+
+### Correctif
+
+0. **Liste blanche d'apprentissage** (ordre #9 7052903849) : un identifiant de session pseudonymisé n'est appris et exposé que sous un nom d'identité d'abonné ou de sa session — `subscriber_pseudonym`, `msisdn_pseudonym`, `tmsi_pseudonym`, `temporary_identity_pseudonym`, `ue_ip`. Tout autre nom (`imei_pseudonym`, `imeisv_pseudonym`, `identity_pseudonym`, ou un nom à venir) est ignoré. Le domaine du pseudonyme n'est pas lisible dans sa valeur : l'IMEISV masqué du NGAP, émis sous le nom `subscriber_pseudonym`, est écarté par son identifiant d'IE (point 1). Une identité d'équipement ne rattache que si la trace la tient de son ouverture.
+1. **Pseudonymes d'équipement** (NGAP IE 34 ; SBI `imei_pseudonym`, `imeisv_pseudonym`, `pei_pseudonym`) : retenus comme tels par la trace dès qu'ils sont vus, sur un event rattaché ou non ; **jamais appris ni exposés**, quel que soit leur libellé, y compris sur un event enfant qui les hérite ; retirés des clés s'ils avaient été appris avant d'être reconnus. Un pseudonyme que la trace tient de son ouverture (trace ouverte sur un IMEI) n'est pas concerné.
+2. **PFCP rattaché après coup** : les 256 derniers messages PFCP de session rejetés sont gardés ; dès qu'un event rattaché apporte des SEID ou des tunnels, ils sont représentés à cette trace par le **test de rattachement ordinaire** (couple nœud / SEID, couple adresse / TEID), sans force. Compté dans `stats.pfcp.attached_after_the_fact`. Ces messages sortent après ceux qui les ont fait reconnaître, marqués `late`.
+
+### Résultat sur la capture réelle, après correctif
+
+522 events décodés (N2, N4, SBI). Events rattachés à chacun des cinq abonnés : **70, 68, 67, 69, 65**, soit 339 ; non rattachés : 183 ; aucun event dans deux traces. Par abonné : N2 26 messages sur 26 (22 sur 22 pour le dernier), N4 4 sur 4, SBI 37 à 40 ; 0 message N2 d'un autre contexte UE ; 0 message portant le pseudonyme d'un autre abonné ; 0 pseudonyme tiers ou d'équipement appris ou exposé ; le pseudonyme de l'abonné est exposé.
+
+**Amorçage** : la relecture sans émission passe par le même code de rattachement et d'apprentissage ; le test le vérifie sur la capture (rien d'un autre abonné ni d'un équipement appris, aucun identifiant UE d'un autre contexte).
+
+### OUVERT
+
+- **Le libellé dans le décodeur n'est pas corrigé** : `decoder-ngap` continue d'émettre l'IMEISV masqué comme `subscriber_pseudonym`, y compris vers les datasets publiés. Si `session-engine` ou `correlation-engine` s'en servent pour rapprocher des sessions, ils rapprochent des terminaux du même modèle. Non instruit ici.
+- Les enregistrements de la capture sont successifs, pas simultanés ; deux UE qui s'enregistrent en même temps ne sont couverts que par les tests synthétiques.
+- Pas de plan usager dans cette capture : l'isolement des G-PDU sur données réelles à plusieurs UE n'est pas vérifié ici.
+- SBI : aucune vérité terrain de complétude ; le test vérifie qu'aucun SBI d'un autre abonné n'entre, pas que tous ceux de l'abonné entrent.
+- Une trace ouverte sur un IMEI repose sur le pseudonyme donné par le coffre d'identités ; non testé.
+
+### Test
+
+`five_real_subscribers_on_one_gnb_each_trace_holds_only_its_subscriber_2_21_124`, sur la capture réelle : cinq traces, chacune vérifiée sur les points ci-dessus plus la présence des quatre messages PFCP de la session ; les cinq comptes sont affirmés (`[70, 68, 67, 69, 65]`), ainsi que l'absence d'event commun à deux traces ; l'amorçage est vérifié sur le premier abonné.
+
 ## oiran-api 2.21.123 — 2026-11-20 — lecteur live : la passe est une fonction testée sur un ring de plus de 1 024 segments (ordre #9 7052206763)
 
 Upgrade **patch** sans déploiement, un commit au-dessus du train 2.21.122 @ `8b0dcae`. Branche `fix/oiran-2.21.123-reader-pass-testable`. Seul `apps/api/src/live_trace.rs` change. **Aucun changement de comportement voulu** : refonte et test.
