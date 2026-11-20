@@ -2062,7 +2062,12 @@ pub fn insert_pfcp_siblings_into_callflow_using_session_keys(
             .and_then(Value::as_str)
             .is_some_and(|id| !known.contains(id))
     }) {
-        let converted = raw_event_to_callflow_event(&raw);
+        let mut converted = raw_event_to_callflow_event(&raw);
+        // 2.21.112 (recette 2.21.104, ANR1 #10 7050183853 : 5 PFCP sans
+        // clé sur 72) — un frère PFCP vient du JSONL brut et est inséré
+        // APRÈS la dérivation de clé du callflow persisté : il doit
+        // recevoir sa `stable_event_key` ici.
+        stamp_stable_event_key_if_missing(events, &mut converted);
         let seq = pfcp_sequence_of(&converted);
         let position = seq
             .as_deref()
@@ -2077,6 +2082,70 @@ pub fn insert_pfcp_siblings_into_callflow_using_session_keys(
         added += 1;
     }
     Ok(added)
+}
+
+/// Premier `packet_references` d'un event : `(source_file, interface_id,
+/// packet_number, byte_offset)`.
+fn first_packet_reference(event: &Value) -> Option<(String, u32, u64, u64)> {
+    let packet = event
+        .get("packet_references")
+        .and_then(Value::as_array)
+        .and_then(|list| list.first())
+        .and_then(Value::as_object)?;
+    Some((
+        packet
+            .get("source_file")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        packet.get("interface_id").and_then(Value::as_u64).unwrap_or(0) as u32,
+        packet.get("packet_number").and_then(Value::as_u64).unwrap_or(0),
+        packet.get("byte_offset").and_then(Value::as_u64).unwrap_or(0),
+    ))
+}
+
+/// 2.21.112 — pose `stable_event_key` sur un event inséré à la lecture
+/// s'il n'en porte pas. Même formule que
+/// `event_schema::backfill_stable_event_keys_in_callflow` :
+/// `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}`, l'ordinal étant
+/// le nombre d'events de `existing` déjà rattachés au même paquet. Un
+/// event sans `packet_references` reste sans clé. Retourne `true` si
+/// une clé a été posée.
+fn stamp_stable_event_key_if_missing(existing: &[Value], event: &mut Value) -> bool {
+    let has_key = event
+        .get("stable_event_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty());
+    if has_key {
+        return false;
+    }
+    let Some(reference) = first_packet_reference(event) else {
+        return false;
+    };
+    let ordinal = existing
+        .iter()
+        .filter(|other| first_packet_reference(other).as_ref() == Some(&reference))
+        .count() as u32;
+    let protocol = event
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let key = event_schema::derive_stable_event_key(
+        &reference.0,
+        reference.1,
+        reference.2,
+        reference.3,
+        &protocol,
+        ordinal,
+    );
+    match event.as_object_mut() {
+        Some(object) => {
+            object.insert("stable_event_key".into(), Value::String(key));
+            true
+        }
+        None => false,
+    }
 }
 
 fn pfcp_sequence_of(event: &Value) -> Option<String> {
@@ -3025,6 +3094,81 @@ mod callflow_pfcp_insert_tests {
             "count helper must match insert delta ; count={count} delta={delta}"
         );
         assert_eq!(count, 2, "exactly 2 siblings (a + b), not the 'other' session's PFCP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.21.112 (recette 2.21.104, ANR1 #10 7050183853 : une session
+    /// ancienne rend 67 events sur 72 avec `stable_event_key`, 5 PFCP
+    /// sans) — un frère PFCP inséré à la lecture depuis le JSONL brut
+    /// reçoit sa clé, par la même formule que le reste du callflow.
+    /// Avant correctif : clé absente. Un frère sans `packet_references`
+    /// reste sans clé, et un frère qui en porte déjà une la garde.
+    #[test]
+    fn inserted_pfcp_siblings_carry_a_stable_event_key_2_21_112() {
+        let dir = std::env::temp_dir().join(format!(
+            "rtp-sibling-key-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sibling = |id: &str, seq: &str, packet: u64, extra: Value| {
+            let mut event = json!({"event_id":id,"capture_id":"c","interface":"N4","protocol":"PFCP",
+                "message_name":"PFCP Session Establishment Request","pfcp_sequence":seq,
+                "session_identifiers":[{"name":"pfcp_sequence","value":seq}],
+                "timestamp":{"seconds":1,"nanoseconds":0,"raw_ticks":packet,"display":"x"},
+                "source_endpoint":{"address":"10.0.0.1","port":8805,"network_function":"SMF"},
+                "destination_endpoint":{"address":"10.0.0.2","port":8805,"network_function":"UPF"}});
+            for (key, value) in extra.as_object().unwrap() {
+                event[key] = value.clone();
+            }
+            event
+        };
+        let reference = |packet: u64| {
+            json!([{"source_file":"/ring/n4/n4_00007.pcapng","interface_id":0,
+                "packet_number":packet,"byte_offset":packet * 100}])
+        };
+        let with_packet = sibling("evt-sib-a", "100", 7, json!({"packet_references": reference(7)}));
+        let without_packet = sibling("evt-sib-b", "101", 8, json!({}));
+        let already_keyed = sibling(
+            "evt-sib-c",
+            "102",
+            9,
+            json!({"packet_references": reference(9), "stable_event_key": "kept|0|9|900|PFCP|0"}),
+        );
+        std::fs::write(
+            dir.join("oiran_events.jsonl"),
+            format!("{}\n{}\n{}\n", with_packet, without_packet, already_keyed),
+        )
+        .unwrap();
+        let response = |id: &str, seq: &str| {
+            json!({"event_id":id,"protocol":"PFCP","interface":"N4",
+                "message_name":"PFCP Session Establishment Response",
+                "stable_event_key":"n4_00007.pcapng|0|1|100|PFCP|0",
+                "decoded_ie_tree":[{"name":"pfcp_sequence","value":seq}]})
+        };
+        let mut events = vec![
+            response("evt-resp-a", "100"),
+            response("evt-resp-b", "101"),
+            response("evt-resp-c", "102"),
+        ];
+        let added = insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap();
+        assert_eq!(added, 3);
+        let key_of = |id: &str| {
+            events
+                .iter()
+                .find(|e| e["event_id"] == id)
+                .and_then(|e| e.get("stable_event_key"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        assert_eq!(
+            key_of("evt-sib-a"),
+            event_schema::derive_stable_event_key("/ring/n4/n4_00007.pcapng", 0, 7, 700, "PFCP", 0),
+            "clé dérivée par la formule commune"
+        );
+        assert_eq!(key_of("evt-sib-c"), "kept|0|9|900|PFCP|0", "clé existante gardée");
+        assert_eq!(key_of("evt-sib-b"), "", "sans packet_references : pas de clé inventée");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

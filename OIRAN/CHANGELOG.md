@@ -1,5 +1,30 @@
 # Changelog
 
+## oiran-api 2.21.112 — 2026-11-20 — callflow : clé stable sur les PFCP frères insérés à la lecture (recette 2.21.104 ANR1 #10 7050183853, ordre #9 7050201220 point 3)
+
+Upgrade **patch** sans déploiement, base 2.21.109 second commit @ `33e544a`. Branche `fix/oiran-2.21.112-pfcp-sibling-stable-key`. 2.21.110 est le lot de CLAUDE2, 2.21.111 le train du cœur.
+
+### Audit
+
+Fait recette : une session ancienne rend 67 events sur 72 avec `stable_event_key`, **5 PFCP sans clé**.
+
+Ce n'est pas le cas `skipped` de 2.21.102 (event sans `packet_references`) : aucun code de production ne construit d'event de callflow sans référence de paquet. Dans `session_callflow_blocking` (`apps/api/src/lib.rs`), la clé est dérivée par `backfill_stable_event_keys_in_callflow` **à la lecture de la page**, puis `read_time_patch::insert_pfcp_siblings_into_callflow_using_session_keys` insère en page 1 les PFCP frères de la session, lus dans le JSONL brut. Pour un dataset publié avant 2.21.91 ces events n'ont pas de clé, et rien ne la dérivait après l'insertion.
+
+**Non vérifié sur la donnée** : je n'ai pas accès à la session. Le compte attendu est celui des frères insérés ; ANR1 peut le confirmer si les 5 events sans clé sont bien ceux absents du callflow persisté.
+
+### Correctif
+
+`stamp_stable_event_key_if_missing` (`read_time_patch.rs`) pose la clé sur chaque frère inséré qui n'en porte pas, par la formule commune `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}` ; l'ordinal est le nombre d'events du callflow déjà rattachés au même paquet. Une clé existante est gardée ; un event sans `packet_references` reste sans clé.
+
+### OUVERT
+
+- `extend_items_with_pfcp_siblings_from_jsonl` (route des éléments de l'arbre protocolaire, `lib.rs`) insère aussi des frères PFCP bruts ; non touché, non vérifié.
+- L'ordinal est exact tant qu'un paquet PFCP ne produit qu'un event, ce qui est le cas du décodeur aujourd'hui.
+
+### Test
+
+`read_time_patch::callflow_pfcp_insert_tests::inserted_pfcp_siblings_carry_a_stable_event_key_2_21_112` : trois frères insérés — avec référence de paquet (clé = formule commune), déjà porteur d'une clé (gardée), sans référence (pas de clé inventée). Avant correctif le premier n'avait pas de clé.
+
 ## oiran-api 2.21.109, oiran-decode 0.10.0, capture-pcap 0.3.0 — 2026-11-20 — lecteur live : reprise à l'offset, lot A (ordres #9 7049622543 et 7049845272, design #9 7049817473)
 
 Upgrade **patch** sans déploiement, base `fix/oiran-2.21.108-train` @ `fb7b721`. Branche `fix/oiran-2.21.109-live-reader-offset-resume`.
