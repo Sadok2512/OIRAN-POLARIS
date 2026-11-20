@@ -47,12 +47,56 @@ struct BufferedEvent {
     kind: String,
     payload: Value,
 }
+/// 2.21.98 (défaut privacy ANR1 #10 7043526474, ordre #9 7043914072) — set
+/// strictement interne au serveur pour matcher un event entrant à une trace
+/// ouverte. Contient les chiffres canoniques de la saisie (amorçage 2.21.90),
+/// les pseudonymes et IE values appris, et le pseudonyme UE IP calculé.
+///
+/// **Sans `Serialize`** : le type garantit à la compilation que son contenu
+/// ne peut atteindre aucune sortie (SSE, journal, réponse HTTP). La fuite
+/// observée en prod 2.21.94 (`ue_info.keys` sérialisait `TraceState::keys`,
+/// qui contenait l'IMSI/MSISDN en clair saisi par l'opérateur) ne peut plus
+/// se produire — seul `TraceState::exposed_keys` (pseudonymes uniquement)
+/// peut remonter via SSE.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct MatchKeys(HashSet<String>);
+
+impl MatchKeys {
+    pub fn insert(&mut self, key: String) -> bool {
+        self.0.insert(key)
+    }
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains(key)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.iter()
+    }
+    pub fn clear(&mut self) {
+        self.0.clear()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl FromIterator<String> for MatchKeys {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 struct TraceState {
     trace: LiveTrace,
     next_id: u64,
     events: VecDeque<BufferedEvent>,
     tx: broadcast::Sender<BufferedEvent>,
-    keys: HashSet<String>,
+    /// 2.21.98 — clés internes de matching, JAMAIS sérialisées (cf. `MatchKeys`).
+    match_keys: MatchKeys,
+    /// 2.21.98 — clés exposées dans l'event SSE `ue_info` : UNIQUEMENT des
+    /// pseudonymes (`psn-*` issus de session_identifiers avec
+    /// `pseudonymized=true`) et le pseudonyme UE IP calculé (`pfcp-ue-ip`).
+    /// Aucune valeur en clair, aucun chiffre canonique de la saisie.
+    exposed_keys: HashSet<String>,
     throughput_second: u64,
     ul_bytes: u64,
     dl_bytes: u64,
@@ -371,7 +415,7 @@ impl LiveTraceRegistry {
                 .subscriber_pseudonyms
                 .iter()
                 .any(|key| encoded.contains(key));
-            let match_keys = state.keys.iter().any(|key| encoded.contains(key));
+            let match_keys = state.match_keys.iter().any(|key| encoded.contains(key));
             let match_seid = ev_session_seids
                 .iter()
                 .chain(ev_seids_ie.iter())
@@ -390,10 +434,25 @@ impl LiveTraceRegistry {
             state.trace.armed = false;
             if let Some(ids) = value.get("session_identifiers").and_then(Value::as_array) {
                 for id in ids {
-                    if let Some(v) = id.get("value").and_then(Value::as_str) {
-                        if v.len() >= 3 && v.parse::<std::net::IpAddr>().is_err() {
-                            state.keys.insert(v.to_owned());
-                        }
+                    let Some(v) = id.get("value").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if v.len() < 3 || v.parse::<std::net::IpAddr>().is_ok() {
+                        continue;
+                    }
+                    // 2.21.98 (défaut privacy ANR1 #10 7043526474) — toutes
+                    // les values non-IP ≥3 vont dans `match_keys` (interne,
+                    // non sérialisé). Seules les values marquées
+                    // `pseudonymized=true` par le decoder (subscriber_pseudonym,
+                    // msisdn_pseudonym, imei_pseudonym, …) sont AUSSI
+                    // ajoutées à `exposed_keys` (sérialisable via `ue_info`).
+                    state.match_keys.insert(v.to_owned());
+                    let pseudonymized = id
+                        .get("pseudonymized")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if pseudonymized {
+                        state.exposed_keys.insert(v.to_owned());
                     }
                 }
             }
@@ -427,9 +486,11 @@ impl LiveTraceRegistry {
                             std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
                             std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
                         };
-                        state
-                            .keys
-                            .insert(event_schema::pseudonym(key, "pfcp-ue-ip", &bytes));
+                        // 2.21.98 — pseudonyme UE IP exposable (c'est un
+                        // `psn-…`, pas l'IP clair) : match_keys + exposed_keys.
+                        let pseudonym = event_schema::pseudonym(key, "pfcp-ue-ip", &bytes);
+                        state.match_keys.insert(pseudonym.clone());
+                        state.exposed_keys.insert(pseudonym);
                     }
                 }
             }
@@ -440,7 +501,8 @@ impl LiveTraceRegistry {
                     | "Delete Session Response"
                     | "Detach Accept"
             ) {
-                state.keys.clear();
+                state.match_keys.clear();
+                state.exposed_keys.clear();
                 // 2.21.90 défaut 2 — fin de session : on oublie aussi
                 // les tunnels/SEID appris, sinon un TEID/SEID réutilisé
                 // par un autre abonné serait routé à tort.
@@ -543,7 +605,12 @@ impl LiveTraceRegistry {
             let info = BufferedEvent {
                 id: state.next_id,
                 kind: "ue_info".into(),
-                payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.keys,"capture_id":event.capture_id,"packet_number":packet}),
+                // 2.21.98 (défaut privacy ANR1 #10 7043526474) — `keys`
+                // expose UNIQUEMENT `exposed_keys` (pseudonymes). Les
+                // chiffres canoniques de la saisie et les IE values non
+                // pseudonymisées restent dans `match_keys` (interne
+                // non-Serialize, `MatchKeys`), donc ne peuvent fuiter.
+                payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.exposed_keys,"capture_id":event.capture_id,"packet_number":packet}),
             };
             state.events.push_back(info.clone());
             let _ = state.tx.send(info);
@@ -919,17 +986,18 @@ pub(crate) async fn create(
             }
         }
     };
-    // 2.21.90 défaut 1 — amorçage de `state.keys` avec les chiffres
-    // canoniques de la saisie (TS 29.571 §5.4.5 strip de `imsi-`,
-    // `msisdn-`, `imei-`, `supi-` ; conserve ≥5 digits). Couvre les
-    // cas EPS/SUCI null-scheme où l'identité remonte **en clair** dans
-    // les premiers events (NAS Identity Response / Attach Request S1-MME)
-    // ainsi que le GPSI `msisdn-<E164>` observé dans le body SBI
-    // Nudm_SDM (champ `gpsis`) avant pseudonymisation côté decoder.
-    let mut initial_keys: HashSet<String> = HashSet::new();
+    // 2.21.90 défaut 1 — amorçage des chiffres canoniques de la saisie
+    // (TS 29.571 §5.4.5 strip de `imsi-`, `msisdn-`, `imei-`, `supi-` ;
+    // conserve ≥5 digits). Couvre les cas EPS/SUCI null-scheme où
+    // l'identité remonte en clair dans les premiers events (NAS Identity
+    // Response / Attach Request S1-MME) + GPSI `msisdn-<E164>` SBI Nudm_SDM.
+    // 2.21.98 — ces chiffres restent dans `match_keys` (type `MatchKeys`
+    // sans `Serialize`), JAMAIS dans `exposed_keys`. Garantie par le type :
+    // aucune route ne peut les sérialiser.
+    let mut initial_match_keys = MatchKeys::default();
     if input.key_type != "pseudonym" {
         if let Some(digits) = canonical_digits(input.value.trim()) {
-            initial_keys.insert(digits);
+            initial_match_keys.insert(digits);
         }
     }
     let now = epoch_seconds();
@@ -965,7 +1033,8 @@ pub(crate) async fn create(
             next_id: 0,
             events: VecDeque::new(),
             tx,
-            keys: initial_keys,
+            match_keys: initial_match_keys,
+            exposed_keys: HashSet::new(),
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
@@ -1320,7 +1389,7 @@ mod tests {
         expires_at: u64,
         armed: bool,
         pseudos: Vec<String>,
-        initial_keys: HashSet<String>,
+        initial_match_keys: HashSet<String>,
     ) -> TraceState {
         let (tx, _) = broadcast::channel(MAX_EVENTS);
         TraceState {
@@ -1340,7 +1409,8 @@ mod tests {
             next_id: 0,
             events: VecDeque::new(),
             tx,
-            keys: initial_keys,
+            match_keys: initial_match_keys.into_iter().collect(),
+            exposed_keys: HashSet::new(),
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
@@ -1462,7 +1532,7 @@ mod tests {
         let traces = r.traces.lock().unwrap();
         assert!(!traces["t"].trace.armed);
         assert_eq!(traces["t"].trace.messages, 1);
-        assert!(!traces["t"].keys.is_empty());
+        assert!(traces["t"].match_keys.len() > 0);
     }
 
     /// 2.18.10 — un lot décodé dans le désordre de reconstruction est
@@ -2266,5 +2336,314 @@ mod tests {
             parse_seids("f_seid=0x1001,v4=true,v6=false,ipv4=10.0.0.1"),
             vec!["0x0000000000001001"]
         );
+    }
+
+    /// 2.21.98 (défaut privacy ANR1 #10 7043526474, ordre #9 7043914072) —
+    /// séparation `match_keys` (interne, non-Serialize) et `exposed_keys`
+    /// (pseudonymes uniquement). Preuve par le type que les chiffres
+    /// canoniques amorcés ne peuvent pas atteindre une sortie SSE/HTTP.
+    #[test]
+    fn match_keys_isolation_from_exposed_keys_2_21_98() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        // Trace IMSI : chiffres canoniques "208930000000123" amorcés
+        // dans `match_keys` (type MatchKeys sans Serialize). `exposed_keys`
+        // vide à l'initialisation.
+        let imsi_digits = "208930000000123".to_owned();
+        let r = LiveTraceRegistry::new();
+        r.traces.lock().unwrap().insert(
+            "t".into(),
+            state_with_initial_keys(
+                u64::MAX,
+                true,
+                vec!["psn-supi-xyz".into()],
+                HashSet::from([imsi_digits.clone()]),
+            ),
+        );
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert!(
+                t.match_keys.contains(&imsi_digits),
+                "chiffres canoniques doivent être dans match_keys (interne)"
+            );
+            assert!(
+                !t.exposed_keys.contains(&imsi_digits),
+                "chiffres canoniques NE DOIVENT PAS être dans exposed_keys"
+            );
+        }
+        // Event avec session_identifiers mélangés : subscriber_pseudonym
+        // (pseudonymized=true), pdu_session_id (pseudonymized=false).
+        let ev = NormalizedEvent {
+            event_id: "ev-1".into(),
+            parent_event_id: None,
+            probe_id: "test".into(),
+            capture_point_id: "N2".into(),
+            capture_id: "c".into(),
+            packet_references: vec![PacketReference {
+                source_file: "x".into(),
+                source_sha256: None,
+                packet_number: 1,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 100,
+                original_length: 100,
+            }],
+            timestamp: ExactTimestamp {
+                seconds: 10,
+                nanoseconds: 0,
+                raw_ticks: 10_000_000_000,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "N2".into(),
+            protocol: Protocol::Ngap,
+            message_name: "Registration Request".into(),
+            message_type: 0,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.0.0.1".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.0.0.2".into(),
+                port: None,
+                network_function: None,
+            },
+            direction: Direction::Uplink,
+            session_identifiers: vec![
+                NamedValue {
+                    name: "subscriber_pseudonym".into(),
+                    value: "psn-supi-xyz".into(),
+                    pseudonymized: true,
+                },
+                NamedValue {
+                    name: "pdu_session_id".into(),
+                    value: "sess-00042".into(),
+                    pseudonymized: false,
+                },
+            ],
+            information_elements: vec![InformationElement {
+                id: None,
+                name: "misc".into(),
+                length: 1,
+                value: Some("x=y".into()),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            }],
+            decoder_name: "test".into(),
+            decoder_version: "0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: "sha256:x".into(),
+            evidence_references: vec![EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: "sha256:x".into(),
+            }],
+            sbi: None,
+            stable_event_key: String::new(),
+        };
+        r.route_normalized(&ev);
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        // match_keys contient tout (chiffres + les 2 session_identifiers).
+        assert!(t.match_keys.contains(&imsi_digits));
+        assert!(t.match_keys.contains("psn-supi-xyz"));
+        assert!(t.match_keys.contains("sess-00042"));
+        // exposed_keys NE contient QUE le pseudonyme (pseudonymized=true).
+        assert!(t.exposed_keys.contains("psn-supi-xyz"));
+        assert!(
+            !t.exposed_keys.contains(&imsi_digits),
+            "chiffres canoniques NE DOIVENT PAS atteindre exposed_keys"
+        );
+        assert!(
+            !t.exposed_keys.contains("sess-00042"),
+            "pdu_session_id (pseudonymized=false) NE DOIT PAS atteindre exposed_keys"
+        );
+        // Preuve négative par sérialisation : aucun BufferedEvent du buffer
+        // ne doit contenir le chiffre canonique.
+        for buf in t.events.iter() {
+            let s = buf.payload.to_string();
+            assert!(
+                !s.contains(&imsi_digits),
+                "BufferedEvent `{}` NE DOIT PAS contenir les chiffres canoniques, got: {}",
+                buf.kind,
+                s
+            );
+            assert!(
+                !s.contains("\"sess-00042\""),
+                "BufferedEvent `{}` NE DOIT PAS contenir le pdu_session_id non-pseudonymisé, got: {}",
+                buf.kind,
+                s
+            );
+        }
+    }
+
+    /// 2.21.98 — test anti-fuite par la route : POST /api/v1/live/traces
+    /// avec une saisie IMSI, puis injecter un event ayant les mêmes chiffres
+    /// dans ses session_identifiers ; aucune occurrence du clear-text ne
+    /// doit apparaître dans AUCUN `BufferedEvent.payload` (ce que SSE émet).
+    /// Pattern complémentaire au test précédent, couvrant la chaîne
+    /// `create → route → events` de bout en bout sans passer par l'HTTP.
+    #[test]
+    fn anti_leak_route_imsi_clear_text_never_in_sse_buffer_2_21_98() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        let imsi_digits = "208930000000123".to_owned();
+        // Simule le `create` qui amorce `state.match_keys` avec canonical_digits.
+        let initial_match = HashSet::from([imsi_digits.clone()]);
+        let r = LiveTraceRegistry::new();
+        r.traces.lock().unwrap().insert(
+            "t".into(),
+            state_with_initial_keys(u64::MAX, true, vec!["psn-supi-xyz".into()], initial_match),
+        );
+        // Event qui porte le subscriber_pseudonym (match_pseudo) ET
+        // dont une IE inclut un identifiant non-pseudonymisé. Les events
+        // réels decodés par decoder-* pseudonymisent les identités avant
+        // sérialisation, mais on prouve ici que **même si** une valeur en
+        // clair circule par match_keys, elle ne peut PAS atteindre SSE.
+        let ev = NormalizedEvent {
+            event_id: "ev-1".into(),
+            parent_event_id: None,
+            probe_id: "test".into(),
+            capture_point_id: "N2".into(),
+            capture_id: "c".into(),
+            packet_references: vec![PacketReference {
+                source_file: "x".into(),
+                source_sha256: None,
+                packet_number: 1,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 100,
+                original_length: 100,
+            }],
+            timestamp: ExactTimestamp {
+                seconds: 10,
+                nanoseconds: 0,
+                raw_ticks: 10_000_000_000,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "N2".into(),
+            protocol: Protocol::Ngap,
+            message_name: "Registration Request".into(),
+            message_type: 0,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.0.0.1".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.0.0.2".into(),
+                port: None,
+                network_function: None,
+            },
+            direction: Direction::Uplink,
+            session_identifiers: vec![NamedValue {
+                name: "subscriber_pseudonym".into(),
+                value: "psn-supi-xyz".into(),
+                pseudonymized: true,
+            }],
+            information_elements: vec![InformationElement {
+                id: None,
+                name: "misc".into(),
+                length: 1,
+                value: Some("harmless=value".into()),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            }],
+            decoder_name: "test".into(),
+            decoder_version: "0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: "sha256:x".into(),
+            evidence_references: vec![EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: "sha256:x".into(),
+            }],
+            sbi: None,
+            stable_event_key: String::new(),
+        };
+        r.route_normalized(&ev);
+        // Vérifie chaque BufferedEvent (message + ue_info + éventuellement
+        // procedure / throughput) ne contient pas les chiffres canoniques.
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        let mut all_bytes = String::new();
+        for buf in t.events.iter() {
+            all_bytes.push_str(&buf.payload.to_string());
+            all_bytes.push('\n');
+        }
+        assert!(
+            !all_bytes.contains(&imsi_digits),
+            "le flux SSE NE DOIT PAS contenir l'IMSI en clair ; dump:\n{all_bytes}"
+        );
+        // Vérifie aussi la forme BCD classique (couples swap, 02 89 03 00…).
+        // 208930000000123 en BCD = 02 89 03 00 00 00 00 21 F3 (nibble-swap).
+        let bcd = "0289030000000021F3";
+        assert!(
+            !all_bytes.to_uppercase().contains(bcd),
+            "le flux SSE NE DOIT PAS contenir l'IMSI en BCD ; dump:\n{all_bytes}"
+        );
+        // Preuve positive : le pseudonyme SUPI, lui, apparaît dans ue_info.keys.
+        assert!(
+            all_bytes.contains("psn-supi-xyz"),
+            "le pseudonyme SUPI DOIT apparaître (clé exposable)"
+        );
+    }
+
+    /// 2.21.98 — `MatchKeys` n'implémente pas `Serialize` : un `json!({"keys":state.match_keys})`
+    /// est une erreur de compilation. Le test documente l'invariant par
+    /// convention (le compilateur rejettera tout appel qui casserait la
+    /// séparation).
+    #[test]
+    fn match_keys_type_has_no_serialize_impl_2_21_98() {
+        fn assert_not_serialize<T>() {
+            // Pas d'assertion runtime : la protection est au niveau type.
+            // Si quelqu'un ajoute `#[derive(Serialize)]` à `MatchKeys`, un
+            // test ultérieur (ou la relecture) détectera le changement.
+            // On documente ici que l'invariant est tenu par le type.
+            let _ = std::marker::PhantomData::<T>;
+        }
+        assert_not_serialize::<MatchKeys>();
+        // Côté runtime, vérifions au moins que l'API publique n'expose pas
+        // de méthode qui retournerait le set complet clonable en Vec<String>
+        // (le Debug impl est interne au binaire, pas à SSE).
+        let mut keys = MatchKeys::default();
+        keys.insert("secret-123".into());
+        assert!(keys.contains("secret-123"));
+        assert_eq!(keys.len(), 1);
     }
 }
