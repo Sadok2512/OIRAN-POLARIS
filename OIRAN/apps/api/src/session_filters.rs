@@ -500,6 +500,7 @@ mod tests {
     ) -> CallFlowEvent {
         CallFlowEvent {
             event_id: id.into(),
+            stable_event_key: String::new(),
             timestamp: "2026-11-10T00:00:00.000000000Z".into(),
             timestamp_ns: "0".into(),
             interface: interface.into(),

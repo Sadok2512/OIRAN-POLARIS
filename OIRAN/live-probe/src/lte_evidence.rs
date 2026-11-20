@@ -1937,6 +1937,7 @@ mod tests {
         };
         EventRecord {
             event_id: id.into(),
+            stable_event_key: String::new(),
             parent_event_id: None,
             capture_id: format!("sha256:{capture_sha}"),
             capture_point_id: plane.into(),

@@ -27,6 +27,12 @@ pub struct CanonicalRef {
     pub capture_id: String,
     pub packet_number: u64,
     pub event_id: String,
+    /// 2.21.95 (défaut recette #10 7039298457, ordre #9 7039438165) —
+    /// clé de corrélation live↔publi propagée depuis `CallFlowEvent`.
+    /// `skip_serializing_if = "String::is_empty"` préserve la sortie
+    /// pour les datasets pré-2.21.91 qui ne portent pas le champ.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stable_event_key: String,
     pub session_id: String,
     pub message_name: String,
 }
@@ -112,6 +118,8 @@ fn event_ref(flow: &CallFlow, event: &CallFlowEvent) -> CanonicalRef {
             .min()
             .unwrap_or(0),
         event_id: event.event_id.clone(),
+        // 2.21.95 — propagation depuis CallFlowEvent (callflow-schema 1.5.0).
+        stable_event_key: event.stable_event_key.clone(),
         session_id: flow.session_id.clone(),
         message_name: event.message_name.clone(),
     }
@@ -475,6 +483,7 @@ mod tests {
             }],
             events: vec![CallFlowEvent {
                 event_id: format!("evt-{id}"),
+                stable_event_key: String::new(),
                 timestamp: String::new(),
                 timestamp_ns: String::new(),
                 interface: "S1-MME".into(),

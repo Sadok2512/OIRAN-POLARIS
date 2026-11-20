@@ -16716,6 +16716,224 @@ mod tests {
             "aucun refus attendu sur un état cohérent flows/filter_index"
         );
     }
+
+    /// 2.21.95 (défaut recette #10 7039298457, ordre #9 7039438165) —
+    /// test de bout en bout par la route `/sessions/:id/callflow`.
+    ///
+    /// ANR1 a mesuré 0/1738 events portant `stable_event_key` sur 2.21.93
+    /// (`CallFlowEvent` ne déclarait pas le champ). Le présent test
+    /// exerce la chaîne **complète côté API** :
+    ///   1. écrit un `callflow.json` sur disque, dont chaque event
+    ///      porte un `stable_event_key` conforme au format publié par
+    ///      2.21.91 (`{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}`) ;
+    ///   2. configure `AppState` pour ce callflow comme flow primaire
+    ///      (`ApiConfig::callflow_json`) ;
+    ///   3. appelle `GET /api/v1/sessions/:id/callflow` via router ;
+    ///   4. assert **100 %** des events exposés portent `stable_event_key`
+    ///      non vide et non équivoque (contient le séparateur `|`).
+    ///
+    /// Invariant du design : la valeur renvoyée est celle qu'aurait
+    /// émise `derive_stable_event_key(basename, iid, pkt, off, protocol,
+    /// ordinal)` — la même fonction qu'utilise le flux SSE, donc elle
+    /// coïncide par construction pour un même paquet (voir
+    /// `oiran-decode::tests/stable_event_key_parity.rs`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_callflow_route_exposes_stable_event_key_on_every_event_2_21_95() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dataset_name = format!("callflow-stable-key-{suffix}");
+        let dataset_dir_guard =
+            AutoRemoveDir::new(workspace.join("datasets").join(&dataset_name));
+        let dataset_dir = dataset_dir_guard.as_pathbuf();
+        let session_id = "sess-stable-key-2-21-95";
+
+        // 5 events N2, chacun avec un stable_event_key distinct (différent
+        // protocol ou ordinal) — matrice minimale pour prouver l'unicité
+        // par event + propagation 1:1.
+        let make_event = |event_id: &str,
+                          packet_number: u64,
+                          byte_offset: u64,
+                          protocol: &str,
+                          ordinal: u32| {
+            let stable_key =
+                format!("N2.pcapng|0|{packet_number}|{byte_offset}|{protocol}|{ordinal}");
+            json!({
+                "event_id": event_id,
+                "stable_event_key": stable_key,
+                "timestamp": "2026-11-20T10:00:00.000000000Z",
+                "timestamp_ns": "0",
+                "interface": "N2",
+                "protocol": protocol,
+                "message_name": "InitialUEMessage",
+                "source_participant": "gNB",
+                "destination_participant": "AMF",
+                "direction": "RAN_TO_CORE",
+                "decoded_ie_tree": [],
+                "decoding_status": "DECODED",
+                "semantic_status": "EXACT",
+                "association": "SESSION",
+                "procedure_group": "Registration",
+                "packet_references": [{
+                    "source_file": "/var/lib/oiran/ring/n2/N2.pcapng",
+                    "packet_number": packet_number,
+                    "byte_offset": byte_offset,
+                    "interface_id": 0u32,
+                    "captured_length": 64u32,
+                    "original_length": 64u32,
+                }],
+                "capture_id": "sha256:cap-stable-key-test",
+                "decoder_name": "decoder-ngap",
+                "decoder_version": "0.6.3",
+                "raw_payload_reference": "sha256:payload",
+                "errors": [],
+            })
+        };
+        let events = json!([
+            make_event("evt-ngap-init-01", 7, 40, "NGAP", 0),
+            // NAS enfant sur le même paquet → même prefix, protocol+ordinal différents.
+            make_event("evt-nas-regreq-01", 7, 40, "NAS-5GS-MM", 1),
+            make_event("evt-ngap-init-02", 12, 200, "NGAP", 0),
+            make_event("evt-nas-regreq-02", 12, 200, "NAS-5GS-MM", 1),
+            make_event("evt-ngap-release-03", 42, 1_024, "NGAP", 0),
+        ]);
+        let callflow = json!({
+            "callflow_id": format!("cf-{session_id}"),
+            "session_id": session_id,
+            "technology": "5G SA",
+            "start_timestamp": "2026-11-20T10:00:00Z",
+            "end_timestamp": "2026-11-20T10:00:01Z",
+            "participants": [],
+            "interfaces": ["N2"],
+            "procedures": [],
+            "events": events,
+            "correlation_edges": [],
+            "correlation_status": {},
+            "decoder_versions": {"decoder-ngap":"0.6.3","decoder-nas":"0.4.3"},
+            "schema_version": "1.5.0",
+            "capture_references": ["sha256:cap-stable-key-test"],
+            "accounting": {"source_events":5,"session_events":5,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields": 0,
+        });
+        let callflow_json_path = dataset_dir.join("callflow.json");
+        fs::write(
+            &callflow_json_path,
+            serde_json::to_vec_pretty(&callflow).unwrap(),
+        )
+        .unwrap();
+        fs::write(dataset_dir.join("callflow.html"), b"<html>stub</html>").unwrap();
+        fs::write(dataset_dir.join("synthetic.pcap"), b"\0").unwrap();
+        fs::write(dataset_dir.join("oiran_events.jsonl"), b"").unwrap();
+        fs::write(
+            dataset_dir.join("scenario_manifest.json"),
+            json!({
+                "scenario_id": "callflow-stable-key-2.21.95",
+                "captures": [{
+                    "file": "synthetic.pcap",
+                    "capture_id": "sha256:cap-stable-key-test",
+                    "name": "synthetic.pcap",
+                    "interface": "N2",
+                    "sha256": "0".repeat(64),
+                    "packet_count": 1,
+                    "size_bytes": 1,
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut config = test_config(workspace, &format!("registry-{dataset_name}"));
+        config.dataset_dir = dataset_dir.clone();
+        config.callflow_json = callflow_json_path.clone();
+        config.callflow_html = dataset_dir.join("callflow.html");
+        config.reference_dataset_enabled = true;
+        let state = AppState::load(config)
+            .expect("AppState::load succeeds on 2.21.95 callflow fixture");
+
+        let response = router(state, None)
+            .oneshot(req(
+                &format!("/api/v1/sessions/{session_id}/callflow?limit=100"),
+                true,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200, got {status}; body={body}"
+        );
+        let events = body["data"]["events"]
+            .as_array()
+            .expect("data.events array present on /callflow response");
+        assert_eq!(events.len(), 5, "fixture a 5 événements");
+
+        // Preuve 1 — 100 % des events portent `stable_event_key` non vide.
+        for (idx, event) in events.iter().enumerate() {
+            let key = event["stable_event_key"]
+                .as_str()
+                .expect(&format!("event #{idx} manque stable_event_key"));
+            assert!(
+                !key.is_empty(),
+                "event #{idx} ({}) stable_event_key vide",
+                event["event_id"]
+            );
+            // Format : `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}`.
+            assert_eq!(
+                key.matches('|').count(),
+                5,
+                "format stable_event_key invalide pour event #{idx}: {key}"
+            );
+            assert!(
+                key.starts_with("N2.pcapng|"),
+                "basename dumpcap doit préfixer la clé, got {key}"
+            );
+        }
+
+        // Preuve 2 — unicité par event, invariant 2.21.91 raffinement
+        // 7034553419. Chaque event a sa propre `stable_event_key`
+        // (parent NGAP + enfant NAS sur même paquet se discriminent
+        // via `|protocol|ordinal`).
+        let keys: std::collections::BTreeSet<&str> = events
+            .iter()
+            .filter_map(|e| e["stable_event_key"].as_str())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            events.len(),
+            "chaque event doit avoir une stable_event_key unique"
+        );
+
+        // Preuve 3 — parent NGAP + enfant NAS sur le MÊME paquet
+        // partagent le prefix `(basename, iid, pkt, off)` mais
+        // diffèrent par `(protocol, ordinal)`. Tiré de la mesure
+        // ANR1 originale : le NGAP et le NAS encapsulé sortent sur
+        // le même packet_number mais sont deux events distincts.
+        let evt_ngap = events
+            .iter()
+            .find(|e| e["event_id"] == "evt-ngap-init-01")
+            .unwrap();
+        let evt_nas = events
+            .iter()
+            .find(|e| e["event_id"] == "evt-nas-regreq-01")
+            .unwrap();
+        let k_ngap = evt_ngap["stable_event_key"].as_str().unwrap();
+        let k_nas = evt_nas["stable_event_key"].as_str().unwrap();
+        assert!(k_ngap.starts_with("N2.pcapng|0|7|40|"));
+        assert!(k_nas.starts_with("N2.pcapng|0|7|40|"));
+        assert_ne!(k_ngap, k_nas, "parent + enfant même paquet, clés distinctes");
+    }
 }
 
 #[cfg(test)]

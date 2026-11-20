@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use session_engine::{Association, EventRecord, LteSession, PacketRef, Reconstruction};
+use session_engine::{
+    Association, EventRecord, LteSession, PacketRef, PfcpSession, Reconstruction, UeContext,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,6 +19,14 @@ pub struct Participant {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallFlowEvent {
     pub event_id: String,
+    /// 2.21.95 (défaut recette #10 7039298457, ordre #9 7039438165) —
+    /// clé de corrélation live↔publi propagée depuis `EventRecord`
+    /// (session-engine 0.5.25) et in fine depuis `NormalizedEvent`
+    /// (event-schema 1.6.0). `skip_serializing_if = "String::is_empty"`
+    /// préserve la sortie bit-identique aux call flows émis depuis un
+    /// JSONL pré-2.21.91 (qui ne portent pas le champ).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stable_event_key: String,
     pub timestamp: String,
     pub timestamp_ns: String,
     pub interface: String,
@@ -300,6 +310,8 @@ pub fn build_callflow(reconstruction: &Reconstruction, edges: Vec<CorrelationEdg
             .unwrap_or(Association::Unmatched);
         events.push(CallFlowEvent {
             event_id: event.event_id.clone(),
+            // 2.21.95 — propagation du champ depuis EventRecord.
+            stable_event_key: event.stable_event_key.clone(),
             timestamp: event.timestamp.clone(),
             timestamp_ns: event.timestamp_ns.to_string(),
             interface: event.interface.clone(),
@@ -486,6 +498,8 @@ pub fn build_lte_callflow(
         }
         events.push(CallFlowEvent {
             event_id: event.event_id.clone(),
+            // 2.21.95 — propagation du champ depuis EventRecord.
+            stable_event_key: event.stable_event_key.clone(),
             timestamp: event.timestamp.clone(),
             timestamp_ns: event.timestamp_ns.to_string(),
             interface: event.interface.clone(),
@@ -699,6 +713,7 @@ mod tests {
     fn lte_event(id: &str, interface: &str, protocol: &str, name: &str, timestamp: i128) -> EventRecord {
         EventRecord {
             event_id: id.into(),
+            stable_event_key: format!("synthetic.json|0|{timestamp}|0|{protocol}|0"),
             parent_event_id: None,
             capture_id: "synthetic-lte".into(),
             capture_point_id: interface.into(),
@@ -869,6 +884,7 @@ mod tests {
     fn call_flow_event_without_multi_probe_fields_omits_them_in_serialization() {
         let event = CallFlowEvent {
             event_id: "e1".into(),
+            stable_event_key: String::new(),
             timestamp: "2026-11-16T00:00:00.000000000Z".into(),
             timestamp_ns: "0".into(),
             interface: "N2".into(),
@@ -910,6 +926,7 @@ mod tests {
     fn call_flow_event_with_multi_probe_fields_serializes_them() {
         let event = CallFlowEvent {
             event_id: "e1".into(),
+            stable_event_key: String::new(),
             timestamp: "2026-11-16T00:00:00.000000000Z".into(),
             timestamp_ns: "0".into(),
             interface: "N2".into(),
@@ -940,5 +957,127 @@ mod tests {
         assert_eq!(json["timestamp_source"], "kernel");
         // physical_link reste None → absent.
         assert!(json.as_object().unwrap().get("physical_link").is_none());
+    }
+
+    /// 2.21.95 (défaut recette #10 7039298457, ordre #9 7039438165) —
+    /// ANR1 a mesuré 0/1738 events portant `stable_event_key` sur le
+    /// candidat 2.21.93. La conversion `EventRecord → CallFlowEvent`
+    /// doit propager le champ ; la sérialisation doit l'émettre quand
+    /// il est non vide et l'omettre sinon (contrat backward-compat).
+    #[test]
+    fn call_flow_event_propagates_stable_event_key_from_event_record() {
+        let reconstruction = Reconstruction {
+            session_id: "s-2-21-95".into(),
+            ue: UeContext {
+                pseudonym: String::new(),
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: None,
+                pdu_session_id: None,
+                state: "INACTIVE".into(),
+            },
+            pfcp: PfcpSession {
+                smf_f_seid: None,
+                upf_f_seid: None,
+                pdr_ids: vec![],
+                far_ids: vec![],
+                qer_ids: vec![],
+                state: "INACTIVE".into(),
+            },
+            tunnels: vec![],
+            events: vec![lte_event("evt-ngap", "N2", "NGAP", "InitialUEMessage", 1)],
+            association: BTreeMap::from([("evt-ngap".into(), Association::Session)]),
+            duplicate_event_ids: vec![],
+        };
+        let flow = build_callflow(&reconstruction, vec![]);
+        assert_eq!(flow.events.len(), 1);
+        assert!(
+            !flow.events[0].stable_event_key.is_empty(),
+            "stable_event_key doit être propagé depuis EventRecord"
+        );
+        assert_eq!(
+            flow.events[0].stable_event_key,
+            "synthetic.json|0|1|0|NGAP|0",
+            "format exact `(basename, iid, pkt, off, protocol, ordinal)`"
+        );
+        // Bit-level — la sérialisation JSON contient la clé.
+        let serialized = serde_json::to_value(&flow).unwrap();
+        assert_eq!(
+            serialized["events"][0]["stable_event_key"],
+            "synthetic.json|0|1|0|NGAP|0"
+        );
+    }
+
+    /// 2.21.95 — contrat backward-compat : un `EventRecord` issu d'un
+    /// JSONL pré-2.21.91 (sans `stable_event_key` dans la source) donne
+    /// `CallFlowEvent.stable_event_key = ""`, et la sérialisation
+    /// JSON omet le champ (`skip_serializing_if = "String::is_empty"`).
+    #[test]
+    fn call_flow_event_omits_stable_event_key_when_empty_backward_compat() {
+        let mut record = lte_event("evt-legacy", "N2", "NGAP", "InitialUEMessage", 1);
+        record.stable_event_key = String::new();
+        let reconstruction = Reconstruction {
+            session_id: "s-legacy".into(),
+            ue: UeContext {
+                pseudonym: String::new(),
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: None,
+                pdu_session_id: None,
+                state: "INACTIVE".into(),
+            },
+            pfcp: PfcpSession {
+                smf_f_seid: None,
+                upf_f_seid: None,
+                pdr_ids: vec![],
+                far_ids: vec![],
+                qer_ids: vec![],
+                state: "INACTIVE".into(),
+            },
+            tunnels: vec![],
+            events: vec![record],
+            association: BTreeMap::from([("evt-legacy".into(), Association::Session)]),
+            duplicate_event_ids: vec![],
+        };
+        let flow = build_callflow(&reconstruction, vec![]);
+        assert_eq!(flow.events[0].stable_event_key, "");
+        let serialized = serde_json::to_value(&flow).unwrap();
+        assert!(
+            serialized["events"][0]
+                .as_object()
+                .unwrap()
+                .get("stable_event_key")
+                .is_none(),
+            "champ vide → omis (contrat pré-2.21.91 préservé)"
+        );
+    }
+
+    /// 2.21.95 — contrat de désérialisation : un callflow JSON émis
+    /// par 2.21.95 est relu sans perte (round-trip symétrique).
+    #[test]
+    fn call_flow_event_round_trips_stable_event_key_through_serde() {
+        let json = serde_json::json!({
+            "event_id": "evt-X",
+            "stable_event_key": "capture.pcapng|0|42|100|NGAP|0",
+            "timestamp": "2026-11-20T00:00:00Z",
+            "timestamp_ns": "0",
+            "interface": "N2",
+            "protocol": "NGAP",
+            "message_name": "InitialUEMessage",
+            "source_participant": "gNB",
+            "destination_participant": "AMF",
+            "direction": "RAN_TO_CORE",
+            "decoded_ie_tree": [],
+            "decoding_status": "DECODED",
+            "semantic_status": "NORMAL",
+            "association": "SESSION",
+            "procedure_group": "Registration",
+            "packet_references": [],
+            "capture_id": "sha256:cap",
+            "decoder_name": "decoder-ngap",
+            "decoder_version": "test",
+            "raw_payload_reference": "sha256:payload",
+            "errors": [],
+        });
+        let event: CallFlowEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event.stable_event_key, "capture.pcapng|0|42|100|NGAP|0");
     }
 }
