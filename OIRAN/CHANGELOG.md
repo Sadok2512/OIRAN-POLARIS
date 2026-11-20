@@ -1,5 +1,38 @@
 # Changelog
 
+## oiran-api 2.21.116 — 2026-11-20 — trace live : la mise en veille ne ferme pas la session de données (relecture CLAUDE2 #9 7051364956)
+
+Upgrade **patch** sans déploiement, base 2.21.113 @ `2f7f77f`. Branche `fix/oiran-2.21.116-trace-idle-release`. Seul `apps/api/src/live_trace.rs` change. **2.21.113 ne doit pas être déployée sans ce correctif.**
+
+### Audit
+
+- **F1 — régression introduite par 2.21.113.** À la libération du contexte UE (`UEContextReleaseComplete`), 2.21.113 oubliait aussi les SEID, les couples (nœud, SEID), les IP UE et les références de contexte SM. Or cette libération est aussi le passage en veille : la session de données reste établie au SMF et à l'UPF, et la séquence normale place après elle l'`UpdateSMContext` puis la `Session Modification` (TS 23.502 §4.2.6), plus tard le `Session Report Request`. Ces messages n'étaient plus rattachés. À `33e544a` la branche ne se déclenchait jamais et gardait donc les SEID. Reproduit par la sonde RVB2 de CLAUDE2 à `2f7f77f` ; je ne l'ai pas rejouée.
+- **F2.** `parents_attached_after_child` comptait deux fois chaque parent : les décodeurs posent la même référence dans `parent_event_id` et dans `parent_ngap_event_id` / `parent_s1ap_event_id`, le parent était routé deux fois, la seconde écartée par la déduplication après incrément du compteur (et de `duplicates_dropped`).
+
+### Correctif
+
+Trois fins distinctes :
+- **libération du contexte UE** (`UEContextReleaseComplete`, NGAP et S1AP) : identifiants UE NGAP / S1AP, tunnels du plan usager et références d'event oubliés ; SEID, couples (nœud, SEID), références de contexte SM et IP UE **gardés** ;
+- **libération d'une session de données** : inchangé depuis 2.21.113 (ses tunnels seulement si elle est nommée) ;
+- **détachement** (`Detach Accept`) : tout est oublié.
+Les références de parent sont dédoublonnées.
+
+### Identité de l'abonné gardée en fin de session — bornée par l'expiration de la trace (décision cœur #9 7051448601)
+
+Depuis 2.21.113 les pseudonymes appris et les chiffres amorcés ne sont plus oubliés à la fin d'une session, pour rattacher la procédure suivante de l'abonné (Service Request après veille). Ce maintien est borné par la durée de vie de la trace : une trace expire à `expires_at` (durée demandée à l'ouverture, 3 600 s au plus) et tout son état, identité comprise, est supprimé par `purge` à l'expiration ou à sa suppression explicite. Rien n'en est écrit sur disque.
+
+### OUVERT
+
+- L'ordre réel des messages de mise en veille sur le lab (Open5GS) n'est pas vérifié : le correctif suit la norme, pas une capture.
+- Les tunnels N3 sont oubliés à la mise en veille et réappris à la reprise sur le message qui les redonne ; si la reprise ne les redonne pas dans un message rattaché, les G-PDU suivants sont rejetés (`gpdu.rejected_no_match`).
+- **Repli quand le nœud de cœur n'est pas reconnu** (limite relevée par CLAUDE2) : l'AMF / MME est reconnu par le port 38412 / 36412 ou par un rôle contenant `amf` / `mme`. Sur un cœur à port non standard et sans rôle, l'identifiant du cœur retombe sur l'association et le handover est de nouveau perdu.
+- Non vérifié sur une capture S1AP réelle que les extrémités portent le port 36412.
+- Retour de veille : la reprise n'est rattachée que par un message qui porte une identité connue de la trace (pseudonyme de l'abonné ou identité temporaire apprise sur un message déjà rattaché). Si l'identité temporaire n'a été attribuée que dans un message NAS chiffré, le Service Request ne peut pas être rattaché côté N2 ; N4 et SBI le restent par SEID et contexte SM. Non vérifié sur le lab.
+
+### Tests
+
+`idle_release_keeps_the_pdu_session_signalling_attached_2_21_116` (mise en veille, puis SBI de même contexte SM et PFCP de même SEID rattachés ; identifiants NGAP libérés rejetés ; `Detach Accept` oublie tout). `real_n2_capture_attaches_the_whole_dialogue_and_nothing_else_2_21_113` affirme maintenant exactement 1 parent rattaché après coup et 0 doublon écarté (il affirmait `>= 1`, ce qui laissait passer le double).
+
 ## oiran-api 2.21.113 — 2026-11-20 — trace live : cinq écarts de rattachement relevés en relecture croisée (CLAUDE2 #9 7050861203)
 
 Upgrade **patch** sans déploiement, base 2.21.109 second commit @ `33e544a` (la version en cours de déploiement). Branche `fix/oiran-2.21.113-trace-attach-review`. Seul `apps/api/src/live_trace.rs` change.
