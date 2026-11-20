@@ -1,5 +1,80 @@
 # Changelog
 
+## OIRAN API 2.21.98 — 2026-11-20 — PRIORITÉ privacy : séparation match_keys / exposed_keys (défaut ANR1 #10 7043526474, ordre #9 7043914072 CLAUDE2)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.97-train` @ `37747ef`. Branche `fix/oiran-2.21.98-live-keys-leak`. Numerology CLAUDE2 = pair. Référence terrain : ANR1 recette prod 2.21.94/train 2.21.97, SSE `ue_info.keys` contenait **les deux identités saisies, en clair** (IMSI + MSISDN) pour chaque trace créée.
+
+### Cause confirmée (lecture `apps/api/src/live_trace.rs` @ `37747ef`)
+
+Le champ `TraceState::keys: HashSet<String>` était sérialisé dans l'event SSE `ue_info` (ligne ~546 de `route_normalized`). Depuis 2.21.90 (ordre #9 7033006772 option C), il est amorcé avec les **chiffres canoniques de la saisie** (`canonical_digits(input.value.trim())`) pour permettre le routing quand le vault est vide. Ces chiffres **ne devaient jamais quitter le serveur** — c'est une erreur de spécification du cœur reconnue dans l'ordre 7043914072.
+
+Points de fuite audités :
+  * **SSE `ue_info.keys`** (`apps/api/src/live_trace.rs:546`) — **confirmé par ANR1 en prod** : le set complet est rendu dans le payload JSON.
+  * Autres payloads SSE (`message`, `procedure`, `throughput`) ne consomment pas `state.keys`.
+  * `POST /api/v1/live/traces` réponse (`live_trace::create`) : renvoie `trace_id`, `subscriber_pseudonyms` (pseudonymes vault), jamais la valeur saisie ni `state.keys`.
+  * Journal d'audit (`audit_lookup`, `audit` entries dans `live_trace`) : jamais la valeur, jamais `state.keys`.
+  * `eprintln` du module : aucune entrée `state.keys` / value.
+  * Seul point de fuite restant avant 2.21.98 : `ue_info.keys`.
+
+### Correctif (3 axes)
+
+**1. Séparation par type.** Nouveau newtype `MatchKeys(HashSet<String>)` **sans `#[derive(Serialize)]`** (`apps/api/src/live_trace.rs:50-95`). Contient toutes les clés de matching internes : chiffres canoniques, session_identifiers values non-IP ≥ 3, pseudonyme UE IP calculé. **Garantie à la compilation** : `json!({"keys":state.match_keys})` est une erreur de type. API : `insert/contains/iter/clear/len`.
+
+**2. `TraceState::exposed_keys: HashSet<String>` séparé.** Contient UNIQUEMENT :
+  * les `session_identifiers.value` avec `pseudonymized=true` (subscriber_pseudonym, msisdn_pseudonym, imei_pseudonym, …) ;
+  * le pseudonyme UE IP calculé (`pfcp-ue-ip` domain, cf. decoder-pfcp IE 93).
+Jamais la valeur saisie, jamais les chiffres canoniques, jamais les IE values non-pseudonymisées (pdu_session_id, dnn, cause…).
+
+**3. Payload SSE `ue_info`.** Ligne ~556 : `"keys": state.exposed_keys` (au lieu de `state.keys`). Les tests prouvent la non-fuite.
+
+### Tests ajoutés (3, 12 runs × 241 passed / 0 failed)
+
+1. `match_keys_isolation_from_exposed_keys_2_21_98` — setup state + event avec 2 session_identifiers (subscriber_pseudonym `pseudonymized=true` + pdu_session_id `pseudonymized=false`). Assertions :
+   * `match_keys` contient les chiffres canoniques, le pseudonyme ET le pdu_session_id (interne, non fuité).
+   * `exposed_keys` contient UNIQUEMENT le pseudonyme (pas les chiffres, pas le pdu_session_id).
+   * Preuve négative par sérialisation : aucun `BufferedEvent.payload` ne contient les chiffres canoniques ni le pdu_session_id non-pseudonymisé.
+
+2. `anti_leak_route_imsi_clear_text_never_in_sse_buffer_2_21_98` — chaîne `create → route → events` : trace IMSI "208930000000123", event routé, vérification que le dump complet de **tous** les `BufferedEvent.payload` NE CONTIENT NI le décimal "208930000000123" NI la forme BCD nibble-swap "0289030000000021F3". Preuve positive : le pseudonyme SUPI apparaît bien dans `ue_info.keys`.
+
+3. `match_keys_type_has_no_serialize_impl_2_21_98` — documente l'invariant que `MatchKeys` n'a pas d'impl `Serialize` et tient l'API publique minimale (`insert/contains/len`).
+
+### Preuves (règle CPU + amendement #9 7034385961)
+
+Préflight final :
+```
+cat /proc/pressure/cpu    → some avg10=0.54 full avg10=0.00  (GO)
+cat /proc/pressure/memory → full avg10=0.00  (GO ; seuil amendé mem full<1)
+free -b (avail)           → 8 226 693 120 (≥ 4 GiB GO)
+df -B1 / (avail)          → 201 749 569 536 (≥ 25 Go GO)
+lslocks nsplus-heavy      → lock free
+```
+
+12 runs tests `oiran-api --lib` sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2` :
+
+```
+Run  1 → 241 passed; 0 failed; 3 ignored; 15.24 s
+Run  2 → 241 passed; 0 failed; 3 ignored; 16.40 s
+Run  3 → 241 passed; 0 failed; 3 ignored; 15.61 s
+Run  4 → 241 passed; 0 failed; 3 ignored; 15.73 s
+Run  5 → 241 passed; 0 failed; 3 ignored; 15.51 s
+Run  6 → 241 passed; 0 failed; 3 ignored; 15.59 s
+Run  7 → 241 passed; 0 failed; 3 ignored; 15.74 s
+Run  8 → 241 passed; 0 failed; 3 ignored; 15.59 s
+Run  9 → 241 passed; 0 failed; 3 ignored; 16.26 s
+Run 10 → 241 passed; 0 failed; 3 ignored; 15.42 s
+Run 11 → 241 passed; 0 failed; 3 ignored; 15.74 s
+Run 12 → 241 passed; 0 failed; 3 ignored; 16.25 s
+```
+
+241 = 238 (train 2.21.97) + 3 ajoutés 2.21.98. 3 `ignored` historiques, aucun `#[ignore]` ajouté. cpu some avg10 pendant la boucle : before Run 1 = 1.32 ; after Run 12 = 1.86 ; jamais `cpu full > 0` ni `mem full > 0`. Durées très stables (15.24 – 16.40 s).
+
+Audit lock Rust 1.83 : `OIRAN/Cargo.lock` ligne 677 passée à `version = "2.21.98"` (seul changement). `cargo test --locked` passe ⇒ lock cohérent. OIRAN/vtap non concerné.
+
+### Scope et coordination #9
+
+- Base `fix/oiran-2.21.97-train` @ `37747ef`. Zone touchée : `apps/api/src/live_trace.rs` + Cargo.toml + Cargo.lock + CHANGELOG. **CLAUDE1 touche aussi `live_trace.rs` dans son lot 2.21.99 (débit live)** — coordination par #9 : mon lot ne touche QUE les champs `match_keys`/`exposed_keys` et la ligne 556 (`ue_info` payload). La refonte `throughput` de 2.21.99 (CLAUDE1) devrait être disjointe fonctionnellement ; tout conflit sera résolu par le cœur au train.
+- Aucun bump de crate partagée. OIRAN/vtap non concerné.
+
 ## oiran-api 2.21.97 — train (cœur) : 2.21.94 (garde de bascule, référence interrogeable) + 2.21.95 (stable_event_key dans le callflow)
 
 - Fusion `--no-ff` de `fix/oiran-2.21.95-callflow-stable-key` @ `a3a8634` sur `820da0c`. Conflits limités aux numéros de version et à cet en-tête. Aucun changement de code propre au train.
