@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.123 — 2026-11-20 — lecteur live : la passe est une fonction testée sur un ring de plus de 1 024 segments (ordre #9 7052206763)
+
+Upgrade **patch** sans déploiement, un commit au-dessus du train 2.21.122 @ `8b0dcae`. Branche `fix/oiran-2.21.123-reader-pass-testable`. Seul `apps/api/src/live_trace.rs` change. **Aucun changement de comportement voulu** : refonte et test.
+
+### Audit
+
+Le correctif le plus important de la série — la fin du vidage de la table des segments lus au-delà de 1 024 fichiers (2.21.109), cause prouvée en prod du redécodage de tout le ring (8 080 segments, un cœur à 99,9 %, 768 912 G-PDU émis pour 151 061 capturés) — n'avait aucun test : le corps de la passe était une fermeture à l'intérieur de `start_reader`, liée à l'état de l'application et au volume du lab.
+
+### Changement
+
+- `reader_pass(root, key, traces, states, sessions, catchup, full_redecode, hooks)` : le corps d'une passe, extrait tel quel de `start_reader`, qui ne garde que la boucle, le chargement de la clé et le minutage.
+- `ReaderHooks` : les trois appels de la passe vers le registre de débit (`bytes_gap`, `file_decoded`, `observe`). `ThroughputHooks` les branche sur l'application ; les tests en fournissent un qui compte.
+
+### Test
+
+`reader_pass_on_a_ring_over_1024_segments_decodes_one_segment_per_active_plane_2_21_123` : ring simulé de **1 160 segments** (1 100 sur N3, 30 sur N2, 30 sur N4), copies des captures réelles du dépôt, dates de modification croissantes ; une trace ouverte sur l'abonné du jeu.
+- passe 1 (rattrapage) : la table garde ses 1 160 entrées ; **3 segments décodés**, un par plan actif ; les G-PDU du segment N3 courant rattachés une fois ;
+- passe 2 (rien n'a changé) : **0 segment décodé**, aucun G-PDU recompté ;
+- passe 3 (le segment N3 courant grossit d'une section) : **1 segment décodé**, `bytes_decoded` = octets ajoutés, `bytes_file` = taille, aucune remise à zéro, les G-PDU ajoutés rattachés une fois ;
+- passe 4 (un vieux segment disparaît) : il quitte la table, sans alerte d'octets perdus.
+**Vérifié par mutation** : en remettant l'ancien vidage (`if states.len() > 1024 { states.clear(); sessions.clear(); }`), le test échoue dès la passe 1 (`left: 0, right: 1160`).
+
+### OUVERT
+
+- Le test couvre trois plans (N2, N3, N4) ; SBI, IMS, N6 et les plans LTE passent par le même code mais n'y sont pas exercés, faute de captures dans le dépôt.
+- `start_reader` lui-même (boucle asynchrone, arrêt quand il n'y a plus ni trace ni flux de débit, cadence de 750 ms, event `stats` toutes les 5 s) reste sans test.
+- Le repli `OIRAN_LIVE_READER_FULL_REDECODE` n'est pas exercé à travers `reader_pass` (paramètre `full_redecode` toujours `false` dans le test).
+
 ## oiran-api 2.21.122 — 2026-11-20 — trace live : la voix rattachée par l'identifiant d'appel SIP, et l'appelant hors de la trace de l'appelé (ordres #9 7052446877 et 7052593612)
 
 Upgrade **patch** sans déploiement, un commit au-dessus du train 2.21.121 @ `d4d7781`. Branches `fix/oiran-2.21.122-trace-sip-call-id` et `fix/oiran-2.21.121-train` (avance rapide). Seul `apps/api/src/live_trace.rs` change.

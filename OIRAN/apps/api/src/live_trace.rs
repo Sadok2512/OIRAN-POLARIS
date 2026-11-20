@@ -2186,6 +2186,299 @@ fn sort_by_capture_order(events: &mut [event_schema::NormalizedEvent]) {
     });
 }
 
+/// 2.21.123 (ordre #9 7052206763) — ce que la passe du lecteur doit au
+/// registre de débit. Séparé du lecteur pour que la passe se teste sans
+/// l'état de l'application.
+pub(crate) trait ReaderHooks {
+    /// Octets d'un segment disparu avant d'avoir été lus.
+    fn bytes_gap(&mut self, gap: u64);
+    /// Un segment va être décodé.
+    fn file_decoded(&mut self);
+    /// Un event à compter dans le débit (déjà dédoublonné).
+    fn observe(&mut self, event: &event_schema::NormalizedEvent);
+}
+
+/// Branche la passe sur le registre de débit de l'application.
+struct ThroughputHooks<'a> {
+    state: &'a AppState,
+}
+
+impl ReaderHooks for ThroughputHooks<'_> {
+    fn bytes_gap(&mut self, gap: u64) {
+        self.state.inner.throughput.bump_bytes_gap(gap);
+    }
+    fn file_decoded(&mut self) {
+        self.state.inner.throughput.bump_file_decoded();
+    }
+    fn observe(&mut self, event: &event_schema::NormalizedEvent) {
+        let session_id = crate::throughput::resolve_session_id_for_event(self.state, event);
+        self.state
+            .inner
+            .throughput
+            .observe_event(event, session_id.as_deref());
+    }
+}
+
+/// 2.21.123 (ordre #9 7052206763) — UNE passe du lecteur live sur le ring
+/// `root` : amorçage des traces nouvelles, puis, plan par plan, décodage
+/// des segments modifiés et routage vers les traces et le débit. Extraite
+/// de `start_reader` sans changement de comportement, pour être testée
+/// sur un ring simulé. `states` (segments déjà lus) et `sessions`
+/// (reprises à l'offset) sont l'état gardé d'une passe à l'autre ;
+/// `catchup` vaut `true` à la première passe du lecteur.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reader_pass(
+    root: &std::path::Path,
+    key: &event_schema::PseudonymKey,
+    traces: &LiveTraceRegistry,
+    states: &mut HashMap<std::path::PathBuf, crate::throughput::PcapFileState>,
+    sessions: &mut HashMap<std::path::PathBuf, ReaderSession>,
+    catchup: bool,
+    full_redecode: bool,
+    hooks: &mut dyn ReaderHooks,
+) {
+    if full_redecode {
+        sessions.clear();
+    }
+    let mut pass_io: BTreeMap<String, ReaderIo> = BTreeMap::new();
+    let mut files_decoded = 0u64;
+    // 2.21.105 (ordre #9 7048974175) — amorçage des
+    // traces ouvertes depuis la passe précédente : le
+    // ring de signalisation est relu sans émission
+    // AVANT le routage live de cette passe.
+    if traces.begin_seed() {
+        let report = seed_from_ring(root, key, traces);
+        traces.finish_seed(&report);
+    }
+    for interface in [
+        "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
+        "S6a", "IMS",
+        // 2.21.107 (ordre #9 7049222982) — plan N6 : SIP
+        // et RTP IMS, publiés `interface="IMS"`.
+        "N6",
+    ] {
+        let dir = root.join(ring_directory(interface));
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        // 2.21.78 (correction 7013902603) — énumère tous les
+        // pcapng, triés par mtime ancien → récent. La
+        // décision de redécoder est prise PAR FICHIER selon
+        // `(size, mtime)` vs `file_state`.
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().and_then(|v| v.to_str()) == Some("pcapng")
+            })
+            .collect();
+        paths.sort_by_key(|path| {
+            path.metadata().and_then(|m| m.modified()).ok()
+        });
+        // 2.21.78 (correction défaut 1) — détecte les fichiers
+        // précédemment vus qui ont DISPARU. Le gap n'est
+        // PAS la taille totale : c'est `last_size -
+        // consumed_bytes`. Un fichier lu en entier et GC'é
+        // par le ring dumpcap contribue 0 — pas d'alerte
+        // sur le régime normal du ring.
+        let present: std::collections::HashSet<std::path::PathBuf> =
+            paths.iter().cloned().collect();
+        let gone: Vec<_> = states
+            .keys()
+            .filter(|p| p.starts_with(&dir) && !present.contains(*p))
+            .cloned()
+            .collect();
+        for path in &gone {
+            sessions.remove(path);
+            if let Some(file_state) = states.remove(path) {
+                let gap = file_state
+                    .size
+                    .saturating_sub(file_state.consumed_bytes);
+                if gap > 0 {
+                    hooks.bytes_gap(gap);
+                }
+            }
+        }
+        // 2.21.78 (correction 7014327787) — rattrapage du
+        // ring au démarrage : tous les fichiers sauf le
+        // plus récent sont marqués consommés sans décodage.
+        // Le filigrane est au MAX pour que toute re-lecture
+        // ultérieure (très improbable : fichier passé) soit
+        // ignorée.
+        let last_idx = paths.len().saturating_sub(1);
+        for path in paths.iter().enumerate() {
+            let (idx, path) = path;
+            let meta = match path.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let size = meta.len();
+            let mtime = meta.modified().ok();
+            let is_newest = idx == last_idx;
+            // Rattrapage : au premier passage, tous les
+            // fichiers sauf le plus récent sont ignorés.
+            if catchup && !is_newest {
+                states.insert(
+                    path.clone(),
+                    crate::throughput::PcapFileState {
+                        size,
+                        mtime,
+                        consumed_bytes: size,
+                        last_packet_number: u64::MAX,
+                        last_event_id: String::new(),
+                        routed_event_ids: Default::default(),
+                    },
+                );
+                continue;
+            }
+            // 2.21.78 (correction défaut 2) — lecture
+            // incrémentale : `(size, mtime)` inchangé
+            // ⇒ **0 décodage**.
+            let prev = states.get(path).cloned().unwrap_or_default();
+            let should_decode = if prev.size == size && prev.mtime == mtime && prev.size > 0 {
+                false
+            } else if prev.consumed_bytes >= size && prev.size == size {
+                // Already fully consumed at that size.
+                false
+            } else {
+                true
+            };
+            if !should_decode {
+                // Mémorise au moins la taille (si c'est la
+                // première vue du fichier avec taille nulle,
+                // il peut toujours grandir plus tard).
+                states.insert(
+                    path.clone(),
+                    crate::throughput::PcapFileState {
+                        size,
+                        mtime,
+                        consumed_bytes: prev.consumed_bytes,
+                        last_packet_number: prev.last_packet_number,
+                        last_event_id: prev.last_event_id,
+                        routed_event_ids: prev.routed_event_ids,
+                    },
+                );
+                // 2.21.109 — segment fermé et inchangé :
+                // clôture de sa session (flux RTP du
+                // tunnel émis une fois, à la rotation).
+                if !is_newest && sessions.contains_key(path) {
+                    let config = ring_decode_config(path, interface);
+                    for event in close_reader_session(sessions, &config) {
+                        traces.route_normalized(&event);
+                    }
+                }
+                continue;
+            }
+            hooks.file_decoded();
+            files_decoded += 1;
+            let config = ring_decode_config(path, interface);
+            // 2.21.109 (ordre #9 7049845272) — reprise à
+            // l'offset sur les plans sans état (lot A) :
+            // seuls les octets ajoutés depuis la passe
+            // précédente sont décodés. Les autres plans,
+            // et tous si le repli est demandé, gardent le
+            // redécodage intégral.
+            let incremental =
+                !full_redecode && oiran_decode::supports_incremental(interface);
+            let mut fresh = Vec::new();
+            let consumed_after;
+            let mut session_reset = false;
+            let io = pass_io.entry(interface.to_string()).or_default();
+            io.incremental = incremental;
+            io.bytes_file = io.bytes_file.saturating_add(size);
+            if incremental {
+                let outcome = decode_increment(sessions, &config, key, size);
+                if outcome.reset {
+                    traces.bump_resume_resets();
+                    session_reset = true;
+                }
+                io.bytes_decoded =
+                    io.bytes_decoded.saturating_add(outcome.bytes_decoded);
+                consumed_after = outcome.consumed_bytes;
+                fresh = outcome.events;
+            } else {
+                let decode_result =
+                    oiran_decode::decode_capture_streaming(&config, key, |event| {
+                        fresh.push(event);
+                        Ok(())
+                    });
+                io.bytes_decoded = io.bytes_decoded.saturating_add(size);
+                consumed_after = if decode_result.is_ok() {
+                    size
+                } else {
+                    prev.consumed_bytes
+                };
+            }
+            sort_by_capture_order(&mut fresh);
+            // 2.21.78 (corrections 7014327787 + 7014783020)
+            // — **deux dédoublonnages distincts** :
+            //   - live trace : `route_once_for_live_trace`
+            //     via set d'`event_id` par fichier. Un event
+            //     late (packet_number < filigrane mais
+            //     event_id inédit) est routé avec `late:true`
+            //     par la logique interne de `route_normalized`.
+            //   - débit : `should_count_in_throughput` avance
+            //     le filigrane `(packet_number, event_id)`
+            //     monotone — aucun double comptage même sous
+            //     iperf 10⁵ pps.
+            let mut file_state_entry =
+                states.remove(path).unwrap_or_default();
+            if session_reset {
+                // Fichier remplacé : les filigranes de
+                // l'ancien contenu ne valent plus.
+                file_state_entry.last_packet_number = 0;
+                file_state_entry.last_event_id.clear();
+            }
+            if incremental {
+                // En reprise, chaque event n'est décodé
+                // qu'une fois : plus de table d'`event_id`.
+                file_state_entry.routed_event_ids.clear();
+            }
+            for event in &fresh {
+                let packet_number = event
+                    .packet_references
+                    .first()
+                    .map(|p| p.packet_number)
+                    .unwrap_or(0);
+                if incremental
+                    || file_state_entry.route_once_for_live_trace(&event.event_id)
+                {
+                    traces.route_normalized(event);
+                }
+                if file_state_entry.should_count_in_throughput(
+                    packet_number,
+                    &event.event_id,
+                ) {
+                    hooks.observe(event);
+                }
+            }
+            file_state_entry.size = size;
+            file_state_entry.mtime = mtime;
+            file_state_entry.consumed_bytes = consumed_after;
+            states.insert(path.clone(), file_state_entry);
+            if incremental && !is_newest {
+                for event in close_reader_session(sessions, &config) {
+                    traces.route_normalized(&event);
+                }
+            }
+        }
+    }
+    // 2.21.109 (donnée ANR1 #10 7050464161 : 768 912 G-PDU
+    // émis pour 151 061 capturés) — jusqu'ici la table
+    // était VIDÉE dès qu'elle dépassait 1 024 fichiers.
+    // Le rattrapage y inscrit tous les segments du ring,
+    // tous plans confondus : au-delà de 1 024 segments
+    // sur disque elle était vidée à la fin de chaque
+    // passe, et la passe suivante redécodait TOUT le
+    // ring et rerouter chaque event. Elle n'est plus
+    // vidée : les segments disparus en sont retirés un
+    // par un (`gone`), sa taille est donc bornée par le
+    // nombre de segments présents sur disque.
+    traces.set_reader_files_tracked(states.len() as u64);
+    traces.set_reader_files_decoded(files_decoded);
+    traces.set_reader_io(pass_io);
+}
+
 pub(crate) fn start_reader(state: AppState) {
     if state
         .inner
@@ -2245,254 +2538,18 @@ pub(crate) fn start_reader(state: AppState) {
                         Ok(k) => k,
                         Err(_) => return (states, sessions),
                     };
-                    // 2.21.109 — repli lu à chaque passe.
-                    let full_redecode = full_redecode_requested();
-                    if full_redecode {
-                        sessions.clear();
-                    }
-                    let mut pass_io: BTreeMap<String, ReaderIo> = BTreeMap::new();
-                    let mut files_decoded = 0u64;
-                    // 2.21.105 (ordre #9 7048974175) — amorçage des
-                    // traces ouvertes depuis la passe précédente : le
-                    // ring de signalisation est relu sans émission
-                    // AVANT le routage live de cette passe.
-                    if state2.inner.live_traces.begin_seed() {
-                        let report = seed_from_ring(&root, &key, &state2.inner.live_traces);
-                        state2.inner.live_traces.finish_seed(&report);
-                    }
-                    for interface in [
-                        "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
-                        "S6a", "IMS",
-                        // 2.21.107 (ordre #9 7049222982) — plan N6 : SIP
-                        // et RTP IMS, publiés `interface="IMS"`.
-                        "N6",
-                    ] {
-                        let dir = root.join(ring_directory(interface));
-                        let Ok(entries) = fs::read_dir(&dir) else {
-                            continue;
-                        };
-                        // 2.21.78 (correction 7013902603) — énumère tous les
-                        // pcapng, triés par mtime ancien → récent. La
-                        // décision de redécoder est prise PAR FICHIER selon
-                        // `(size, mtime)` vs `file_state`.
-                        let mut paths: Vec<_> = entries
-                            .flatten()
-                            .map(|entry| entry.path())
-                            .filter(|path| {
-                                path.extension().and_then(|v| v.to_str()) == Some("pcapng")
-                            })
-                            .collect();
-                        paths.sort_by_key(|path| {
-                            path.metadata().and_then(|m| m.modified()).ok()
-                        });
-                        // 2.21.78 (correction défaut 1) — détecte les fichiers
-                        // précédemment vus qui ont DISPARU. Le gap n'est
-                        // PAS la taille totale : c'est `last_size -
-                        // consumed_bytes`. Un fichier lu en entier et GC'é
-                        // par le ring dumpcap contribue 0 — pas d'alerte
-                        // sur le régime normal du ring.
-                        let present: std::collections::HashSet<std::path::PathBuf> =
-                            paths.iter().cloned().collect();
-                        let gone: Vec<_> = states
-                            .keys()
-                            .filter(|p| p.starts_with(&dir) && !present.contains(*p))
-                            .cloned()
-                            .collect();
-                        for path in &gone {
-                            sessions.remove(path);
-                            if let Some(file_state) = states.remove(path) {
-                                let gap = file_state
-                                    .size
-                                    .saturating_sub(file_state.consumed_bytes);
-                                if gap > 0 {
-                                    state2.inner.throughput.bump_bytes_gap(gap);
-                                }
-                            }
-                        }
-                        // 2.21.78 (correction 7014327787) — rattrapage du
-                        // ring au démarrage : tous les fichiers sauf le
-                        // plus récent sont marqués consommés sans décodage.
-                        // Le filigrane est au MAX pour que toute re-lecture
-                        // ultérieure (très improbable : fichier passé) soit
-                        // ignorée.
-                        let last_idx = paths.len().saturating_sub(1);
-                        for path in paths.iter().enumerate() {
-                            let (idx, path) = path;
-                            let meta = match path.metadata() {
-                                Ok(m) => m,
-                                Err(_) => continue,
-                            };
-                            let size = meta.len();
-                            let mtime = meta.modified().ok();
-                            let is_newest = idx == last_idx;
-                            // Rattrapage : au premier passage, tous les
-                            // fichiers sauf le plus récent sont ignorés.
-                            if catchup && !is_newest {
-                                states.insert(
-                                    path.clone(),
-                                    crate::throughput::PcapFileState {
-                                        size,
-                                        mtime,
-                                        consumed_bytes: size,
-                                        last_packet_number: u64::MAX,
-                                        last_event_id: String::new(),
-                                        routed_event_ids: Default::default(),
-                                    },
-                                );
-                                continue;
-                            }
-                            // 2.21.78 (correction défaut 2) — lecture
-                            // incrémentale : `(size, mtime)` inchangé
-                            // ⇒ **0 décodage**.
-                            let prev = states.get(path).cloned().unwrap_or_default();
-                            let should_decode = if prev.size == size && prev.mtime == mtime && prev.size > 0 {
-                                false
-                            } else if prev.consumed_bytes >= size && prev.size == size {
-                                // Already fully consumed at that size.
-                                false
-                            } else {
-                                true
-                            };
-                            if !should_decode {
-                                // Mémorise au moins la taille (si c'est la
-                                // première vue du fichier avec taille nulle,
-                                // il peut toujours grandir plus tard).
-                                states.insert(
-                                    path.clone(),
-                                    crate::throughput::PcapFileState {
-                                        size,
-                                        mtime,
-                                        consumed_bytes: prev.consumed_bytes,
-                                        last_packet_number: prev.last_packet_number,
-                                        last_event_id: prev.last_event_id,
-                                        routed_event_ids: prev.routed_event_ids,
-                                    },
-                                );
-                                // 2.21.109 — segment fermé et inchangé :
-                                // clôture de sa session (flux RTP du
-                                // tunnel émis une fois, à la rotation).
-                                if !is_newest && sessions.contains_key(path) {
-                                    let config = ring_decode_config(path, interface);
-                                    for event in close_reader_session(&mut sessions, &config) {
-                                        state2.inner.live_traces.route_normalized(&event);
-                                    }
-                                }
-                                continue;
-                            }
-                            state2.inner.throughput.bump_file_decoded();
-                            files_decoded += 1;
-                            let config = ring_decode_config(path, interface);
-                            // 2.21.109 (ordre #9 7049845272) — reprise à
-                            // l'offset sur les plans sans état (lot A) :
-                            // seuls les octets ajoutés depuis la passe
-                            // précédente sont décodés. Les autres plans,
-                            // et tous si le repli est demandé, gardent le
-                            // redécodage intégral.
-                            let incremental =
-                                !full_redecode && oiran_decode::supports_incremental(interface);
-                            let mut fresh = Vec::new();
-                            let consumed_after;
-                            let mut session_reset = false;
-                            let io = pass_io.entry(interface.to_string()).or_default();
-                            io.incremental = incremental;
-                            io.bytes_file = io.bytes_file.saturating_add(size);
-                            if incremental {
-                                let outcome = decode_increment(&mut sessions, &config, &key, size);
-                                if outcome.reset {
-                                    state2.inner.live_traces.bump_resume_resets();
-                                    session_reset = true;
-                                }
-                                io.bytes_decoded =
-                                    io.bytes_decoded.saturating_add(outcome.bytes_decoded);
-                                consumed_after = outcome.consumed_bytes;
-                                fresh = outcome.events;
-                            } else {
-                                let decode_result =
-                                    oiran_decode::decode_capture_streaming(&config, &key, |event| {
-                                        fresh.push(event);
-                                        Ok(())
-                                    });
-                                io.bytes_decoded = io.bytes_decoded.saturating_add(size);
-                                consumed_after = if decode_result.is_ok() {
-                                    size
-                                } else {
-                                    prev.consumed_bytes
-                                };
-                            }
-                            sort_by_capture_order(&mut fresh);
-                            // 2.21.78 (corrections 7014327787 + 7014783020)
-                            // — **deux dédoublonnages distincts** :
-                            //   - live trace : `route_once_for_live_trace`
-                            //     via set d'`event_id` par fichier. Un event
-                            //     late (packet_number < filigrane mais
-                            //     event_id inédit) est routé avec `late:true`
-                            //     par la logique interne de `route_normalized`.
-                            //   - débit : `should_count_in_throughput` avance
-                            //     le filigrane `(packet_number, event_id)`
-                            //     monotone — aucun double comptage même sous
-                            //     iperf 10⁵ pps.
-                            let mut file_state_entry =
-                                states.remove(path).unwrap_or_default();
-                            if session_reset {
-                                // Fichier remplacé : les filigranes de
-                                // l'ancien contenu ne valent plus.
-                                file_state_entry.last_packet_number = 0;
-                                file_state_entry.last_event_id.clear();
-                            }
-                            if incremental {
-                                // En reprise, chaque event n'est décodé
-                                // qu'une fois : plus de table d'`event_id`.
-                                file_state_entry.routed_event_ids.clear();
-                            }
-                            for event in &fresh {
-                                let packet_number = event
-                                    .packet_references
-                                    .first()
-                                    .map(|p| p.packet_number)
-                                    .unwrap_or(0);
-                                if incremental
-                                    || file_state_entry.route_once_for_live_trace(&event.event_id)
-                                {
-                                    state2.inner.live_traces.route_normalized(event);
-                                }
-                                if file_state_entry.should_count_in_throughput(
-                                    packet_number,
-                                    &event.event_id,
-                                ) {
-                                    let session_id = crate::throughput::resolve_session_id_for_event(
-                                        &state2, event,
-                                    );
-                                    state2
-                                        .inner
-                                        .throughput
-                                        .observe_event(event, session_id.as_deref());
-                                }
-                            }
-                            file_state_entry.size = size;
-                            file_state_entry.mtime = mtime;
-                            file_state_entry.consumed_bytes = consumed_after;
-                            states.insert(path.clone(), file_state_entry);
-                            if incremental && !is_newest {
-                                for event in close_reader_session(&mut sessions, &config) {
-                                    state2.inner.live_traces.route_normalized(&event);
-                                }
-                            }
-                        }
-                    }
-                    // 2.21.109 (donnée ANR1 #10 7050464161 : 768 912 G-PDU
-                    // émis pour 151 061 capturés) — jusqu'ici la table
-                    // était VIDÉE dès qu'elle dépassait 1 024 fichiers.
-                    // Le rattrapage y inscrit tous les segments du ring,
-                    // tous plans confondus : au-delà de 1 024 segments
-                    // sur disque elle était vidée à la fin de chaque
-                    // passe, et la passe suivante redécodait TOUT le
-                    // ring et rerouter chaque event. Elle n'est plus
-                    // vidée : les segments disparus en sont retirés un
-                    // par un (`gone`), sa taille est donc bornée par le
-                    // nombre de segments présents sur disque.
-                    state2.inner.live_traces.set_reader_files_tracked(states.len() as u64);
-                    state2.inner.live_traces.set_reader_files_decoded(files_decoded);
-                    state2.inner.live_traces.set_reader_io(pass_io);
+                    // 2.21.123 — le corps de la passe est `reader_pass`,
+                    // testable sur un ring simulé.
+                    reader_pass(
+                        &root,
+                        &key,
+                        &state2.inner.live_traces,
+                        &mut states,
+                        &mut sessions,
+                        catchup,
+                        full_redecode_requested(),
+                        &mut ThroughputHooks { state: &state2 },
+                    );
                     (states, sessions)
                 })
                 .await
@@ -5127,6 +5184,165 @@ mod tests {
         assert_eq!(t.trace.messages, 1);
         assert!(t.exposed_keys.contains("psn-ue-a"));
         assert!(!t.match_keys.contains("psn-ue-b") && !t.exposed_keys.contains("psn-ue-b"));
+    }
+
+    #[derive(Default)]
+    struct CountingHooks {
+        files_decoded: u64,
+        observed: u64,
+        gap_bytes: u64,
+    }
+
+    impl ReaderHooks for CountingHooks {
+        fn bytes_gap(&mut self, gap: u64) {
+            self.gap_bytes += gap;
+        }
+        fn file_decoded(&mut self) {
+            self.files_decoded += 1;
+        }
+        fn observe(&mut self, _event: &event_schema::NormalizedEvent) {
+            self.observed += 1;
+        }
+    }
+
+    /// 2.21.123 (ordre #9 7052206763) — la passe du lecteur sur un ring
+    /// simulé de 1 160 segments (1 100 sur N3, 30 sur N2, 30 sur N4),
+    /// donc au-dessus de l'ancien seuil de 1 024.
+    ///
+    /// Défaut de prod (2.21.78 → 2.21.108, ring à 8 080 segments, un cœur
+    /// à 99,9 %, 768 912 G-PDU émis pour 151 061 capturés) : la table des
+    /// segments lus était vidée à la fin de chaque passe au-delà de
+    /// 1 024 entrées, et la passe suivante redécodait tout le ring.
+    ///
+    /// Attendu : la table garde ses 1 160 entrées ; la première passe ne
+    /// décode que le segment le plus récent de chaque plan (3) ; une
+    /// passe sans changement n'en décode aucun ; après un ajout au
+    /// segment N3 courant, la passe en décode UN, et seulement les octets
+    /// ajoutés ; chaque G-PDU n'est rattaché et compté qu'une fois.
+    #[test]
+    fn reader_pass_on_a_ring_over_1024_segments_decodes_one_segment_per_active_plane_2_21_123() {
+        let datasets = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let root = std::env::temp_dir().join(format!(
+            "oiran-reader-pass-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let base = std::time::UNIX_EPOCH + Duration::from_secs(1_795_000_000);
+        let mut newest_n3 = std::path::PathBuf::new();
+        for (plane, count) in [("n3", 1_100u64), ("n2", 30), ("n4", 30)] {
+            let bytes = fs::read(datasets.join(format!("{}.pcapng", plane.to_ascii_uppercase()))).unwrap();
+            fs::create_dir_all(root.join(plane)).unwrap();
+            for index in 0..count {
+                let path = root.join(plane).join(format!("{plane}_{index:05}.pcapng"));
+                fs::write(&path, &bytes).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(base + Duration::from_secs(index))
+                    .unwrap();
+                if plane == "n3" {
+                    newest_n3 = path;
+                }
+            }
+        }
+        let n3_bytes = fs::read(datasets.join("N3.pcapng")).unwrap();
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        // L'abonné du jeu : son pseudonyme, et le nombre de G-PDU d'un
+        // segment N3.
+        let decode = |plane: &str, interface: &str| {
+            let mut events = Vec::new();
+            oiran_decode::decode_capture_streaming(
+                &ring_decode_config(&root.join(plane).join(format!("{plane}_00000.pcapng")), interface),
+                &key,
+                |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            events
+        };
+        let pseudonym = decode("n2", "N2")
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let gpdus_per_segment = decode("n3", "N3")
+            .iter()
+            .filter(|e| e.protocol.as_str() == "GTP-U")
+            .count() as u64;
+        assert!(gpdus_per_segment > 0);
+
+        let registry = trace_on(&pseudonym);
+        let mut states = HashMap::new();
+        let mut sessions = HashMap::new();
+        let mut hooks = CountingHooks::default();
+        let gpdu = |registry: &LiveTraceRegistry| {
+            let traces = registry.traces.lock().unwrap();
+            let t = &traces["t"];
+            (t.trace.gpdu_seen, t.trace.gpdu_attached)
+        };
+        let reader = |registry: &LiveTraceRegistry| {
+            let traces = registry.traces.lock().unwrap();
+            registry.stats_payload(&traces["t"].trace)["reader"].clone()
+        };
+
+        // Passe 1 — rattrapage : le plus récent de chaque plan seulement.
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, true, false, &mut hooks);
+        assert_eq!(states.len(), 1_160, "la table suit tous les segments, sans être vidée");
+        assert_eq!(hooks.files_decoded, 3, "un segment par plan actif");
+        assert_eq!(gpdu(&registry), (gpdus_per_segment, gpdus_per_segment));
+        assert_eq!(reader(&registry)["files_tracked"], 1_160);
+        assert_eq!(reader(&registry)["files_decoded_last_pass"], 3);
+
+        // Passe 2 — rien n'a changé : rien n'est redécodé, rien n'est
+        // recompté. Avant le correctif : 1 160 segments redécodés.
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, false, false, &mut hooks);
+        assert_eq!(states.len(), 1_160);
+        assert_eq!(hooks.files_decoded, 3, "aucun segment redécodé");
+        assert_eq!(gpdu(&registry), (gpdus_per_segment, gpdus_per_segment), "aucun G-PDU recompté");
+        assert_eq!(reader(&registry)["files_decoded_last_pass"], 0);
+
+        // Passe 3 — le segment N3 courant grossit d'une section.
+        {
+            use std::io::Write;
+            let mut file = fs::File::options().append(true).open(&newest_n3).unwrap();
+            file.write_all(&n3_bytes).unwrap();
+            file.set_modified(base + Duration::from_secs(5_000)).unwrap();
+        }
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, false, false, &mut hooks);
+        assert_eq!(hooks.files_decoded, 4, "un seul segment décodé : celui qui a grossi");
+        assert_eq!(states.len(), 1_160);
+        let io = reader(&registry);
+        assert_eq!(io["files_decoded_last_pass"], 1);
+        assert_eq!(io["interfaces"]["N3"]["incremental"], true);
+        assert_eq!(
+            io["interfaces"]["N3"]["bytes_decoded"],
+            n3_bytes.len() as u64,
+            "seuls les octets ajoutés sont décodés"
+        );
+        assert_eq!(io["interfaces"]["N3"]["bytes_file"], 2 * n3_bytes.len() as u64);
+        assert_eq!(io["resume_resets"], 0);
+        assert_eq!(
+            gpdu(&registry),
+            (2 * gpdus_per_segment, 2 * gpdus_per_segment),
+            "les G-PDU ajoutés, une fois chacun"
+        );
+        assert!(hooks.observed >= 2 * gpdus_per_segment, "le débit reçoit chaque G-PDU");
+        assert_eq!(hooks.gap_bytes, 0);
+
+        // Un segment ancien disparaît (rotation du ring) : il quitte la
+        // table, sans alerte d'octets perdus puisqu'il était consommé.
+        fs::remove_file(root.join("n3").join("n3_00000.pcapng")).unwrap();
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, false, false, &mut hooks);
+        assert_eq!(states.len(), 1_159);
+        assert_eq!(hooks.gap_bytes, 0);
+        assert_eq!(hooks.files_decoded, 4);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 2.21.120 (lot B1) — le lecteur reprend aussi à l'offset sur le
