@@ -92,9 +92,17 @@ fn ingestion_with_missing_manifest_raises_vtap_manifest_missing_never_falls_back
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Validation du train 2.21.108 (ordre #9 7049622543) — les deux tests
+/// ci-dessous écrivent la même variable d'environnement du processus
+/// et tournent en parallèle dans ce binaire : le test « défaut » a lu
+/// la valeur posée par le test « override » (1 échec sur 13 passes).
+/// Ce verrou les sérialise ; un verrou empoisonné par un test en échec
+/// reste utilisable.
+static VTAP_OUT_DIRS_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn vtap_out_dirs_env_overrides_default_and_splits_on_comma() {
-    // Isole la var d'env à ce test — aucun autre test ne la touche.
+    let _env = VTAP_OUT_DIRS_ENV.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("OIRAN_VTAP_OUT_DIRS", "/tmp/oiran-vtap-a,/tmp/oiran-vtap-b");
     let dirs = vtap_out_dirs();
     std::env::remove_var("OIRAN_VTAP_OUT_DIRS");
@@ -105,6 +113,7 @@ fn vtap_out_dirs_env_overrides_default_and_splits_on_comma() {
 
 #[test]
 fn vtap_out_dirs_default_is_var_lib_oiran_vtap_when_env_absent() {
+    let _env = VTAP_OUT_DIRS_ENV.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("OIRAN_VTAP_OUT_DIRS");
     let dirs = vtap_out_dirs();
     assert_eq!(dirs, vec![PathBuf::from("/var/lib/oiran/vtap")]);
