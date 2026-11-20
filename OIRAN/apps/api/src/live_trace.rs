@@ -5150,36 +5150,70 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        sort_by_capture_order(&mut events);
+        // Ordre 7053229737 (constat CLAUDE2 7053217728) — ce test triait
+        // par `(numéro de paquet, event_id)`. L'`event_id` dérive du
+        // `capture_id`, lui-même empreinte du CHEMIN du fichier : dans un
+        // même paquet, le parent NGAP passait avant ou après son enfant
+        // NAS selon le répertoire du dépôt, et le compteur attendu valait
+        // 1 ou 0. Les deux ordres sont maintenant construits et vérifiés,
+        // sans dépendre de l'`event_id`.
+        let packet = |event: &event_schema::NormalizedEvent| {
+            event.packet_references.first().map(|r| r.packet_number).unwrap_or(u64::MAX)
+        };
+        // Tri stable par paquet : dans un paquet, ordre d'émission du
+        // décodeur, parent puis enfant.
+        events.sort_by_key(|event| packet(event));
+        let parent_first = events.clone();
+        let child_first: Vec<event_schema::NormalizedEvent> = events
+            .chunk_by(|a, b| packet(a) == packet(b))
+            .flat_map(|group| group.iter().rev().cloned())
+            .collect();
+        let position = |list: &[event_schema::NormalizedEvent], name: &str| {
+            list.iter().position(|e| e.message_name.ends_with(name)).unwrap()
+        };
+        assert!(
+            position(&parent_first, "InitialUEMessage") < position(&parent_first, "Registration Request"),
+            "le décodeur émet le parent avant son enfant"
+        );
+        assert!(
+            position(&child_first, "Registration Request") < position(&child_first, "InitialUEMessage")
+        );
         let pseudonym = events
             .iter()
             .flat_map(|e| e.session_identifiers.iter())
             .find(|id| id.name == "subscriber_pseudonym")
             .map(|id| id.value.clone())
             .unwrap();
-        let foreign: Vec<&str> = events
-            .iter()
-            .filter(|e| e.message_name.starts_with("UEContextRelease"))
-            .map(|e| e.event_id.as_str())
-            .collect();
-        assert_eq!(foreign.len(), 2, "deux messages d'un autre contexte UE dans le jeu");
-        let r = trace_on(&pseudonym);
-        for event in &events {
-            r.route_normalized(event);
+        for (label, events, expected_after_child) in
+            [("parent d'abord", &parent_first, 1u64), ("enfant d'abord", &child_first, 0)]
+        {
+            let foreign: Vec<&str> = events
+                .iter()
+                .filter(|e| e.message_name.starts_with("UEContextRelease"))
+                .map(|e| e.event_id.as_str())
+                .collect();
+            assert_eq!(foreign.len(), 2, "deux messages d'un autre contexte UE dans le jeu");
+            let r = trace_on(&pseudonym);
+            for event in events {
+                r.route_normalized(event);
+            }
+            let routed = routed_ids(&r);
+            assert!(foreign.iter().all(|id| !routed.iter().any(|r| r == id)), "{label}");
+            assert_eq!(routed.len(), events.len() - 2, "{label} : tout le dialogue de l'abonné");
+            let initial = events
+                .iter()
+                .find(|e| e.message_name == "InitialUEMessage")
+                .unwrap();
+            assert!(routed.contains(&initial.event_id), "{label} : InitialUEMessage rattaché");
+            let traces = r.traces.lock().unwrap();
+            // 2.21.116 (F2) — parent rattaché après coup compté une fois
+            // quand il précède son enfant ; jamais de doublon.
+            assert_eq!(
+                traces["t"].trace.parents_attached_after_child, expected_after_child,
+                "{label}"
+            );
+            assert_eq!(traces["t"].trace.duplicates_dropped, 0, "{label}");
         }
-        let routed = routed_ids(&r);
-        assert!(foreign.iter().all(|id| !routed.iter().any(|r| r == id)));
-        assert_eq!(routed.len(), events.len() - 2, "tout le dialogue de l'abonné");
-        let initial = events
-            .iter()
-            .find(|e| e.message_name == "InitialUEMessage")
-            .unwrap();
-        assert!(routed.contains(&initial.event_id), "InitialUEMessage rattaché après son enfant");
-        let traces = r.traces.lock().unwrap();
-        // 2.21.116 (F2) — un parent rattaché après coup, compté une fois,
-        // sans doublon écarté.
-        assert_eq!(traces["t"].trace.parents_attached_after_child, 1);
-        assert_eq!(traces["t"].trace.duplicates_dropped, 0);
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
