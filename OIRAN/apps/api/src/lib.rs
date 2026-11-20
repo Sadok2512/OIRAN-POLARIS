@@ -183,6 +183,21 @@ struct Inner {
     /// `/health.session_count` annonçait N > 0 (recette 2.21.89 ANR1).
     /// Exposé via `/health.sessions_filter_generation_swap_refused`.
     generation_swap_refused: std::sync::Mutex<GenerationSwapRefusedState>,
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 1) — jalon de la règle
+    /// « une génération à 0 session ne remplace jamais une génération non
+    /// vide sur un seul préchauffage ». Positionné à `Some(now + 30 s)`
+    /// quand un `(0,0)` est refusé au titre de `empty_after_nonempty_unconfirmed`.
+    /// Le préchauffage suivant, s'il observe encore `(0,0)` ET que cette
+    /// deadline n'est pas dépassée, accepte la bascule (confirmation par
+    /// double observation). Le first-boot (slot=None) n'est pas concerné
+    /// et bascule un `(0,0)` au premier préchauffage.
+    pending_empty_confirmation_until: std::sync::Mutex<Option<std::time::Instant>>,
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 2) — compteur des
+    /// nouvelles tentatives programmées après un refus. Exposé dans
+    /// `/health.sessions_filter_generation_swap_refused.retries_scheduled_total`.
+    /// Sous `cfg(test)`, l'incrément se fait mais le thread du retry
+    /// n'est PAS lancé (évite les side-effects asynchrones en test).
+    generation_swap_retry_scheduled: std::sync::Mutex<u64>,
     /// 2.21.11 (défaut 2 #9 6930315055) — cache `/sessions/catalog`
     /// keyé par `(commit_seq, dataset_ids, scope_hash)`. Évite de
     /// reconstruire `protocol_tree` + `network_elements` à chaque
@@ -804,6 +819,8 @@ impl AppState {
                 generation_swap_refused: std::sync::Mutex::new(
                     GenerationSwapRefusedState::default(),
                 ),
+                pending_empty_confirmation_until: std::sync::Mutex::new(None),
+                generation_swap_retry_scheduled: std::sync::Mutex::new(0),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -911,6 +928,8 @@ impl AppState {
                 generation_swap_refused: std::sync::Mutex::new(
                     GenerationSwapRefusedState::default(),
                 ),
+                pending_empty_confirmation_until: std::sync::Mutex::new(None),
+                generation_swap_retry_scheduled: std::sync::Mutex::new(0),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -1677,6 +1696,12 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
     // signifie qu'au moins une génération candidate a été rejetée pour
     // préserver l'ancienne ; `last_reason` + `last_candidate_session_count`
     // + `last_published_session_count` donnent l'écart observé.
+    let retries_scheduled_total = state
+        .inner
+        .generation_swap_retry_scheduled
+        .lock()
+        .map(|n| *n)
+        .unwrap_or(0);
     let swap_refused = state
         .inner
         .generation_swap_refused
@@ -1689,9 +1714,12 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
                 "last_candidate_session_count": g.last_candidate_session_count,
                 "last_published_session_count": g.last_published_session_count,
                 "last_trigger": g.last_trigger,
+                "retries_scheduled_total": retries_scheduled_total,
             })
         })
-        .unwrap_or_else(|_| json!({"total": 0}));
+        .unwrap_or_else(|_| {
+            json!({"total": 0, "retries_scheduled_total": retries_scheduled_total})
+        });
     data["sessions_filter_generation_swap_refused"] = swap_refused;
     ok(data)
 }
@@ -3920,8 +3948,8 @@ fn trace_session_filter_prewarm_rss(trigger: &str, phase: &str) {
 /// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — décide si une bascule du
 /// double tampon doit être refusée au vu de l'écart `(session_count candidat,
 /// published_session_count observé)`. Fonction pure : tous les autres motifs
-/// de refus (verrou empoisonné, cache journey vide) ont déjà leur propre
-/// code de raison et ne passent pas par ici.
+/// de refus (verrou empoisonné, cache journey vide, zéro contre zéro après
+/// non-vide) ont leur propre code de raison et ne passent pas par ici.
 ///
 /// Règles :
 ///   * `candidate == published` ⇒ `None` (bascule OK, même quand les deux
@@ -3938,6 +3966,50 @@ fn swap_refusal_reason(
         Some("session_count_mismatch")
     } else {
         None
+    }
+}
+
+/// 2.21.92 raffinement (ordre #9 7036719807 trou 1) — décision pour le cas
+/// `(0,0)` avec garde « une génération à 0 session ne remplace jamais une
+/// génération non vide sur un seul préchauffage » :
+///   * `NotApplicable` si `(candidate, published) != (0,0)` (traité ailleurs).
+///   * `Accept` si first-boot (`previous_session_count` None) ou la
+///     génération précédente valait aussi 0 (régime stable à vide).
+///   * `AcceptConfirmed` si la génération précédente avait des sessions mais
+///     un `(0,0)` précédent a déjà noté `pending_until` et cette deadline
+///     n'est pas dépassée (double observation = confirmation de l'état
+///     publié).
+///   * `RefuseAndMarkPending` sinon : la génération précédente avait des
+///     sessions, c'est le premier `(0,0)` — on refuse et on note une
+///     confirmation pending pour la prochaine tentative.
+#[derive(Debug, PartialEq, Eq)]
+enum EmptyAfterNonemptyDecision {
+    NotApplicable,
+    Accept,
+    AcceptConfirmed,
+    RefuseAndMarkPending,
+}
+
+fn empty_after_nonempty_decision(
+    candidate_session_count: u64,
+    published_session_count: u64,
+    previous_session_count: Option<u64>,
+    pending_until: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> EmptyAfterNonemptyDecision {
+    if !(candidate_session_count == 0 && published_session_count == 0) {
+        return EmptyAfterNonemptyDecision::NotApplicable;
+    }
+    match previous_session_count {
+        None | Some(0) => EmptyAfterNonemptyDecision::Accept,
+        Some(_) => {
+            if let Some(until) = pending_until {
+                if now <= until {
+                    return EmptyAfterNonemptyDecision::AcceptConfirmed;
+                }
+            }
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending
+        }
     }
 }
 
@@ -3995,6 +4067,94 @@ fn record_swap_refused(
             "epoch_ms": now_ms,
         })
     );
+    // 2.21.92 raffinement (ordre #9 7036719807 trou 2) — nouvelle tentative
+    // bornée. Un verrou empoisonné est irrécupérable dans le même process :
+    // on ne retente pas. Tous les autres motifs (`session_count_mismatch`,
+    // `empty_after_nonempty_unconfirmed`, `journey_index_cache_empty`) sont
+    // transitoires : on programme un retry 5 s plus tard, jusqu'à 3 fois.
+    let retryable = matches!(
+        reason,
+        "session_count_mismatch" | "empty_after_nonempty_unconfirmed" | "journey_index_cache_empty"
+    );
+    if retryable {
+        let next_attempt = retry_attempt_from_trigger(trigger) + 1;
+        schedule_retry_after_refusal(state, trigger, next_attempt);
+    }
+}
+
+/// 2.21.92 raffinement — extrait le numéro de tentative d'un trigger comme
+/// `"retry-2-after-publication"`. Trigger n'ayant pas le préfixe `retry-` ⇒ 0.
+fn retry_attempt_from_trigger(trigger: &str) -> u32 {
+    trigger
+        .strip_prefix("retry-")
+        .and_then(|rest| rest.split_once("-after-").map(|(n, _)| n))
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// 2.21.92 raffinement (ordre #9 7036719807 trou 2) — programme une nouvelle
+/// tentative de préchauffage dans 5 s avec un `trigger` construit comme
+/// `"retry-{attempt}-after-{from_trigger}"`. Chaque tentative incrémente
+/// `generation_swap_retry_scheduled` et log
+/// `SESSIONS_FILTER_GENERATION_SWAP_RETRY_SCHEDULED`. Au-delà de 3 tentatives
+/// consécutives, on arrête et on attend la prochaine publication (log
+/// `SESSIONS_FILTER_GENERATION_SWAP_RETRY_EXHAUSTED`). Sous `cfg(test)` le
+/// thread n'est PAS lancé — seule la trace et l'incrément se produisent,
+/// pour éviter les side-effects asynchrones dans les tests.
+fn schedule_retry_after_refusal(state: &AppState, from_trigger: &str, attempt: u32) {
+    if attempt > 3 {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "SESSIONS_FILTER_GENERATION_SWAP_RETRY_EXHAUSTED",
+                "from_trigger": from_trigger,
+                "max_attempts": 3,
+            })
+        );
+        return;
+    }
+    if let Ok(mut n) = state.inner.generation_swap_retry_scheduled.lock() {
+        *n = n.saturating_add(1);
+    }
+    eprintln!(
+        "{}",
+        json!({
+            "event": "SESSIONS_FILTER_GENERATION_SWAP_RETRY_SCHEDULED",
+            "from_trigger": from_trigger,
+            "attempt": attempt,
+            "delay_s": 5,
+        })
+    );
+    if cfg!(test) {
+        // En test : incrément + trace, mais pas de thread réel.
+        return;
+    }
+    let state_clone = state.clone();
+    let from_trigger = from_trigger.to_owned();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Même garde que `install_session_filter_cache_prewarm` : si une
+        // publication tient le verrou exclusif, on skip — l'observateur
+        // prendra le relais à son `upsert_dataset`.
+        let Some(_gate) = state_clone
+            .inner
+            .capture_manager
+            .heavy_memory_try_enter_exclusive()
+        else {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "SESSIONS_FILTER_GENERATION_SWAP_RETRY_SKIPPED",
+                    "from_trigger": from_trigger,
+                    "attempt": attempt,
+                    "reason": "publication_in_progress",
+                })
+            );
+            return;
+        };
+        let trigger = format!("retry-{attempt}-after-{from_trigger}");
+        prewarm_session_filter_caches_locked(&state_clone, &trigger);
+    });
 }
 
 fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
@@ -4117,6 +4277,49 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
         // `SESSIONS_FILTER_GENERATION_SWAP generation=2 session_count=0`
         // alors que `/health.published_session_count=325`.
         let published_session_count = published_session_count_snapshot(state);
+        // 2.21.92 raffinement (ordre #9 7036719807 trou 1) — règle
+        // « empty_after_nonempty_unconfirmed » via la fonction pure
+        // `empty_after_nonempty_decision`.
+        let previous_session_count = state
+            .inner
+            .generation_slot
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|g| g.session_count));
+        let pending_until = state
+            .inner
+            .pending_empty_confirmation_until
+            .lock()
+            .ok()
+            .and_then(|lock| *lock);
+        let now = std::time::Instant::now();
+        match empty_after_nonempty_decision(
+            session_count,
+            published_session_count,
+            previous_session_count,
+            pending_until,
+            now,
+        ) {
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending => {
+                if let Ok(mut lock) = state.inner.pending_empty_confirmation_until.lock() {
+                    *lock = Some(now + std::time::Duration::from_secs(30));
+                }
+                record_swap_refused(
+                    state,
+                    trigger,
+                    "empty_after_nonempty_unconfirmed",
+                    Some(0),
+                    Some(0),
+                );
+                return;
+            }
+            EmptyAfterNonemptyDecision::AcceptConfirmed => {
+                if let Ok(mut lock) = state.inner.pending_empty_confirmation_until.lock() {
+                    *lock = None;
+                }
+            }
+            EmptyAfterNonemptyDecision::Accept | EmptyAfterNonemptyDecision::NotApplicable => {}
+        }
         if let Some(reason) = swap_refusal_reason(session_count, published_session_count) {
             record_swap_refused(
                 state,
@@ -4175,6 +4378,12 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
         });
         if let Ok(mut slot) = state.inner.generation_slot.write() {
             *slot = Some(generation.clone());
+        }
+        // 2.21.92 raffinement (ordre #9 7036719807 trou 1) — toute bascule
+        // réussie efface le jalon de confirmation pending (le pending ne
+        // s'applique qu'à la prochaine séquence de `(0,0)` répétés).
+        if let Ok(mut lock) = state.inner.pending_empty_confirmation_until.lock() {
+            *lock = None;
         }
         eprintln!(
             "{}",
@@ -16267,6 +16476,166 @@ mod tests {
         assert_eq!(node["last_candidate_session_count"], 0);
         assert_eq!(node["last_published_session_count"], 325);
         assert!(node["last_epoch_ms"].as_u64().unwrap_or(0) > 0);
+    }
+
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 1) — la règle
+    /// « une génération à 0 session ne remplace jamais une génération non
+    /// vide sur un seul préchauffage » encodée par
+    /// `empty_after_nonempty_decision` :
+    ///   * first-boot (previous None) ⇒ Accept (vrai zéro bootstrap),
+    ///   * vrai zéro continu (previous Some(0)) ⇒ Accept,
+    ///   * prev non vide, aucun pending ⇒ RefuseAndMarkPending,
+    ///   * prev non vide, pending expiré ⇒ RefuseAndMarkPending,
+    ///   * prev non vide, pending valide ⇒ AcceptConfirmed,
+    ///   * (candidate, published) != (0,0) ⇒ NotApplicable.
+    #[test]
+    fn empty_after_nonempty_decision_matrix_2_21_92() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // First-boot : Accept.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, None, None, now),
+            EmptyAfterNonemptyDecision::Accept
+        );
+        // Vrai zéro continu : Accept.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, Some(0), None, now),
+            EmptyAfterNonemptyDecision::Accept
+        );
+        // Prev non vide, sans pending : refuse + marque pending.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, Some(325), None, now),
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending
+        );
+        // Prev non vide, pending valide : AcceptConfirmed.
+        assert_eq!(
+            empty_after_nonempty_decision(
+                0,
+                0,
+                Some(325),
+                Some(now + Duration::from_secs(10)),
+                now
+            ),
+            EmptyAfterNonemptyDecision::AcceptConfirmed
+        );
+        // Prev non vide, pending expiré : refuse à nouveau.
+        assert_eq!(
+            empty_after_nonempty_decision(
+                0,
+                0,
+                Some(325),
+                Some(now - Duration::from_secs(1)),
+                now
+            ),
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending
+        );
+        // (3, 3) match exact : NotApplicable (traité par swap_refusal_reason).
+        assert_eq!(
+            empty_after_nonempty_decision(3, 3, Some(325), None, now),
+            EmptyAfterNonemptyDecision::NotApplicable
+        );
+        // (0, 5) mismatch : NotApplicable (traité par swap_refusal_reason).
+        assert_eq!(
+            empty_after_nonempty_decision(0, 5, Some(325), None, now),
+            EmptyAfterNonemptyDecision::NotApplicable
+        );
+    }
+
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 2) —
+    /// `retry_attempt_from_trigger` parse le numéro depuis des triggers
+    /// comme `"retry-2-after-publication"`. Trigger brut (non-retry) ⇒ 0.
+    #[test]
+    fn retry_attempt_from_trigger_parses_2_21_92() {
+        assert_eq!(retry_attempt_from_trigger("publication"), 0);
+        assert_eq!(retry_attempt_from_trigger("startup"), 0);
+        assert_eq!(retry_attempt_from_trigger("retry-1-after-publication"), 1);
+        assert_eq!(retry_attempt_from_trigger("retry-2-after-retry-1-after-publication"), 2);
+        assert_eq!(retry_attempt_from_trigger("retry-3-after-startup"), 3);
+        // Malformed : pas de -after- ou numéro invalide.
+        assert_eq!(retry_attempt_from_trigger("retry-publication"), 0);
+        assert_eq!(retry_attempt_from_trigger("retry-abc-after-x"), 0);
+    }
+
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 2) — `record_swap_refused`
+    /// avec une raison retryable programme automatiquement une tentative
+    /// (incrément du compteur) ; `*_lock_poisoned` n'est pas retryable.
+    /// Sous `cfg(test)`, le thread réel n'est pas lancé — seule la trace et
+    /// l'incrément du compteur sont observables.
+    #[test]
+    fn record_swap_refused_schedules_retry_for_retryable_reasons_2_21_92() {
+        let state = operator_state();
+        // session_count_mismatch ⇒ retry programmé.
+        record_swap_refused(
+            &state,
+            "publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        let after_mismatch = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(after_mismatch, 1, "mismatch doit programmer 1 retry");
+        // empty_after_nonempty_unconfirmed ⇒ retry programmé.
+        record_swap_refused(
+            &state,
+            "publication",
+            "empty_after_nonempty_unconfirmed",
+            Some(0),
+            Some(0),
+        );
+        let after_empty = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(after_empty, 2, "empty_after_nonempty doit programmer 1 retry de plus");
+        // *_lock_poisoned ⇒ PAS retryable (irrécupérable intra-process).
+        record_swap_refused(
+            &state,
+            "publication",
+            "session_filter_index_lock_poisoned",
+            None,
+            None,
+        );
+        let after_poisoned = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(after_poisoned, 2, "lock_poisoned NE DOIT PAS programmer de retry");
+        // attempt > 3 ⇒ no retry (exhausted).
+        record_swap_refused(
+            &state,
+            "retry-3-after-publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        let after_exhaust = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(
+            after_exhaust, 2,
+            "attempt=4 (>3) doit s'arrêter avec SWAP_RETRY_EXHAUSTED, pas incrémenter"
+        );
+    }
+
+    /// 2.21.92 raffinement — `/health.sessions_filter_generation_swap_refused`
+    /// expose aussi `retries_scheduled_total` (compteur global des retries
+    /// programmés depuis le démarrage).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_exposes_retries_scheduled_total_2_21_92() {
+        let state = operator_state();
+        record_swap_refused(
+            &state,
+            "publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        let app = router(state.clone(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let node = &body["data"]["sessions_filter_generation_swap_refused"];
+        assert_eq!(node["total"], 1);
+        assert_eq!(node["retries_scheduled_total"], 1);
     }
 
     /// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — sur un state

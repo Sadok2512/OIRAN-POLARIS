@@ -1,5 +1,88 @@
 # Changelog
 
+## OIRAN API 2.21.92 — 2026-11-20 (raffinement) — deux trous fermés + écart OUVERT (revue cœur #9 7036719807)
+
+Deuxième commit sur la même branche `fix/oiran-2.21.92-prewarm-swap-guard`. Ferme les deux cas que la garde initiale laissait passer, déclare la cause OUVERTE.
+
+### Trou 1 fermé — `empty_after_nonempty_unconfirmed` (0,0)
+
+Jusqu'à présent, `(candidate=0, published=0)` était toujours accepté (« vrai zéro »). Mais si `flows` **et** `continuous.session_ids` sont tous deux transitoirement vides, `published_session_count_snapshot` renvoie 0 aussi — la garde lit sa référence dans le même état intermédiaire que le candidat et laisse passer. Résultat : une liste vide remplace une liste de 325 sessions.
+
+Règle encodée par `empty_after_nonempty_decision(candidate, published, previous_session_count, pending_until, now) -> EmptyAfterNonemptyDecision` (fn pure, 5 cas) :
+  * **first-boot** (previous None) ⇒ Accept (vrai zéro bootstrap).
+  * **vrai zéro continu** (previous Some(0)) ⇒ Accept.
+  * **prev non vide, aucun pending ou pending expiré** ⇒ RefuseAndMarkPending (refus `empty_after_nonempty_unconfirmed`, note `pending_empty_confirmation_until = now + 30 s`).
+  * **prev non vide, pending valide** ⇒ AcceptConfirmed (double observation de `(0,0)` = confirmation de l'état publié).
+  * `(candidate, published) != (0,0)` ⇒ NotApplicable (passé à `swap_refusal_reason`).
+
+Toute bascule réussie efface le jalon `pending_empty_confirmation_until`.
+
+Nouveau champ `InnerState::pending_empty_confirmation_until: Mutex<Option<Instant>>`.
+
+### Trou 2 fermé — nouvelle tentative bornée après refus
+
+Après un refus, rien ne re-déclenchait le préchauffage : l'ancienne génération était servie jusqu'à la publication suivante avec un `stale_since_ms` qui grandissait. `schedule_retry_after_refusal(state, from_trigger, attempt)` programme désormais une nouvelle tentative 5 s plus tard, jusqu'à 3 tentatives (trigger `"retry-N-after-{from_trigger}"`). Chaque essai est tracé :
+  * `SESSIONS_FILTER_GENERATION_SWAP_RETRY_SCHEDULED` (attempt, delay_s=5, from_trigger).
+  * `SESSIONS_FILTER_GENERATION_SWAP_RETRY_SKIPPED` (publication en cours).
+  * `SESSIONS_FILTER_GENERATION_SWAP_RETRY_EXHAUSTED` (attempt > 3).
+
+Appelé depuis `record_swap_refused` **uniquement** pour les raisons transitoires (`session_count_mismatch`, `empty_after_nonempty_unconfirmed`, `journey_index_cache_empty`). Un verrou empoisonné n'est pas retryable intra-process et attend la prochaine publication.
+
+Nouveau champ `InnerState::generation_swap_retry_scheduled: Mutex<u64>` (compteur global exposé sous `/health.sessions_filter_generation_swap_refused.retries_scheduled_total`).
+
+Sous `cfg(test)` : l'incrément du compteur et les logs se font, mais le thread réel du retry n'est **PAS** lancé — évite les side-effects asynchrones dans la suite de tests.
+
+### Écart **OUVERT** — la cause elle-même n'est pas supprimée
+
+La garde `swap_refusal_reason` + `empty_after_nonempty_decision` + retry bornée **masque** le défaut mais ne supprime pas la cause : l'observateur `set_dataset_publish_observer` déclenche `prewarm_session_filter_caches_locked(&state, "publication")` à chaque `upsert_dataset`, y compris pendant une fenêtre transitoire où `datasets()` est vue vide. Site : `OIRAN/apps/api/src/lib.rs:4486` (fonction `install_session_filter_cache_prewarm`), lignes 4496-4525 (installation du callback `set_dataset_publish_observer` ⇒ appel à `prewarm_session_filter_caches_locked`).
+
+Fermer cette cause demanderait soit :
+  * un verrou de publication qui couvre la fenêtre complète `swap_in / swap_out` (actuellement on expose seulement `heavy_memory_try_enter_exclusive` hors de `upsert_dataset`),
+  * soit un snapshot atomique `(flows, datasets, lte)` pris sous verrou avant le `prewarm`, pour que `published_session_count_snapshot` et la construction de `filter_index` partagent la même source cohérente.
+
+Les deux options touchent `CaptureManager::upsert_dataset` (live-probe) hors du périmètre 2.21.92. **ANR1 recettera avec la garde actuelle + retry + confirmation, et l'écart OUVERT sera clos dans un lot ultérieur côté live-probe.** Entre-temps, aucun bascule à vide ne peut plus être publiée.
+
+### Tests ajoutés par le raffinement (4, cumul 9 pour 2.21.92)
+
+1. `empty_after_nonempty_decision_matrix_2_21_92` — matrice complète (7 cas) : first-boot, vrai zéro continu, prev non-vide × (pas de pending / pending valide / pending expiré), NotApplicable × 2.
+2. `retry_attempt_from_trigger_parses_2_21_92` — parsing des triggers `retry-N-after-*`.
+3. `record_swap_refused_schedules_retry_for_retryable_reasons_2_21_92` — session_count_mismatch et empty_after_nonempty_unconfirmed incrémentent le compteur ; lock_poisoned non ; attempt > 3 non (SWAP_RETRY_EXHAUSTED).
+4. `health_exposes_retries_scheduled_total_2_21_92` — `/health.sessions_filter_generation_swap_refused.retries_scheduled_total` exposé.
+
+Les 5 tests du premier commit 2.21.92 restent verts (`swap_refusal_reason_catches_empty_candidate_against_published_2_21_92`, etc.).
+
+### Preuves (règle CPU + amendement)
+
+Préflight final avant 12 runs :
+```
+cat /proc/pressure/cpu    → some avg10=1.38 full avg10=0.00  (GO)
+cat /proc/pressure/memory → full avg10=0.00  (GO)
+free -b (avail)           → 8 233 197 568 (≥ 4 GiB GO)
+df -B1 / (avail)          → 27 539 845 120 (≥ 25 Go GO)
+lslocks nsplus-heavy      → tenu par PID 1233320 au préflight, attente dans flock
+```
+
+12 runs tests `oiran-api --lib` sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2` :
+
+```
+Run  1 → 226 passed; 0 failed; 3 ignored; 33.14 s
+Run  2 → 226 passed; 0 failed; 3 ignored; 24.36 s
+Run  3 → 226 passed; 0 failed; 3 ignored; 21.80 s
+Run  4 → 226 passed; 0 failed; 3 ignored; 21.11 s
+Run  5 → 226 passed; 0 failed; 3 ignored; 23.99 s
+Run  6 → 226 passed; 0 failed; 3 ignored; 27.90 s
+Run  7 → 226 passed; 0 failed; 3 ignored; 17.40 s
+Run  8 → 226 passed; 0 failed; 3 ignored; 16.03 s
+Run  9 → 226 passed; 0 failed; 3 ignored; 17.66 s
+Run 10 → 226 passed; 0 failed; 3 ignored; 16.84 s
+Run 11 → 226 passed; 0 failed; 3 ignored; 17.05 s
+Run 12 → 226 passed; 0 failed; 3 ignored; 16.41 s
+```
+
+226 = 222 du premier commit 2.21.92 + 4 ajoutés par le raffinement. 3 `ignored` historiques. cpu some avg10 pendant la boucle : before Run 1 = 5.70 ; after Run 12 = 8.64 ; max intra-run observé ~9 (concurrence avec un autre consommateur de `flock /tmp/nsplus-heavy-build.lock` au préflight, libéré pendant la boucle) ; jamais `cpu full > 0` ni `mem full > 0`. Seuils amendement #9 7034385961 respectés (cpu full<1, mem full<1 ; aucun abandon).
+
+Audit lock Rust 1.83 : inchangé, `oiran-api = "2.21.92"` ligne 677. OIRAN/vtap non touché.
+
 ## OIRAN API 2.21.92 — 2026-11-20 — correctif BLOQUANT double tampon basculé vide (ordre #9 7035807909 CLAUDE2)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174`. Branche `fix/oiran-2.21.92-prewarm-swap-guard`. Numerology CLAUDE2 = pair. Référence terrain : ANR1 recette 2.21.89 #10 `7035121536` (`SESSIONS_FILTER_GENERATION_SWAP generation=2 session_count=0 bytes_estimate=375010` alors que `/health.session_count=325, published_session_count=325, queryable_session_count=325` — 1 réponse `meta.total=0 data=[]` renvoyée aux clients SSE).
