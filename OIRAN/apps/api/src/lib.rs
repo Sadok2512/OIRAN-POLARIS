@@ -169,6 +169,35 @@ struct Inner {
     /// génération READY existait auparavant.
     generation_slot: std::sync::RwLock<Option<Arc<FilterGeneration>>>,
     generation_counter: std::sync::atomic::AtomicU64,
+    /// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — compteur et dernière
+    /// occurrence d'un refus de bascule du double tampon. Un refus signifie
+    /// qu'une génération candidate n'a pas pu remplacer la précédente car :
+    ///   * son `session_count` divergeait du nombre de sessions publiées
+    ///     (/health.published_session_count) hors cas « vrai zéro », ou
+    ///   * un des verrous (filter_index/journey_index_cache/list_row_cache)
+    ///     était empoisonné ou le journey cache n'avait pas encore été
+    ///     construit.
+    /// Avant 2.21.92 ces cas basculaient silencieusement une génération vide
+    /// ou tronquée (`unwrap_or_else(|_| …empty())` / `unwrap_or_default()`),
+    /// servie à 200 OK avec `meta.total=0` et `data=[]` alors que
+    /// `/health.session_count` annonçait N > 0 (recette 2.21.89 ANR1).
+    /// Exposé via `/health.sessions_filter_generation_swap_refused`.
+    generation_swap_refused: std::sync::Mutex<GenerationSwapRefusedState>,
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 1) — jalon de la règle
+    /// « une génération à 0 session ne remplace jamais une génération non
+    /// vide sur un seul préchauffage ». Positionné à `Some(now + 30 s)`
+    /// quand un `(0,0)` est refusé au titre de `empty_after_nonempty_unconfirmed`.
+    /// Le préchauffage suivant, s'il observe encore `(0,0)` ET que cette
+    /// deadline n'est pas dépassée, accepte la bascule (confirmation par
+    /// double observation). Le first-boot (slot=None) n'est pas concerné
+    /// et bascule un `(0,0)` au premier préchauffage.
+    pending_empty_confirmation_until: std::sync::Mutex<Option<std::time::Instant>>,
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 2) — compteur des
+    /// nouvelles tentatives programmées après un refus. Exposé dans
+    /// `/health.sessions_filter_generation_swap_refused.retries_scheduled_total`.
+    /// Sous `cfg(test)`, l'incrément se fait mais le thread du retry
+    /// n'est PAS lancé (évite les side-effects asynchrones en test).
+    generation_swap_retry_scheduled: std::sync::Mutex<u64>,
     /// 2.21.11 (défaut 2 #9 6930315055) — cache `/sessions/catalog`
     /// keyé par `(commit_seq, dataset_ids, scope_hash)`. Évite de
     /// reconstruire `protocol_tree` + `network_elements` à chaque
@@ -787,6 +816,11 @@ impl AppState {
                 ),
                 generation_slot: std::sync::RwLock::new(None),
                 generation_counter: std::sync::atomic::AtomicU64::new(0),
+                generation_swap_refused: std::sync::Mutex::new(
+                    GenerationSwapRefusedState::default(),
+                ),
+                pending_empty_confirmation_until: std::sync::Mutex::new(None),
+                generation_swap_retry_scheduled: std::sync::Mutex::new(0),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -891,6 +925,11 @@ impl AppState {
                 ),
                 generation_slot: std::sync::RwLock::new(None),
                 generation_counter: std::sync::atomic::AtomicU64::new(0),
+                generation_swap_refused: std::sync::Mutex::new(
+                    GenerationSwapRefusedState::default(),
+                ),
+                pending_empty_confirmation_until: std::sync::Mutex::new(None),
+                generation_swap_retry_scheduled: std::sync::Mutex::new(0),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
@@ -1652,6 +1691,36 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
         "count": recovery_items.len(),
         "items": recovery_items,
     });
+    // 2.21.92 (défaut bloquant ANR1 #10 7035121536) — compteur et dernière
+    // occurrence d'un refus de bascule du double tampon READY. `total > 0`
+    // signifie qu'au moins une génération candidate a été rejetée pour
+    // préserver l'ancienne ; `last_reason` + `last_candidate_session_count`
+    // + `last_published_session_count` donnent l'écart observé.
+    let retries_scheduled_total = state
+        .inner
+        .generation_swap_retry_scheduled
+        .lock()
+        .map(|n| *n)
+        .unwrap_or(0);
+    let swap_refused = state
+        .inner
+        .generation_swap_refused
+        .lock()
+        .map(|g| {
+            json!({
+                "total": g.total,
+                "last_epoch_ms": g.last_epoch_ms,
+                "last_reason": g.last_reason,
+                "last_candidate_session_count": g.last_candidate_session_count,
+                "last_published_session_count": g.last_published_session_count,
+                "last_trigger": g.last_trigger,
+                "retries_scheduled_total": retries_scheduled_total,
+            })
+        })
+        .unwrap_or_else(|_| {
+            json!({"total": 0, "retries_scheduled_total": retries_scheduled_total})
+        });
+    data["sessions_filter_generation_swap_refused"] = swap_refused;
     ok(data)
 }
 
@@ -3687,6 +3756,21 @@ struct SessionFilterCacheReadiness {
     ready_generation: Option<Vec<String>>,
 }
 
+/// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — journal du dernier refus de
+/// bascule du double tampon + compteur total. Un refus ne tue pas le process :
+/// l'ancienne génération reste servie, et l'opérateur peut comparer le
+/// candidat (`last_candidate_session_count`) et la cible
+/// (`last_published_session_count`) pour diagnostiquer l'écart.
+#[derive(Default, Clone)]
+struct GenerationSwapRefusedState {
+    total: u64,
+    last_epoch_ms: Option<u64>,
+    last_reason: Option<String>,
+    last_candidate_session_count: Option<u64>,
+    last_published_session_count: Option<u64>,
+    last_trigger: Option<String>,
+}
+
 /// 2.21.85 (CLAUDE1, ordre #9 7015585561) — snapshot immuable servi
 /// par `/sessions/filter` tant qu'une nouvelle génération n'a pas été
 /// préchauffée avec succès. Toutes les données servables sont Arc'd ;
@@ -3861,6 +3945,218 @@ fn trace_session_filter_prewarm_rss(trigger: &str, phase: &str) {
     );
 }
 
+/// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — décide si une bascule du
+/// double tampon doit être refusée au vu de l'écart `(session_count candidat,
+/// published_session_count observé)`. Fonction pure : tous les autres motifs
+/// de refus (verrou empoisonné, cache journey vide, zéro contre zéro après
+/// non-vide) ont leur propre code de raison et ne passent pas par ici.
+///
+/// Règles :
+///   * `candidate == published` ⇒ `None` (bascule OK, même quand les deux
+///     valent 0 — bootstrapping avant toute publication).
+///   * `candidate != published` ⇒ `Some("session_count_mismatch")`.
+///     Attrape précisément le défaut observé en recette 2.21.89 :
+///     `SESSIONS_FILTER_GENERATION_SWAP generation=2 session_count=0`
+///     alors que `/health.published_session_count=325`.
+fn swap_refusal_reason(
+    candidate_session_count: u64,
+    published_session_count: u64,
+) -> Option<&'static str> {
+    if candidate_session_count != published_session_count {
+        Some("session_count_mismatch")
+    } else {
+        None
+    }
+}
+
+/// 2.21.92 raffinement (ordre #9 7036719807 trou 1) — décision pour le cas
+/// `(0,0)` avec garde « une génération à 0 session ne remplace jamais une
+/// génération non vide sur un seul préchauffage » :
+///   * `NotApplicable` si `(candidate, published) != (0,0)` (traité ailleurs).
+///   * `Accept` si first-boot (`previous_session_count` None) ou la
+///     génération précédente valait aussi 0 (régime stable à vide).
+///   * `AcceptConfirmed` si la génération précédente avait des sessions mais
+///     un `(0,0)` précédent a déjà noté `pending_until` et cette deadline
+///     n'est pas dépassée (double observation = confirmation de l'état
+///     publié).
+///   * `RefuseAndMarkPending` sinon : la génération précédente avait des
+///     sessions, c'est le premier `(0,0)` — on refuse et on note une
+///     confirmation pending pour la prochaine tentative.
+#[derive(Debug, PartialEq, Eq)]
+enum EmptyAfterNonemptyDecision {
+    NotApplicable,
+    Accept,
+    AcceptConfirmed,
+    RefuseAndMarkPending,
+}
+
+fn empty_after_nonempty_decision(
+    candidate_session_count: u64,
+    published_session_count: u64,
+    previous_session_count: Option<u64>,
+    pending_until: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> EmptyAfterNonemptyDecision {
+    if !(candidate_session_count == 0 && published_session_count == 0) {
+        return EmptyAfterNonemptyDecision::NotApplicable;
+    }
+    match previous_session_count {
+        None | Some(0) => EmptyAfterNonemptyDecision::Accept,
+        Some(_) => {
+            if let Some(until) = pending_until {
+                if now <= until {
+                    return EmptyAfterNonemptyDecision::AcceptConfirmed;
+                }
+            }
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending
+        }
+    }
+}
+
+/// 2.21.92 — compteur de sessions publiées strictement aligné sur
+/// `/health.published_session_count` (voir le calcul inline lignes 1462-1480) :
+/// `flows.len()` OU, si vide, `continuous.session_ids.len()`. C'est la source
+/// que l'opérateur consulte pour « combien de sessions sont publiées ? »,
+/// donc la cible de la garde de bascule 2.21.92.
+fn published_session_count_snapshot(state: &AppState) -> u64 {
+    let flows = state.inner.flows.len() as u64;
+    if flows > 0 {
+        return flows;
+    }
+    state
+        .inner
+        .capture_manager
+        .dataset(live_probe::CONTINUOUS_DATASET_ID)
+        .map(|live| live.session_ids.len() as u64)
+        .unwrap_or(0)
+}
+
+/// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — enregistre un refus de
+/// bascule du double tampon : incrémente le compteur global et journalise
+/// l'event `SESSIONS_FILTER_GENERATION_SWAP_REFUSED` avec les deux compteurs
+/// et la raison. Appelé depuis `prewarm_session_filter_caches_locked` dès
+/// qu'une condition de rejet est atteinte ; l'ancienne génération reste
+/// dans `generation_slot` et continue d'être servie à `/sessions/filter`.
+fn record_swap_refused(
+    state: &AppState,
+    trigger: &str,
+    reason: &str,
+    candidate_session_count: Option<u64>,
+    published_session_count: Option<u64>,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Ok(mut g) = state.inner.generation_swap_refused.lock() {
+        g.total = g.total.saturating_add(1);
+        g.last_epoch_ms = Some(now_ms);
+        g.last_reason = Some(reason.into());
+        g.last_candidate_session_count = candidate_session_count;
+        g.last_published_session_count = published_session_count;
+        g.last_trigger = Some(trigger.into());
+    }
+    eprintln!(
+        "{}",
+        json!({
+            "event": "SESSIONS_FILTER_GENERATION_SWAP_REFUSED",
+            "trigger": trigger,
+            "reason": reason,
+            "candidate_session_count": candidate_session_count,
+            "published_session_count": published_session_count,
+            "epoch_ms": now_ms,
+        })
+    );
+    // 2.21.92 raffinement (ordre #9 7036719807 trou 2) — nouvelle tentative
+    // bornée. Un verrou empoisonné est irrécupérable dans le même process :
+    // on ne retente pas. Tous les autres motifs (`session_count_mismatch`,
+    // `empty_after_nonempty_unconfirmed`, `journey_index_cache_empty`) sont
+    // transitoires : on programme un retry 5 s plus tard, jusqu'à 3 fois.
+    let retryable = matches!(
+        reason,
+        "session_count_mismatch" | "empty_after_nonempty_unconfirmed" | "journey_index_cache_empty"
+    );
+    if retryable {
+        let next_attempt = retry_attempt_from_trigger(trigger) + 1;
+        schedule_retry_after_refusal(state, trigger, next_attempt);
+    }
+}
+
+/// 2.21.92 raffinement — extrait le numéro de tentative d'un trigger comme
+/// `"retry-2-after-publication"`. Trigger n'ayant pas le préfixe `retry-` ⇒ 0.
+fn retry_attempt_from_trigger(trigger: &str) -> u32 {
+    trigger
+        .strip_prefix("retry-")
+        .and_then(|rest| rest.split_once("-after-").map(|(n, _)| n))
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// 2.21.92 raffinement (ordre #9 7036719807 trou 2) — programme une nouvelle
+/// tentative de préchauffage dans 5 s avec un `trigger` construit comme
+/// `"retry-{attempt}-after-{from_trigger}"`. Chaque tentative incrémente
+/// `generation_swap_retry_scheduled` et log
+/// `SESSIONS_FILTER_GENERATION_SWAP_RETRY_SCHEDULED`. Au-delà de 3 tentatives
+/// consécutives, on arrête et on attend la prochaine publication (log
+/// `SESSIONS_FILTER_GENERATION_SWAP_RETRY_EXHAUSTED`). Sous `cfg(test)` le
+/// thread n'est PAS lancé — seule la trace et l'incrément se produisent,
+/// pour éviter les side-effects asynchrones dans les tests.
+fn schedule_retry_after_refusal(state: &AppState, from_trigger: &str, attempt: u32) {
+    if attempt > 3 {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "SESSIONS_FILTER_GENERATION_SWAP_RETRY_EXHAUSTED",
+                "from_trigger": from_trigger,
+                "max_attempts": 3,
+            })
+        );
+        return;
+    }
+    if let Ok(mut n) = state.inner.generation_swap_retry_scheduled.lock() {
+        *n = n.saturating_add(1);
+    }
+    eprintln!(
+        "{}",
+        json!({
+            "event": "SESSIONS_FILTER_GENERATION_SWAP_RETRY_SCHEDULED",
+            "from_trigger": from_trigger,
+            "attempt": attempt,
+            "delay_s": 5,
+        })
+    );
+    if cfg!(test) {
+        // En test : incrément + trace, mais pas de thread réel.
+        return;
+    }
+    let state_clone = state.clone();
+    let from_trigger = from_trigger.to_owned();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Même garde que `install_session_filter_cache_prewarm` : si une
+        // publication tient le verrou exclusif, on skip — l'observateur
+        // prendra le relais à son `upsert_dataset`.
+        let Some(_gate) = state_clone
+            .inner
+            .capture_manager
+            .heavy_memory_try_enter_exclusive()
+        else {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "SESSIONS_FILTER_GENERATION_SWAP_RETRY_SKIPPED",
+                    "from_trigger": from_trigger,
+                    "attempt": attempt,
+                    "reason": "publication_in_progress",
+                })
+            );
+            return;
+        };
+        let trigger = format!("retry-{attempt}-after-{from_trigger}");
+        prewarm_session_filter_caches_locked(&state_clone, &trigger);
+    });
+}
+
 fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
     trace_session_filter_prewarm_rss(trigger, "before_heap_release");
     live_probe::release_publication_heap_pages();
@@ -3886,33 +4182,67 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
     // requêtes `/sessions/filter` qui ont déjà fait `Arc::clone` sur la
     // génération précédente la gardent vivante jusqu'à leur retour.
     if ready {
-        let filter_index_arc = state
-            .inner
-            .session_filter_index
-            .read()
-            .map(|guard| Arc::new((*guard).clone()))
-            .unwrap_or_else(|_| Arc::new(session_filters::SessionFilterIndex::empty()));
-        let journey_index_arc = state
-            .inner
-            .journey_index_cache
-            .lock()
-            .ok()
-            .and_then(|cache| cache.as_ref().map(|(_sig, idx)| idx.clone()))
-            .unwrap_or_else(|| Arc::new(subscriber_journey::JourneyIndex::default()));
-        let list_rows_map: std::collections::HashMap<(String, String), (Value, Value)> = state
-            .inner
-            .list_row_cache
-            .lock()
-            .ok()
-            .map(|cache| {
-                cache
+        // 2.21.92 (défaut bloquant ANR1 #10 7035121536) — plus de repli
+        // silencieux empty()/default()/unwrap_or_default(). Un verrou qui
+        // échoue ou un cache non construit sont des écarts réels : on refuse
+        // explicitement la bascule et on sert l'ancienne génération.
+        let filter_index_arc = match state.inner.session_filter_index.read() {
+            Ok(guard) => Arc::new((*guard).clone()),
+            Err(_) => {
+                record_swap_refused(
+                    state,
+                    trigger,
+                    "session_filter_index_lock_poisoned",
+                    None,
+                    None,
+                );
+                return;
+            }
+        };
+        let journey_index_arc = match state.inner.journey_index_cache.lock() {
+            Ok(cache) => match cache.as_ref().map(|(_sig, idx)| idx.clone()) {
+                Some(idx) => idx,
+                None => {
+                    record_swap_refused(
+                        state,
+                        trigger,
+                        "journey_index_cache_empty",
+                        None,
+                        None,
+                    );
+                    return;
+                }
+            },
+            Err(_) => {
+                record_swap_refused(
+                    state,
+                    trigger,
+                    "journey_index_cache_lock_poisoned",
+                    None,
+                    None,
+                );
+                return;
+            }
+        };
+        let list_rows_map: std::collections::HashMap<(String, String), (Value, Value)> =
+            match state.inner.list_row_cache.lock() {
+                Ok(cache) => cache
                     .iter()
                     .map(|(k, (_sig, summary, extra))| {
                         (k.clone(), (summary.clone(), extra.clone()))
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .collect(),
+                Err(_) => {
+                    record_swap_refused(
+                        state,
+                        trigger,
+                        "list_row_cache_lock_poisoned",
+                        None,
+                        None,
+                    );
+                    return;
+                }
+            };
         let list_rows_arc = Arc::new(list_rows_map);
         // 2.21.85 — projection inverse `session_id → row` pour la condition
         // 2. Chaque session_id n'apparaît qu'une fois dans `list_rows` (clé
@@ -3940,6 +4270,82 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
         // ne change pas. On conserve une estimation lower-bound.
         let bytes_estimate = bytes_filter.saturating_add(bytes_journey);
         let session_count = filter_index_arc.session_count() as u64;
+        // 2.21.92 (défaut bloquant ANR1 #10 7035121536) — garde de bascule :
+        // refus si `session_count` diverge de `/health.published_session_count`
+        // hors cas « vrai zéro » (bootstrapping avant toute publication).
+        // Évite la bascule observée en recette 2.21.89 :
+        // `SESSIONS_FILTER_GENERATION_SWAP generation=2 session_count=0`
+        // alors que `/health.published_session_count=325`.
+        let published_session_count = published_session_count_snapshot(state);
+        // 2.21.92 raffinement (ordre #9 7036719807 trou 1) — règle
+        // « empty_after_nonempty_unconfirmed » via la fonction pure
+        // `empty_after_nonempty_decision`.
+        let previous_session_count = state
+            .inner
+            .generation_slot
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|g| g.session_count));
+        let pending_until = state
+            .inner
+            .pending_empty_confirmation_until
+            .lock()
+            .ok()
+            .and_then(|lock| *lock);
+        let now = std::time::Instant::now();
+        match empty_after_nonempty_decision(
+            session_count,
+            published_session_count,
+            previous_session_count,
+            pending_until,
+            now,
+        ) {
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending => {
+                if let Ok(mut lock) = state.inner.pending_empty_confirmation_until.lock() {
+                    *lock = Some(now + std::time::Duration::from_secs(30));
+                }
+                record_swap_refused(
+                    state,
+                    trigger,
+                    "empty_after_nonempty_unconfirmed",
+                    Some(0),
+                    Some(0),
+                );
+                return;
+            }
+            EmptyAfterNonemptyDecision::AcceptConfirmed => {
+                if let Ok(mut lock) = state.inner.pending_empty_confirmation_until.lock() {
+                    *lock = None;
+                }
+            }
+            EmptyAfterNonemptyDecision::Accept | EmptyAfterNonemptyDecision::NotApplicable => {}
+        }
+        if let Some(reason) = swap_refusal_reason(session_count, published_session_count) {
+            record_swap_refused(
+                state,
+                trigger,
+                reason,
+                Some(session_count),
+                Some(published_session_count),
+            );
+            trace_session_filter_prewarm_rss(trigger, "after_prewarm");
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "SESSIONS_FILTER_PREWARM_READY",
+                    "trigger": trigger,
+                    "filter_ready_ms": filter_ready_ms,
+                    "journey_ready_ms": journey_ready_ms,
+                    "list_rows_cached": list_rows.cached,
+                    "list_rows_deferred": list_rows.deferred,
+                    "list_rows_missing": list_rows.missing,
+                    "index_wait_ms": list_rows.index_wait_ms,
+                    "total_ms": started.elapsed().as_millis(),
+                    "swap_refused": true,
+                })
+            );
+            return;
+        }
         let commit_seq = state
             .inner
             .capture_manager
@@ -3972,6 +4378,12 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
         });
         if let Ok(mut slot) = state.inner.generation_slot.write() {
             *slot = Some(generation.clone());
+        }
+        // 2.21.92 raffinement (ordre #9 7036719807 trou 1) — toute bascule
+        // réussie efface le jalon de confirmation pending (le pending ne
+        // s'applique qu'à la prochaine séquence de `(0,0)` répétés).
+        if let Ok(mut lock) = state.inner.pending_empty_confirmation_until.lock() {
+            *lock = None;
         }
         eprintln!(
             "{}",
@@ -15933,6 +16345,338 @@ mod tests {
         assert_eq!(body["data"]["pagination"]["total"], 1);
         assert!(body.to_string().contains("event-test-identity"));
         assert!(body.to_string().contains("\"packet_number\":15"));
+    }
+
+    /// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — la logique de garde
+    /// est pure : refuse une bascule avec `session_count != published`, ok
+    /// sinon (y compris « vrai zéro » 0/0 avant toute publication). Prouve
+    /// que le scénario observé en recette (`candidate=0, published=325`)
+    /// renvoie bien `session_count_mismatch`.
+    #[test]
+    fn swap_refusal_reason_catches_empty_candidate_against_published_2_21_92() {
+        // Scénario ANR1 : candidate vide alors que /health annonce 325.
+        assert_eq!(
+            swap_refusal_reason(0, 325),
+            Some("session_count_mismatch")
+        );
+        // Candidat tronqué (ex. 324 contre 325) : attrapé aussi.
+        assert_eq!(
+            swap_refusal_reason(324, 325),
+            Some("session_count_mismatch")
+        );
+        // Candidat surdimensionné (improbable mais détecté) : attrapé.
+        assert_eq!(
+            swap_refusal_reason(326, 325),
+            Some("session_count_mismatch")
+        );
+        // Match exact : bascule OK.
+        assert_eq!(swap_refusal_reason(325, 325), None);
+        // Vrai zéro (bootstrapping) : bascule OK.
+        assert_eq!(swap_refusal_reason(0, 0), None);
+    }
+
+    /// 2.21.92 — `published_session_count_snapshot` suit strictement la
+    /// logique /health.published_session_count : `flows.len()` OR, si vide,
+    /// `continuous.session_ids.len()`. Preuve que l'oracle de la garde est
+    /// stable sur un `operator_state()` (qui charge le reference dataset en
+    /// mode test) : snapshot == flows.len() tant que flows > 0.
+    #[test]
+    fn published_session_count_snapshot_follows_flows_count_2_21_92() {
+        let state = operator_state();
+        let flows_count = state.inner.flows.len() as u64;
+        let snapshot = published_session_count_snapshot(&state);
+        assert_eq!(
+            snapshot, flows_count,
+            "snapshot doit refléter flows.len() quand > 0"
+        );
+    }
+
+    /// 2.21.92 — `record_swap_refused` incrémente le compteur global et
+    /// publie toutes les coordonnées du refus (trigger, reason, candidate,
+    /// published, epoch_ms) dans `generation_swap_refused`.
+    #[test]
+    fn record_swap_refused_updates_counter_and_last_fields_2_21_92() {
+        let state = operator_state();
+        {
+            let g = state.inner.generation_swap_refused.lock().unwrap();
+            assert_eq!(g.total, 0);
+            assert!(g.last_reason.is_none());
+        }
+        record_swap_refused(
+            &state,
+            "test-publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        record_swap_refused(
+            &state,
+            "test-startup",
+            "session_filter_index_lock_poisoned",
+            None,
+            None,
+        );
+        let g = state.inner.generation_swap_refused.lock().unwrap();
+        assert_eq!(g.total, 2);
+        assert_eq!(g.last_trigger.as_deref(), Some("test-startup"));
+        assert_eq!(
+            g.last_reason.as_deref(),
+            Some("session_filter_index_lock_poisoned")
+        );
+        assert_eq!(g.last_candidate_session_count, None);
+        assert_eq!(g.last_published_session_count, None);
+        assert!(g.last_epoch_ms.is_some());
+    }
+
+    /// 2.21.92 — `/health` expose `sessions_filter_generation_swap_refused`
+    /// avec le total et les dernières coordonnées (shape complète, visible
+    /// à l'opérateur). Preuve négative : à l'état initial, `total=0` et
+    /// aucun `last_*`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_exposes_sessions_filter_generation_swap_refused_counter_2_21_92() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let node = &body["data"]["sessions_filter_generation_swap_refused"];
+        assert_eq!(node["total"], 0);
+        assert!(node.get("last_reason").map(Value::is_null).unwrap_or(false));
+        // Incrémentons le compteur et vérifions la remontée.
+        record_swap_refused(
+            &state,
+            "test-publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        let app = router(state.clone(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let node = &body["data"]["sessions_filter_generation_swap_refused"];
+        assert_eq!(node["total"], 1);
+        assert_eq!(node["last_reason"], "session_count_mismatch");
+        assert_eq!(node["last_trigger"], "test-publication");
+        assert_eq!(node["last_candidate_session_count"], 0);
+        assert_eq!(node["last_published_session_count"], 325);
+        assert!(node["last_epoch_ms"].as_u64().unwrap_or(0) > 0);
+    }
+
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 1) — la règle
+    /// « une génération à 0 session ne remplace jamais une génération non
+    /// vide sur un seul préchauffage » encodée par
+    /// `empty_after_nonempty_decision` :
+    ///   * first-boot (previous None) ⇒ Accept (vrai zéro bootstrap),
+    ///   * vrai zéro continu (previous Some(0)) ⇒ Accept,
+    ///   * prev non vide, aucun pending ⇒ RefuseAndMarkPending,
+    ///   * prev non vide, pending expiré ⇒ RefuseAndMarkPending,
+    ///   * prev non vide, pending valide ⇒ AcceptConfirmed,
+    ///   * (candidate, published) != (0,0) ⇒ NotApplicable.
+    #[test]
+    fn empty_after_nonempty_decision_matrix_2_21_92() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // First-boot : Accept.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, None, None, now),
+            EmptyAfterNonemptyDecision::Accept
+        );
+        // Vrai zéro continu : Accept.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, Some(0), None, now),
+            EmptyAfterNonemptyDecision::Accept
+        );
+        // Prev non vide, sans pending : refuse + marque pending.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, Some(325), None, now),
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending
+        );
+        // Prev non vide, pending valide : AcceptConfirmed.
+        assert_eq!(
+            empty_after_nonempty_decision(
+                0,
+                0,
+                Some(325),
+                Some(now + Duration::from_secs(10)),
+                now
+            ),
+            EmptyAfterNonemptyDecision::AcceptConfirmed
+        );
+        // Prev non vide, pending expiré : refuse à nouveau.
+        assert_eq!(
+            empty_after_nonempty_decision(
+                0,
+                0,
+                Some(325),
+                Some(now - Duration::from_secs(1)),
+                now
+            ),
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending
+        );
+        // (3, 3) match exact : NotApplicable (traité par swap_refusal_reason).
+        assert_eq!(
+            empty_after_nonempty_decision(3, 3, Some(325), None, now),
+            EmptyAfterNonemptyDecision::NotApplicable
+        );
+        // (0, 5) mismatch : NotApplicable (traité par swap_refusal_reason).
+        assert_eq!(
+            empty_after_nonempty_decision(0, 5, Some(325), None, now),
+            EmptyAfterNonemptyDecision::NotApplicable
+        );
+    }
+
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 2) —
+    /// `retry_attempt_from_trigger` parse le numéro depuis des triggers
+    /// comme `"retry-2-after-publication"`. Trigger brut (non-retry) ⇒ 0.
+    #[test]
+    fn retry_attempt_from_trigger_parses_2_21_92() {
+        assert_eq!(retry_attempt_from_trigger("publication"), 0);
+        assert_eq!(retry_attempt_from_trigger("startup"), 0);
+        assert_eq!(retry_attempt_from_trigger("retry-1-after-publication"), 1);
+        assert_eq!(retry_attempt_from_trigger("retry-2-after-retry-1-after-publication"), 2);
+        assert_eq!(retry_attempt_from_trigger("retry-3-after-startup"), 3);
+        // Malformed : pas de -after- ou numéro invalide.
+        assert_eq!(retry_attempt_from_trigger("retry-publication"), 0);
+        assert_eq!(retry_attempt_from_trigger("retry-abc-after-x"), 0);
+    }
+
+    /// 2.21.92 raffinement (ordre #9 7036719807 trou 2) — `record_swap_refused`
+    /// avec une raison retryable programme automatiquement une tentative
+    /// (incrément du compteur) ; `*_lock_poisoned` n'est pas retryable.
+    /// Sous `cfg(test)`, le thread réel n'est pas lancé — seule la trace et
+    /// l'incrément du compteur sont observables.
+    #[test]
+    fn record_swap_refused_schedules_retry_for_retryable_reasons_2_21_92() {
+        let state = operator_state();
+        // session_count_mismatch ⇒ retry programmé.
+        record_swap_refused(
+            &state,
+            "publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        let after_mismatch = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(after_mismatch, 1, "mismatch doit programmer 1 retry");
+        // empty_after_nonempty_unconfirmed ⇒ retry programmé.
+        record_swap_refused(
+            &state,
+            "publication",
+            "empty_after_nonempty_unconfirmed",
+            Some(0),
+            Some(0),
+        );
+        let after_empty = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(after_empty, 2, "empty_after_nonempty doit programmer 1 retry de plus");
+        // *_lock_poisoned ⇒ PAS retryable (irrécupérable intra-process).
+        record_swap_refused(
+            &state,
+            "publication",
+            "session_filter_index_lock_poisoned",
+            None,
+            None,
+        );
+        let after_poisoned = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(after_poisoned, 2, "lock_poisoned NE DOIT PAS programmer de retry");
+        // attempt > 3 ⇒ no retry (exhausted).
+        record_swap_refused(
+            &state,
+            "retry-3-after-publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        let after_exhaust = *state.inner.generation_swap_retry_scheduled.lock().unwrap();
+        assert_eq!(
+            after_exhaust, 2,
+            "attempt=4 (>3) doit s'arrêter avec SWAP_RETRY_EXHAUSTED, pas incrémenter"
+        );
+    }
+
+    /// 2.21.92 raffinement — `/health.sessions_filter_generation_swap_refused`
+    /// expose aussi `retries_scheduled_total` (compteur global des retries
+    /// programmés depuis le démarrage).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_exposes_retries_scheduled_total_2_21_92() {
+        let state = operator_state();
+        record_swap_refused(
+            &state,
+            "publication",
+            "session_count_mismatch",
+            Some(0),
+            Some(325),
+        );
+        let app = router(state.clone(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let node = &body["data"]["sessions_filter_generation_swap_refused"];
+        assert_eq!(node["total"], 1);
+        assert_eq!(node["retries_scheduled_total"], 1);
+    }
+
+    /// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — sur un state
+    /// `operator_state()` où `flows.len() == published_session_count`,
+    /// `prewarm` bascule une génération READY sans refus : la garde
+    /// `swap_refusal_reason` ne franchit PAS un état cohérent. Reproduit la
+    /// preuve négative (bootstrap normal) après installation du correctif.
+    /// La reproduction positive (candidate=0 alors que published=N) est
+    /// couverte par la logique pure
+    /// `swap_refusal_reason_catches_empty_candidate_against_published_2_21_92`
+    /// et l'intégration live sous `publication` + concurrence capture_manager
+    /// (hors périmètre d'un test unitaire car nécessite un état incohérent
+    /// `flows`/`filter_index` forgé via mutations instables d'`Arc<InnerState>`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prewarm_consistent_state_swaps_without_refusal_2_21_92() {
+        let state = operator_state();
+        let published = published_session_count_snapshot(&state);
+        install_session_filter_cache_prewarm(&state);
+        {
+            let _gate = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test-consistent");
+        }
+        let slot = state
+            .inner
+            .generation_slot
+            .read()
+            .ok()
+            .and_then(|s| s.as_ref().map(|g| (g.generation, g.session_count)));
+        let Some((gen, session_count)) = slot else {
+            panic!("generation_slot doit être Some après prewarm d'un état cohérent");
+        };
+        assert!(gen >= 1, "generation doit être positive, got {gen}");
+        assert_eq!(
+            session_count, published,
+            "session_count de la génération doit matcher published_session_count"
+        );
+        let g = state.inner.generation_swap_refused.lock().unwrap();
+        assert_eq!(
+            g.total, 0,
+            "aucun refus attendu sur un état cohérent flows/filter_index"
+        );
     }
 }
 
