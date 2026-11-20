@@ -3996,6 +3996,7 @@ fn empty_after_nonempty_decision(
     previous_session_count: Option<u64>,
     pending_until: Option<std::time::Instant>,
     now: std::time::Instant,
+    trigger_is_retry: bool,
 ) -> EmptyAfterNonemptyDecision {
     if !(candidate_session_count == 0 && published_session_count == 0) {
         return EmptyAfterNonemptyDecision::NotApplicable;
@@ -4003,9 +4004,17 @@ fn empty_after_nonempty_decision(
     match previous_session_count {
         None | Some(0) => EmptyAfterNonemptyDecision::Accept,
         Some(_) => {
-            if let Some(until) = pending_until {
-                if now <= until {
-                    return EmptyAfterNonemptyDecision::AcceptConfirmed;
+            // 2.21.92 micro-raffinement (ordre #9 7037361185) — un ré-essai
+            // qui revoit `(0,0)` tourne 5 s plus tard, possiblement toujours
+            // dans la MÊME fenêtre intermédiaire (ex. publication qui
+            // s'étire). Il NE DOIT PAS confirmer — il prolonge l'attente.
+            // Seul un préchauffage déclenché par une publication terminée
+            // (trigger non-retry) peut confirmer la seconde observation.
+            if !trigger_is_retry {
+                if let Some(until) = pending_until {
+                    if now <= until {
+                        return EmptyAfterNonemptyDecision::AcceptConfirmed;
+                    }
                 }
             }
             EmptyAfterNonemptyDecision::RefuseAndMarkPending
@@ -4293,12 +4302,14 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
             .ok()
             .and_then(|lock| *lock);
         let now = std::time::Instant::now();
+        let trigger_is_retry = trigger.starts_with("retry-");
         match empty_after_nonempty_decision(
             session_count,
             published_session_count,
             previous_session_count,
             pending_until,
             now,
+            trigger_is_retry,
         ) {
             EmptyAfterNonemptyDecision::RefuseAndMarkPending => {
                 if let Ok(mut lock) = state.inner.pending_empty_confirmation_until.lock() {
@@ -16494,27 +16505,28 @@ mod tests {
         let now = Instant::now();
         // First-boot : Accept.
         assert_eq!(
-            empty_after_nonempty_decision(0, 0, None, None, now),
+            empty_after_nonempty_decision(0, 0, None, None, now, false),
             EmptyAfterNonemptyDecision::Accept
         );
         // Vrai zéro continu : Accept.
         assert_eq!(
-            empty_after_nonempty_decision(0, 0, Some(0), None, now),
+            empty_after_nonempty_decision(0, 0, Some(0), None, now, false),
             EmptyAfterNonemptyDecision::Accept
         );
         // Prev non vide, sans pending : refuse + marque pending.
         assert_eq!(
-            empty_after_nonempty_decision(0, 0, Some(325), None, now),
+            empty_after_nonempty_decision(0, 0, Some(325), None, now, false),
             EmptyAfterNonemptyDecision::RefuseAndMarkPending
         );
-        // Prev non vide, pending valide : AcceptConfirmed.
+        // Prev non vide, pending valide, trigger non-retry (publication) : AcceptConfirmed.
         assert_eq!(
             empty_after_nonempty_decision(
                 0,
                 0,
                 Some(325),
                 Some(now + Duration::from_secs(10)),
-                now
+                now,
+                false,
             ),
             EmptyAfterNonemptyDecision::AcceptConfirmed
         );
@@ -16525,19 +16537,45 @@ mod tests {
                 0,
                 Some(325),
                 Some(now - Duration::from_secs(1)),
-                now
+                now,
+                false,
             ),
             EmptyAfterNonemptyDecision::RefuseAndMarkPending
         );
         // (3, 3) match exact : NotApplicable (traité par swap_refusal_reason).
         assert_eq!(
-            empty_after_nonempty_decision(3, 3, Some(325), None, now),
+            empty_after_nonempty_decision(3, 3, Some(325), None, now, false),
             EmptyAfterNonemptyDecision::NotApplicable
         );
         // (0, 5) mismatch : NotApplicable (traité par swap_refusal_reason).
         assert_eq!(
-            empty_after_nonempty_decision(0, 5, Some(325), None, now),
+            empty_after_nonempty_decision(0, 5, Some(325), None, now, false),
             EmptyAfterNonemptyDecision::NotApplicable
+        );
+    }
+
+    /// 2.21.92 micro-raffinement (ordre #9 7037361185) — la confirmation du
+    /// zéro NE DOIT venir QUE d'une publication terminée (trigger non-retry).
+    /// Un ré-essai qui revoit `(0,0)` prolonge l'attente, ne confirme pas :
+    /// sinon la 2e observation peut tomber dans la MÊME fenêtre intermédiaire
+    /// que la 1re.
+    #[test]
+    fn empty_after_nonempty_decision_retry_never_confirms_2_21_92() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let pending_valid = Some(now + Duration::from_secs(10));
+        // Trigger = ré-essai (retry-after-refusal) : même pending valide,
+        // DOIT prolonger l'attente, PAS confirmer.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, Some(325), pending_valid, now, true),
+            EmptyAfterNonemptyDecision::RefuseAndMarkPending,
+            "un retry NE DOIT PAS confirmer la 2e observation (0,0) : il peut tourner dans la même fenêtre intermédiaire que la 1re"
+        );
+        // Trigger = publication terminée : confirme.
+        assert_eq!(
+            empty_after_nonempty_decision(0, 0, Some(325), pending_valid, now, false),
+            EmptyAfterNonemptyDecision::AcceptConfirmed,
+            "une publication terminée (non-retry) confirme la 2e observation (0,0)"
         );
     }
 
