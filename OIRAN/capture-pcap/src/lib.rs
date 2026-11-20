@@ -117,7 +117,7 @@ impl std::fmt::Display for CaptureError {
 }
 impl std::error::Error for CaptureError {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Endian {
     Little,
     Big,
@@ -184,6 +184,396 @@ pub fn visit_capture(
         visit_pcapng_stream(reader, magic, &source, capture_id, &mut visitor)
     } else {
         visit_pcap_stream(reader, magic, &source, capture_id, &mut visitor)
+    }
+}
+
+/// 0.3.0 (oiran-api 2.21.109, ordre #9 7049845272) — point de reprise
+/// d'une lecture incrémentale : tout ce qu'il faut pour continuer à
+/// lire un fichier de capture qui grossit sans repartir de l'octet 0.
+/// `Default` = début du fichier.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResumePoint {
+    /// Offset du prochain bloc (pcapng) ou enregistrement (pcap) non lu.
+    offset: u64,
+    /// Nombre de paquets déjà émis : le prochain porte `packets + 1`.
+    packets: u64,
+    format: Option<ResumeFormat>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResumeFormat {
+    Pcap {
+        endian: Endian,
+        nano: bool,
+        snaplen: u32,
+        link: u32,
+    },
+    PcapNg {
+        /// `None` tant qu'aucun Section Header Block complet n'a été lu.
+        endian: Option<Endian>,
+        interfaces: Vec<Interface>,
+    },
+}
+
+impl ResumePoint {
+    /// Octets du fichier déjà consommés (blocs complets seulement).
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    /// Paquets déjà émis depuis le début du fichier.
+    pub fn packets(&self) -> u64 {
+        self.packets
+    }
+}
+
+/// Lit exactement `bytes.len()` octets ; `Ok(false)` si le fichier se
+/// termine avant (fin de fichier ou bloc en cours d'écriture).
+fn read_full(reader: &mut BufReader<File>, bytes: &mut [u8], offset: u64) -> Result<bool, CaptureError> {
+    let mut filled = 0usize;
+    while filled < bytes.len() {
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => return Ok(false),
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(err(CaptureErrorKind::Io, offset, error.to_string())),
+        }
+    }
+    Ok(true)
+}
+
+/// 0.3.0 — comme [`visit_capture`], mais reprend à `resume` et s'arrête
+/// sans erreur avant un bloc incomplet en fin de fichier : ce bloc sera
+/// relu à l'appel suivant, quand il sera entier. `resume` n'avance que
+/// sur des blocs complets et valides ; les paquets émis portent le même
+/// `packet_number` et le même `byte_offset` qu'une lecture intégrale.
+/// Sur erreur de format, `resume` reste sur le bloc fautif.
+/// `CaptureSummary::packets` compte les paquets émis par CET appel.
+pub fn visit_capture_from(
+    path: impl AsRef<Path>,
+    capture_id: &str,
+    resume: &mut ResumePoint,
+    mut visitor: impl FnMut(CapturePacket),
+) -> Result<CaptureSummary, CaptureError> {
+    use std::io::{Seek, SeekFrom};
+    let path = path.as_ref();
+    let source = path.to_string_lossy().into_owned();
+    let mut file =
+        File::open(path).map_err(|error| err(CaptureErrorKind::Io, 0, error.to_string()))?;
+    file.seek(SeekFrom::Start(resume.offset))
+        .map_err(|error| err(CaptureErrorKind::Io, resume.offset, error.to_string()))?;
+    let mut reader = BufReader::new(file);
+    let before = resume.packets;
+    let mut warnings = Vec::new();
+    if resume.format.is_none() {
+        let mut magic = [0u8; 4];
+        if !read_full(&mut reader, &mut magic, 0)? {
+            return Ok(CaptureSummary {
+                format: CaptureFormat::PcapNg,
+                interfaces: Vec::new(),
+                packets: 0,
+                warnings,
+            });
+        }
+        if magic == [0x0a, 0x0d, 0x0d, 0x0a] {
+            // Le Section Header Block est relu par la boucle pcapng.
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| err(CaptureErrorKind::Io, 0, error.to_string()))?;
+            resume.format = Some(ResumeFormat::PcapNg {
+                endian: None,
+                interfaces: Vec::new(),
+            });
+        } else {
+            let (endian, nano) = match magic {
+                [0xd4, 0xc3, 0xb2, 0xa1] => (Endian::Little, false),
+                [0xa1, 0xb2, 0xc3, 0xd4] => (Endian::Big, false),
+                [0x4d, 0x3c, 0xb2, 0xa1] => (Endian::Little, true),
+                [0xa1, 0xb2, 0x3c, 0x4d] => (Endian::Big, true),
+                _ => return Err(err(CaptureErrorKind::InvalidHeader, 0, "unknown PCAP magic")),
+            };
+            let mut header = [0u8; 20];
+            if !read_full(&mut reader, &mut header, 4)? {
+                return Ok(CaptureSummary {
+                    format: CaptureFormat::Pcap,
+                    interfaces: Vec::new(),
+                    packets: 0,
+                    warnings,
+                });
+            }
+            if endian.u16(&header[0..2]) != 2 {
+                return Err(err(
+                    CaptureErrorKind::InvalidHeader,
+                    4,
+                    "unsupported PCAP major version",
+                ));
+            }
+            resume.format = Some(ResumeFormat::Pcap {
+                endian,
+                nano,
+                snaplen: endian.u32(&header[12..16]),
+                link: endian.u32(&header[16..20]),
+            });
+            resume.offset = 24;
+        }
+    }
+    match resume.format.clone().expect("format set above") {
+        ResumeFormat::Pcap {
+            endian,
+            nano,
+            snaplen,
+            link,
+        } => {
+            loop {
+                let offset = resume.offset;
+                let mut record = [0u8; 16];
+                if !read_full(&mut reader, &mut record, offset)? {
+                    break;
+                }
+                let sec = endian.u32(&record[0..4]) as i64;
+                let fraction = endian.u32(&record[4..8]) as u64;
+                let cap = endian.u32(&record[8..12]);
+                let orig = endian.u32(&record[12..16]);
+                if orig < cap || (snaplen != 0 && cap > snaplen) {
+                    return Err(err(
+                        CaptureErrorKind::InvalidBlock,
+                        offset,
+                        "PCAP captured/original/snap lengths are inconsistent",
+                    ));
+                }
+                if cap as usize > MAX_PACKET_BYTES {
+                    return Err(err(
+                        CaptureErrorKind::InvalidBlock,
+                        offset,
+                        "packet exceeds safety limit",
+                    ));
+                }
+                let mut packet_data = vec![0u8; cap as usize];
+                if !read_full(&mut reader, &mut packet_data, offset)? {
+                    break;
+                }
+                let units = if nano { 1_000_000_000 } else { 1_000_000 };
+                if fraction >= units {
+                    return Err(err(
+                        CaptureErrorKind::InvalidTimestamp,
+                        offset,
+                        "PCAP fractional timestamp out of range",
+                    ));
+                }
+                resume.packets += 1;
+                resume.offset = offset.saturating_add(16 + u64::from(cap));
+                visitor(CapturePacket {
+                    metadata: PacketMetadata {
+                        capture_id: capture_id.into(),
+                        source_file: source.clone(),
+                        packet_number: resume.packets,
+                        byte_offset: offset,
+                        timestamp: ExactTimestamp {
+                            seconds: sec,
+                            nanoseconds: if nano {
+                                fraction as u32
+                            } else {
+                                (fraction * 1000) as u32
+                            },
+                            raw_ticks: (sec as u64).saturating_mul(units) + fraction,
+                            resolution_base: 10,
+                            resolution_exponent: if nano { 9 } else { 6 },
+                        },
+                        captured_length: cap,
+                        original_length: orig,
+                        interface_id: 0,
+                        link_type: link,
+                        sll2: sll2_metadata_if_valid(link, &packet_data),
+                        truncated: cap < orig,
+                    },
+                    data: packet_data,
+                });
+            }
+            Ok(CaptureSummary {
+                format: CaptureFormat::Pcap,
+                interfaces: vec![Interface {
+                    id: 0,
+                    link_type: link,
+                    snaplen,
+                    ts_base: 10,
+                    ts_exponent: if nano { 9 } else { 6 },
+                    ts_offset_seconds: 0,
+                }],
+                packets: (resume.packets - before) as usize,
+                warnings,
+            })
+        }
+        ResumeFormat::PcapNg {
+            mut endian,
+            mut interfaces,
+        } => {
+            let result = (|| -> Result<(), CaptureError> {
+                loop {
+                    let offset = resume.offset;
+                    let mut head = [0u8; 8];
+                    if !read_full(&mut reader, &mut head, offset)? {
+                        break;
+                    }
+                    let block_type_raw = [head[0], head[1], head[2], head[3]];
+                    let length_raw = [head[4], head[5], head[6], head[7]];
+                    if block_type_raw == [0x0a, 0x0d, 0x0d, 0x0a] {
+                        let mut bom = [0u8; 4];
+                        if !read_full(&mut reader, &mut bom, offset)? {
+                            break;
+                        }
+                        let e = match bom {
+                            [0x4d, 0x3c, 0x2b, 0x1a] => Endian::Little,
+                            [0x1a, 0x2b, 0x3c, 0x4d] => Endian::Big,
+                            _ => {
+                                return Err(err(
+                                    CaptureErrorKind::InvalidHeader,
+                                    offset + 8,
+                                    "invalid PCAPNG byte-order magic",
+                                ))
+                            }
+                        };
+                        let len = e.u32(&length_raw) as usize;
+                        validate_stream_block_length(len, offset)?;
+                        if len < 28 {
+                            return Err(err(
+                                CaptureErrorKind::Truncated,
+                                offset,
+                                "section header truncated",
+                            ));
+                        }
+                        let mut remainder = vec![0u8; len - 12];
+                        if !read_full(&mut reader, &mut remainder, offset)? {
+                            break;
+                        }
+                        validate_stream_trailer(&remainder, len, e, offset)?;
+                        if e.u16(&remainder[0..2]) != 1 {
+                            return Err(err(
+                                CaptureErrorKind::InvalidHeader,
+                                offset + 12,
+                                "unsupported PCAPNG major version",
+                            ));
+                        }
+                        endian = Some(e);
+                        interfaces.clear();
+                        resume.offset = offset.saturating_add(len as u64);
+                        continue;
+                    }
+                    let e = endian.ok_or_else(|| {
+                        err(
+                            CaptureErrorKind::InvalidHeader,
+                            offset,
+                            "block before section header",
+                        )
+                    })?;
+                    let len = e.u32(&length_raw) as usize;
+                    validate_stream_block_length(len, offset)?;
+                    let mut remainder = vec![0u8; len - 8];
+                    if !read_full(&mut reader, &mut remainder, offset)? {
+                        break;
+                    }
+                    validate_stream_trailer(&remainder, len, e, offset)?;
+                    let body = &remainder[..remainder.len() - 4];
+                    match e.u32(&block_type_raw) {
+                        1 => {
+                            if body.len() < 8 {
+                                return Err(err(
+                                    CaptureErrorKind::Truncated,
+                                    offset,
+                                    "interface description truncated",
+                                ));
+                            }
+                            let mut iface = Interface {
+                                id: interfaces.len() as u32,
+                                link_type: e.u16(&body[0..2]) as u32,
+                                snaplen: e.u32(&body[4..8]),
+                                ts_base: 10,
+                                ts_exponent: 6,
+                                ts_offset_seconds: 0,
+                            };
+                            parse_idb_options(&body[8..], e, &mut iface, offset as usize + 16)?;
+                            interfaces.push(iface);
+                        }
+                        6 | 2 => {
+                            if body.len() < 20 {
+                                return Err(err(
+                                    CaptureErrorKind::Truncated,
+                                    offset,
+                                    "packet block truncated",
+                                ));
+                            }
+                            let iface_id = if e.u32(&block_type_raw) == 6 {
+                                e.u32(&body[0..4])
+                            } else {
+                                e.u16(&body[0..2]) as u32
+                            };
+                            let iface = interfaces.get(iface_id as usize).ok_or_else(|| {
+                                err(
+                                    CaptureErrorKind::InvalidBlock,
+                                    offset,
+                                    "packet references unknown interface",
+                                )
+                            })?;
+                            let ticks =
+                                ((e.u32(&body[4..8]) as u64) << 32) | e.u32(&body[8..12]) as u64;
+                            let cap = e.u32(&body[12..16]);
+                            let orig = e.u32(&body[16..20]);
+                            if orig < cap || (iface.snaplen != 0 && cap > iface.snaplen) {
+                                return Err(err(
+                                    CaptureErrorKind::InvalidBlock,
+                                    offset,
+                                    "packet lengths exceed original length or snaplen",
+                                ));
+                            }
+                            if cap as usize > MAX_PACKET_BYTES
+                                || 20 + align4(cap as usize) > body.len()
+                            {
+                                return Err(err(
+                                    CaptureErrorKind::Truncated,
+                                    offset,
+                                    "packet data truncated",
+                                ));
+                            }
+                            let packet_data = body[20..20 + cap as usize].to_vec();
+                            let mut packet_metadata = metadata(
+                                capture_id,
+                                &source,
+                                resume.packets + 1,
+                                offset,
+                                ticks,
+                                cap,
+                                orig,
+                                iface,
+                            )?;
+                            packet_metadata.sll2 =
+                                sll2_metadata_if_valid(iface.link_type, &packet_data);
+                            resume.packets += 1;
+                            visitor(CapturePacket {
+                                metadata: packet_metadata,
+                                data: packet_data,
+                            });
+                        }
+                        3 => warnings.push(err(
+                            CaptureErrorKind::UnsupportedPacket,
+                            offset,
+                            "simple packet block has no source timestamp and was not emitted",
+                        )),
+                        _ => {}
+                    }
+                    resume.offset = offset.saturating_add(len as u64);
+                }
+                Ok(())
+            })();
+            resume.format = Some(ResumeFormat::PcapNg {
+                endian,
+                interfaces: interfaces.clone(),
+            });
+            result?;
+            Ok(CaptureSummary {
+                format: CaptureFormat::PcapNg,
+                interfaces,
+                packets: (resume.packets - before) as usize,
+                warnings,
+            })
+        }
     }
 }
 
@@ -1359,6 +1749,96 @@ fn parse_v6(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Découpages déterministes d'un fichier de `len` octets : tailles
+    /// de tranche tirées par un générateur congruentiel à graine fixe,
+    /// de 1 à `max_step` octets, donc souvent au milieu d'un bloc.
+    fn seeded_cuts(len: usize, seed: u64, max_step: usize) -> Vec<usize> {
+        let mut state = seed;
+        let mut cuts = Vec::new();
+        let mut at = 0usize;
+        while at < len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            at = (at + 1 + ((state >> 33) as usize % max_step)).min(len);
+            cuts.push(at);
+        }
+        cuts
+    }
+
+    /// 0.3.0 (oiran-api 2.21.109) — parité lecture intégrale / lecture
+    /// par reprise : pour 12 graines et des tranches de 1 à 97 octets
+    /// puis de 1 à 4096, le fichier est écrit par morceaux et relu avec
+    /// `visit_capture_from` après chaque morceau. La suite de paquets
+    /// (numéro, offset, horodatage, données) est identique à celle de
+    /// `visit_capture`, et l'offset final égale la taille du fichier.
+    #[test]
+    fn visit_capture_from_matches_full_visit_for_any_split_0_3_0() {
+        let datasets = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let mut inputs: Vec<(String, Vec<u8>)> = ["N2", "N3", "N4"]
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    std::fs::read(datasets.join(format!("{name}.pcapng"))).unwrap(),
+                )
+            })
+            .collect();
+        // Un pcap classique à 5 enregistrements.
+        let mut classic = vec![
+            0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0,
+            0,
+        ];
+        for index in 0u32..5 {
+            let data = vec![index as u8; 40 + index as usize * 7];
+            classic.extend_from_slice(&(1_795_200_000 + index).to_le_bytes());
+            classic.extend_from_slice(&index.to_le_bytes());
+            classic.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            classic.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            classic.extend_from_slice(&data);
+        }
+        inputs.push(("classic".into(), classic));
+        for (name, bytes) in &inputs {
+            let path = std::env::temp_dir().join(format!(
+                "oiran-resume-{}-{}-{:?}.cap",
+                name,
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, bytes).unwrap();
+            let mut full = Vec::new();
+            visit_capture(&path, "sha256:x", |packet| full.push(packet)).unwrap();
+            assert!(!full.is_empty(), "{name}: le jeu porte des paquets");
+            for seed in 0..12u64 {
+                for max_step in [97usize, 4096] {
+                    let mut resume = ResumePoint::default();
+                    let mut incremental = Vec::new();
+                    for cut in seeded_cuts(bytes.len(), seed, max_step) {
+                        std::fs::write(&path, &bytes[..cut]).unwrap();
+                        let before = incremental.len();
+                        let summary =
+                            visit_capture_from(&path, "sha256:x", &mut resume, |packet| {
+                                incremental.push(packet)
+                            })
+                            .unwrap();
+                        assert_eq!(summary.packets, incremental.len() - before);
+                        assert!(resume.offset() <= cut as u64);
+                    }
+                    assert_eq!(incremental, full, "{name} graine {seed} pas {max_step}");
+                    assert_eq!(resume.offset(), bytes.len() as u64, "{name}: tout est consommé");
+                    assert_eq!(resume.packets(), full.len() as u64);
+                    // Un appel de plus sans nouvel octet n'émet rien.
+                    let summary =
+                        visit_capture_from(&path, "sha256:x", &mut resume, |_| panic!("rien"))
+                            .unwrap();
+                    assert_eq!(summary.packets, 0);
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_capture(name: &str, bytes: &[u8]) -> std::path::PathBuf {

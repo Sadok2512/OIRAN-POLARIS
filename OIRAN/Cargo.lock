@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "capture-pcap"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "event-schema",
 ]
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.9.4"
+version = "0.10.1"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",

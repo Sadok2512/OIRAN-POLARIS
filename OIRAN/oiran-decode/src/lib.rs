@@ -3,7 +3,7 @@
 pub mod lte_fixture;
 
 use capture_pcap::{
-    transport_view, visit_capture, CapturePacket, TransportProtocol, TransportView,
+    transport_view, visit_capture, visit_capture_from, CapturePacket, TransportProtocol, TransportView,
 };
 use decoder_diameter::DiameterDecoder;
 use decoder_gtpu::GtpuDecoder;
@@ -260,13 +260,205 @@ where
 pub fn decode_capture_streaming_with_sbi_carry<F>(
     config: &DecodeConfig,
     pseudonym_key: &PseudonymKey,
+    sbi_carry: Option<&mut SbiCarryContext>,
+    sink: F,
+) -> Result<DecodeReport, String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    let mut state = DecodeState::new();
+    decode_core(config, pseudonym_key, sbi_carry, &mut state, None, sink)
+}
+
+/// 0.10.0 (oiran-api 2.21.109) — état qu'un décodage crée et que la
+/// reprise à l'offset doit garder d'un appel à l'autre.
+struct DecodeState {
+    key_ordinals: HashMap<String, u32>,
+    rtp_aggregator: RtpFlowAggregator,
+    sctp: SctpReassembler,
+    tcp: TcpReassembler,
+    /// Reprise seulement — ordinaux des paquets qui ouvrent un flux RTP
+    /// du tunnel : l'event du flux, émis à la clôture, continue leur
+    /// numérotation. Les ordinaux des autres paquets sont oubliés dès
+    /// le paquet suivant, sinon la table grossirait avec le segment.
+    retained_ordinals: HashMap<String, u32>,
+    /// Reprise seulement — flux RTP du tunnel déjà vus.
+    rtp_flows_seen: std::collections::HashSet<(String, u16, String, u16, u32)>,
+    /// Reprise seulement — le paquet en cours ouvre un flux RTP.
+    retain_current_packet: bool,
+}
+
+impl DecodeState {
+    fn new() -> Self {
+        Self {
+            key_ordinals: HashMap::new(),
+            rtp_aggregator: RtpFlowAggregator::new(),
+            sctp: SctpReassembler::new(),
+            tcp: TcpReassembler::new(),
+            retained_ordinals: HashMap::new(),
+            rtp_flows_seen: std::collections::HashSet::new(),
+            retain_current_packet: false,
+        }
+    }
+
+    /// Reprise : clôt le paquet précédent. Ses ordinaux sont gardés
+    /// s'il a ouvert un flux RTP, oubliés sinon.
+    fn close_packet(&mut self) {
+        if self.retain_current_packet {
+            self.retained_ordinals.extend(self.key_ordinals.drain());
+        } else {
+            self.key_ordinals.clear();
+        }
+        self.retain_current_packet = false;
+    }
+}
+
+/// 0.10.0 (oiran-api 2.21.109, ordre #9 7049845272) — session de
+/// décodage incrémental d'UN fichier de capture qui grossit. Gardée en
+/// mémoire par l'appelant entre deux appels de
+/// [`decode_capture_incremental`].
+pub struct DecodeSession {
+    resume: capture_pcap::ResumePoint,
+    state: DecodeState,
+}
+
+impl Default for DecodeSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecodeSession {
+    pub fn new() -> Self {
+        Self {
+            resume: capture_pcap::ResumePoint::default(),
+            state: DecodeState::new(),
+        }
+    }
+    /// Octets du fichier déjà décodés (blocs complets seulement).
+    pub fn consumed_bytes(&self) -> u64 {
+        self.resume.offset()
+    }
+    /// Paquets déjà lus depuis le début du fichier.
+    pub fn packets(&self) -> u64 {
+        self.resume.packets()
+    }
+}
+
+/// 0.10.0 — plans décodables par reprise à l'offset (lot A) : un
+/// datagramme UDP y porte un message entier, sans état entre paquets.
+/// Les plans à état (SCTP : N2, S1-MME ; TCP : SBI, S6a ; SIP/RTP par
+/// SDP : IMS, N6) gardent le décodage intégral.
+pub fn supports_incremental(interface: &str) -> bool {
+    matches!(
+        interface,
+        "N3" | "S1-U" | "S5-U" | "N4" | "Sxab" | "S11" | "S5-C"
+    )
+}
+
+/// 0.10.0 — décode les octets ajoutés au fichier depuis le dernier
+/// appel. Un bloc incomplet en fin de fichier n'est pas consommé. Les
+/// events émis (ordre, `event_id`, `stable_event_key`, numéro de
+/// paquet, offset) sont ceux qu'un décodage intégral émet pour les
+/// mêmes paquets. Les events de flux RTP du tunnel ne sont PAS émis
+/// ici : ils le sont par [`finish_incremental`], à la clôture du
+/// fichier. `DecodeReport::packets` et `events` comptent cet appel.
+pub fn decode_capture_incremental<F>(
+    config: &DecodeConfig,
+    pseudonym_key: &PseudonymKey,
+    session: &mut DecodeSession,
+    sink: F,
+) -> Result<DecodeReport, String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    if !supports_incremental(&config.interface) {
+        return Err(format!(
+            "incremental decode is not supported on interface {}",
+            config.interface
+        ));
+    }
+    decode_core(
+        config,
+        pseudonym_key,
+        None,
+        &mut session.state,
+        Some(&mut session.resume),
+        sink,
+    )
+}
+
+/// 0.10.0 — clôt une session incrémentale : émet les events de flux
+/// RTP agrégés (un par flux), comme la fin d'un décodage intégral.
+/// La session ne doit plus être utilisée ensuite. Retourne le nombre
+/// d'events émis.
+pub fn finish_incremental<F>(
+    config: &DecodeConfig,
+    session: &mut DecodeSession,
+    mut sink: F,
+) -> Result<usize, String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    let state = &mut session.state;
+    state.close_packet();
+    std::mem::swap(&mut state.key_ordinals, &mut state.retained_ordinals);
+    let mut event_count = 0usize;
+    emit_rtp_flows(config, state, &mut sink, &mut event_count)?;
+    Ok(event_count)
+}
+
+/// Émet un event par flux RTP agrégé et vide l'agrégateur.
+fn emit_rtp_flows<F>(
+    config: &DecodeConfig,
+    state: &mut DecodeState,
+    sink: &mut F,
+    event_count: &mut usize,
+) -> Result<(), String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    let aggregator = std::mem::replace(&mut state.rtp_aggregator, RtpFlowAggregator::new());
+    let rtp_events = aggregator.finish(&config.capture_id, ims_event_interface(&config.interface));
+    for mut event in rtp_events {
+        // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — stamper
+        // `stable_event_key` unique par event (RTP agrégé partage le
+        // compteur par-paquet avec `emit_events`).
+        if !config.stable_source_file.is_empty() {
+            if let Some(packet) = event.packet_references.first() {
+                let lookup = event_schema::packet_lookup_key(
+                    &config.stable_source_file,
+                    packet.interface_id,
+                    packet.packet_number,
+                    packet.byte_offset,
+                );
+                let ordinal = *state
+                    .key_ordinals
+                    .entry(lookup)
+                    .and_modify(|v| *v = v.saturating_add(1))
+                    .or_insert(0);
+                event.assign_stable_event_key(&config.stable_source_file, ordinal);
+            }
+        }
+        sink(event)?;
+        *event_count = event_count.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn decode_core<F>(
+    config: &DecodeConfig,
+    pseudonym_key: &PseudonymKey,
     mut sbi_carry: Option<&mut SbiCarryContext>,
+    state: &mut DecodeState,
+    mut resume: Option<&mut capture_pcap::ResumePoint>,
     mut sink: F,
 ) -> Result<DecodeReport, String>
 where
     F: FnMut(NormalizedEvent) -> Result<(), String>,
 {
     validate_config(config)?;
+    let incremental = resume.is_some();
     // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — compteur
     // des events par paquet (clé = `packet_lookup_key`). Partagé entre
     // toutes les invocations de `emit_events` (SCTP, UDP, SBI/TCP,
@@ -274,7 +466,6 @@ where
     // déterministe, identique en live et en publication car la
     // séquence d'émission du décodeur est elle-même déterministe pour
     // un même pcapng.
-    let mut key_ordinals: HashMap<String, u32> = HashMap::new();
     // 2.7.6: the caller owns the pseudonym key. One key per logical import —
     // standalone decode_capture() generates its own; live-probe continuous
     // imports hold a job-scoped key and reuse it across every segment so
@@ -287,18 +478,18 @@ where
     let gtpv2c = Gtpv2cDecoder;
     let diameter = DiameterDecoder;
     let sip = SipDecoder;
-    let mut rtp_aggregator = RtpFlowAggregator::new();
-    let mut sctp = SctpReassembler::new();
-    let mut tcp = TcpReassembler::new();
     let mut event_count = 0usize;
     let mut transport_errors = 0usize;
     let mut sink_error = None;
     let mut sbi_report = SbiDecodeReport::default();
     let mut diameter_tcp_connections = 0usize;
 
-    let capture = visit_capture(&config.input, &config.capture_id, |packet| {
+    let mut on_packet = |packet: CapturePacket| {
         if sink_error.is_some() {
             return;
+        }
+        if incremental {
+            state.close_packet();
         }
         if packet.metadata.truncated {
             transport_errors += 1;
@@ -311,6 +502,12 @@ where
                 return;
             }
         };
+        // Reprise (lot A) : seuls les plans UDP sans état sont admis ;
+        // SCTP et TCP n'y produisent aucun event et leur réassemblage
+        // ne doit pas accumuler d'état d'un appel à l'autre.
+        if incremental && !matches!(view.protocol, TransportProtocol::Udp) {
+            return;
+        }
         match view.protocol {
             TransportProtocol::Udp => {
                 let ports = (
@@ -342,7 +539,7 @@ where
                     // extraire `(ip, port)` + Call-ID + payload type et nourrir
                     // l'agrégateur RTP qui tourne pour la même capture.
                     if matches!(route, UdpRoute::ImsSip) {
-                        register_sdp_flows_from_sip(&decoded, &mut rtp_aggregator);
+                        register_sdp_flows_from_sip(&decoded, &mut state.rtp_aggregator);
                     }
                     // 2.21.100 (ordre #9 7046402022 décision a, design CLAUDE1
                     // #9 7012805654) — pour chaque G-PDU GTP-U (N3/S1-U/S5-U),
@@ -358,17 +555,24 @@ where
                         route,
                         UdpRoute::N3Gtpu | UdpRoute::S1uGtpu | UdpRoute::S5uGtpu
                     ) {
-                        route_inner_udp_after_gtpu(
+                        let rtp_flow = route_inner_udp_after_gtpu(
                             &packet,
                             &view,
                             config,
                             &pseudonym_key,
                             &sip,
-                            &mut rtp_aggregator,
+                            &mut state.rtp_aggregator,
                             &mut decoded,
                         );
+                        if incremental {
+                            if let Some(flow) = rtp_flow {
+                                if state.rtp_flows_seen.insert(flow) {
+                                    state.retain_current_packet = true;
+                                }
+                            }
+                        }
                     }
-                    emit_events(decoded, config, &mut key_ordinals, &mut sink, &mut event_count, &mut sink_error);
+                    emit_events(decoded, config, &mut state.key_ordinals, &mut sink, &mut event_count, &mut sink_error);
                 } else if carries_ims_media(&config.interface) {
                     // 2.11.0 : paquet UDP IMS en dehors du port SIP 5060 → tenter
                     // RTP/RTCP sur un flux déjà enregistré par un SDP.
@@ -378,7 +582,7 @@ where
                     let arrival_ns = packet_arrival_ns(&packet);
                     let packet_ref = build_packet_reference(&packet, config);
                     let ts = build_timestamp(&packet);
-                    let _ = rtp_aggregator.observe_rtp(
+                    let _ = state.rtp_aggregator.observe_rtp(
                         src_ip,
                         ports.0,
                         dst_ip,
@@ -388,11 +592,11 @@ where
                         &packet_ref,
                         &ts,
                     );
-                    let _ = rtp_aggregator.observe_rtcp(src_ip, ports.0, dst_ip, ports.1, payload);
+                    let _ = state.rtp_aggregator.observe_rtcp(src_ip, ports.0, dst_ip, ports.1, payload);
                 }
             }
             TransportProtocol::Sctp => {
-                for message in sctp.consume(&packet, &view) {
+                for message in state.sctp.consume(&packet, &view) {
                     let Some(interface) = sctp_route(&config.interface, message.ppid) else {
                         continue;
                     };
@@ -437,19 +641,19 @@ where
                         "S6a" => diameter.decode(&input).events,
                         _ => ngap.decode(&input).events,
                     };
-                    emit_events(decoded, config, &mut key_ordinals, &mut sink, &mut event_count, &mut sink_error,
+                    emit_events(decoded, config, &mut state.key_ordinals, &mut sink, &mut event_count, &mut sink_error,
                     );
                 }
             }
             TransportProtocol::Tcp if config.interface == "SBI" => {
-                tcp.consume(&packet, &view);
-                let finalized = tcp.take_finalized();
+                state.tcp.consume(&packet, &view);
+                let finalized = state.tcp.take_finalized();
                 emit_sbi_connections(
                     finalized,
                     config,
                     &pseudonym_key,
                     sbi_carry.as_deref_mut(),
-                    &mut key_ordinals,
+                    &mut state.key_ordinals,
                     &mut sink,
                     &mut event_count,
                     &mut sink_error,
@@ -463,14 +667,14 @@ where
                     view.destination_port.unwrap_or(0),
                 ) =>
             {
-                tcp.consume(&packet, &view);
-                let finalized = tcp.take_finalized();
+                state.tcp.consume(&packet, &view);
+                let finalized = state.tcp.take_finalized();
                 diameter_tcp_connections += emit_diameter_connections(
                     finalized,
                     config,
                     &diameter,
                     &pseudonym_key,
-                    &mut key_ordinals,
+                    &mut state.key_ordinals,
                     &mut sink,
                     &mut event_count,
                     &mut sink_error,
@@ -478,20 +682,47 @@ where
             }
             TransportProtocol::Tcp | TransportProtocol::Other(_) => {}
         }
-    })
-    .map_err(|error| error.to_string())?;
+    };
+    let capture = match resume.as_deref_mut() {
+        Some(point) => {
+            visit_capture_from(&config.input, &config.capture_id, point, &mut on_packet)
+        }
+        None => visit_capture(&config.input, &config.capture_id, &mut on_packet),
+    };
+    drop(on_packet);
     if let Some(error) = sink_error.take() {
         return Err(error);
     }
-    let (sctp_errors, incomplete_sctp) = sctp.finish();
-    let (connections, tcp_errors) = tcp.finish();
+    let capture = capture.map_err(|error| error.to_string())?;
+    if incremental {
+        // Reprise : pas de clôture ici. Les flux RTP du tunnel sont
+        // émis par `finish_incremental`.
+        return Ok(DecodeReport {
+            capture_format: format!("{:?}", capture.format),
+            packets: capture.packets,
+            events: event_count,
+            warnings: capture.warnings.len(),
+            transport_errors,
+            sctp_errors: 0,
+            incomplete_sctp: 0,
+            tcp_connections: 0,
+            tcp_errors: 0,
+            http2_frames: 0,
+            http2_streams: 0,
+            sbi_transactions: 0,
+        });
+    }
+    let (sctp_errors, incomplete_sctp) =
+        std::mem::replace(&mut state.sctp, SctpReassembler::new()).finish();
+    let (connections, tcp_errors) =
+        std::mem::replace(&mut state.tcp, TcpReassembler::new()).finish();
     if config.interface == "S6a" {
         diameter_tcp_connections += emit_diameter_connections(
             connections,
             config,
             &diameter,
             &pseudonym_key,
-            &mut key_ordinals,
+            &mut state.key_ordinals,
             &mut sink,
             &mut event_count,
             &mut sink_error,
@@ -502,7 +733,7 @@ where
             config,
             &pseudonym_key,
             sbi_carry.as_deref_mut(),
-            &mut key_ordinals,
+            &mut state.key_ordinals,
             &mut sink,
             &mut event_count,
             &mut sink_error,
@@ -515,32 +746,7 @@ where
     // 2.11.0 : émet UN event par flux RTP agrégé — jamais un event
     // par paquet. L'agrégateur peut être vide si le dataset n'a vu
     // aucune SDP + RTP ; c'est le cas habituel hors IMS.
-    let rtp_events =
-        rtp_aggregator.finish(&config.capture_id, ims_event_interface(&config.interface));
-    for mut event in rtp_events {
-        // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — stamper
-        // `stable_event_key` unique par event (RTP agrégé partage le
-        // compteur par-paquet avec `emit_events`).
-        if !config.stable_source_file.is_empty() {
-            if let Some(packet) = event.packet_references.first() {
-                let lookup = event_schema::packet_lookup_key(
-                    &config.stable_source_file,
-                    packet.interface_id,
-                    packet.packet_number,
-                    packet.byte_offset,
-                );
-                let ordinal = *key_ordinals
-                    .entry(lookup)
-                    .and_modify(|v| *v = v.saturating_add(1))
-                    .or_insert(0);
-                event.assign_stable_event_key(&config.stable_source_file, ordinal);
-            }
-        }
-        if let Err(error) = sink(event) {
-            return Err(error);
-        }
-        event_count = event_count.saturating_add(1);
-    }
+    emit_rtp_flows(config, state, &mut sink, &mut event_count)?;
     Ok(DecodeReport {
         capture_format: format!("{:?}", capture.format),
         packets: capture.packets,
@@ -878,15 +1084,15 @@ fn route_inner_udp_after_gtpu(
     sip: &decoder_sip::SipDecoder,
     rtp_aggregator: &mut decoder_rtp::RtpFlowAggregator,
     decoded: &mut Vec<NormalizedEvent>,
-) {
+) -> Option<(String, u16, String, u16, u32)> {
     let gtpu_payload = packet_payload_slice(packet, view);
     let Some(inner) = decoder_gtpu::extract_inner_udp(gtpu_payload) else {
-        return;
+        return None;
     };
     let inner_start = inner.udp_payload_offset;
     let inner_end = inner_start + inner.udp_payload_length;
     if inner_end > gtpu_payload.len() {
-        return;
+        return None;
     }
     let inner_payload = &gtpu_payload[inner_start..inner_end];
     let ts = &packet.metadata.timestamp;
@@ -919,8 +1125,9 @@ fn route_inner_udp_after_gtpu(
             register_sdp_flows_from_sip(&sip_output.events, rtp_aggregator);
         }
         decoded.extend(sip_output.events);
+        None
     } else {
-        let _ = rtp_aggregator.observe_rtp(
+        let accepted = rtp_aggregator.observe_rtp(
             &inner.source_ip,
             inner.source_port,
             &inner.destination_ip,
@@ -937,6 +1144,21 @@ fn route_inner_udp_after_gtpu(
             inner.destination_port,
             inner_payload,
         );
+        // 0.10.0 — flux RTP auquel ce paquet a été agrégé : la reprise
+        // à l'offset garde l'ordinal du paquet qui ouvre le flux.
+        if accepted {
+            decoder_rtp::parse_rtp_header(inner_payload).map(|header| {
+                (
+                    inner.source_ip.clone(),
+                    inner.source_port,
+                    inner.destination_ip.clone(),
+                    inner.destination_port,
+                    header.ssrc,
+                )
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -1223,6 +1445,202 @@ Content-Length: 0\r\n\
         // 2.21.110 : le média d'un plan tunnel est publié `N3-IMS`.
         assert_eq!(ims_event_interface("N3"), "N3-IMS");
         assert!(carries_ims_media("N6") && carries_ims_media("IMS") && !carries_ims_media("N3"));
+    }
+
+    /// Trame Ethernet/IPv4/UDP 2152 portant un G-PDU dont le paquet
+    /// interne est un datagramme UDP `src:sport → dst:dport`.
+    fn gtpu_frame(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, payload: &[u8]) -> Vec<u8> {
+        let inner_udp = (8 + payload.len()) as u16;
+        let inner_ip = 20 + inner_udp;
+        let outer_udp = 8 + 8 + inner_ip;
+        let outer_ip = 20 + outer_udp;
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&[0x08, 0x00, 0x45, 0x00]);
+        f.extend_from_slice(&outer_ip.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0, 10, 77, 11, 13, 10, 77, 22, 13]);
+        f.extend_from_slice(&2152u16.to_be_bytes());
+        f.extend_from_slice(&2152u16.to_be_bytes());
+        f.extend_from_slice(&outer_udp.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0x30, 0xff]);
+        f.extend_from_slice(&inner_ip.to_be_bytes());
+        f.extend_from_slice(&[0x00, 0x00, 0x00, 0x2a, 0x45, 0x00]);
+        f.extend_from_slice(&inner_ip.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+        f.extend_from_slice(&src);
+        f.extend_from_slice(&dst);
+        f.extend_from_slice(&sport.to_be_bytes());
+        f.extend_from_slice(&dport.to_be_bytes());
+        f.extend_from_slice(&inner_udp.to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    fn classic_pcap(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut file = Vec::new();
+        file.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+        file.extend_from_slice(&2u16.to_le_bytes());
+        file.extend_from_slice(&4u16.to_le_bytes());
+        file.extend_from_slice(&[0u8; 8]);
+        file.extend_from_slice(&65_535u32.to_le_bytes());
+        file.extend_from_slice(&1u32.to_le_bytes());
+        for (index, frame) in frames.iter().enumerate() {
+            file.extend_from_slice(&(1_795_200_000u32 + index as u32 / 50).to_le_bytes());
+            file.extend_from_slice(&((index as u32 % 50) * 20_000).to_le_bytes());
+            file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            file.extend_from_slice(frame);
+        }
+        file
+    }
+
+    /// Capture N3 synthétique : G-PDU de données, un INVITE SIP avec
+    /// SDP dans le tunnel, puis deux flux RTP négociés par ce SDP.
+    fn synthetic_n3_voice_capture() -> Vec<u8> {
+        let ue = [10, 47, 0, 2];
+        let peer = [10, 77, 24, 30];
+        let sdp = "v=0\r\no=- 1 1 IN IP4 10.47.0.2\r\ns=-\r\nc=IN IP4 10.47.0.2\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let invite = format!(
+            "INVITE sip:callee@example.invalid SIP/2.0\r\nVia: SIP/2.0/UDP 10.47.0.2:5060;branch=z9hG4bKres\r\nMax-Forwards: 70\r\nFrom: <sip:caller@example.invalid>;tag=a\r\nTo: <sip:callee@example.invalid>\r\nCall-ID: synthetic-2-21-109@oiran\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            sdp.len(),
+            sdp
+        );
+        let rtp = |ssrc: u32, seq: u16| {
+            let mut p = vec![0x80, 0x00];
+            p.extend_from_slice(&seq.to_be_bytes());
+            p.extend_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+            p.extend_from_slice(&ssrc.to_be_bytes());
+            p.extend_from_slice(&[0x55; 20]);
+            p
+        };
+        let mut frames = Vec::new();
+        for i in 0..5u8 {
+            frames.push(gtpu_frame(ue, 33_000, [10, 77, 24, 40], 443, &[i; 60]));
+        }
+        frames.push(gtpu_frame(ue, 5060, [10, 77, 24, 20], 5060, invite.as_bytes()));
+        for seq in 0..40u16 {
+            frames.push(gtpu_frame(ue, 40_000, peer, 50_000, &rtp(0x1111, seq)));
+            frames.push(gtpu_frame(peer, 50_000, ue, 40_000, &rtp(0x2222, seq)));
+            frames.push(gtpu_frame(ue, 33_000, [10, 77, 24, 40], 443, &[seq as u8; 30]));
+        }
+        classic_pcap(&frames)
+    }
+
+    fn seeded_cuts(len: usize, seed: u64, max_step: usize) -> Vec<usize> {
+        let mut state = seed;
+        let mut cuts = Vec::new();
+        let mut at = 0usize;
+        while at < len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            at = (at + 1 + ((state >> 33) as usize % max_step)).min(len);
+            cuts.push(at);
+        }
+        cuts
+    }
+
+    /// 0.10.0 (oiran-api 2.21.109, ordre #9 7049845272) — gate du lot A :
+    /// pour tout découpage du fichier, y compris au milieu d'un bloc,
+    /// décodage incrémental + clôture = décodage intégral, event pour
+    /// event (JSON complet : ordre, `event_id`, `stable_event_key`,
+    /// numéro de paquet, offset). Jeux N3 et N4 du dépôt et capture N3
+    /// synthétique avec SIP et RTP dans le tunnel ; 12 graines, pas
+    /// fins (≤ 61 octets) et larges (≤ 3000).
+    #[test]
+    fn incremental_decode_matches_full_decode_for_any_split_2_21_109() {
+        let datasets = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let inputs: Vec<(&str, &str, Vec<u8>)> = vec![
+            ("N3", "pcapng", std::fs::read(datasets.join("N3.pcapng")).unwrap()),
+            ("N4", "pcapng", std::fs::read(datasets.join("N4.pcapng")).unwrap()),
+            ("N3", "pcap", synthetic_n3_voice_capture()),
+        ];
+        let key = PseudonymKey::from_bytes([3; 32]);
+        for (interface, extension, bytes) in &inputs {
+            let path = std::env::temp_dir().join(format!(
+                "oiran-incr-{}-{}-{:?}.{}",
+                interface,
+                std::process::id(),
+                std::thread::current().id(),
+                extension
+            ));
+            let config = DecodeConfig {
+                input: path.clone(),
+                capture_id: format!("sha256:{}", "e".repeat(64)),
+                interface: (*interface).into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "n3_00001_20261120.pcapng".into(),
+            };
+            std::fs::write(&path, bytes).unwrap();
+            let mut full = Vec::new();
+            decode_capture_streaming(&config, &key, |event| {
+                full.push(event.to_json());
+                Ok(())
+            })
+            .unwrap();
+            assert!(!full.is_empty(), "{interface}.{extension} : des events");
+            if *extension == "pcap" {
+                let count = |needle: &str| full.iter().filter(|e| e.contains(needle)).count();
+                assert_eq!(count("\"protocol\":\"RTP\""), 2, "deux flux RTP du tunnel");
+                assert!(count("\"interface\":\"N3-IMS\"") >= 1, "le SIP du tunnel");
+            }
+            for seed in 0..12u64 {
+                for max_step in [61usize, 3000] {
+                    let mut session = DecodeSession::new();
+                    let mut incremental = Vec::new();
+                    for cut in seeded_cuts(bytes.len(), seed, max_step) {
+                        std::fs::write(&path, &bytes[..cut]).unwrap();
+                        decode_capture_incremental(&config, &key, &mut session, |event| {
+                            incremental.push(event.to_json());
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert!(session.consumed_bytes() <= cut as u64);
+                        assert!(
+                            session.state.key_ordinals.len() <= 1,
+                            "les ordinaux d'un paquet clos sont oubliés"
+                        );
+                    }
+                    assert_eq!(session.consumed_bytes(), bytes.len() as u64);
+                    assert!(
+                        session.state.retained_ordinals.len() <= 2,
+                        "au plus un ordinal gardé par flux RTP"
+                    );
+                    finish_incremental(&config, &mut session, |event| {
+                        incremental.push(event.to_json());
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        incremental, full,
+                        "{interface}.{extension} graine {seed} pas {max_step}"
+                    );
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// 0.10.0 — les plans à état refusent la reprise (lot B non livré).
+    #[test]
+    fn incremental_decode_is_refused_on_stateful_planes_2_21_109() {
+        for interface in ["N2", "S1-MME", "SBI", "S6a", "IMS", "N6"] {
+            assert!(!supports_incremental(interface));
+            let config = DecodeConfig {
+                input: "unused.pcap".into(),
+                capture_id: format!("sha256:{}", "0".repeat(64)),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: String::new(),
+            };
+            let key = PseudonymKey::from_bytes([3; 32]);
+            let mut session = DecodeSession::new();
+            assert!(decode_capture_incremental(&config, &key, &mut session, |_| Ok(())).is_err());
+        }
+        for interface in ["N3", "S1-U", "S5-U", "N4", "Sxab", "S11", "S5-C"] {
+            assert!(supports_incremental(interface));
+        }
     }
 
     #[test]
@@ -2336,6 +2754,30 @@ Content-Length: {}\r\n\
             );
             assert_eq!(gtpu.len(), inner.len(), "{plane} : un event GTP-U par G-PDU");
             assert!(gtpu.iter().all(|e| e.interface == plane), "{plane} : GTP-U inchangé");
+
+            // Chemin incrémental du lecteur live (2.21.109 lot A) : le flux
+            // RTP n'est émis qu'à la clôture, avec le même marqueur.
+            let mut session = DecodeSession::new();
+            let mut live = Vec::new();
+            decode_capture_incremental(&config, &key, &mut session, |event| {
+                live.push(event);
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                live.iter().all(|e| e.protocol.as_str() != "RTP"),
+                "{plane} : pas de flux RTP avant la clôture"
+            );
+            let mut closing = Vec::new();
+            finish_incremental(&config, &mut session, |event| {
+                closing.push(event);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(closing.len(), 1, "{plane} : un flux RTP à la clôture");
+            assert_eq!(closing[0].protocol.as_str(), "RTP");
+            assert_eq!(closing[0].interface, "N3-IMS", "{plane} : chemin incrémental");
+            assert_eq!(closing[0].event_id, rtp[0].event_id, "{plane} : parité avec le décodage intégral");
         }
         let _ = std::fs::remove_file(&path);
     }

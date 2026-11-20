@@ -513,6 +513,10 @@ pub(crate) struct LiveTraceRegistry {
     /// séquentielle : cette durée est le retard qu'une interface
     /// volumineuse (N3) impose aux suivantes et au tour d'après.
     reader_pass_ms: AtomicU64,
+    /// 2.21.109 — sessions de reprise jetées (fichier remplacé/tronqué).
+    resume_resets: AtomicU64,
+    /// 2.21.109 — octets décodés / taille par plan, dernière passe.
+    reader_io: Mutex<BTreeMap<String, ReaderIo>>,
 }
 
 impl LiveTraceRegistry {
@@ -522,6 +526,8 @@ impl LiveTraceRegistry {
             reader_running: AtomicBool::new(false),
             audit: Mutex::new(VecDeque::new()),
             reader_pass_ms: AtomicU64::new(0),
+            resume_resets: AtomicU64::new(0),
+            reader_io: Mutex::new(BTreeMap::new()),
         }
     }
     pub(crate) fn audit(&self, entry: Value) {
@@ -595,6 +601,11 @@ impl LiveTraceRegistry {
         json!({
             "wall_clock_s": epoch_seconds(),
             "reader_pass_ms": self.reader_pass_ms.load(Ordering::Relaxed),
+            "reader": {
+                "resume_resets": self.resume_resets.load(Ordering::Relaxed),
+                "full_redecode": full_redecode_requested(),
+                "interfaces": *self.reader_io.lock().unwrap(),
+            },
             "messages": trace.messages,
             "gpdu": {
                 "seen": trace.gpdu_seen,
@@ -622,6 +633,18 @@ impl LiveTraceRegistry {
                 kind: "stats".into(),
                 payload,
             });
+        }
+    }
+
+    pub(crate) fn bump_resume_resets(&self) {
+        self.resume_resets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 2.21.109 — publie les octets lus par plan pendant la passe.
+    /// Une passe sans aucun décodage garde le dernier relevé.
+    pub(crate) fn set_reader_io(&self, pass: BTreeMap<String, ReaderIo>) {
+        if !pass.is_empty() {
+            *self.reader_io.lock().unwrap() = pass;
         }
     }
 
@@ -1077,6 +1100,151 @@ impl LiveTraceRegistry {
     }
 }
 
+/// 2.21.109 (ordre #9 7049845272) — variable d'environnement de repli :
+/// `1`/`true` remet le lecteur live en redécodage intégral de chaque
+/// segment modifié (comportement d'avant 2.21.109), sans redéploiement.
+const FULL_REDECODE_ENV: &str = "OIRAN_LIVE_READER_FULL_REDECODE";
+
+fn full_redecode_requested() -> bool {
+    std::env::var(FULL_REDECODE_ENV)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
+/// 2.21.109 — octets lus par le lecteur pour un plan pendant la
+/// dernière passe : `bytes_decoded` (réellement décodés) contre
+/// `bytes_file` (taille des segments touchés). En reprise à l'offset,
+/// décodé = croissance du segment ; en redécodage intégral, décodé =
+/// taille.
+#[derive(Clone, Default, Serialize, Debug, PartialEq)]
+pub(crate) struct ReaderIo {
+    bytes_decoded: u64,
+    bytes_file: u64,
+    incremental: bool,
+}
+
+/// 2.21.109 — session de reprise d'un segment du ring, gardée par le
+/// lecteur d'une passe à l'autre.
+pub(crate) struct ReaderSession {
+    /// (périphérique, inode) du fichier quand la session a été ouverte.
+    device_inode: (u64, u64),
+    /// Empreinte des 64 derniers octets consommés : `(offset, sha256)`.
+    /// Détecte un fichier réécrit sur place sous le même inode.
+    tail: Option<(u64, String)>,
+    session: oiran_decode::DecodeSession,
+}
+
+pub(crate) struct IncrementOutcome {
+    events: Vec<event_schema::NormalizedEvent>,
+    bytes_decoded: u64,
+    consumed_bytes: u64,
+    /// La session précédente a été jetée : fichier remplacé ou tronqué.
+    reset: bool,
+    ok: bool,
+}
+
+fn device_inode(path: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    path.metadata()
+        .map(|meta| (meta.dev(), meta.ino()))
+        .unwrap_or((0, 0))
+}
+
+fn tail_fingerprint(path: &std::path::Path, consumed: u64) -> Option<(u64, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+    if consumed == 0 {
+        return None;
+    }
+    let start = consumed.saturating_sub(64);
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = vec![0u8; (consumed - start) as usize];
+    file.read_exact(&mut bytes).ok()?;
+    Some((consumed, sha256_hex(&bytes)))
+}
+
+/// 2.21.109 (ordre #9 7049845272) — décode les octets ajoutés à un
+/// segment depuis la passe précédente. La session est jetée, et le
+/// segment relu depuis 0, si le fichier n'est plus le même : inode
+/// différent, taille inférieure à l'offset consommé, ou derniers octets
+/// consommés modifiés.
+pub(crate) fn decode_increment(
+    sessions: &mut HashMap<std::path::PathBuf, ReaderSession>,
+    config: &oiran_decode::DecodeConfig,
+    key: &event_schema::PseudonymKey,
+    size: u64,
+) -> IncrementOutcome {
+    let path = &config.input;
+    let identity = device_inode(path);
+    let mut reset = false;
+    if let Some(existing) = sessions.get(path) {
+        let consumed = existing.session.consumed_bytes();
+        let same = existing.device_inode == identity
+            && size >= consumed
+            && existing.tail == tail_fingerprint(path, consumed);
+        if !same {
+            sessions.remove(path);
+            reset = true;
+        }
+    }
+    let entry = sessions.entry(path.clone()).or_insert_with(|| ReaderSession {
+        device_inode: identity,
+        tail: None,
+        session: oiran_decode::DecodeSession::new(),
+    });
+    let before = entry.session.consumed_bytes();
+    let mut events = Vec::new();
+    let result = oiran_decode::decode_capture_incremental(config, key, &mut entry.session, |event| {
+        events.push(event);
+        Ok(())
+    });
+    let consumed_bytes = entry.session.consumed_bytes();
+    entry.tail = tail_fingerprint(path, consumed_bytes);
+    IncrementOutcome {
+        events,
+        bytes_decoded: consumed_bytes.saturating_sub(before),
+        consumed_bytes,
+        reset,
+        ok: result.is_ok(),
+    }
+}
+
+/// 2.21.109 — clôt la session d'un segment fermé (un successeur existe
+/// dans le ring) : émet les events de flux RTP du tunnel, puis oublie
+/// la session. Retourne les events à router.
+pub(crate) fn close_reader_session(
+    sessions: &mut HashMap<std::path::PathBuf, ReaderSession>,
+    config: &oiran_decode::DecodeConfig,
+) -> Vec<event_schema::NormalizedEvent> {
+    let Some(mut closed) = sessions.remove(&config.input) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let _ = oiran_decode::finish_incremental(config, &mut closed.session, |event| {
+        events.push(event);
+        Ok(())
+    });
+    events
+}
+
+/// Configuration de décodage d'un segment du ring dumpcap.
+fn ring_decode_config(path: &std::path::Path, interface: &str) -> oiran_decode::DecodeConfig {
+    oiran_decode::DecodeConfig {
+        input: path.to_path_buf(),
+        capture_id: format!("sha256:{}", sha256_hex(path.to_string_lossy().as_bytes())),
+        interface: interface.into(),
+        endpoints: HashMap::new(),
+        // 2.21.91 (ordre #9 7033006772 défaut 3) — basename dumpcap
+        // ORIGINAL pour stamper `stable_event_key` : même valeur en
+        // live et en publication.
+        stable_source_file: path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_owned())
+            .unwrap_or_default(),
+    }
+}
+
 /// 2.18.10 — ordre canonique intra-capture d'un lot d'events :
 /// (packet_number du premier paquet, event_id). Tri stable.
 fn sort_by_capture_order(events: &mut [event_schema::NormalizedEvent]) {
@@ -1116,6 +1284,8 @@ pub(crate) fn start_reader(state: AppState) {
         // décodage). Le débit commence « maintenant ». Si false, le
         // premier passage décode normalement (régime nominal).
         let mut initial_catchup_done = false;
+        // 2.21.109 — sessions de reprise à l'offset, par segment.
+        let mut reader_sessions: HashMap<std::path::PathBuf, ReaderSession> = HashMap::new();
         // 2.21.105 — dernier envoi de l'event SSE `stats`.
         let mut last_stats: Option<std::time::Instant> = None;
         loop {
@@ -1141,15 +1311,22 @@ pub(crate) fn start_reader(state: AppState) {
             {
                 let state2 = state.clone();
                 let mut states = file_state;
+                let mut sessions = reader_sessions;
                 let catchup = !initial_catchup_done;
                 let pass_started = std::time::Instant::now();
-                file_state = tokio::task::spawn_blocking(move || {
+                (file_state, reader_sessions) = tokio::task::spawn_blocking(move || {
                     let key = match event_schema::PseudonymKey::load_or_generate(
                         &event_schema::PseudonymKey::resolve_default_path(),
                     ) {
                         Ok(k) => k,
-                        Err(_) => return states,
+                        Err(_) => return (states, sessions),
                     };
+                    // 2.21.109 — repli lu à chaque passe.
+                    let full_redecode = full_redecode_requested();
+                    if full_redecode {
+                        sessions.clear();
+                    }
+                    let mut pass_io: BTreeMap<String, ReaderIo> = BTreeMap::new();
                     // 2.21.105 (ordre #9 7048974175) — amorçage des
                     // traces ouvertes depuis la passe précédente : le
                     // ring de signalisation est relu sans émission
@@ -1197,6 +1374,7 @@ pub(crate) fn start_reader(state: AppState) {
                             .cloned()
                             .collect();
                         for path in &gone {
+                            sessions.remove(path);
                             if let Some(file_state) = states.remove(path) {
                                 let gap = file_state
                                     .size
@@ -1265,38 +1443,56 @@ pub(crate) fn start_reader(state: AppState) {
                                         routed_event_ids: prev.routed_event_ids,
                                     },
                                 );
+                                // 2.21.109 — segment fermé et inchangé :
+                                // clôture de sa session (flux RTP du
+                                // tunnel émis une fois, à la rotation).
+                                if !is_newest && sessions.contains_key(path) {
+                                    let config = ring_decode_config(path, interface);
+                                    for event in close_reader_session(&mut sessions, &config) {
+                                        state2.inner.live_traces.route_normalized(&event);
+                                    }
+                                }
                                 continue;
                             }
                             state2.inner.throughput.bump_file_decoded();
-                            let capture_id = format!(
-                                "sha256:{}",
-                                sha256_hex(path.to_string_lossy().as_bytes())
-                            );
-                            // 2.21.91 (ordre #9 7033006772 défaut 3) — propage
-                            // le basename dumpcap ORIGINAL pour stamper
-                            // `stable_event_key`. Ici `path` EST le fichier
-                            // du ring dumpcap, donc son basename est la
-                            // valeur canonique attendue aussi côté publication
-                            // (même pcapng même basename, qu'il soit lu en
-                            // live ou après copie de staging).
-                            let stable_source_file = path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .map(|s| s.to_owned())
-                                .unwrap_or_default();
-                            let config = oiran_decode::DecodeConfig {
-                                input: path.clone(),
-                                capture_id,
-                                interface: interface.into(),
-                                endpoints: HashMap::new(),
-                                stable_source_file,
-                            };
+                            let config = ring_decode_config(path, interface);
+                            // 2.21.109 (ordre #9 7049845272) — reprise à
+                            // l'offset sur les plans sans état (lot A) :
+                            // seuls les octets ajoutés depuis la passe
+                            // précédente sont décodés. Les autres plans,
+                            // et tous si le repli est demandé, gardent le
+                            // redécodage intégral.
+                            let incremental =
+                                !full_redecode && oiran_decode::supports_incremental(interface);
                             let mut fresh = Vec::new();
-                            let decode_result =
-                                oiran_decode::decode_capture_streaming(&config, &key, |event| {
-                                    fresh.push(event);
-                                    Ok(())
-                                });
+                            let consumed_after;
+                            let mut session_reset = false;
+                            let io = pass_io.entry(interface.to_string()).or_default();
+                            io.incremental = incremental;
+                            io.bytes_file = io.bytes_file.saturating_add(size);
+                            if incremental {
+                                let outcome = decode_increment(&mut sessions, &config, &key, size);
+                                if outcome.reset {
+                                    state2.inner.live_traces.bump_resume_resets();
+                                    session_reset = true;
+                                }
+                                io.bytes_decoded =
+                                    io.bytes_decoded.saturating_add(outcome.bytes_decoded);
+                                consumed_after = outcome.consumed_bytes;
+                                fresh = outcome.events;
+                            } else {
+                                let decode_result =
+                                    oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                                        fresh.push(event);
+                                        Ok(())
+                                    });
+                                io.bytes_decoded = io.bytes_decoded.saturating_add(size);
+                                consumed_after = if decode_result.is_ok() {
+                                    size
+                                } else {
+                                    prev.consumed_bytes
+                                };
+                            }
                             sort_by_capture_order(&mut fresh);
                             // 2.21.78 (corrections 7014327787 + 7014783020)
                             // — **deux dédoublonnages distincts** :
@@ -1311,13 +1507,26 @@ pub(crate) fn start_reader(state: AppState) {
                             //     iperf 10⁵ pps.
                             let mut file_state_entry =
                                 states.remove(path).unwrap_or_default();
+                            if session_reset {
+                                // Fichier remplacé : les filigranes de
+                                // l'ancien contenu ne valent plus.
+                                file_state_entry.last_packet_number = 0;
+                                file_state_entry.last_event_id.clear();
+                            }
+                            if incremental {
+                                // En reprise, chaque event n'est décodé
+                                // qu'une fois : plus de table d'`event_id`.
+                                file_state_entry.routed_event_ids.clear();
+                            }
                             for event in &fresh {
                                 let packet_number = event
                                     .packet_references
                                     .first()
                                     .map(|p| p.packet_number)
                                     .unwrap_or(0);
-                                if file_state_entry.route_once_for_live_trace(&event.event_id) {
+                                if incremental
+                                    || file_state_entry.route_once_for_live_trace(&event.event_id)
+                                {
                                     state2.inner.live_traces.route_normalized(event);
                                 }
                                 if file_state_entry.should_count_in_throughput(
@@ -1335,18 +1544,21 @@ pub(crate) fn start_reader(state: AppState) {
                             }
                             file_state_entry.size = size;
                             file_state_entry.mtime = mtime;
-                            file_state_entry.consumed_bytes = if decode_result.is_ok() {
-                                size
-                            } else {
-                                prev.consumed_bytes
-                            };
+                            file_state_entry.consumed_bytes = consumed_after;
                             states.insert(path.clone(), file_state_entry);
+                            if incremental && !is_newest {
+                                for event in close_reader_session(&mut sessions, &config) {
+                                    state2.inner.live_traces.route_normalized(&event);
+                                }
+                            }
                         }
                     }
                     if states.len() > 1024 {
                         states.clear();
+                        sessions.clear();
                     }
-                    states
+                    state2.inner.live_traces.set_reader_io(pass_io);
+                    (states, sessions)
                 })
                 .await
                 .unwrap_or_default();
@@ -2376,6 +2588,168 @@ mod tests {
         assert_eq!(attached, gpdus.len() as u64, "tous les G-PDU rattachés après amorçage");
         assert_eq!(total, injected, "somme des buckets = octets des G-PDU");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
+        let bytes = fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N3.pcapng"),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "oiran-reader-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        (dir.join("n3_00001.pcapng"), bytes)
+    }
+
+    fn full_event_ids(path: &std::path::Path, key: &event_schema::PseudonymKey) -> Vec<String> {
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(path, "N3"), key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        sort_by_capture_order(&mut events);
+        events
+            .into_iter()
+            .map(|e| format!("{}|{}", e.event_id, e.stable_event_key))
+            .collect()
+    }
+
+    fn ids(events: &[event_schema::NormalizedEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| format!("{}|{}", e.event_id, e.stable_event_key))
+            .collect()
+    }
+
+    /// 2.21.109 (ordre #9 7049845272) — le lecteur ne décode que les
+    /// octets ajoutés : segment écrit en trois fois (dont une coupe au
+    /// milieu d'un bloc), somme des octets décodés = taille du fichier,
+    /// events = ceux du décodage intégral, aucune remise à zéro ; une
+    /// passe sans nouvel octet ne décode rien.
+    #[test]
+    fn decode_increment_reads_only_appended_bytes_2_21_109() {
+        let (path, bytes) = n3_ring_file("append");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let config = ring_decode_config(&path, "N3");
+        let mut sessions = HashMap::new();
+        let mut events = Vec::new();
+        let mut decoded = 0u64;
+        for cut in [bytes.len() / 3 + 5, 2 * bytes.len() / 3 + 3, bytes.len(), bytes.len()] {
+            fs::write(&path, &bytes[..cut]).unwrap();
+            let outcome = decode_increment(&mut sessions, &config, &key, cut as u64);
+            assert!(outcome.ok && !outcome.reset);
+            assert!(outcome.consumed_bytes <= cut as u64);
+            decoded += outcome.bytes_decoded;
+            events.extend(outcome.events);
+        }
+        assert_eq!(decoded, bytes.len() as u64, "chaque octet décodé une seule fois");
+        sort_by_capture_order(&mut events);
+        assert_eq!(ids(&events), full_event_ids(&path, &key));
+        assert!(close_reader_session(&mut sessions, &config).is_empty(), "pas de flux RTP ici");
+        assert!(sessions.is_empty(), "session oubliée à la clôture");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 2.21.109 (ordre #9 7049845272) — fichier remplacé par un autre de
+    /// taille supérieure : la session est jetée une fois (`reset`), le
+    /// nouveau fichier est décodé depuis 0 et ses events sont ceux de
+    /// son décodage intégral. Deux formes de remplacement : par
+    /// renommage (inode différent, même début de fichier) et par
+    /// réécriture sur place (même inode, derniers octets consommés
+    /// modifiés).
+    #[test]
+    fn decode_increment_resets_when_file_is_replaced_by_a_larger_one_2_21_109() {
+        let (path, bytes) = n3_ring_file("replace");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let config = ring_decode_config(&path, "N3");
+        // Fichier plus grand : deux sections pcapng bout à bout.
+        let mut larger = bytes.clone();
+        larger.extend_from_slice(&bytes);
+
+        // (1) remplacement par renommage.
+        let mut sessions = HashMap::new();
+        fs::write(&path, &bytes).unwrap();
+        let first = decode_increment(&mut sessions, &config, &key, bytes.len() as u64);
+        assert!(first.ok && !first.reset && !first.events.is_empty());
+        let staged = path.with_extension("staged");
+        fs::write(&staged, &larger).unwrap();
+        fs::rename(&staged, &path).unwrap();
+        let mut resets = 0;
+        let mut replaced = decode_increment(&mut sessions, &config, &key, larger.len() as u64);
+        resets += usize::from(replaced.reset);
+        assert_eq!(replaced.bytes_decoded, larger.len() as u64, "relu depuis 0");
+        sort_by_capture_order(&mut replaced.events);
+        assert_eq!(ids(&replaced.events), full_event_ids(&path, &key));
+        let again = decode_increment(&mut sessions, &config, &key, larger.len() as u64);
+        resets += usize::from(again.reset);
+        assert_eq!(resets, 1, "resume_resets = 1 pour un remplacement");
+        assert_eq!(again.bytes_decoded, 0);
+
+        // (2) réécriture sur place : même inode, contenu consommé modifié.
+        let mut sessions = HashMap::new();
+        fs::write(&path, &bytes).unwrap();
+        let first = decode_increment(&mut sessions, &config, &key, bytes.len() as u64);
+        assert!(!first.reset);
+        let inode_before = device_inode(&path);
+        let mut rewritten = larger.clone();
+        // Dernier octet de données du dernier paquet du premier bloc :
+        // 5 octets avant la fin (les 4 derniers sont la longueur du bloc).
+        let flip = bytes.len() - 5;
+        rewritten[flip] ^= 0xff;
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all(&rewritten).unwrap();
+        }
+        assert_eq!(device_inode(&path), inode_before, "réécriture sur place");
+        let mut replaced = decode_increment(&mut sessions, &config, &key, rewritten.len() as u64);
+        assert!(replaced.reset, "contenu consommé modifié → remise à zéro");
+        assert_eq!(replaced.bytes_decoded, rewritten.len() as u64);
+        sort_by_capture_order(&mut replaced.events);
+        assert_eq!(ids(&replaced.events), full_event_ids(&path, &key));
+
+        // (3) fichier tronqué sous l'offset consommé.
+        fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        let truncated = decode_increment(&mut sessions, &config, &key, (bytes.len() / 2) as u64);
+        assert!(truncated.reset);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 2.21.109 — l'event `stats` porte le bloc `reader` : remises à
+    /// zéro, octets décodés contre taille par plan, et l'état du repli.
+    /// Le repli se pilote par `OIRAN_LIVE_READER_FULL_REDECODE`.
+    #[test]
+    fn stats_expose_reader_io_and_full_redecode_switch_2_21_109() {
+        let r = LiveTraceRegistry::new();
+        r.bump_resume_resets();
+        r.set_reader_io(BTreeMap::from([(
+            "N3".to_string(),
+            ReaderIo {
+                bytes_decoded: 1_500,
+                bytes_file: 30_000_000,
+                incremental: true,
+            },
+        )]));
+        // Une passe sans décodage garde le dernier relevé.
+        r.set_reader_io(BTreeMap::new());
+        let stats = r.stats_payload(&state(u64::MAX, false, vec![]).trace);
+        assert_eq!(stats["reader"]["resume_resets"], 1);
+        assert_eq!(stats["reader"]["interfaces"]["N3"]["bytes_decoded"], 1_500);
+        assert_eq!(stats["reader"]["interfaces"]["N3"]["bytes_file"], 30_000_000);
+        assert_eq!(stats["reader"]["interfaces"]["N3"]["incremental"], true);
+        // Seul ce test écrit cette variable d'environnement.
+        std::env::remove_var(FULL_REDECODE_ENV);
+        assert!(!full_redecode_requested(), "reprise à l'offset par défaut");
+        std::env::set_var(FULL_REDECODE_ENV, "1");
+        let requested = full_redecode_requested();
+        std::env::remove_var(FULL_REDECODE_ENV);
+        assert!(requested, "le repli est atteignable sans redéploiement");
     }
 
     #[test]
