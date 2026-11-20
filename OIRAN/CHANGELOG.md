@@ -1,5 +1,84 @@
 # Changelog
 
+## OIRAN API 2.21.102 — 2026-11-20 — stable_event_key dérivée à la lecture pour les données stockées (défaut ANR1 #9 7044712668, ordre #9 7045732954 point 2, CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.101-train` @ `80d7527`. Branche `fix/oiran-2.21.102-stable-event-key-read-time`.
+
+### Défaut adressé
+
+ANR1 (#9 7044712668) : les callflows publiés AVANT 2.21.91 (= avant que `stable_event_key` soit injecté à l'écriture par event-schema 1.6.0 / callflow-schema 1.5.0) ne portent PAS le champ. La route `GET /sessions/:id/callflow` renvoie des events sans clé stable. 2.21.95 l'ajoute aux contrats de sortie mais ne couvre pas les fichiers callflow déjà écrits sur disque.
+
+### Correctif
+
+**Dérivation à la LECTURE**, sans réécriture disque, avec la MÊME formule que la republication live.
+
+- **event-schema 1.9.0 → 1.10.0** — `pub fn backfill_stable_event_keys_in_callflow(value: &mut serde_json::Value) -> (usize, usize)`. Patche en place les events d'un callflow (JSON Value) qui n'ont pas `stable_event_key`. Utilise `derive_stable_event_key` + `packet_lookup_key` (déjà publics). Ordinal 0-based dans l'ordre d'apparition (= ordre d'émission du décodeur, invariant depuis 2.21.91). Retourne `(patched, skipped_no_packet_references)` pour tracer OUVERT si des events sans provenance existent. `serde_json` passe de `[dev-dependencies]` à `[dependencies]` (impact : path-deps internes uniquement).
+- **session-engine 0.5.25 → 0.5.26** — `pub fn backfill_stable_event_keys(events: &mut [EventRecord])`. Appelé par `load_jsonl` + `load_jsonl_slim` AVANT `deterministic_sort` (ordre de fichier préservé pour que les ordinaux coïncident avec la republication live).
+- **live-probe 0.6.29 → 0.6.30** — `callflow_page::read_callflow_page` patche le résultat de la pagination via `event_schema::backfill_stable_event_keys_in_callflow` avant de retourner.
+- **oiran-api 2.21.101 → 2.21.102** — `callflow_page_from_value` patche le callflow lu depuis `state.inner.flow_values` (chemin reference_dataset).
+
+### Tests ajoutés (4)
+
+- `event-schema::backfill_stable_event_keys_in_callflow_fills_missing_keys_in_order` — prouve la formule + l'ordinal par ordre d'apparition (NGAP parent `|NGAP|0`, NAS enfant même paquet `|NAS-5GS-MM|1`, événement paquet différent `|NGAP|0`).
+- `event-schema::backfill_stable_event_keys_in_callflow_preserves_existing_keys` — idempotence : clé existante non vide laissée intacte.
+- `event-schema::backfill_stable_event_keys_in_callflow_skips_events_without_packet_references` — events sans provenance comptés dans `skipped` (écart OUVERT exposable).
+- `oiran-api::sessions_callflow_backfills_missing_stable_event_key_from_stored_fixture_2_21_102` — test E2E par la route : callflow pre-2.21.91 écrit sur disque **sans** `stable_event_key` sur AUCUN des 5 events → `GET /sessions/:id/callflow` renvoie 100 % de clés non vides, strictement égales à celles qu'aurait produites la republication live (identité bit-à-bit avec `derive_stable_event_key`). Inclut NGAP parent + NAS enfant sur même paquet pour prouver l'unicité par event via `|protocol|ordinal`.
+
+### Préflight + preuves (règle CPU #9 7018292949 amendée 7034385961)
+
+```
+cat /proc/pressure/cpu    → full avg10=0.00  (GO)
+cat /proc/pressure/memory → full avg10=0.02  (GO, <1)
+cat /proc/pressure/io     → full avg10=0.00  (GO, <20)
+```
+
+Build + tests sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 cargo … -j 2` :
+
+```
+cargo build -p oiran-api --release -j 2
+→ Finished `release` profile [optimized] target(s) in 4m 23s
+
+cargo test --locked --release --workspace -j 2 -- --test-threads=2
+→ sum passed = **886** ; sum failed = **0** ; EXIT=0
+
+cd vtap && cargo update -w
+→ Locking 1 package : event-schema v1.9.0 → v1.10.0
+
+cd vtap && cargo test --locked --release -j 2
+→ 12 + 3 = 15 passed ; 0 failed
+
+python3 /tmp/audit.py Cargo.lock vtap/Cargo.lock
+→ Total violators MSRV > 1.83 : **0**
+```
+
+12 runs à 0 échec sur les tests ajoutés :
+
+```
+=== 12 runs 2.21.102 ===
+run 1  : ok rcs=0/0 dur=25s passed=4
+run 2  : ok rcs=0/0 dur=38s passed=4
+run 3  : ok rcs=0/0 dur=21s passed=4
+run 4  : ok rcs=0/0 dur=1s  passed=4
+…
+run 12 : ok rcs=0/0 dur=1s  passed=4
+FAILURES=0 / 12
+```
+
+4 passed par run = 3 event-schema (backfill_*) + 1 oiran-api E2E par la route.
+
+### Non-régression + écarts
+
+- Les 10 tests stable_event_key de 2.21.91 (`derive_stable_event_key_*`, `assign_stable_event_key_*`) + les 3 tests `backfill_*` cohabitent : backfill n'écrase jamais une clé non vide.
+- Les 2 sites `load_jsonl` / `load_jsonl_slim` appellent le backfill en ORDRE DE FICHIER, avant `deterministic_sort` qui re-trie par `(capture_id, packet_number, event_id)`. Ainsi les ordinaux d'un dataset relu correspondent à ceux qu'aurait produits le live decoder (invariant par construction).
+- **Écart déclaré OUVERT** potentiel : un event sans `packet_references` reste sans clé (compté dans `skipped`). Aucun callflow en prod n'est dans ce cas (la provenance est un invariant `has_complete_provenance` du décodeur 2.7.11+), mais la fonction expose le compteur pour tracer si observé.
+
+### Livrables
+
+- Branche `fix/oiran-2.21.102-stable-event-key-read-time` poussée après `cargo test --locked -p oiran-api --lib` vert.
+- Pas de déploiement. Pas de force-push. Pas de `#[ignore]` ajouté.
+
+---
+
 ## oiran-api 2.21.101 — 2026-11-20 — train final (cœur) : 2.21.97 + 2.21.98 (fuite `ue_info.keys`) + 2.21.99 (débit live)
 
 - Merge `--no-ff` de `fix/oiran-2.21.98-live-keys-leak` @ 922cf7f et de `fix/oiran-2.21.99-live-throughput` @ 5cfffa7 sur `fix/oiran-2.21.97-train` @ 37747ef.

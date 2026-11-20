@@ -209,7 +209,7 @@ pub fn read_callflow_page(
     let file = File::open(path).map_err(|error| format!("CALLFLOW_OPEN_FAILED: {error}"))?;
     let reader = BufReader::with_capacity(1024 * 1024, file);
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    CallflowPageSeed { cursor, limit }
+    let mut page = CallflowPageSeed { cursor, limit }
         .deserialize(&mut deserializer)
         .map_err(|error| {
             let message = error.to_string();
@@ -218,7 +218,18 @@ pub fn read_callflow_page(
             } else {
                 format!("CALLFLOW_READ_FAILED: {message}")
             }
-        })
+        })?;
+    // 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954) —
+    // backfill `stable_event_key` à la lecture pour les callflows
+    // publiés AVANT 2.21.91 (le champ y est absent). Formule
+    // identique à la republication live, ordinal 0-based en ordre
+    // d'émission. Pas de réécriture disque. Note : chaque page de
+    // pagination redémarre son compteur ; par construction, les
+    // events d'un même paquet sont dans la MÊME page (pagination
+    // par event_id en ordre de fichier, aucun split possible entre
+    // parent et enfant même-paquet).
+    event_schema::backfill_stable_event_keys_in_callflow(&mut page);
+    Ok(page)
 }
 
 #[cfg(test)]

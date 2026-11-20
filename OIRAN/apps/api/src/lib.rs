@@ -8177,7 +8177,15 @@ fn callflow_page_from_value(
     if !(1..=MAX_CALLFLOW_PAGE_EVENTS).contains(&limit) {
         return Err("CALLFLOW_LIMIT_INVALID".into());
     }
-    let source_object = source.as_object().ok_or("CALLFLOW_READ_FAILED")?;
+    // 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954) —
+    // backfill `stable_event_key` à la lecture pour les callflows
+    // publiés AVANT 2.21.91 (le champ y est absent). Formule
+    // identique à la republication live, ordinal 0-based en ordre
+    // d'émission du décodeur (= ordre des events dans le JSON
+    // callflow). Pas de réécriture disque.
+    let mut owned = source.clone();
+    event_schema::backfill_stable_event_keys_in_callflow(&mut owned);
+    let source_object = owned.as_object().ok_or("CALLFLOW_READ_FAILED")?;
     let source_events = source_object
         .get("events")
         .and_then(Value::as_array)
@@ -17273,6 +17281,200 @@ mod tests {
         assert!(k_ngap.starts_with("N2.pcapng|0|7|40|"));
         assert!(k_nas.starts_with("N2.pcapng|0|7|40|"));
         assert_ne!(k_ngap, k_nas, "parent + enfant même paquet, clés distinctes");
+    }
+
+    /// 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954 point 2) —
+    /// clé sur **données stockées**. Un callflow persisté AVANT
+    /// 2.21.91 (le champ `stable_event_key` est ABSENT du JSON disque)
+    /// doit, à la lecture par la route `/sessions/:id/callflow`,
+    /// rendre 100 % de clés **identiques** à celles qu'aurait émises
+    /// une republication live.
+    ///
+    /// Modélisation :
+    ///   1. callflow écrit sur disque sans `stable_event_key` sur
+    ///      aucun des 5 events (dont NGAP parent + NAS enfant sur
+    ///      le même paquet) — exactement la forme pre-2.21.91 ;
+    ///   2. `AppState::load` ; puis `GET /sessions/:id/callflow` ;
+    ///   3. 100 % des events renvoyés par la route portent
+    ///      `stable_event_key` non vide, dérivée à la LECTURE par
+    ///      `backfill_stable_event_keys_in_callflow` ;
+    ///   4. chaque clé respecte exactement la formule
+    ///      `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}`
+    ///      — identique à celle qu'aurait produite la republication
+    ///      (invariant garanti par la fonction `derive_stable_event_key`
+    ///      commune).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_callflow_backfills_missing_stable_event_key_from_stored_fixture_2_21_102() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dataset_name = format!("callflow-backfill-{suffix}");
+        let dataset_dir_guard =
+            AutoRemoveDir::new(workspace.join("datasets").join(&dataset_name));
+        let dataset_dir = dataset_dir_guard.as_pathbuf();
+        let session_id = "sess-backfill-2-21-102";
+
+        // Fixture pré-2.21.91 : AUCUN event ne porte `stable_event_key`.
+        // 5 events dont NGAP parent + NAS enfant sur le même paquet (7, 40).
+        let make_pre_2_21_91 = |event_id: &str,
+                               packet_number: u64,
+                               byte_offset: u64,
+                               protocol: &str| {
+            json!({
+                "event_id": event_id,
+                // PAS de `stable_event_key` — dataset pre-2.21.91.
+                "timestamp": "2026-11-20T18:00:00.000000000Z",
+                "timestamp_ns": "0",
+                "interface": "N2",
+                "protocol": protocol,
+                "message_name": "InitialUEMessage",
+                "source_participant": "gNB",
+                "destination_participant": "AMF",
+                "direction": "RAN_TO_CORE",
+                "decoded_ie_tree": [],
+                "decoding_status": "DECODED",
+                "semantic_status": "EXACT",
+                "association": "SESSION",
+                "procedure_group": "Registration",
+                "packet_references": [{
+                    "source_file": "/var/lib/oiran/ring/n2/N2.pcapng",
+                    "packet_number": packet_number,
+                    "byte_offset": byte_offset,
+                    "interface_id": 0u32,
+                    "captured_length": 64u32,
+                    "original_length": 64u32,
+                }],
+                "capture_id": "sha256:pre-2-21-91",
+                "decoder_name": "decoder-ngap",
+                "decoder_version": "0.6.0",
+                "raw_payload_reference": "sha256:payload",
+                "errors": [],
+            })
+        };
+        let events = json!([
+            make_pre_2_21_91("evt-ngap-init-01", 7, 40, "NGAP"),
+            make_pre_2_21_91("evt-nas-regreq-01", 7, 40, "NAS-5GS-MM"),
+            make_pre_2_21_91("evt-ngap-init-02", 12, 200, "NGAP"),
+            make_pre_2_21_91("evt-nas-regreq-02", 12, 200, "NAS-5GS-MM"),
+            make_pre_2_21_91("evt-ngap-release-03", 42, 1_024, "NGAP"),
+        ]);
+        let callflow = json!({
+            "callflow_id": format!("cf-{session_id}"),
+            "session_id": session_id,
+            "technology": "5G SA",
+            "start_timestamp": "2026-11-20T18:00:00Z",
+            "end_timestamp": "2026-11-20T18:00:01Z",
+            "participants": [],
+            "interfaces": ["N2"],
+            "procedures": [],
+            "events": events,
+            "correlation_edges": [],
+            "correlation_status": {},
+            "decoder_versions": {"decoder-ngap":"0.6.0","decoder-nas":"0.4.0"},
+            // Schéma pre-2.21.91 (= 1.5.0).
+            "schema_version": "1.5.0",
+            "capture_references": ["sha256:pre-2-21-91"],
+            "accounting": {"source_events":5,"session_events":5,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields": 0,
+        });
+        let callflow_json_path = dataset_dir.join("callflow.json");
+        fs::write(&callflow_json_path, serde_json::to_vec_pretty(&callflow).unwrap())
+            .unwrap();
+        fs::write(dataset_dir.join("callflow.html"), b"<html>stub</html>").unwrap();
+        fs::write(dataset_dir.join("synthetic.pcap"), b"\0").unwrap();
+        fs::write(dataset_dir.join("oiran_events.jsonl"), b"").unwrap();
+        fs::write(
+            dataset_dir.join("scenario_manifest.json"),
+            json!({
+                "scenario_id": "callflow-backfill-2.21.102",
+                "captures": [{
+                    "file": "synthetic.pcap",
+                    "capture_id": "sha256:pre-2-21-91",
+                    "name": "synthetic.pcap",
+                    "interface": "N2",
+                    "sha256": "0".repeat(64),
+                    "packet_count": 1,
+                    "size_bytes": 1,
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut config = test_config(workspace, &format!("registry-{dataset_name}"));
+        config.dataset_dir = dataset_dir.clone();
+        config.callflow_json = callflow_json_path.clone();
+        config.callflow_html = dataset_dir.join("callflow.html");
+        config.reference_dataset_enabled = true;
+        let state = AppState::load(config)
+            .expect("AppState::load succeeds on pre-2.21.91 callflow fixture");
+
+        let response = router(state, None)
+            .oneshot(req(
+                &format!("/api/v1/sessions/{session_id}/callflow?limit=100"),
+                true,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let events_out = body["data"]["events"]
+            .as_array()
+            .expect("data.events array");
+        assert_eq!(events_out.len(), 5);
+
+        // Preuve 1 — 100 % des events exposés portent `stable_event_key`
+        // non vide, alors que la fixture disque n'en portait AUCUN.
+        for (idx, event) in events_out.iter().enumerate() {
+            let key = event["stable_event_key"]
+                .as_str()
+                .unwrap_or_else(|| panic!("event #{idx} manque stable_event_key : {event}"));
+            assert!(!key.is_empty(), "event #{idx} clé vide");
+        }
+
+        // Preuve 2 — les valeurs sont strictement identiques à celles
+        // qu'aurait produites `derive_stable_event_key` (= republication
+        // live). Formule reproduite in situ pour comparaison :
+        let expected_keys = vec![
+            "N2.pcapng|0|7|40|NGAP|0",
+            "N2.pcapng|0|7|40|NAS-5GS-MM|1",
+            "N2.pcapng|0|12|200|NGAP|0",
+            "N2.pcapng|0|12|200|NAS-5GS-MM|1",
+            "N2.pcapng|0|42|1024|NGAP|0",
+        ];
+        for (idx, (event, expected)) in
+            events_out.iter().zip(expected_keys.iter()).enumerate()
+        {
+            assert_eq!(
+                event["stable_event_key"].as_str().unwrap(),
+                *expected,
+                "event #{idx} ({}) key mismatch",
+                event["event_id"]
+            );
+        }
+
+        // Preuve 3 — unicité par event (parent + enfant sur même
+        // paquet se discriminent via `|protocol|ordinal`).
+        let keys: std::collections::BTreeSet<&str> = events_out
+            .iter()
+            .filter_map(|e| e["stable_event_key"].as_str())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            events_out.len(),
+            "chaque event a sa propre clé après backfill"
+        );
     }
 }
 
