@@ -1,5 +1,92 @@
 # Changelog
 
+## OIRAN API 2.21.92 — 2026-11-20 — correctif BLOQUANT double tampon basculé vide (ordre #9 7035807909 CLAUDE2)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174`. Branche `fix/oiran-2.21.92-prewarm-swap-guard`. Numerology CLAUDE2 = pair. Référence terrain : ANR1 recette 2.21.89 #10 `7035121536` (`SESSIONS_FILTER_GENERATION_SWAP generation=2 session_count=0 bytes_estimate=375010` alors que `/health.session_count=325, published_session_count=325, queryable_session_count=325` — 1 réponse `meta.total=0 data=[]` renvoyée aux clients SSE).
+
+### Cause confirmée (lecture `apps/api/src/lib.rs` @ `f600174`, `prewarm_session_filter_caches_locked`)
+
+1. **`ready = deferred==0 && missing==0` à vide** (l. 3874) : si `datasets()` ou `state.inner.flows` sont transitoirement vides pendant un commit de publication, `prewarm_live_list_row_cache_locked` n'itère rien et renvoie `stats = 0/0/0` ⇒ `ready=true`. Une bascule à `session_count=0` est alors acceptée.
+2. **Replis silencieux** (l. 3889-3915) : `.read().unwrap_or_else(|_| Arc::new(SessionFilterIndex::empty()))`, `.lock().ok().and_then(...).unwrap_or_else(|| Arc::new(JourneyIndex::default()))`, `.lock().ok().map(...).unwrap_or_default()`. Un verrou empoisonné (panic d'un autre thread) ou un cache non construit produit une génération vide **sans la moindre erreur**.
+3. **Aucune comparaison** entre le `session_count` de la génération candidate et `/health.published_session_count` : la bascule n'avait aucune garde sémantique. C'est exactement le FAIL ANR1.
+
+### Correctif (ordre #9 7035807909, trois axes)
+
+**a. Cause** — refus explicite au niveau de l'écriture. Plus de repli silencieux :
+```
+match state.inner.session_filter_index.read()        → Err ⇒ record_swap_refused("session_filter_index_lock_poisoned"); return
+match state.inner.journey_index_cache.lock()         → Err ⇒ "journey_index_cache_lock_poisoned"
+                                                     → Ok(None) ⇒ "journey_index_cache_empty"
+match state.inner.list_row_cache.lock()              → Err ⇒ "list_row_cache_lock_poisoned"
+```
+
+**b. Garde de bascule** — fonction pure `swap_refusal_reason(candidate, published) -> Option<&'static str>` :
+```
+Some("session_count_mismatch") si candidate != published
+None sinon (y compris 0/0 vrai zéro bootstrap)
+```
+Appel juste avant l'écriture dans `generation_slot`. `published_session_count_snapshot(state)` réplique exactement la logique `/health.published_session_count` (lignes 1462-1480 du train 2.21.89) : `flows.len()` OR, si vide, `continuous.session_ids.len()`. **L'ancienne génération reste servie** par la route `/sessions/filter` (l'`Arc<FilterGeneration>` précédent reste dans `generation_slot`), aucune 503 n'est provoquée par la garde.
+
+**c. Observabilité** — nouveau champ `generation_swap_refused: Mutex<GenerationSwapRefusedState>` dans `InnerState` (`total, last_epoch_ms, last_reason, last_candidate_session_count, last_published_session_count, last_trigger`). Exposé sous `data.sessions_filter_generation_swap_refused` dans `/health`. Nouvel event JSON `SESSIONS_FILTER_GENERATION_SWAP_REFUSED` journalisé via `eprintln` avec les mêmes coordonnées (trigger, reason, candidate_session_count, published_session_count, epoch_ms). Fonction `record_swap_refused(state, trigger, reason, candidate, published)`.
+
+### Tests ajoutés (5, dans `apps/api/src/lib.rs::tests`)
+
+1. `swap_refusal_reason_catches_empty_candidate_against_published_2_21_92` — logique pure, matrice complète : `(0,325)` refus, `(324,325)` refus (régression partielle), `(326,325)` refus (sur-dimensionnement), `(325,325)` ok, `(0,0)` ok (vrai zéro). **Prouve que le scénario ANR1 est attrapé.**
+2. `published_session_count_snapshot_follows_flows_count_2_21_92` — oracle stable sur `operator_state()` (reference dataset chargé).
+3. `record_swap_refused_updates_counter_and_last_fields_2_21_92` — 2 refus successifs, vérifie `total=2` + les derniers champs reflètent le second (last-write-wins).
+4. `health_exposes_sessions_filter_generation_swap_refused_counter_2_21_92` — GET `/health` avant/après refus : expose `{total, last_reason, last_trigger, last_candidate_session_count, last_published_session_count, last_epoch_ms}`.
+5. `prewarm_consistent_state_swaps_without_refusal_2_21_92` — preuve négative : `operator_state()` cohérent (flows>0, filter_index aligné) ⇒ `prewarm` bascule sans refus, `session_count == published_session_count`, `generation_swap_refused.total == 0`.
+
+### Tests 2.21.85 non régressés
+
+Les 2 tests double tampon de CLAUDE1 (`sessions_filter_first_boot_without_any_ready_generation_returns_503_2_21_85`, `sessions_filter_serves_generation_after_file_gc_2_21_85`) passent dans les 222 — la garde `swap_refusal_reason` ne bloque pas les cas de bascule légitime (first-boot vrai zéro ; GC survival où `ready=false` bail out plus tôt, jamais atteint la garde).
+
+### Preuves (règle CPU #9 7018292949 + amendement #9 7034385961)
+
+Préflight final :
+```
+cat /proc/pressure/cpu    → some avg10=0.16 full avg10=0.00  (GO ; seuil amendé: cpu full<1)
+cat /proc/pressure/memory → full avg10=0.00  (GO ; seuil amendé: mem full<1)
+free -b (avail)           → 9 145 712 640 (≥ 4 GiB GO)
+df -B1 / (avail)          → 29 485 322 240 (≥ 25 Go GO)
+pgrep -af "cargo|rustc"   → (vide avant start)
+```
+
+12 runs tests `oiran-api --lib` sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2` :
+```
+Run  1 → 222 passed; 0 failed; 3 ignored; 14.18 s
+Run  2 → 222 passed; 0 failed; 3 ignored; 15.09 s
+Run  3 → 222 passed; 0 failed; 3 ignored; 15.13 s
+Run  4 → 222 passed; 0 failed; 3 ignored; 15.18 s
+Run  5 → 222 passed; 0 failed; 3 ignored; 14.67 s
+Run  6 → 222 passed; 0 failed; 3 ignored; 14.79 s
+Run  7 → 222 passed; 0 failed; 3 ignored; 14.02 s
+Run  8 → 222 passed; 0 failed; 3 ignored; 14.98 s
+Run  9 → 222 passed; 0 failed; 3 ignored; 14.52 s
+Run 10 → 222 passed; 0 failed; 3 ignored; 15.00 s
+Run 11 → 222 passed; 0 failed; 3 ignored; 14.62 s
+Run 12 → 222 passed; 0 failed; 3 ignored; 14.74 s
+```
+222 = 217 historiques (train 2.21.89) + 5 ajoutés 2.21.92. `3 ignored` = tests réseau historiques, aucun `#[ignore]` ajouté par 2.21.92. cpu some avg10 (pression /30 s pendant la boucle) : before Run 1 = 0.15 ; after Run 12 = 0.14 ; jamais `full > 0` sur CPU ni mémoire.
+
+Audit lock Rust 1.83 : `OIRAN/Cargo.lock` ligne 677 passée à `version = "2.21.92"` (seul changement). `cargo check --locked` implicite passe (sinon `test --locked` échouerait). OIRAN/vtap non concerné — aucun bump de crate partagée.
+
+### Fichiers touchés
+
+- `OIRAN/apps/api/src/lib.rs` : +200 lignes ~ (struct `GenerationSwapRefusedState`, champ `generation_swap_refused` dans `InnerState` + initialisation dans 2 constructeurs, helpers `swap_refusal_reason` + `published_session_count_snapshot` + `record_swap_refused`, refonte du bloc `if ready` de `prewarm_session_filter_caches_locked` (3 verrous explicites + garde de bascule), exposition sous `/health.sessions_filter_generation_swap_refused`, 5 tests).
+- `OIRAN/apps/api/Cargo.toml` : `version = "2.21.92"`.
+- `OIRAN/Cargo.lock` : ligne 677 `oiran-api = "2.21.92"`.
+- `OIRAN/CHANGELOG.md` : ce bloc.
+
+### Scope et coordination #9
+
+- Lot indépendant de 2.21.90 (défauts 1 + 2 ACCEPTÉS `44ba484`) et de 2.21.91 (défaut 3 en cours CLAUDE1 `ac1bcc9`). Zone touchée : `lib.rs` uniquement. `live_trace.rs` intact ⇒ 0 intersection avec 2.21.90/91.
+- Le train 2.21.93 (CLAUDE1) empilera 2.21.89 + 2.21.92 + 2.21.90 + 2.21.91 via `merge --no-ff`. L'ordre d'empilage privilégie 2.21.92 avant 2.21.90 car le correctif bloquant doit entrer avant les features (= l'option B du cœur dans `7035284990` + `7035807909`).
+
+### Écarts
+
+- **AUCUN écart non déclaré.** Verrou `nsplus-heavy-build.lock` libre au préflight, aucune contention observée pendant les 12 runs.
+
 ## OIRAN API 2.21.89 — 2026-11-19 — train de livraison : 2.21.87 + 2.21.88 merge --no-ff (ordre #9 7019778994 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.87-train` @ `592b0e3` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.89-train`. Numerology CLAUDE1 = impair. **Candidat unique de prod**, recetté ensuite par ANR2.
