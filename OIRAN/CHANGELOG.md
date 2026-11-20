@@ -1,5 +1,51 @@
 # Changelog
 
+## oiran-api 2.21.122 — 2026-11-20 — trace live : la voix rattachée par l'identifiant d'appel SIP, et l'appelant hors de la trace de l'appelé (ordres #9 7052446877 et 7052593612)
+
+Upgrade **patch** sans déploiement, un commit au-dessus du train 2.21.121 @ `d4d7781`. Branches `fix/oiran-2.21.122-trace-sip-call-id` et `fix/oiran-2.21.121-train` (avance rapide). Seul `apps/api/src/live_trace.rs` change.
+
+### Audit — régression introduite par 2.21.109
+
+Un event de flux RTP (`decoder-rtp`, `RTP Flow`) ne porte comme identifiant que `sip_call_id`, non pseudonymisé. Jusqu'à 2.21.108 il entrait dans une trace par le défaut d'isolement d'alors : toute valeur d'un event rattaché devenait une clé de rattachement par sous-chaîne. 2.21.109 a fermé ce défaut et, avec lui, le seul chemin de rattachement des flux RTP : **depuis 2.21.109, aucun flux RTP n'entre dans une trace voix**, ni sur `IMS` ni sur `N3-IMS`. De même, un message SIP du dialogue qui ne porte pas l'identité de l'abonné n'était plus rattaché.
+
+**Reproduit avant correctif** : `rtp_flows_and_dialog_messages_attach_by_exact_sip_call_id_2_21_122` à `d4d7781` → `left: ["evt-sip-0001"]`, seul l'INVITE entre ; le 180 Ringing et les deux flux RTP manquent.
+
+### Comment un SIP est rattaché à l'abonné (question du cœur)
+
+Par le code de `decoder-sip` :
+- `subscriber_pseudonym` : pseudonyme unifié (même domaine que le NAS) des chiffres IMSI / MSISDN de la partie utilisateur de l'URI **From** — présent dans `session_identifiers` et dans les IE ;
+- `peer_subscriber_pseudonym` et `request_subscriber_pseudonym` : le même calcul sur l'URI **To** et l'URI de requête — dans les IE seulement ;
+- `sdp.c_ue_ip_pseudonym` : pseudonyme de l'IP UE du SDP, égal à celui que la trace apprend sur l'adresse PDU du NAS.
+Un SIP est donc rattaché quand l'une de ces valeurs égale un pseudonyme de la trace. **Le trou** : un SIP dont les URI n'ont pas de partie utilisateur numérique (`sip:alice@…`) et qui ne porte pas de SDP n'est rattaché par rien — pas de pseudonyme unifié, pas d'IP UE. `from_uri_pseudonym` / `to_uri_pseudonym` existent mais ne correspondent à aucune identité connue de la trace. Ce lot comble le trou pour la suite d'un dialogue déjà rattaché, pas pour un dialogue dont aucun message n'est rattachable.
+
+### Audit — I1 : l'appelant entrait dans la trace de l'appelé (sonde CLAUDE2 #9 7052558777, antérieur : 2.21.98)
+
+Tout pseudonyme des `session_identifiers` d'un event rattaché devenait une clé de rattachement et une clé exposée (`ue_info`). Sur un SIP, le `subscriber_pseudonym` des `session_identifiers` est celui du **From**. Quand l'abonné tracé est **appelé**, l'INVITE est rattaché par le To, et c'est le pseudonyme de l'appelant qui était appris et exposé ; sa signalisation suivait, puis ses identifiants UE, ses tunnels et son trafic. Reproduit avant correctif : `a_trace_on_the_callee_never_learns_the_caller_2_21_122` à `d4d7781` (résultat ci-dessous).
+
+**Le même motif hors SIP** : par `grep 'pseudonymized: true'` dans les décodeurs, cinq en posent dans `session_identifiers` — `decoder-nas`, `decoder-s1ap`, `decoder-gtpv2c`, `decoder-sbi`, `decoder-sip`. Seul `decoder-sip` y met une identité qui peut désigner le pair ; les autres portent l'identité du sujet de la procédure (SUPI, GPSI, identité temporaire, IP UE). **Non vérifié** : un message SBI portant deux abonnés (transfert d'appel, par exemple) — je n'en ai trouvé aucun dans le code du décodeur, sans capture pour le confirmer.
+
+### Correctif
+
+- **I1** : un event SIP n'apprend ni n'expose un pseudonyme que la trace ne connaît pas déjà. Règle : un pseudonyme d'abonné n'est appris que sur un event où il désigne l'abonné de la trace, jamais le pair.
+- `sip_call_id` est appris **uniquement sur un SIP déjà rattaché**, rangé par appel, et comparé par **égalité exacte** — aucune sous-chaîne. Il rattache les SIP du même dialogue et les events de flux RTP de l'appel.
+- Fin de dialogue (réponse 2xx à un BYE, lue dans l'IE `CSeq`) : l'appel passe dans les appels terminés. Il ne rattache plus aucun SIP ; il rattache encore son flux RTP, parce que l'event de flux RTP n'est émis qu'à la clôture du segment, donc après le BYE.
+- Détachement et expiration de la trace : tout est oublié.
+
+### OUVERT
+
+- Events synthétiques seulement : aucune capture IMS réelle dans le dépôt. À vérifier au lab sur un appel voix : `interfaces.IMS.attached`, et la présence d'un `RTP Flow` dans la trace après la rotation du segment.
+- Un appel terminé reste connu (pour son flux RTP) jusqu'au détachement ou à l'expiration de la trace. Un `sip_call_id` est un identifiant aléatoire propre à un appel ; le risque de réattribution est tenu pour négligeable, non mesuré.
+- Un dialogue qui se termine sans 2xx au BYE vu par la trace (CANCEL, échec, capture partielle) reste « en cours » jusqu'au détachement ou à l'expiration.
+- Le trou décrit plus haut (SIP sans utilisateur numérique ni SDP, jamais rattaché) n'est pas traité.
+- Conséquence de I1 : une trace ouverte sur l'IMSI n'apprend plus, sur un SIP, le pseudonyme MSISDN de son propre abonné ; elle ne le connaît que si le coffre d'identités le lui donne à l'ouverture ou si un event non SIP le lui apprend.
+- Le flux RTP du tunnel sort encore en `interface="N3"` dans cette base si le lot 2.21.110 n'y a pas changé le marqueur ; le rattachement ne dépend pas de l'interface.
+
+### Tests
+
+`a_trace_on_the_callee_never_learns_the_caller_2_21_122` (reprise de RVE2) : trace sur l'appelé, 1 seul message attendu, pseudonyme de l'appelant ni appris ni exposé, aucun identifiant UE de l'appelant ; sens sortant inchangé.
+
+`rtp_flows_and_dialog_messages_attach_by_exact_sip_call_id_2_21_122` : INVITE rattaché par pseudonyme ; 180 Ringing sans identité, flux RTP sur `IMS` et sur `N3-IMS` rattachés ; SIP et flux RTP d'un autre appel rejetés ; après le 200 du BYE, un SIP du même `sip_call_id` rejeté, le flux RTP de l'appel encore rattaché.
+
 ## oiran-api 2.21.121 — 2026-11-20 — trace live : un couple côté cœur appris en PFCP finit avec sa session (relecture CLAUDE2 #9 7052103318, H1 ; ordres #9 7052116208 et 7052206763)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.120 (lot B1) @ `a6a3448`. Branches `fix/oiran-2.21.121-trace-core-tunnel-seid` et `fix/oiran-2.21.121-train` (même SHA). Le numéro 2.21.120, d'abord prévu pour ce correctif, est celui du lot B1 (mise au point cœur #9 7052206763). Seul `apps/api/src/live_trace.rs` change.

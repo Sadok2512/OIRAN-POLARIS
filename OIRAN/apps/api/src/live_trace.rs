@@ -359,6 +359,14 @@ struct TraceState {
     /// 2.21.119 (G2) — références de contexte SM apprises, `(référence,
     /// association)` → session de données quand l'event la nomme.
     sm_context_sessions: HashMap<(String, String), Option<String>>,
+    /// 2.21.122 (ordre #9 7052446877) — appels en cours de l'abonné :
+    /// `sip_call_id` appris sur un SIP rattaché. Rattache par égalité
+    /// exacte les SIP du même dialogue et ses flux RTP.
+    sip_call_ids: HashSet<String>,
+    /// 2.21.122 — appels terminés (200 du BYE vu). Ne rattachent plus
+    /// aucun SIP ; ils rattachent encore l'event de flux RTP de l'appel,
+    /// qui n'est émis qu'à la clôture du segment, après le BYE.
+    ended_sip_call_ids: HashSet<String>,
     /// 2.21.121 (H1) — couples côté cœur appris sur un message PFCP,
     /// rangés sous le ou les SEID de ce message : oubliés au
     /// `Session Deletion Response` de la session PFCP.
@@ -1240,6 +1248,19 @@ impl LiveTraceRegistry {
         let ev_pdu_session: Option<String> = session_ids_named(&value, "pdu_session_id")
             .first()
             .map(|v| v.to_string());
+        // 2.21.122 — identifiant d'appel SIP porté par l'event (SIP ou
+        // flux RTP), et fin de dialogue : réponse 2xx à un BYE.
+        let ev_sip_call_ids: Vec<String> = session_ids_named(&value, "sip_call_id")
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let is_sip = event.protocol.as_str() == "SIP";
+        let is_rtp = event.protocol.as_str() == "RTP";
+        let ends_sip_dialog = is_sip
+            && event.message_name.starts_with('2')
+            && ev_ies
+                .iter()
+                .any(|ie| ie.trim().to_ascii_uppercase().ends_with(" BYE"));
         let mut parents_to_attach: Vec<(String, String)> = Vec::new();
         let mut rejected_by_a_trace = false;
         let ev_pdu_address: Option<String> = ev_ies
@@ -1382,7 +1403,16 @@ impl LiveTraceRegistry {
                 (true, false) => ran_known,
                 (true, true) => false,
             } || ev_sm_contexts.iter().any(|id| state.ue_ids.contains(id));
+            // 2.21.122 — appel de l'abonné : égalité exacte sur
+            // `sip_call_id`. Un appel terminé ne rattache plus que son
+            // flux RTP.
+            let match_call = (is_sip || is_rtp)
+                && ev_sip_call_ids.iter().any(|call| {
+                    state.sip_call_ids.contains(call)
+                        || (is_rtp && state.ended_sip_call_ids.contains(call))
+                });
             let matched = force_trace.is_some()
+                || match_call
                 || match_pseudo
                 || match_keys
                 || match_seid
@@ -1485,6 +1515,25 @@ impl LiveTraceRegistry {
                     // l'était : la trace rattachait alors les autres UE
                     // de la cellule et leur trafic N3.
                     let name = id.get("name").and_then(Value::as_str).unwrap_or("");
+                    // 2.21.122 (I1, sonde CLAUDE2 #9 7052558777, ordre #9
+                    // 7052593612) — un pseudonyme d'abonné n'est appris, et
+                    // exposé, que sur un event où il désigne l'abonné de la
+                    // trace, jamais le pair. Sur un SIP, le
+                    // `subscriber_pseudonym` de `session_identifiers` est
+                    // celui du **From** : quand l'abonné tracé est appelé
+                    // (event rattaché par le To, la Request-URI, le SDP ou
+                    // l'identifiant d'appel), c'est celui de l'APPELANT.
+                    // Un SIP n'apprend donc ni n'expose un pseudonyme que
+                    // la trace ne connaît pas déjà. Avant : le pseudonyme
+                    // de l'appelant devenait une clé de la trace de
+                    // l'appelé, sortait dans `ue_info`, et sa signalisation
+                    // puis son trafic suivaient.
+                    let is_pseudonym = pseudonymized || name.ends_with("_pseudonym");
+                    let already_known = state.match_keys.contains(v)
+                        || state.trace.subscriber_pseudonyms.iter().any(|known| known == v);
+                    if is_sip && is_pseudonym && !already_known {
+                        continue;
+                    }
                     if is_subscriber_scoped_key(name, v, pseudonymized) {
                         state.match_keys.insert(v.to_owned());
                     }
@@ -1528,6 +1577,19 @@ impl LiveTraceRegistry {
                         .entry(seid.clone())
                         .or_default()
                         .extend(ev_core_tunnel_pairs.iter().cloned());
+                }
+            }
+            // 2.21.122 — un `sip_call_id` n'est appris que sur un SIP
+            // rattaché (jamais sur un flux RTP, jamais sur un event
+            // rejeté), et rangé par appel.
+            if is_sip {
+                for call in &ev_sip_call_ids {
+                    if ends_sip_dialog {
+                        state.sip_call_ids.remove(call);
+                        state.ended_sip_call_ids.insert(call.clone());
+                    } else if !state.ended_sip_call_ids.contains(call) {
+                        state.sip_call_ids.insert(call.clone());
+                    }
                 }
             }
             for (_, reference, scope) in &ev_sm_contexts {
@@ -1791,6 +1853,11 @@ impl LiveTraceRegistry {
                     .ue_ids
                     .retain(|(name, _, _)| !detach && name == SM_CONTEXT_NAME);
                 state.match_keys.forget_event_references();
+            }
+            if detach {
+                // Détachement : plus aucun appel de l'abonné.
+                state.sip_call_ids.clear();
+                state.ended_sip_call_ids.clear();
             }
             if seed_only {
                 // Amorçage : l'état de rattachement est appris, rien
@@ -2622,6 +2689,8 @@ pub(crate) async fn create(
             session_tunnels: HashMap::new(),
             core_tunnel_endpoints: HashSet::new(),
             sm_context_sessions: HashMap::new(),
+            sip_call_ids: HashSet::new(),
+            ended_sip_call_ids: HashSet::new(),
             seid_tunnels: HashMap::new(),
             // 2.21.105 — le lecteur relit le ring de signalisation
             // pour cette trace à sa prochaine passe.
@@ -3022,6 +3091,8 @@ mod tests {
             session_tunnels: HashMap::new(),
             core_tunnel_endpoints: HashSet::new(),
             sm_context_sessions: HashMap::new(),
+            sip_call_ids: HashSet::new(),
+            ended_sip_call_ids: HashSet::new(),
             seid_tunnels: HashMap::new(),
             needs_seed: true,
             seeding: false,
@@ -4933,6 +5004,129 @@ mod tests {
         assert!(close_reader_session(&mut sessions, &config).is_empty(), "pas de flux RTP ici");
         assert!(sessions.is_empty(), "session oubliée à la clôture");
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 2.21.122 (ordre #9 7052446877) — la voix dans une trace. Trace sur
+    /// un abonné ; son INVITE est rattaché par son pseudonyme ; les
+    /// events de flux RTP du même appel ne portent que `sip_call_id`.
+    /// Depuis 2.21.109 ce n'était plus une clé : aucun flux RTP n'entrait
+    /// dans la trace (échec de ce test à `d4d7781`).
+    ///
+    /// Attendu : le `sip_call_id` appris sur un SIP rattaché rattache, par
+    /// égalité exacte, les SIP du même dialogue sans identité (180
+    /// Ringing) et ses flux RTP, sur `IMS` comme sur `N3-IMS` ; un autre
+    /// appel n'entre pas. Après le 200 du BYE, un SIP portant ce
+    /// `sip_call_id` n'est plus rattaché, mais le flux RTP de l'appel,
+    /// émis après coup à la clôture du segment, l'est encore.
+    #[test]
+    fn rtp_flows_and_dialog_messages_attach_by_exact_sip_call_id_2_21_122() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        let sip = |packet: u64, message: &str, cseq: &'static str, ids: Vec<(&'static str, &'static str)>| {
+            let mut event = mk_event("IMS", Protocol::Sip, message, packet, Direction::Unknown, ids, vec![("CSeq", cseq)]);
+            event.event_id = format!("evt-sip-{packet:04}");
+            event
+        };
+        let rtp = |packet: u64, interface: &str, call: &'static str| {
+            let mut event = mk_event(interface, Protocol::Rtp, "RTP Flow", packet, Direction::Unknown, vec![("sip_call_id", call)], vec![("ssrc", "0x00001111")]);
+            event.event_id = format!("evt-rtp-{packet:04}");
+            event
+        };
+        let call = "a84b4c76e66710@ims.example.invalid";
+        let other = "ffff0000aaaa11@ims.example.invalid";
+        r.route_normalized(&sip(1, "INVITE", "1 INVITE", vec![("sip_call_id", call), ("subscriber_pseudonym", "psn-ue-a")]));
+        // Même dialogue, sans identité de l'abonné.
+        r.route_normalized(&sip(2, "180 Ringing", "1 INVITE", vec![("sip_call_id", call)]));
+        // Un autre appel, d'un autre abonné.
+        r.route_normalized(&sip(3, "INVITE", "1 INVITE", vec![("sip_call_id", other), ("subscriber_pseudonym", "psn-ue-b")]));
+        r.route_normalized(&rtp(4, "IMS", call));
+        r.route_normalized(&rtp(5, "N3-IMS", call));
+        r.route_normalized(&rtp(6, "IMS", other));
+        assert_eq!(
+            routed_ids(&r),
+            vec!["evt-sip-0001", "evt-sip-0002", "evt-rtp-0004", "evt-rtp-0005"],
+            "le dialogue et ses flux RTP, rien de l'autre appel"
+        );
+        // Fin du dialogue.
+        r.route_normalized(&sip(7, "BYE", "2 BYE", vec![("sip_call_id", call)]));
+        r.route_normalized(&sip(8, "200 OK", "2 BYE", vec![("sip_call_id", call)]));
+        // Après la fin : un SIP portant ce Call-ID n'entre plus ; le flux
+        // RTP de l'appel, émis après coup, entre encore.
+        r.route_normalized(&sip(9, "OPTIONS", "3 OPTIONS", vec![("sip_call_id", call)]));
+        r.route_normalized(&rtp(10, "IMS", call));
+        assert_eq!(
+            routed_ids(&r),
+            vec![
+                "evt-sip-0001",
+                "evt-sip-0002",
+                "evt-rtp-0004",
+                "evt-rtp-0005",
+                "evt-sip-0007",
+                "evt-sip-0008",
+                "evt-rtp-0010"
+            ]
+        );
+    }
+
+    /// 2.21.122 (I1, sonde RVE2 de CLAUDE2 #9 7052558777) — une trace sur
+    /// l'APPELÉ n'apprend pas l'appelant. Trace sur A ; INVITE de B vers
+    /// A (rattaché par le To) ; puis trois events propres à B : un
+    /// `DownlinkNASTransport` portant son pseudonyme, un INVITE de B vers
+    /// un tiers, un `UplinkNASTransport` sans pseudonyme. À `d4d7781` les
+    /// quatre entraient dans la trace de A et le pseudonyme de B sortait
+    /// dans ses clés exposées. Attendu : 1 seul message, rien de B appris
+    /// ni exposé. Dans l'autre sens (A appelle B), le pseudonyme de A est
+    /// déjà celui de la trace : rien ne change.
+    #[test]
+    fn a_trace_on_the_callee_never_learns_the_caller_2_21_122() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        let invite = |packet: u64, call: &'static str, from: &'static str, to: &'static str| {
+            let mut event = mk_event(
+                "IMS",
+                Protocol::Sip,
+                "INVITE",
+                packet,
+                Direction::Unknown,
+                vec![("sip_call_id", call), ("subscriber_pseudonym", from)],
+                vec![("CSeq", "1 INVITE"), ("subscriber_pseudonym", from), ("peer_subscriber_pseudonym", to)],
+            );
+            event.event_id = format!("evt-sip-{packet:04}");
+            event
+        };
+        r.route_normalized(&invite(1, "call-b-to-a@ims", "psn-ue-b", "psn-ue-a"));
+        r.route_normalized(&ngap_between(
+            "10.77.11.99",
+            false,
+            "DownlinkNASTransport",
+            2,
+            vec![("amf_ue_ngap_id", "12"), ("ran_ue_ngap_id", "22"), ("subscriber_pseudonym", "psn-ue-b")],
+        ));
+        r.route_normalized(&invite(3, "call-b-to-d@ims", "psn-ue-b", "psn-ue-d"));
+        r.route_normalized(&ngap_between(
+            "10.77.11.99",
+            true,
+            "UplinkNASTransport",
+            4,
+            vec![("amf_ue_ngap_id", "12"), ("ran_ue_ngap_id", "22")],
+        ));
+        assert_eq!(routed_ids(&r), vec!["evt-sip-0001"], "seul l'appel reçu par A");
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert!(!t.match_keys.contains("psn-ue-b"), "le pseudonyme de l'appelant n'est pas appris");
+            assert!(!t.exposed_keys.contains("psn-ue-b"), "ni exposé dans ue_info");
+            assert!(t.ue_ids.is_empty(), "aucun identifiant UE de B");
+            assert!(t.sip_call_ids.contains("call-b-to-a@ims"), "l'appel de A, lui, est connu");
+        }
+        // Sens sortant : A appelle B — From = A, déjà connu.
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&invite(1, "call-a-to-b@ims", "psn-ue-a", "psn-ue-b"));
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.messages, 1);
+        assert!(t.exposed_keys.contains("psn-ue-a"));
+        assert!(!t.match_keys.contains("psn-ue-b") && !t.exposed_keys.contains("psn-ue-b"));
     }
 
     /// 2.21.120 (lot B1) — le lecteur reprend aussi à l'offset sur le
