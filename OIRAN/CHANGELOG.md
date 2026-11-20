@@ -1,5 +1,36 @@
 # Changelog
 
+## oiran-api 2.21.107, oiran-decode 0.9.2, live-probe 0.6.31 — 2026-11-20 — plan N6 ouvert à l'import continu et à la trace live (ordre #9 7049222982)
+
+Upgrade **patch** sans déploiement, même branche `fix/oiran-2.21.105-live-throughput-attach`, au-dessus de 2.21.105 @ `44dd5c8`. 2.21.106 est réservée au train du cœur. `oiran-decode` passe à 0.9.2 parce que 2.21.100 (CLAUDE2) prend 0.9.1.
+
+### Audit
+
+- N6 était exclu à trois endroits, tous codés en dur : `live-probe` `interface_has_decoder` (journal `CONTINUOUS_PLANE_NOT_ALLOWLISTED`), `oiran-decode` `validate_config`, et la liste d'interfaces du lecteur live (`apps/api/src/live_trace.rs`).
+- La capture N6 du lab (ANR2 #10 7049148190) porte les réseaux UE et le SIP UDP 5060 vers le P-CSCF.
+
+### Changement
+
+1. `oiran-decode` : `N6` accepté ; SIP UDP 5060 décodé par la route IMS, RTP/RTCP présenté à l'agrégateur par SDP. Les events sont publiés **`interface="IMS"`** (`ims_event_interface`). Le reste du trafic N6 n'émet aucun event.
+2. `live-probe` : `interface_has_decoder` accepte `N6` ; l'import continu parcourt `import_interface_specs()` = `interface_specs()` + N6. **`interface_specs()` est inchangé** : N6 ne devient pas une interface capturable par l'API de capture.
+3. `oiran-api` : le lecteur live lit aussi `n6/`.
+
+### Double comptage avec `N3-IMS`
+
+Règle : seule `interface == "IMS"` est comptée par `correlation-engine` pour la voix. Le SIP capturé sur N6 est `IMS` ; le SIP extrait du tunnel GTP-U par 2.21.100 est `N3-IMS` et reste une preuve tunnel, non comptée. Vérifié par un test dans `correlation-engine` (test seul, pas de changement de code ni de version de ce crate).
+
+**OUVERT** :
+- Affichage : un même message peut apparaître deux fois dans un callflow (une ligne `N3-IMS`, une ligne `IMS`). La fusion d'affichage relève de la règle de dédup proposée par CLAUDE2 (2.21.100), pas de ce lot.
+- Si un lab capture à la fois un bridge `ims/` et `n6/` portant les mêmes paquets, les deux sont publiés `IMS` et seraient comptés deux fois. Le lab actuel n'a pas de répertoire `ims/` (inventaire ANR2 : 12 plans, sans `ims`). Non traité.
+- Le plan d'origine d'un event `IMS` issu de N6 ne se lit que dans `packet_references[].source_file` (`N6.pcap-…`) ; `capture_point_id` vaut `IMS`.
+- Non vérifié sur une capture N6 réelle : tests sur trames synthétiques. Fusion avec 2.21.100 non faite ici : conflits attendus dans `oiran-decode/src/lib.rs` (route UDP), versions et lock.
+
+### Tests
+
+- `oiran-decode` `n6_plane_decodes_sip_as_ims_interface_2_21_107` : REGISTER sur N6 → 1 event `IMS`/`SIP`, identique au même datagramme sur le plan IMS ; UDP non SIP → 0 event.
+- `live-probe` `continuous_import_decodes_n6_sip_as_ims_2_21_107` : segment `N6.pcap-…` importé → 1 event `IMS`/`SIP` ; avec la liste d'avant, 0. `source_segments_counts_every_plane_and_surfaces_undecoded_paths` mis à jour : N6 n'est plus écarté.
+- `correlation-engine` `n3_ims_twin_of_an_n6_sip_event_is_not_counted_twice_2_21_107` : INVITE vu en `IMS` et en `N3-IMS` → 1 arête SIP↔N4, 1 arête RTP↔SIP.
+
 ## oiran-api 2.21.105 — 2026-11-20 — trace live : session établie avant l'ouverture, compteurs par interface, horodatage SSE (G3 FAIL prod ANR1 #10 7047592953 ; ordres #9 7047782479, 7048974175, 7049222982)
 
 Upgrade **patch** sans déploiement, base `fix/oiran-2.21.104-train` @ `068e9c1`. Branche `fix/oiran-2.21.105-live-throughput-attach`. Seul `oiran-api` change.

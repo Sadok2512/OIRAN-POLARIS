@@ -1161,6 +1161,9 @@ pub(crate) fn start_reader(state: AppState) {
                     for interface in [
                         "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
                         "S6a", "IMS",
+                        // 2.21.107 (ordre #9 7049222982) — plan N6 : SIP
+                        // et RTP IMS, publiés `interface="IMS"`.
+                        "N6",
                     ] {
                         let dir = root.join(ring_directory(interface));
                         let Ok(entries) = fs::read_dir(&dir) else {
