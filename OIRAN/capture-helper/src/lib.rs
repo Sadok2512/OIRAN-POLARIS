@@ -1605,8 +1605,39 @@ mod tests {
         }
     }
 
+    /// Attend que la capture en cours ait reçu au moins `packets` paquets
+    /// (compteur publié par la boucle de capture à chaque tour). Borné à
+    /// 10 s : au-delà, le test échoue avec l'état observé.
+    fn wait_for_packets(service: &CaptureService<MockBackend>, capture_id: &str, packets: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = service.handle(
+                peer(),
+                IpcRequest::GetCaptureStatus {
+                    capture_id: capture_id.into(),
+                },
+            );
+            let job = expect_started_job(response, &format!("wait_for_packets({capture_id})"));
+            if job.metrics.packets_received >= packets {
+                return;
+            }
+            assert!(
+                job.state.active(),
+                "capture ended in {:?} with {} packet(s) before {packets} were received",
+                job.state,
+                job.metrics.packets_received
+            );
+            assert!(
+                Instant::now() < deadline,
+                "capture received {} packet(s) in 10 s, expected {packets}",
+                job.metrics.packets_received
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn wait_for_terminal(service: &CaptureService<MockBackend>, capture_id: &str) -> HelperJob {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let response = service.handle(
                 peer(),
@@ -1911,14 +1942,8 @@ mod tests {
         );
         let response = service.handle(peer(), IpcRequest::StartCapture(spec("init-failure")));
         assert!(response.ok);
-        thread::sleep(Duration::from_millis(30));
-        let result = service.handle(
-            peer(),
-            IpcRequest::GetCaptureStatus {
-                capture_id: "init-failure".into(),
-            },
-        );
-        let job = result.job.unwrap();
+        // Attente bornée de l'état terminal, au lieu de 30 ms fixes.
+        let job = wait_for_terminal(&service, "init-failure");
         assert_eq!(job.state, HelperState::Failed);
         assert_eq!(job.failure.unwrap().category, "CAPTURE_INITIALIZATION");
     }
@@ -1965,14 +1990,9 @@ mod tests {
             },
         );
         service.handle(peer(), IpcRequest::StartCapture(spec("offline-empty")));
-        thread::sleep(Duration::from_millis(1100));
-        let response = service.handle(
-            peer(),
-            IpcRequest::GetCaptureStatus {
-                capture_id: "offline-empty".into(),
-            },
-        );
-        let job = expect_started_job(response, "empty_capture_is_explicit");
+        // Attente bornée de l'état terminal, au lieu de 1 100 ms fixes
+        // (la capture dure 1 s : 100 ms de marge ne tenaient pas sous charge).
+        let job = wait_for_terminal(&service, "offline-empty");
         assert_eq!(job.state, HelperState::CompletedEmpty);
         assert_eq!(job.metrics.packets_received, 0);
     }
@@ -2074,7 +2094,11 @@ mod tests {
         let mut request = spec("manual-stop-finalize");
         request.duration_seconds = 10;
         assert!(service.handle(peer(), IpcRequest::StartCapture(request)).ok);
-        thread::sleep(Duration::from_millis(30));
+        // Attente bornée du paquet lu, au lieu de 30 ms fixes : sous
+        // charge le fil de capture n'avait pas toujours lu le paquet avant
+        // l'arrêt, et la capture finissait `CompletedEmpty` (vu en validant
+        // le train 2.21.114, ordre #9 7051448601).
+        wait_for_packets(&service, "manual-stop-finalize", 1);
         assert!(service.stop(peer().uid, "manual-stop-finalize").ok);
         let job = wait_for_terminal(&service, "manual-stop-finalize");
         assert_eq!(job.state, HelperState::Completed);
