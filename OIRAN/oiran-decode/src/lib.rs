@@ -345,15 +345,24 @@ impl DecodeSession {
     }
 }
 
-/// 0.10.0 — plans décodables par reprise à l'offset (lot A) : un
-/// datagramme UDP y porte un message entier, sans état entre paquets.
-/// Les plans à état (SCTP : N2, S1-MME ; TCP : SBI, S6a ; SIP/RTP par
-/// SDP : IMS, N6) gardent le décodage intégral.
+/// 0.10.0 — plans décodables par reprise à l'offset.
+///   * lot A (0.10.0) : un datagramme UDP y porte un message entier,
+///     sans état entre paquets ;
+///   * lot B1 (0.11.0) : plans SCTP N2 et S1-MME — le réassemblage est
+///     gardé dans la session, un message sort à son dernier fragment.
+/// Gardent le décodage intégral : SBI et S6a (TCP), IMS et N6 (SIP/RTP
+/// par SDP).
 pub fn supports_incremental(interface: &str) -> bool {
     matches!(
         interface,
         "N3" | "S1-U" | "S5-U" | "N4" | "Sxab" | "S11" | "S5-C"
-    )
+    ) || is_incremental_sctp_plane(interface)
+}
+
+/// 0.11.0 (oiran-api 2.21.120, lot B1) — plans SCTP admis en reprise.
+/// S6a n'en est pas : il peut aussi porter Diameter sur TCP.
+fn is_incremental_sctp_plane(interface: &str) -> bool {
+    matches!(interface, "N2" | "S1-MME")
 }
 
 /// 0.10.0 — décode les octets ajoutés au fichier depuis le dernier
@@ -459,6 +468,7 @@ where
 {
     validate_config(config)?;
     let incremental = resume.is_some();
+    let incremental_sctp = incremental && is_incremental_sctp_plane(&config.interface);
     // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — compteur
     // des events par paquet (clé = `packet_lookup_key`). Partagé entre
     // toutes les invocations de `emit_events` (SCTP, UDP, SBI/TCP,
@@ -488,7 +498,13 @@ where
         if sink_error.is_some() {
             return;
         }
-        if incremental {
+        // Les ordinaux d'un paquet ne sont oubliés au paquet suivant que
+        // sur les plans sans état. Sur un plan SCTP, un message
+        // fragmenté sort plus tard avec la référence de son PREMIER
+        // fragment : son ordinal continue ceux des messages déjà sortis
+        // de ce paquet, qu'il faut donc garder. Ces plans sont de la
+        // signalisation, la table reste petite.
+        if incremental && !incremental_sctp {
             state.close_packet();
         }
         if packet.metadata.truncated {
@@ -502,11 +518,19 @@ where
                 return;
             }
         };
-        // Reprise (lot A) : seuls les plans UDP sans état sont admis ;
-        // SCTP et TCP n'y produisent aucun event et leur réassemblage
-        // ne doit pas accumuler d'état d'un appel à l'autre.
-        if incremental && !matches!(view.protocol, TransportProtocol::Udp) {
-            return;
+        // Reprise : sur un plan UDP sans état (lot A), SCTP et TCP ne
+        // produisent aucun event et leur réassemblage ne doit pas
+        // accumuler d'état. Sur un plan SCTP (lot B1), seul le SCTP est
+        // traité ; son réassemblage vit dans la session.
+        if incremental {
+            let admitted = if incremental_sctp {
+                matches!(view.protocol, TransportProtocol::Sctp)
+            } else {
+                matches!(view.protocol, TransportProtocol::Udp)
+            };
+            if !admitted {
+                return;
+            }
         }
         match view.protocol {
             TransportProtocol::Udp => {
@@ -1622,10 +1646,157 @@ Content-Length: 0\r\n\
         }
     }
 
-    /// 0.10.0 — les plans à état refusent la reprise (lot B non livré).
+    /// Trame Ethernet/IPv4/SCTP portant les chunks donnés.
+    fn sctp_frame(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let ip_len = (20 + 12 + body.len()) as u16;
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&[0x08, 0x00, 0x45, 0x00]);
+        f.extend_from_slice(&ip_len.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0, 64, 132, 0, 0, 10, 77, 11, 13, 10, 77, 21, 20]);
+        f.extend_from_slice(&33_492u16.to_be_bytes());
+        f.extend_from_slice(&38_412u16.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]);
+        f.extend_from_slice(&body);
+        f
+    }
+
+    /// Chunk SCTP DATA (`flags` : 2 = début, 1 = fin, 3 = entier).
+    fn sctp_data(flags: u8, tsn: u32, ssn: u16, payload: &[u8]) -> Vec<u8> {
+        let length = (16 + payload.len()) as u16;
+        let mut c = vec![0u8, flags];
+        c.extend_from_slice(&length.to_be_bytes());
+        c.extend_from_slice(&tsn.to_be_bytes());
+        c.extend_from_slice(&0u16.to_be_bytes());
+        c.extend_from_slice(&ssn.to_be_bytes());
+        c.extend_from_slice(&60u32.to_be_bytes());
+        c.extend_from_slice(payload);
+        while c.len() % 4 != 0 {
+            c.push(0);
+        }
+        c
+    }
+
+    /// Messages NGAP réels du jeu N2 du dépôt, tels que réassemblés.
+    fn real_ngap_payloads(count: usize) -> Vec<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let mut reassembler = SctpReassembler::new();
+        let mut payloads = Vec::new();
+        visit_capture(&path, "sha256:x", |packet| {
+            if let Ok(view) = transport_view(&packet) {
+                if matches!(view.protocol, TransportProtocol::Sctp) {
+                    for message in reassembler.consume(&packet, &view) {
+                        if message.ppid == 60 {
+                            payloads.push(message.payload.to_vec());
+                        }
+                    }
+                }
+            }
+        })
+        .unwrap();
+        assert!(payloads.len() >= count, "le jeu N2 porte au moins {count} messages NGAP");
+        payloads.truncate(count);
+        payloads
+    }
+
+    /// Capture N2 synthétique faite de vrais messages NGAP :
+    ///   paquet 1 — un message entier ET le premier fragment d'un second ;
+    ///   paquet 2 — fragment du milieu ;
+    ///   paquet 3 — dernier fragment ET un troisième message entier ;
+    ///   paquet 4 — deux messages entiers dans le même paquet.
+    /// Le message fragmenté sort au paquet 3 avec la référence du
+    /// paquet 1, qui a déjà émis un message : son ordinal doit continuer.
+    fn synthetic_n2_fragmented_capture() -> Vec<u8> {
+        let p = real_ngap_payloads(5);
+        let third = p[1].len() / 3;
+        let frames = vec![
+            sctp_frame(&[sctp_data(3, 1, 0, &p[0]), sctp_data(2, 2, 1, &p[1][..third])]),
+            sctp_frame(&[sctp_data(0, 3, 1, &p[1][third..2 * third])]),
+            sctp_frame(&[sctp_data(1, 4, 1, &p[1][2 * third..]), sctp_data(3, 5, 2, &p[2])]),
+            sctp_frame(&[sctp_data(3, 6, 3, &p[3]), sctp_data(3, 7, 4, &p[4])]),
+        ];
+        classic_pcap(&frames)
+    }
+
+    /// 0.11.0 (oiran-api 2.21.120, lot B1, ordre #9 7050925249) — gate :
+    /// sur les plans SCTP, décodage incrémental = décodage intégral pour
+    /// tout découpage, y compris entre deux fragments d'un message et au
+    /// milieu d'un bloc. Jeu N2 réel du dépôt et capture synthétique
+    /// fragmentée + groupée faite de vrais messages NGAP ; 12 graines,
+    /// pas fins (≤ 61 octets) et larges (≤ 3000). Le même fichier décodé
+    /// comme S1-MME (PPID NGAP, donc aucun event) vérifie que le plan
+    /// est admis et ne produit rien de plus que l'intégral.
+    #[test]
+    fn incremental_sctp_decode_matches_full_decode_for_any_split_2_21_120() {
+        let datasets = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let inputs: Vec<(&str, &str, Vec<u8>, usize)> = vec![
+            ("N2", "pcapng", std::fs::read(datasets.join("N2.pcapng")).unwrap(), 1),
+            ("N2", "pcap", synthetic_n2_fragmented_capture(), 5),
+            ("S1-MME", "pcap", synthetic_n2_fragmented_capture(), 0),
+        ];
+        let key = PseudonymKey::from_bytes([3; 32]);
+        for (interface, extension, bytes, minimum_events) in &inputs {
+            let path = std::env::temp_dir().join(format!(
+                "oiran-incr-sctp-{}-{}-{:?}.{}",
+                interface,
+                std::process::id(),
+                std::thread::current().id(),
+                extension
+            ));
+            let config = DecodeConfig {
+                input: path.clone(),
+                capture_id: format!("sha256:{}", "f".repeat(64)),
+                interface: (*interface).into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "n2_00001_20261120.pcapng".into(),
+            };
+            std::fs::write(&path, bytes).unwrap();
+            let mut full = Vec::new();
+            decode_capture_streaming(&config, &key, |event| {
+                full.push(event.to_json());
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                full.len() >= *minimum_events,
+                "{interface}.{extension} : {} events, au moins {minimum_events} attendus",
+                full.len()
+            );
+            for seed in 0..12u64 {
+                for max_step in [61usize, 3000] {
+                    let mut session = DecodeSession::new();
+                    let mut incremental = Vec::new();
+                    for cut in seeded_cuts(bytes.len(), seed, max_step) {
+                        std::fs::write(&path, &bytes[..cut]).unwrap();
+                        decode_capture_incremental(&config, &key, &mut session, |event| {
+                            incremental.push(event.to_json());
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                    assert_eq!(session.consumed_bytes(), bytes.len() as u64);
+                    finish_incremental(&config, &mut session, |event| {
+                        incremental.push(event.to_json());
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        incremental, full,
+                        "{interface}.{extension} graine {seed} pas {max_step}"
+                    );
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// 0.10.0 — les plans à état non livrés refusent la reprise. Depuis
+    /// 0.11.0 (lot B1), N2 et S1-MME l'acceptent.
     #[test]
     fn incremental_decode_is_refused_on_stateful_planes_2_21_109() {
-        for interface in ["N2", "S1-MME", "SBI", "S6a", "IMS", "N6"] {
+        for interface in ["SBI", "S6a", "IMS", "N6"] {
             assert!(!supports_incremental(interface));
             let config = DecodeConfig {
                 input: "unused.pcap".into(),
@@ -1638,7 +1809,7 @@ Content-Length: 0\r\n\
             let mut session = DecodeSession::new();
             assert!(decode_capture_incremental(&config, &key, &mut session, |_| Ok(())).is_err());
         }
-        for interface in ["N3", "S1-U", "S5-U", "N4", "Sxab", "S11", "S5-C"] {
+        for interface in ["N3", "S1-U", "S5-U", "N4", "Sxab", "S11", "S5-C", "N2", "S1-MME"] {
             assert!(supports_incremental(interface));
         }
     }

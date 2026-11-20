@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.120, oiran-decode 0.11.0 — 2026-11-20 — lecteur live : reprise à l'offset sur les plans SCTP, lot B1 (design #9 7050841418, GO #9 7050925249)
+
+Upgrade **patch** sans déploiement, base 2.21.119 @ `d4aaedb`. Branche `fix/oiran-2.21.120-reader-resume-sctp`.
+
+### Audit
+
+Depuis 2.21.109 (lot A) le lecteur ne décode que les octets ajoutés sur N3, S1-U, S5-U, N4, Sxab, S11 et S5-C. N2 et S1-MME étaient encore redécodés en entier à chaque passe : leur décodage tient un état, le réassemblage SCTP. Cet état est déjà porté par `DecodeSession` depuis le lot A ; il manquait d'admettre ces plans et de garder leurs ordinaux de `stable_event_key`.
+
+### Changement
+
+- `oiran-decode` 0.11.0 : `supports_incremental` admet **N2 et S1-MME**. En reprise sur ces plans, seul le SCTP est traité, le réassemblage vit dans la session, et un message sort à son dernier fragment.
+- Les ordinaux d'un paquet ne sont plus oubliés au paquet suivant sur ces plans : un message fragmenté sort avec la référence de son **premier** fragment, et son ordinal doit continuer ceux des messages déjà sortis de ce paquet. Ces plans sont de la signalisation ; la table reste petite.
+- `oiran-api` : aucun changement de code du lecteur, qui suit `supports_incremental`.
+- S6a n'est pas admis : il peut porter Diameter sur TCP.
+
+### Gate — parité
+
+`oiran-decode` `incremental_sctp_decode_matches_full_decode_for_any_split_2_21_120` : jeu N2 réel du dépôt et capture synthétique faite de vrais messages NGAP — un message entier et le premier fragment d'un second dans le même paquet, fragment du milieu, dernier fragment suivi d'un message entier, puis deux messages entiers groupés ; 12 graines × 2 pas (≤ 61 et ≤ 3000 octets) ; JSON complet de chaque event identique au décodage intégral, dans le même ordre. **Vérifié par mutation** : en oubliant les ordinaux à chaque paquet aussi en SCTP, le test échoue.
+`oiran-api` `decode_increment_resumes_on_the_n2_sctp_plane_2_21_120` : capture N2 réelle écrite en trois fois, somme des octets décodés = taille du fichier, events = décodage intégral.
+
+### OUVERT
+
+- **B2 (IMS, N6, instantané RTP à 5 s) et B3 (SBI, S6a) non livrés** : ces plans gardent le redécodage intégral du segment courant.
+- Aucune capture S1-MME réelle dans le dépôt : S1-MME n'est vérifié que par construction (même chemin que N2) et par un fichier synthétique qui n'y produit aucun event.
+- Un message SCTP dont un fragment manque n'est jamais émis, comme en décodage intégral ; son état de réassemblage reste en mémoire jusqu'à la fin du segment.
+- La refonte annoncée au design (extraire le corps d'une passe de `start_reader` dans une fonction testable) n'est **pas faite** : la boucle du lecteur n'a toujours pas de test.
+- Gain CPU non mesuré ; preuve attendue en recette dans `stats.reader.interfaces.N2`.
+
 ## oiran-api 2.21.119 — 2026-11-20 — trace live : référence de contexte SM bornée à sa session, tunnels côté cœur gardés en veille (relecture CLAUDE2 #9 7051699381, ordre #9 7051758378)
 
 Upgrade **patch** sans déploiement, base 2.21.118 @ `8be247a` (train 2.21.117 @ `cd84b3c` + clé à la lecture sur `/events`). Branche `fix/oiran-2.21.119-trace-sm-context-isolation`. Seul `apps/api/src/live_trace.rs` change. L'ordre nomme ce lot « 2.21.118 » ; ce numéro était déjà pris par le commit `/events`, poussé au même moment.

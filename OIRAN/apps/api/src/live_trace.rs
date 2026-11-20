@@ -4702,6 +4702,52 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// 2.21.120 (lot B1) — le lecteur reprend aussi à l'offset sur le
+    /// plan N2 : capture N2 réelle du dépôt écrite en trois fois, somme
+    /// des octets décodés = taille du fichier, events = décodage
+    /// intégral, aucune remise à zéro.
+    #[test]
+    fn decode_increment_resumes_on_the_n2_sctp_plane_2_21_120() {
+        let bytes = fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng"),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "oiran-reader-n2-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("n2_00001.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let config = ring_decode_config(&path, "N2");
+        assert!(oiran_decode::supports_incremental("N2"));
+        let mut sessions = HashMap::new();
+        let mut events = Vec::new();
+        let mut decoded = 0u64;
+        for cut in [bytes.len() / 3 + 7, 2 * bytes.len() / 3 + 1, bytes.len(), bytes.len()] {
+            fs::write(&path, &bytes[..cut]).unwrap();
+            let outcome = decode_increment(&mut sessions, &config, &key, cut as u64);
+            assert!(outcome.ok && !outcome.reset);
+            decoded += outcome.bytes_decoded;
+            events.extend(outcome.events);
+        }
+        assert_eq!(decoded, bytes.len() as u64);
+        sort_by_capture_order(&mut events);
+        let mut full = Vec::new();
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            full.push(event);
+            Ok(())
+        })
+        .unwrap();
+        sort_by_capture_order(&mut full);
+        assert!(!full.is_empty());
+        assert_eq!(ids(&events), ids(&full));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 2.21.109 (ordre #9 7049845272) — fichier remplacé par un autre de
     /// taille supérieure : la session est jetée une fois (`reset`), le
     /// nouveau fichier est décodé depuis 0 et ses events sont ceux de
