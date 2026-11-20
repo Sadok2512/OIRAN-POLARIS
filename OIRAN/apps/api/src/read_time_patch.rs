@@ -1519,7 +1519,13 @@ pub fn extend_items_with_pfcp_siblings_using_session_keys(
         };
         if same_interface && pfcp_event_matches(value, known_sequences, known_seids) {
             known_event_ids.insert(event_id.to_owned());
-            items.push(value.clone());
+            // 2.21.115 (ordre #9 7050925249) — un frère PFCP lu dans le
+            // JSONL brut d'un dataset d'avant 2.21.91 n'a pas de
+            // `stable_event_key` : elle est posée ici, pour les deux
+            // routes qui étendent une session (`/events` et `/callflow`).
+            let mut sibling = value.clone();
+            stamp_stable_event_key_if_missing(items, &mut sibling);
+            items.push(sibling);
             added += 1;
         }
     }

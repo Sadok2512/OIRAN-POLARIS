@@ -17283,6 +17283,170 @@ mod tests {
         assert_ne!(k_ngap, k_nas, "parent + enfant même paquet, clés distinctes");
     }
 
+    /// 2.21.115 (ordre #9 7050925249, suite de 2.21.112) — à travers le
+    /// routeur : une session d'un dataset d'avant 2.21.91 dont un PFCP
+    /// frère n'existe que dans le JSONL brut. `GET /sessions/:id/callflow`
+    /// et `GET /sessions/:id/events` rendent ce frère AVEC sa
+    /// `stable_event_key`, dérivée par la formule commune. Recette
+    /// 2.21.104 : 5 PFCP sans clé sur 72 (ANR1 #10 7050183853).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inserted_pfcp_sibling_carries_a_stable_event_key_through_the_router_2_21_115() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dataset_name = format!("callflow-sibling-key-{suffix}");
+        let dataset_dir_guard =
+            AutoRemoveDir::new(workspace.join("datasets").join(&dataset_name));
+        let dataset_dir = dataset_dir_guard.as_pathbuf();
+        let session_id = "sess-sibling-key-2-21-115";
+        let persisted = |event_id: &str, interface: &str, protocol: &str, message: &str, packet: u64, ie: Value| {
+            json!({
+                "event_id": event_id,
+                "timestamp": "2026-11-20T18:00:00.000000000Z",
+                "timestamp_ns": "0",
+                "interface": interface,
+                "protocol": protocol,
+                "message_name": message,
+                "source_participant": "UPF",
+                "destination_participant": "SMF",
+                "direction": "CORE_TO_CORE",
+                "decoded_ie_tree": ie,
+                "decoding_status": "DECODED",
+                "semantic_status": "EXACT",
+                "association": "SESSION",
+                "procedure_group": "PDU Session",
+                "packet_references": [{
+                    "source_file": format!("/var/lib/oiran/ring/{}/{}_00007.pcapng",
+                        interface.to_ascii_lowercase(), interface.to_ascii_lowercase()),
+                    "packet_number": packet,
+                    "byte_offset": packet * 100,
+                    "interface_id": 0u32,
+                    "captured_length": 64u32,
+                    "original_length": 64u32,
+                }],
+                "capture_id": "sha256:pre-2-21-91",
+                "decoder_name": "decoder",
+                "decoder_version": "0",
+                "raw_payload_reference": "sha256:payload",
+                "errors": [],
+            })
+        };
+        // Le frère : un vrai PFCP Session Establishment Request du jeu
+        // du dépôt, absent du callflow persisté, et sans clé (dataset
+        // d'avant 2.21.91).
+        let raw_events = fs::read_to_string(
+            workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl"),
+        )
+        .unwrap();
+        let mut sibling: Value = raw_events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["message_name"] == "PFCP Session Establishment Request")
+            .expect("le jeu porte un PFCP Session Establishment Request");
+        sibling.as_object_mut().unwrap().remove("stable_event_key");
+        let sibling_id = sibling["event_id"].as_str().unwrap().to_owned();
+        let sibling_sequence = sibling["session_identifiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|id| id["name"] == "pfcp_sequence")
+            .and_then(|id| id["value"].as_str())
+            .unwrap()
+            .to_owned();
+        let reference = &sibling["packet_references"][0];
+        let expected_sibling_key = event_schema::derive_stable_event_key(
+            reference["source_file"].as_str().unwrap(),
+            reference["interface_id"].as_u64().unwrap_or(0) as u32,
+            reference["packet_number"].as_u64().unwrap(),
+            reference["byte_offset"].as_u64().unwrap_or(0),
+            "PFCP",
+            0,
+        );
+        let callflow = json!({
+            "callflow_id": format!("cf-{session_id}"),
+            "session_id": session_id,
+            "technology": "5G SA",
+            "start_timestamp": "2026-11-20T18:00:00Z",
+            "end_timestamp": "2026-11-20T18:00:01Z",
+            "participants": [],
+            "interfaces": ["N2", "N4"],
+            "procedures": [],
+            "events": [
+                persisted("evt-ngap-01", "N2", "NGAP", "InitialUEMessage", 3, json!([])),
+                persisted("evt-pfcp-resp", "N4", "PFCP", "PFCP Session Establishment Response", 8,
+                    json!([{"name":"pfcp_sequence","value":sibling_sequence.clone()}])),
+            ],
+            "correlation_edges": [],
+            "correlation_status": {},
+            "decoder_versions": {},
+            "schema_version": "1.5.0",
+            "capture_references": ["sha256:pre-2-21-91"],
+            "accounting": {"source_events":2,"session_events":2,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields": 0,
+        });
+        let callflow_json_path = dataset_dir.join("callflow.json");
+        fs::write(&callflow_json_path, serde_json::to_vec_pretty(&callflow).unwrap()).unwrap();
+        fs::write(dataset_dir.join("callflow.html"), b"<html>stub</html>").unwrap();
+        fs::write(dataset_dir.join("synthetic.pcap"), b"\0").unwrap();
+        fs::write(dataset_dir.join("oiran_events.jsonl"), format!("{sibling}\n")).unwrap();
+        fs::write(
+            dataset_dir.join("scenario_manifest.json"),
+            json!({
+                "scenario_id": "callflow-sibling-key-2.21.115",
+                "captures": [{
+                    "file": "synthetic.pcap",
+                    "capture_id": "sha256:pre-2-21-91",
+                    "name": "synthetic.pcap",
+                    "interface": "N2",
+                    "sha256": "0".repeat(64),
+                    "packet_count": 1,
+                    "size_bytes": 1,
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut config = test_config(workspace, &format!("registry-{dataset_name}"));
+        config.dataset_dir = dataset_dir.clone();
+        config.callflow_json = callflow_json_path.clone();
+        config.callflow_html = dataset_dir.join("callflow.html");
+        config.reference_dataset_enabled = true;
+        let state = AppState::load(config).expect("AppState::load");
+        for route in ["callflow?limit=100", "events?page_size=100"] {
+            let response = router(state.clone(), None)
+                .oneshot(req(&format!("/api/v1/sessions/{session_id}/{route}"), true))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{route} body={body}");
+            let events = body["data"]["events"]
+                .as_array()
+                .or_else(|| body["data"]["items"].as_array())
+                .or_else(|| body["data"].as_array())
+                .unwrap_or_else(|| panic!("{route} : liste d'events introuvable : {body}"));
+            let found = events
+                .iter()
+                .find(|event| event["event_id"] == sibling_id.as_str())
+                .unwrap_or_else(|| panic!("{route} : le frère PFCP doit être inséré : {body}"));
+            assert_eq!(
+                found["stable_event_key"].as_str().unwrap_or(""),
+                expected_sibling_key.as_str(),
+                "{route} : clé du frère"
+            );
+        }
+    }
+
     /// 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954 point 2) —
     /// clé sur **données stockées**. Un callflow persisté AVANT
     /// 2.21.91 (le champ `stable_event_key` est ABSENT du JSON disque)

@@ -1,5 +1,26 @@
 # Changelog
 
+## oiran-api 2.21.115 — 2026-11-20 — clé stable sur les PFCP frères de la route `/events`, et test à travers le routeur (ordre #9 7050925249, suite de 2.21.112)
+
+Upgrade **patch** sans déploiement, base train `fix/oiran-2.21.114-train` @ `3f95d53`. Branche `fix/oiran-2.21.115-pfcp-sibling-items-key`. Seul `oiran-api` change.
+
+### Audit
+
+2.21.112 posait la clé dans `insert_pfcp_siblings_into_callflow_using_session_keys`, donc sur `GET /sessions/:id/callflow` seulement. `GET /sessions/:id/events` passe par `extend_items_with_pfcp_siblings_from_jsonl` (`apps/api/src/lib.rs`, `session_events_blocking`), qui ajoute les mêmes PFCP frères lus dans le JSONL brut, sans clé.
+
+### Correctif
+
+La clé est posée au point commun, dans `extend_items_with_pfcp_siblings_using_session_keys`, au moment où le frère est ajouté. Les deux routes en bénéficient ; le poseur de 2.21.112 reste en place et ne fait plus rien quand la clé existe déjà.
+
+### Test
+
+`tests::inserted_pfcp_sibling_carries_a_stable_event_key_through_the_router_2_21_115` : vrai `router(state).oneshot()` sur un dataset d'avant 2.21.91 dont le frère est un PFCP Session Establishment Request réel du jeu du dépôt ; les deux routes rendent le frère avec la clé de la formule commune. **Avant correctif** (fichier `read_time_patch.rs` du train) : échec, clé vide ; après : succès.
+
+### OUVERT
+
+- Non vérifié sur la session de recette (5 PFCP sans clé, 67/72).
+- Sur `/events`, les events persistés d'un dataset d'avant 2.21.91 ne reçoivent pas de clé à la lecture : seul le frère inséré en reçoit une. Non traité, à décider.
+
 ## oiran-api 2.21.114 — 2026-11-20 — train (cœur) : 2.21.109 (lecteur live, isolement) + 2.21.110 (RTP du tunnel en N3-IMS) + 2.21.112 (clé sur PFCP frères)
 
 - Merge `--no-ff` de `fix/oiran-2.21.112-pfcp-sibling-stable-key` @ 7304ed0 sur `fix/oiran-2.21.110-tunnel-rtp-n3-ims` @ df22008 (qui contient 2.21.109 @ 33e544a).
