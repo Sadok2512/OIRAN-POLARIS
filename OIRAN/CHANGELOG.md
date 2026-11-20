@@ -16,7 +16,7 @@ Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.104-train` @ `068
 
 **Marqueur `interface="N3-IMS"`** (distinct de `"IMS"`) permet à la publication de distinguer les deux sources quand N6 capture aussi 10.47/16.
 
-**Déduplication N3 ↔ N6 (réponse explicite du cœur).** Chaque event SIP issu du tunnel porte `interface="N3-IMS"`. Les events équivalents capturés sur N6 portent `interface="IMS"`. Côté correlation-engine / publication (hors périmètre 2.21.100), le callflow render devra dédupliquer sur `(call_id, cseq, from_tag, to_tag, direction)` en priorisant la source la plus proche du P-CSCF (IMS > N3-IMS pour un UA vers Kamailio ; N3-IMS > IMS pour un UA côté UE si le P-CSCF est externe). Le choix de priorité est à graver dans un lot ultérieur côté correlation-engine, avec ANR2 comme arbitre. Pour 2.21.100 (décodeur seul), les deux events coexistent : l'opérateur voit les 2, l'anomalie est visible par `interface`.
+**Déduplication N3 ↔ N6 — OUVERT (hors périmètre 2.21.100).** Chaque event SIP issu du tunnel porte `interface="N3-IMS"`. Les events équivalents capturés sur N6 portent `interface="IMS"`. **Aucune déduplication n'est faite dans ce lot** : tant que la capture N6 n'est pas active (les deux captures parallèles n'existent pas encore en prod), les deux events ne peuvent pas apparaître ensemble, et l'opérateur voit ce qui est disponible. Dès qu'ANR2 ouvrira la capture N6 IMS en parallèle, **les deux events SIP coexisteront dans le flux publié**. La règle à graver est documentée section « Règle de dédup proposée » ci-dessous. Lot futur côté `correlation-engine`, avec ANR2 comme arbitre sur la priorité de plan (dépend de la topologie P-CSCF du lab).
 
 #### Décision (b) — perte RTP `loss_apparent` signé + event journalisé
 
@@ -34,6 +34,13 @@ Pour éviter la collision SSRC entre 2 branches à l'agrégation : rappel que la
   * `pub fn default_ue_ip_pools() -> Vec<String>` = `["10.45.", "10.46.", "10.47."]` (couvre les 3 DNN par défaut lab POLARIS, **y compris IMS 10.47/16**).
   * `pub fn set_ue_ip_pools(pools: Vec<String>)` surcharge les défauts (configurable depuis `oiran-api` au boot).
   * `pub fn is_ue_address(address: &str) -> bool` lit un static `OnceLock<RwLock<Vec<String>>>` initialisé par `set_ue_ip_pools` ou par les défauts.
+
+**Origine des pools en prod — OUVERT.** `set_ue_ip_pools` n'est appelé **NULLE PART** dans `oiran-api`, `live-probe`, ni `oiran-decode` en 2.21.100. Les pools effectifs en prod restent donc les défauts hard-codés étendus `["10.45.", "10.46.", "10.47."]`. Pour un lab qui utiliserait d'autres préfixes UE, un lot futur doit :
+  * ajouter un champ `ue_ip_pools: Vec<String>` à `polaris_config::PolarisConfig` (fichier `polaris.toml`), lu au boot de `oiran-api::main`,
+  * appeler `decoder_gtpu::set_ue_ip_pools(config.ue_ip_pools.clone())` dans `oiran-api::main` avant le démarrage du reader,
+  * exposer la valeur courante via `/health.decoder_gtpu.ue_ip_pools`.
+Le défaut 10.47/16 inclus suffit pour la recette ANR1/ANR2 immédiate ; le câblage config est différé pour éviter d'étendre le périmètre 2.21.100 (décodeur seul).
+
 Le cas (c) **capture elle-même** reste **OUVERT côté lab** (SPAN N3 possiblement unidirectionnel ou absent côté DL N6) — à clôturer par ANR1.
 
 ### Tests ajoutés (9 au total, 12 runs × 287 passed / 0 failed)
@@ -84,6 +91,29 @@ Locking 3 packages to highest compatible versions
     Updating oiran-decode v0.9.0 → v0.9.1
 … Compiling decoder-gtpu v0.2.3 … decoder-rtp — pas dans deps directes de polaris-vtap — compilé via oiran-decode …
 cargo test --locked → 12 + 0 + 3 + 0 passed, 0 failed, 0 ignored.
+```
+
+### Règle de dédup N3/N6 proposée (OUVERT, à graver côté correlation-engine)
+
+Pour un lot futur (côté `correlation-engine`), quand les captures N3 ET N6 sont actives en parallèle :
+
+```
+Clé de dédup SIP : (call_id, cseq_num, cseq_method, from_tag, to_tag, direction)
+  - UN SEUL event par (clé, plan). Si le même (clé) apparaît sur deux plans
+    (interface="N3-IMS" et "IMS"), les deux coexistent en données brutes ;
+    une étape post-corrélation garde l'event du plan prioritaire + une arête
+    `sip-n3-n6-tunneled` vers l'autre (preuve, pas duplicat silencieux).
+
+Clé de dédup RTP : (source_ip, source_port, destination_ip, destination_port, ssrc)
+  - FlowKey déjà inclusive 5-tuple + SSRC ; 2 plans ⇒ 2 FlowKey distincts
+    naturellement. Pas d'action correlation-engine requise.
+
+Plan prioritaire (SIP) : dépend de la topologie P-CSCF du lab :
+  - P-CSCF externe côté DN (défaut ANR2) ⇒ "IMS" prioritaire (plus proche
+    de la terminaison SIP, moins de couches de tunneling à défaire).
+  - P-CSCF interne UPF ⇒ "N3-IMS" prioritaire (la capture N6 verrait un
+    pass-through non représentatif).
+  - À l'arbitrage d'ANR2 sur la topologie courante.
 ```
 
 ### Scope et coordination #9
