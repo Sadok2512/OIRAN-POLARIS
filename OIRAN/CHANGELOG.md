@@ -1,5 +1,41 @@
 # Changelog
 
+## oiran-api 2.21.119 — 2026-11-20 — trace live : référence de contexte SM bornée à sa session, tunnels côté cœur gardés en veille (relecture CLAUDE2 #9 7051699381, ordre #9 7051758378)
+
+Upgrade **patch** sans déploiement, base 2.21.118 @ `8be247a` (train 2.21.117 @ `cd84b3c` + clé à la lecture sur `/events`). Branche `fix/oiran-2.21.119-trace-sm-context-isolation`. Seul `apps/api/src/live_trace.rs` change. L'ordre nomme ce lot « 2.21.118 » ; ce numéro était déjà pris par le commit `/events`, poussé au même moment.
+
+### Audit
+
+- **G2 — régression d'isolement introduite par 2.21.113.** `sm_context_reference` n'était plus oubliée en 5G : la libération d'une session PDU ne touchait plus `ue_ids` (2.21.113), la libération de contexte la gardait (2.21.116), et la seule fin complète, `Detach Accept`, est LTE. La référence n'avait pas de portée de nœud. Dans `decoder-sbi` elle est le segment de chemin après `/sm-contexts/` : un identifiant court alloué par le SMF, réutilisable. Réattribuée à la session d'un autre abonné, elle rattachait ses messages SBI. Reproduit par la sonde RVC3 de CLAUDE2 à `7e0b1bb`.
+- **G1 — retour de veille.** La mise en veille oubliait tous les tunnels. Or seul le côté accès radio est libéré ; le tunnel côté cœur (UPF, TEID montant) vit avec la session. Sans identité lisible dans le Service Request (NAS chiffré), plus rien n'était rattaché au retour, ni N2 ni N3 (sonde RVC2).
+- **Défaut trouvé en corrigeant** : le rangement des tunnels par session créait une entrée vide pour tout event nommant une session, y compris le message de libération. La libération d'une session nommée trouvait donc toujours une entrée, vide si ses tunnels n'étaient pas rangés, et n'oubliait rien, sans le dire.
+
+### Correctif
+
+1. **G2.** Une référence de contexte SM est qualifiée par l'adresse du SMF quand une extrémité est reconnue comme telle, par l'association sinon, et rangée avec le `pdu_session_id` de l'event qui l'apprend. Elle est oubliée : à la libération de cette session (les références qu'aucun event n'a rattachées à une session le sont aussi, choix de l'isolement) ; après un `ReleaseSMContext` (champ `sbi.operation`) ; au détachement. `Deregistration Accept` (fin 5G, dans les deux sens) rejoint `Detach Accept` comme fin complète.
+2. **G1.** Les couples (adresse, TEID) côté cœur sont reconnus à l'apprentissage — tunnel montant du N2 (`tunnel_ip_ul` / `gtp_teid_ul`), F-TEID local d'un PDR PFCP — et gardés à la mise en veille ; le reste (tunnel descendant du N2, Outer Header Creation, TEID sans adresse) est oublié.
+3. **Point mineur.** Libération d'une session nommée dont aucun tunnel n'est rangé par session : les tunnels de l'abonné ne sont pas vidés, et le cas est compté dans `stats.session_releases_without_filed_tunnels`. Une entrée de session n'est plus créée que s'il y a un tunnel à y ranger.
+
+### Échec avant, succès après
+
+Les trois tests du lot, greffés sur le fichier de `8be247a` dans un worktree détaché (lignes sur le nouveau compteur retirées) : G1 et G2 **échouent**, le point mineur **passe déjà** — les tunnels étaient gardés par l'effet de l'entrée vide ; ce qui change est la règle explicite et le comptage. Sur le code corrigé les trois passent.
+
+### Tests existants modifiés
+
+`context_release_and_pdu_release_forget_the_right_things_2_21_113` et `idle_release_keeps_the_pdu_session_signalling_attached_2_21_116` attendaient 0 tunnel après la mise en veille ; ils en attendent 1, le tunnel montant côté cœur (G1). Rien d'autre n'y change.
+
+### OUVERT
+
+- Forme réelle des références de contexte SM sur le lab non vérifiée ; le SMF n'est reconnu que par un rôle contenant `smf` sur une extrémité, sinon la portée retombe sur l'association.
+- Non vérifié que le lab garde le même TEID montant à l'UPF à travers une veille.
+- Retour de veille sans identité : l'`InitialUEMessage` et son enfant NAS restent non rattachés ; le contexte initial et la suite le sont.
+- Session nommée libérée sans tunnel rangé : ses tunnels restent connus de la trace jusqu'à la fin du contexte ; c'est ce que compte `session_releases_without_filed_tunnels`.
+- La boucle `start_reader` n'a toujours pas de test.
+
+### Tests (`live_trace::tests`, suffixe `_2_21_119`)
+
+`sm_context_reference_ends_with_its_pdu_session` (reprise de RVC3 ; plus : même valeur chez un autre SMF, `ReleaseSMContext`, `Deregistration Accept`), `return_from_idle_without_identity_reattaches_by_the_core_tunnel` (reprise de RVC2), `named_release_without_filed_tunnels_keeps_other_tunnels_and_is_counted`.
+
 ## oiran-api 2.21.118 — 2026-11-20 — `/events` : clé stable dérivée à la lecture pour les events persistés (ordre #9 7051448601 point 2)
 
 Upgrade **patch** sans déploiement, base train `fix/oiran-2.21.117-train` (ordre #9 7051620366). Branche `fix/oiran-2.21.118-events-read-time-key`. 2.21.117 est le numéro du train. Seul `oiran-api` change.

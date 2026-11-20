@@ -81,6 +81,10 @@ pub(crate) struct LiveTrace {
     /// valeur de SEID de l'abonné, vers un autre nœud.
     #[serde(default)]
     rejected_seid_endpoint_mismatch: u64,
+    /// 2.21.119 — libérations d'une session nommée dont aucun tunnel
+    /// n'était rangé par session : rien n'a pu être oublié.
+    #[serde(default)]
+    session_releases_without_filed_tunnels: u64,
     /// 2.21.105 (donnée ANR1 #10 7048928345, ordre #9 7048974175) —
     /// alimentation de la trace **par interface** : events décodés
     /// présentés à la trace (`seen`), écartés par le filtre
@@ -349,6 +353,12 @@ struct TraceState {
     /// (`pdu_session_id`) : `(adresse si connue, TEID)`. Permet d'oublier
     /// les tunnels de la seule session libérée.
     session_tunnels: HashMap<String, HashSet<(Option<String>, String)>>,
+    /// 2.21.119 (G1) — couples (adresse, TEID) côté cœur : gardés à la
+    /// mise en veille, oubliés avec la session de données.
+    core_tunnel_endpoints: HashSet<(String, String)>,
+    /// 2.21.119 (G2) — références de contexte SM apprises, `(référence,
+    /// association)` → session de données quand l'event la nomme.
+    sm_context_sessions: HashMap<(String, String), Option<String>>,
     /// 2.21.105 — la trace attend son amorçage depuis le ring.
     needs_seed: bool,
     /// 2.21.105 — la trace est dans la passe d'amorçage en cours :
@@ -622,7 +632,47 @@ fn is_ue_context_release(name: &str) -> bool {
 /// Détachement : l'abonné quitte le réseau, tout ce qui a été appris sur
 /// ses sessions est oublié.
 fn is_detach(name: &str) -> bool {
-    compact_name(name) == "detachaccept"
+    // 2.21.119 (G2) — `Deregistration Accept` est la fin 5G ; sans elle
+    // aucune fin complète n'existait en 5G.
+    matches!(compact_name(name).as_str(), "detachaccept" | "deregistrationaccept")
+}
+
+/// 2.21.119 (relecture CLAUDE2 #9 7051699381, G1) — couples (adresse,
+/// TEID) côté CŒUR portés par une IE : le tunnel montant du N2
+/// (`tunnel_ip_ul` / `gtp_teid_ul`, terminé à l'UPF) et le F-TEID local
+/// d'un PDR PFCP (`teid=…,v4=…,ipv4=…`). Ils vivent avec la session de
+/// données. Le tunnel descendant du N2 et l'Outer Header Creation PFCP
+/// désignent l'accès radio : libérés à la mise en veille.
+fn parse_core_tunnel_pairs(ie_value: &str) -> Vec<(String, String)> {
+    let components: BTreeMap<&str, &str> = ie_value
+        .split(',')
+        .filter_map(|part| {
+            let (k, v) = part.split_once('=')?;
+            Some((k.trim(), v.trim()))
+        })
+        .collect();
+    let mut out = Vec::new();
+    if components.contains_key("v4") && !components.contains_key("outer_header_description") {
+        if let (Some(ip), Some(teid)) = (components.get("ipv4"), components.get("teid")) {
+            if let Some(teid) = event_schema::normalize_teid_hex(teid) {
+                out.push((event_schema::normalize_ip(ip), teid));
+            }
+        }
+    }
+    for (key, ip) in components.iter() {
+        if *key != "tunnel_ip_ul" && !key.ends_with("_tunnel_ip_ul") {
+            continue;
+        }
+        let prefix = key.strip_suffix("tunnel_ip_ul").unwrap_or_default();
+        if let Some(teid) = components
+            .get(format!("{prefix}gtp_teid_ul").as_str())
+            .and_then(|teid| event_schema::normalize_teid_hex(teid))
+        {
+            out.push((event_schema::normalize_ip(ip), teid));
+        }
+    }
+    out.retain(|pair| !is_zero_hex(&pair.1));
+    out
 }
 
 /// Libération d'une session de données : ses tunnels et SEID ne valent
@@ -826,6 +876,7 @@ impl LiveTraceRegistry {
             },
             "pfcp": {"attached_seid_only": trace.pfcp_attached_seid_only},
             "parents_attached_after_child": trace.parents_attached_after_child,
+            "session_releases_without_filed_tunnels": trace.session_releases_without_filed_tunnels,
             "rejects": {
                 "ue_id_mismatch": trace.rejected_ue_id_mismatch,
                 "seid_endpoint_mismatch": trace.rejected_seid_endpoint_mismatch,
@@ -1103,10 +1154,40 @@ impl LiveTraceRegistry {
         };
         let ev_core_ids = ids_named(&CORE_UE_ID_NAMES, &core_node);
         let ev_ran_ids = ids_named(&RAN_UE_ID_NAMES, &association);
+        let smf_scope = {
+            let is_smf = |endpoint: &event_schema::Endpoint| {
+                endpoint
+                    .network_function
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .is_some_and(|nf| nf.contains("smf"))
+            };
+            if is_smf(&event.source_endpoint) {
+                event.source_endpoint.address.clone()
+            } else if is_smf(&event.destination_endpoint) {
+                event.destination_endpoint.address.clone()
+            } else {
+                association.clone()
+            }
+        };
         let ev_sm_contexts: Vec<(String, String, String)> = session_ids_named(&value, SM_CONTEXT_NAME)
             .into_iter()
-            .map(|v| (SM_CONTEXT_NAME.to_string(), v.to_string(), String::new()))
+            // 2.21.119 (G2) — qualifiée par l'adresse du SMF quand une
+            // extrémité est reconnue comme telle, par l'association
+            // sinon : le SMF alloue de petits entiers, une même valeur
+            // chez un autre SMF est une autre session.
+            .map(|v| (SM_CONTEXT_NAME.to_string(), v.to_string(), smf_scope.clone()))
             .collect();
+        let ev_core_tunnel_pairs: Vec<(String, String)> = if event.protocol.as_str() == "GTP-U" {
+            Vec::new()
+        } else {
+            ev_ies.iter().flat_map(|v| parse_core_tunnel_pairs(v)).collect()
+        };
+        let is_release_sm_context = event
+            .sbi
+            .as_ref()
+            .and_then(|sbi| sbi.operation.as_deref())
+            .is_some_and(|operation| operation == "ReleaseSMContext");
         // 2.21.113 (E3) — SEID : couple (nœud destinataire, SEID
         // d'en-tête) du message, et couples des IE F-SEID.
         let is_pfcp = event.protocol.as_str() == "PFCP";
@@ -1417,6 +1498,18 @@ impl LiveTraceRegistry {
             for pair in ev_header_seid_pairs.iter().chain(ev_ie_seid_pairs.iter()) {
                 state.seid_endpoints.insert(pair.clone());
             }
+            for pair in &ev_core_tunnel_pairs {
+                state.core_tunnel_endpoints.insert(pair.clone());
+            }
+            for (_, reference, scope) in &ev_sm_contexts {
+                let session = state
+                    .sm_context_sessions
+                    .entry((reference.clone(), scope.clone()))
+                    .or_insert(None);
+                if session.is_none() {
+                    *session = ev_pdu_session.clone();
+                }
+            }
             if event.protocol.as_str() != "GTP-U" && event.event_id.starts_with("evt-") {
                 state.match_keys.insert(event.event_id.clone());
             }
@@ -1427,7 +1520,13 @@ impl LiveTraceRegistry {
             // 2.21.113 (E5) — tunnels de signalisation rangés par session
             // de données quand l'event la nomme.
             if event.protocol.as_str() != "GTP-U" {
-                if let Some(session) = ev_pdu_session.as_ref() {
+                let has_tunnels = !ev_tunnel_pairs.is_empty()
+                    || !ev_teids.is_empty()
+                    || !ev_session_teids.is_empty();
+                // Une entrée n'est créée que s'il y a un tunnel à ranger :
+                // sinon tout event qui nomme la session, la libération
+                // comprise, ferait croire que ses tunnels sont rangés.
+                if let (Some(session), true) = (ev_pdu_session.as_ref(), has_tunnels) {
                     let entry = state.session_tunnels.entry(session.clone()).or_default();
                     for pair in &ev_tunnel_pairs {
                         entry.insert((Some(pair.0.clone()), pair.1.clone()));
@@ -1507,16 +1606,82 @@ impl LiveTraceRegistry {
                         state.tunnel_teids.remove(&teid);
                     }
                     if let Some(address) = address {
+                        state.core_tunnel_endpoints.remove(&(address.clone(), teid.clone()));
                         state.tunnel_endpoints.remove(&(address, teid));
                     }
                 }
-            } else if context_release || session_release || detach {
-                // Tunnels du plan usager : oubliés. Après une mise en
-                // veille ils sont réappris à la reprise (le contexte
-                // initial les redonne).
+            } else if context_release && !detach && !session_release {
+                // 2.21.119 (G1) — mise en veille : seul le côté accès
+                // radio est libéré. Les couples côté cœur (UPF) vivent
+                // avec la session : gardés, ils rattachent le contexte
+                // initial du retour de veille, qui porte le même tunnel
+                // montant, puis le trafic montant.
+                let core = &state.core_tunnel_endpoints;
+                state.tunnel_endpoints.retain(|pair| core.contains(pair));
+                let kept: HashSet<&String> =
+                    state.tunnel_endpoints.iter().map(|pair| &pair.1).collect();
+                state.tunnel_teids.retain(|teid| kept.contains(teid));
+                for tunnels in state.session_tunnels.values_mut() {
+                    tunnels.retain(|(address, teid)| {
+                        address
+                            .as_ref()
+                            .is_some_and(|address| core.contains(&(address.clone(), teid.clone())))
+                    });
+                }
+                state.session_tunnels.retain(|_, tunnels| !tunnels.is_empty());
+            } else if session_release && !detach && ev_pdu_session.is_some() {
+                // 2.21.119 (point mineur, ordre #9 7051758378) —
+                // libération d'une session NOMMÉE dont aucun tunnel n'est
+                // rangé (appris sans `pdu_session_id`, par PFCP par
+                // exemple) : les tunnels des autres sessions de l'abonné
+                // ne sont pas vidés. Le cas est compté : les tunnels de
+                // la session libérée, eux, restent connus.
+                if !seed_only {
+                    state.trace.session_releases_without_filed_tunnels = state
+                        .trace
+                        .session_releases_without_filed_tunnels
+                        .saturating_add(1);
+                }
+            } else if session_release || detach {
+                // Libération d'une session que l'event ne nomme pas, ou
+                // détachement : tous les tunnels du plan usager sont
+                // oubliés.
                 state.tunnel_teids.clear();
                 state.tunnel_endpoints.clear();
                 state.session_tunnels.clear();
+                state.core_tunnel_endpoints.clear();
+            }
+            // 2.21.119 (G2) — une référence de contexte SM finit avec sa
+            // session de données. Depuis 2.21.113 elle n'était plus
+            // oubliée en 5G : réattribuée par le SMF à un autre abonné,
+            // elle rattachait ses messages SBI.
+            let forget_sm_contexts: Vec<(String, String)> = if detach {
+                state.sm_context_sessions.keys().cloned().collect()
+            } else if is_release_sm_context {
+                ev_sm_contexts
+                    .iter()
+                    .map(|(_, reference, scope)| (reference.clone(), scope.clone()))
+                    .collect()
+            } else if session_release && !context_release {
+                // Libération de session : les références de cette session,
+                // et celles qu'aucun event n'a rattachées à une session
+                // (choix de l'isolement).
+                state
+                    .sm_context_sessions
+                    .iter()
+                    .filter(|(_, session)| {
+                        ev_pdu_session.is_none() || session.is_none() || **session == ev_pdu_session
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for (reference, scope) in forget_sm_contexts {
+                state.sm_context_sessions.remove(&(reference.clone(), scope.clone()));
+                state
+                    .ue_ids
+                    .remove(&(SM_CONTEXT_NAME.to_string(), reference, scope));
             }
             if detach || (session_release && !context_release && ev_pdu_session.is_none()) {
                 // Détachement, ou libération d'une session que l'event ne
@@ -2345,6 +2510,7 @@ pub(crate) async fn create(
         parents_attached_after_child: 0,
         rejected_ue_id_mismatch: 0,
         rejected_seid_endpoint_mismatch: 0,
+        session_releases_without_filed_tunnels: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
     };
@@ -2371,6 +2537,8 @@ pub(crate) async fn create(
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
+            core_tunnel_endpoints: HashSet::new(),
+            sm_context_sessions: HashMap::new(),
             // 2.21.105 — le lecteur relit le ring de signalisation
             // pour cette trace à sa prochaine passe.
             needs_seed: true,
@@ -2745,6 +2913,7 @@ mod tests {
                 parents_attached_after_child: 0,
                 rejected_ue_id_mismatch: 0,
                 rejected_seid_endpoint_mismatch: 0,
+                session_releases_without_filed_tunnels: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
             },
@@ -2767,6 +2936,8 @@ mod tests {
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
+            core_tunnel_endpoints: HashSet::new(),
+            sm_context_sessions: HashMap::new(),
             needs_seed: true,
             seeding: false,
         }
@@ -3894,7 +4065,9 @@ mod tests {
             4,
             vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21")],
         ));
-        assert_eq!(snapshot(&r), (0, 0, true));
+        // 2.21.119 (G1) — le tunnel montant, côté cœur (UPF), vit avec la
+        // session de données : il est gardé à la mise en veille.
+        assert_eq!(snapshot(&r), (0, 1, true));
         // Les identifiants libérés, réutilisés par un autre UE, ne
         // rattachent plus rien.
         r.route_normalized(&ngap_between(
@@ -3991,10 +4164,11 @@ mod tests {
             4,
             vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21")],
         ));
+        // 2.21.119 (G1) — le tunnel montant (UPF) est gardé aussi.
         assert_eq!(
             snapshot(&r),
-            (1, 0, 1, 1),
-            "identifiants NGAP et tunnels oubliés ; contexte SM et SEID gardés"
+            (1, 1, 1, 1),
+            "identifiants NGAP oubliés ; contexte SM, SEID et tunnel côté cœur gardés"
         );
         // Suite normale de la mise en veille, sans pseudonyme.
         r.route_normalized(&sbi(5, vec![("sm_context_reference", "ctx-7")]));
@@ -4027,6 +4201,261 @@ mod tests {
             vec![("subscriber_pseudonym", "psn-ue-a")],
         ));
         assert_eq!(snapshot(&r), (0, 0, 0, 0));
+    }
+
+    /// 2.21.119 (relecture CLAUDE2 #9 7051699381, G2 ; sonde RVC3) —
+    /// isolement : une référence de contexte SM finit avec sa session de
+    /// données. Référence `1` apprise sur un SBI de l'abonné ; libération
+    /// de sa session ; le SMF réattribue `1` à un autre abonné : ses SBI,
+    /// avant comme après une mise en veille, n'entrent pas dans la trace.
+    /// À `7e0b1bb` les deux entraient. Couvre aussi : même valeur chez un
+    /// autre SMF, `ReleaseSMContext`, et la fin 5G `Deregistration Accept`.
+    #[test]
+    fn sm_context_reference_ends_with_its_pdu_session_2_21_119() {
+        use event_schema::{Direction, Protocol};
+        let gnb = "10.77.11.13";
+        let sbi = |packet: u64, smf: &str, operation: &str, ids: Vec<(&'static str, &'static str)>| {
+            let mut event = mk_event("SBI", Protocol::Ngap, operation, packet, Direction::Unknown, ids, vec![]);
+            event.event_id = format!("evt-sbi-{packet:04}");
+            event.source_endpoint.address = "10.77.21.20".into();
+            event.destination_endpoint = event_schema::Endpoint {
+                address: smf.into(),
+                port: Some(7777),
+                network_function: Some("SMF".into()),
+            };
+            event.sbi = Some(event_schema::SbiMetadata {
+                tcp_connection_id: "c".into(),
+                http2_stream_id: 1,
+                service: Some("nsmf-pdusession".into()),
+                operation: Some(operation.into()),
+                http_method: Some("POST".into()),
+                request_uri: None,
+                http_status: None,
+                consumer_nf: None,
+                producer_nf: None,
+                scp_transit: false,
+                transaction_duration_ns: None,
+            });
+            event
+        };
+        let smf = "10.77.24.7";
+        let known = |r: &LiveTraceRegistry| {
+            r.traces.lock().unwrap()["t"]
+                .ue_ids
+                .iter()
+                .filter(|(name, _, _)| name == SM_CONTEXT_NAME)
+                .count()
+        };
+
+        // (a) libération de la session, puis réattribution de la référence.
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&sbi(
+            1,
+            smf,
+            "UpdateSMContext",
+            vec![("sm_context_reference", "1"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        // Même valeur chez un autre SMF : autre session.
+        r.route_normalized(&sbi(2, "10.77.24.99", "UpdateSMContext", vec![("sm_context_reference", "1")]));
+        // Même SMF : la session de l'abonné.
+        r.route_normalized(&sbi(3, smf, "UpdateSMContext", vec![("sm_context_reference", "1")]));
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "PDU Session Release Complete",
+            4,
+            vec![("subscriber_pseudonym", "psn-ue-a"), ("pdu_session_id", "1")],
+        ));
+        assert_eq!(known(&r), 0, "référence oubliée avec la session");
+        r.route_normalized(&sbi(5, smf, "UpdateSMContext", vec![("sm_context_reference", "1")]));
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "UEContextReleaseComplete",
+            6,
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        r.route_normalized(&sbi(7, smf, "UpdateSMContext", vec![("sm_context_reference", "1")]));
+        assert_eq!(
+            routed_ids(&r),
+            vec!["evt-sbi-0001", "evt-sbi-0003", "evt-ngap-0004", "evt-ngap-0006"],
+            "aucun SBI d'après la libération, ni celui d'un autre SMF"
+        );
+
+        // (b) ReleaseSMContext : la référence est oubliée après ce message.
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&sbi(
+            1,
+            smf,
+            "UpdateSMContext",
+            vec![("sm_context_reference", "4"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        r.route_normalized(&sbi(2, smf, "ReleaseSMContext", vec![("sm_context_reference", "4")]));
+        r.route_normalized(&sbi(3, smf, "UpdateSMContext", vec![("sm_context_reference", "4")]));
+        assert_eq!(routed_ids(&r), vec!["evt-sbi-0001", "evt-sbi-0002"]);
+
+        // (c) fin 5G : Deregistration Accept oublie tout.
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&sbi(
+            1,
+            smf,
+            "UpdateSMContext",
+            vec![("sm_context_reference", "9"), ("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        assert_eq!(known(&r), 1);
+        r.route_normalized(&ngap_between(
+            gnb,
+            false,
+            "Deregistration Accept",
+            2,
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+        ));
+        assert_eq!(known(&r), 0);
+        assert!(is_detach("Deregistration Accept") && is_detach("Detach Accept"));
+    }
+
+    /// 2.21.119 (relecture CLAUDE2 #9 7051699381, G1 ; sonde RVC2) —
+    /// retour de veille SANS identité lisible (NAS chiffré). La mise en
+    /// veille garde le tunnel côté cœur (UPF, TEID montant) et oublie
+    /// celui côté accès radio. Au retour : l'`InitialUEMessage` et son
+    /// enfant ne sont pas rattachables, mais l'`InitialContextSetupRequest`
+    /// l'est par le couple (UPF, TEID), fait réapprendre les identifiants
+    /// UE, et les G-PDU montants sont rattachés. À `7e0b1bb` : rien, ni
+    /// N2 ni N3.
+    #[test]
+    fn return_from_idle_without_identity_reattaches_by_the_core_tunnel_2_21_119() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        let gnb = "10.77.11.13";
+        let upf = "10.77.22.13";
+        let with_tunnels = |mut event: event_schema::NormalizedEvent, value: &str| {
+            event.information_elements = vec![event_schema::InformationElement {
+                id: None,
+                name: "Transfer".into(),
+                length: 0,
+                value: Some(value.into()),
+                raw_sha256: None,
+                status: event_schema::DecodeStatus::Decoded,
+            }];
+            event
+        };
+        let gpdu = |packet: u64, teid: &'static str, endpoint: &'static str, uplink: bool| {
+            let mut event = mk_event(
+                "N3",
+                Protocol::Gtpu,
+                "G-PDU",
+                packet,
+                if uplink { Direction::Uplink } else { Direction::Downlink },
+                vec![("teid", teid)],
+                vec![],
+            );
+            event.destination_endpoint.address = endpoint.into();
+            event
+        };
+        // Avant la veille : enregistrement, session (tunnel UL à l'UPF,
+        // tunnel DL au gNB).
+        r.route_normalized(&with_tunnels(
+            ngap_between(
+                gnb,
+                false,
+                "PDUSessionResourceSetupRequest",
+                1,
+                vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21"), ("subscriber_pseudonym", "psn-ue-a")],
+            ),
+            "item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x0000a001,item_0_tunnel_ip_dl=10.77.11.13,item_0_gtp_teid_dl=0x0000a002",
+        ));
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "UEContextReleaseComplete",
+            2,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "21")],
+        ));
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert!(t.tunnel_endpoints.contains(&(upf.to_string(), "0xa001".to_string())), "côté cœur gardé");
+            assert!(!t.tunnel_endpoints.iter().any(|pair| pair.1 == "0xa002"), "côté accès oublié");
+            assert!(t.ue_ids.is_empty());
+        }
+        // Le TEID descendant d'avant la veille ne rattache plus rien.
+        r.route_normalized(&gpdu(3, "0x0000a002", gnb, false));
+        // Retour : parent et enfant sans identité lisible.
+        r.route_normalized(&ngap_between(gnb, true, "InitialUEMessage", 4, vec![("ran_ue_ngap_id", "31")]));
+        let mut child = ngap_between(
+            gnb,
+            true,
+            "Service request",
+            4,
+            vec![("ran_ue_ngap_id", "31"), ("parent_ngap_event_id", "evt-ngap-0004")],
+        );
+        child.event_id = "evt-nas-0004".into();
+        r.route_normalized(&child);
+        // Contexte initial : même tunnel montant, nouveau `ran`.
+        r.route_normalized(&with_tunnels(
+            ngap_between(
+                gnb,
+                false,
+                "InitialContextSetupRequest",
+                5,
+                vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "31")],
+            ),
+            "item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x0000a001",
+        ));
+        r.route_normalized(&ngap_between(
+            gnb,
+            true,
+            "InitialContextSetupResponse",
+            6,
+            vec![("amf_ue_ngap_id", "11"), ("ran_ue_ngap_id", "31")],
+        ));
+        r.route_normalized(&gpdu(7, "0x0000a001", upf, true));
+        r.route_normalized(&gpdu(8, "0x0000a001", upf, true));
+        // Un autre UE reprend l'ancien `ran` 21.
+        let mut stranger = ngap_between(gnb, true, "InitialUEMessage", 9, vec![("ran_ue_ngap_id", "21")]);
+        stranger.event_id = "evt-ngap-stranger".into();
+        r.route_normalized(&stranger);
+        assert_eq!(
+            routed_ids(&r),
+            vec!["evt-ngap-0001", "evt-ngap-0002", "evt-ngap-0005", "evt-ngap-0006"],
+            "contexte initial rattaché par le tunnel côté cœur, puis sa réponse"
+        );
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.gpdu_attached, 2, "les deux G-PDU montants du retour");
+        assert_eq!(t.trace.gpdu_rejected_no_match, 1, "le descendant d'avant la veille");
+    }
+
+    /// 2.21.119 (point mineur, ordre #9 7051758378) — libération d'une
+    /// session NOMMÉE dont les tunnels ne sont pas rangés par session
+    /// (appris par PFCP, sans `pdu_session_id`) : les tunnels de
+    /// l'abonné ne sont pas vidés, et le cas est compté.
+    #[test]
+    fn named_release_without_filed_tunnels_keeps_other_tunnels_and_is_counted_2_21_119() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&mk_event(
+            "N4",
+            Protocol::Pfcp,
+            "PFCP Session Establishment Request",
+            1,
+            Direction::Unknown,
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+            vec![("F-TEID", "teid=0x0000a001,v4=true,v6=false,ipv4=10.77.22.13")],
+        ));
+        r.route_normalized(&ngap_between(
+            "10.77.11.13",
+            true,
+            "PDU Session Release Complete",
+            2,
+            vec![("subscriber_pseudonym", "psn-ue-a"), ("pdu_session_id", "2")],
+        ));
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert!(t.tunnel_teids.contains("0xa001"), "tunnel non rangé : gardé");
+        assert_eq!(t.trace.session_releases_without_filed_tunnels, 1);
+        let stats = r.stats_payload(&t.trace);
+        assert_eq!(stats["session_releases_without_filed_tunnels"], 1);
     }
 
     /// 2.21.113 (E5, exigence cœur #9 7050925249) — libération d'UNE
