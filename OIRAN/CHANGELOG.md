@@ -1,5 +1,42 @@
 # Changelog
 
+## oiran-api 2.21.109, oiran-decode 0.10.0, capture-pcap 0.3.0 — 2026-11-20 — lecteur live : reprise à l'offset, lot A (ordres #9 7049622543 et 7049845272, design #9 7049817473)
+
+Upgrade **patch** sans déploiement, base `fix/oiran-2.21.108-train` @ `fb7b721`. Branche `fix/oiran-2.21.109-live-reader-offset-resume`.
+
+### Audit
+
+Dans `start_reader` (`apps/api/src/live_trace.rs`), dès que `(size, mtime)` d'un segment du ring changeait, `decode_capture_streaming` relisait le fichier depuis l'octet 0, puis une table d'`event_id` par fichier écartait ce qui avait déjà été routé. Passe toutes les 750 ms : pour un segment qui grossit jusqu'à S octets le coût cumulé est en S², et la table grossit avec le segment. Suspect n° 1 de la charge CPU sous trafic ; **non mesuré en prod** à ce jour.
+
+### Changement
+
+1. `capture-pcap` 0.3.0 : `ResumePoint` + `visit_capture_from`. Reprend à l'offset du dernier bloc complet (pcap et pcapng : endianness de section et table des interfaces gardées), s'arrête sans erreur avant un bloc incomplet en fin de fichier, émet les mêmes `packet_number` et `byte_offset` qu'une lecture intégrale.
+2. `oiran-decode` 0.10.0 : `DecodeSession`, `decode_capture_incremental`, `finish_incremental`, `supports_incremental`. Le corps de `decode_capture_streaming_with_sbi_carry` devient `decode_core`, partagé par les deux modes ; le décodage intégral passe par le même code avec un état neuf.
+3. `oiran-api` : le lecteur garde une session par segment pour les plans du **lot A** — N3, S1-U, S5-U, N4, Sxab, S11, S5-C — et ne décode que les octets ajoutés. La table d'`event_id` par fichier n'est plus tenue pour ces plans. Les autres plans (N2, S1-MME, SBI, S6a, IMS, N6) gardent le redécodage intégral : **lot B, non livré**.
+4. **Invalidation** : session jetée et segment relu depuis 0 si l'inode a changé, si la taille est passée sous l'offset consommé, ou si les 64 derniers octets consommés ont changé (réécriture sur place). Compté dans `resume_resets`.
+5. **Repli sans redéploiement** : `OIRAN_LIVE_READER_FULL_REDECODE=1` (lu à chaque passe) remet tous les plans en redécodage intégral.
+6. **Mesure** : l'event SSE `stats` gagne `reader` = `resume_resets`, `full_redecode`, et par plan `bytes_decoded`, `bytes_file`, `incremental` pour la dernière passe ayant décodé quelque chose. Attendu sur N3 : octets décodés = croissance du segment, plus sa taille.
+
+### Mémoire
+
+En reprise, les ordinaux de `stable_event_key` d'un paquet sont oubliés dès le paquet suivant ; seul est gardé celui du paquet qui ouvre un flux RTP du tunnel (au plus un par flux), parce que l'event du flux en continue la numérotation.
+
+### OUVERT
+
+- **Pas d'event RTP N3 en live avant la rotation du segment** (décision cœur 7049845272, option a) : les flux RTP du tunnel sont émis à la clôture du segment, quand un successeur existe dans le ring. L'instantané périodique est au lot B.
+- Lot B non livré : N2, S1-MME, SBI, S6a, IMS, N6 sont toujours redécodés en entier à chaque passe.
+- Après un redémarrage du service les sessions sont perdues : le segment courant est relu une fois depuis 0 (comportement d'avant pour cette passe).
+- Un bloc invalide au milieu d'un segment arrête la reprise sur ce bloc, comme le décodage intégral s'y arrêtait : la suite du segment n'est pas décodée.
+- Gain CPU non mesuré : aucun banc dans ce lot, la preuve attendue est `reader.interfaces.N3` et `reader_pass_ms` en recette.
+- `oiran-decode` : `route_inner_udp_after_gtpu` (2.21.100) retourne maintenant le flux RTP auquel le paquet a été agrégé ; conflit textuel probable avec le lot 2.21.110 de CLAUDE2 (marqueur `N3-IMS` du RTP).
+
+### Tests
+
+- `capture-pcap` `visit_capture_from_matches_full_visit_for_any_split_0_3_0` : jeux N2/N3/N4 du dépôt + un pcap classique, 12 graines × 2 pas (≤ 97 et ≤ 4096 octets, donc au milieu des blocs) ; paquets identiques à la lecture intégrale, offset final = taille.
+- `oiran-decode` `incremental_decode_matches_full_decode_for_any_split_2_21_109` (**gate du lot**) : jeux N3 et N4 + capture N3 synthétique avec INVITE SIP et deux flux RTP dans le tunnel ; 12 graines × 2 pas ; JSON complet de chaque event identique au décodage intégral, dans le même ordre, clôture comprise. `incremental_decode_is_refused_on_stateful_planes_2_21_109`.
+- `oiran-api` `decode_increment_reads_only_appended_bytes_2_21_109` (somme des octets décodés = taille du fichier), `decode_increment_resets_when_file_is_replaced_by_a_larger_one_2_21_109` (renommage, réécriture sur place, troncature ; `resume_resets` = 1 pour un remplacement), `stats_expose_reader_io_and_full_redecode_switch_2_21_109`.
+- Non testé : la boucle `start_reader` elle-même (elle exige le volume lab) ; ce sont ses fonctions `decode_increment` et `close_reader_session` qui le sont.
+
 ## oiran-api 2.21.108 — 2026-11-20 — train (cœur) : 2.21.104 + 2.21.105 (rattachement de la trace live) + 2.21.107 (N6) + 2.21.100 (voix décodeur)
 
 - Merge `--no-ff` de `fix/oiran-2.21.105-live-throughput-attach` @ 477dfda et de `fix/oiran-2.21.100-voice-decode` @ f0b218b sur `fix/oiran-2.21.104-train` @ 068e9c1.
