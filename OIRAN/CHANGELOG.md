@@ -1,5 +1,11 @@
 # Changelog
 
+## oiran-api 2.21.117 — 2026-11-20 — train (cœur) : 2.21.114 + 2.21.115 (clé sur PFCP frères, /events) + 2.21.113 et 2.21.116 (rattachement de la trace : E1 à E5, mise en veille) + tests capture-helper
+
+- Merge `--no-ff` de `fix/oiran-capture-helper-manual-stop-test` @ 9431c21 et de `fix/oiran-2.21.116-trace-idle-release` @ 7e0b1bb sur `fix/oiran-2.21.115-pfcp-sibling-items-key` @ 498767c.
+- Aucun code ajouté par le train ; conflits limités à la version d `oiran-api` et au CHANGELOG.
+- OUVERT : retour de veille côté N2 (Service Request par identité temporaire chiffrée) ; ordre réel des messages de mise en veille non vérifié sur capture.
+
 ## oiran-api 2.21.116 — 2026-11-20 — trace live : la mise en veille ne ferme pas la session de données (relecture CLAUDE2 #9 7051364956)
 
 Upgrade **patch** sans déploiement, base 2.21.113 @ `2f7f77f`. Branche `fix/oiran-2.21.116-trace-idle-release`. Seul `apps/api/src/live_trace.rs` change. **2.21.113 ne doit pas être déployée sans ce correctif.**
