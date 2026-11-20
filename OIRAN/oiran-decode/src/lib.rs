@@ -229,6 +229,14 @@ where
     F: FnMut(NormalizedEvent) -> Result<(), String>,
 {
     validate_config(config)?;
+    // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — compteur
+    // des events par paquet (clé = `packet_lookup_key`). Partagé entre
+    // toutes les invocations de `emit_events` (SCTP, UDP, SBI/TCP,
+    // Diameter/TCP) + l'émission RTP finale. L'incrément est 0-based,
+    // déterministe, identique en live et en publication car la
+    // séquence d'émission du décodeur est elle-même déterministe pour
+    // un même pcapng.
+    let mut key_ordinals: HashMap<String, u32> = HashMap::new();
     // 2.7.6: the caller owns the pseudonym key. One key per logical import —
     // standalone decode_capture() generates its own; live-probe continuous
     // imports hold a job-scoped key and reuse it across every segment so
@@ -298,7 +306,7 @@ where
                     if matches!(route, UdpRoute::ImsSip) {
                         register_sdp_flows_from_sip(&decoded, &mut rtp_aggregator);
                     }
-                    emit_events(decoded, config, &mut sink, &mut event_count, &mut sink_error);
+                    emit_events(decoded, config, &mut key_ordinals, &mut sink, &mut event_count, &mut sink_error);
                 } else if config.interface == "IMS" {
                     // 2.11.0 : paquet UDP IMS en dehors du port SIP 5060 → tenter
                     // RTP/RTCP sur un flux déjà enregistré par un SDP.
@@ -367,7 +375,7 @@ where
                         "S6a" => diameter.decode(&input).events,
                         _ => ngap.decode(&input).events,
                     };
-                    emit_events(decoded, config, &mut sink, &mut event_count, &mut sink_error,
+                    emit_events(decoded, config, &mut key_ordinals, &mut sink, &mut event_count, &mut sink_error,
                     );
                 }
             }
@@ -379,6 +387,7 @@ where
                     config,
                     &pseudonym_key,
                     sbi_carry.as_deref_mut(),
+                    &mut key_ordinals,
                     &mut sink,
                     &mut event_count,
                     &mut sink_error,
@@ -399,6 +408,7 @@ where
                     config,
                     &diameter,
                     &pseudonym_key,
+                    &mut key_ordinals,
                     &mut sink,
                     &mut event_count,
                     &mut sink_error,
@@ -419,6 +429,7 @@ where
             config,
             &diameter,
             &pseudonym_key,
+            &mut key_ordinals,
             &mut sink,
             &mut event_count,
             &mut sink_error,
@@ -429,6 +440,7 @@ where
             config,
             &pseudonym_key,
             sbi_carry.as_deref_mut(),
+            &mut key_ordinals,
             &mut sink,
             &mut event_count,
             &mut sink_error,
@@ -443,9 +455,24 @@ where
     // aucune SDP + RTP ; c'est le cas habituel hors IMS.
     let rtp_events = rtp_aggregator.finish(&config.capture_id, &config.interface);
     for mut event in rtp_events {
-        // 2.21.91 (défaut #9 7033006772) — stamper `stable_event_key`
-        // sur les events RTP agrégés (émission hors `emit_events`).
-        event.assign_stable_event_key(&config.stable_source_file);
+        // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — stamper
+        // `stable_event_key` unique par event (RTP agrégé partage le
+        // compteur par-paquet avec `emit_events`).
+        if !config.stable_source_file.is_empty() {
+            if let Some(packet) = event.packet_references.first() {
+                let lookup = event_schema::packet_lookup_key(
+                    &config.stable_source_file,
+                    packet.interface_id,
+                    packet.packet_number,
+                    packet.byte_offset,
+                );
+                let ordinal = *key_ordinals
+                    .entry(lookup)
+                    .and_modify(|v| *v = v.saturating_add(1))
+                    .or_insert(0);
+                event.assign_stable_event_key(&config.stable_source_file, ordinal);
+            }
+        }
         if let Err(error) = sink(event) {
             return Err(error);
         }
@@ -470,6 +497,7 @@ where
 fn emit_events<F>(
     events: impl IntoIterator<Item = NormalizedEvent>,
     config: &DecodeConfig,
+    key_ordinals: &mut HashMap<String, u32>,
     sink: &mut F,
     event_count: &mut usize,
     sink_error: &mut Option<String>,
@@ -485,12 +513,27 @@ fn emit_events<F>(
                 Some("decoder emitted an event without complete packet provenance".into());
             return;
         }
-        // 2.21.91 (ordre #9 7033006772 défaut 3) — stamp `stable_event_key`
-        // ici, point UNIQUE d'émission pour les chemins live ET publication.
-        // `config.stable_source_file` est non vide quand le caller l'a
-        // alimenté avec le basename dumpcap original ; vide → stamping
-        // sauté pour les tests synthétiques (invariant préservé).
-        event.assign_stable_event_key(&config.stable_source_file);
+        // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — stamp
+        // `stable_event_key` UNIQUE par event. Ordinal = rang 0-based
+        // dans l'ordre d'émission parmi les events partageant le même
+        // (basename, iid, pkt, off). Live et publi décodent le MÊME
+        // pcapng dans le MÊME ordre → mêmes ordinaux → mêmes clés.
+        // `config.stable_source_file` vide → stamping sauté.
+        if !config.stable_source_file.is_empty() {
+            if let Some(packet) = event.packet_references.first() {
+                let lookup = event_schema::packet_lookup_key(
+                    &config.stable_source_file,
+                    packet.interface_id,
+                    packet.packet_number,
+                    packet.byte_offset,
+                );
+                let ordinal = *key_ordinals
+                    .entry(lookup)
+                    .and_modify(|v| *v = v.saturating_add(1))
+                    .or_insert(0);
+                event.assign_stable_event_key(&config.stable_source_file, ordinal);
+            }
+        }
         if let Err(error) = sink(event) {
             *sink_error = Some(error);
             return;
@@ -504,6 +547,7 @@ fn emit_sbi_connections<F>(
     config: &DecodeConfig,
     pseudonym_key: &PseudonymKey,
     mut sbi_carry: Option<&mut SbiCarryContext>,
+    key_ordinals: &mut HashMap<String, u32>,
     sink: &mut F,
     event_count: &mut usize,
     sink_error: &mut Option<String>,
@@ -540,7 +584,7 @@ fn emit_sbi_connections<F>(
         aggregate.incomplete_streams += report.incomplete_streams;
         aggregate.encrypted_connections += report.encrypted_connections;
         aggregate.errors.extend(report.errors);
-        emit_events(events, config, sink, event_count, sink_error);
+        emit_events(events, config, key_ordinals, sink, event_count, sink_error);
     }
 }
 
@@ -549,6 +593,7 @@ fn emit_diameter_connections<F>(
     config: &DecodeConfig,
     decoder: &DiameterDecoder,
     pseudonym_key: &PseudonymKey,
+    key_ordinals: &mut HashMap<String, u32>,
     sink: &mut F,
     event_count: &mut usize,
     sink_error: &mut Option<String>,
@@ -611,7 +656,7 @@ where
                     raw_payload_reference: &raw,
                     pseudonym_key,
                 };
-                emit_events(decoder.decode(&input).events, config, sink, event_count, sink_error,
+                emit_events(decoder.decode(&input).events, config, key_ordinals, sink, event_count, sink_error,
                 );
             }
         }
@@ -1068,12 +1113,14 @@ mod tests {
         let mut events = Vec::new();
         let mut count = 0;
         let mut error = None;
+        let mut key_ordinals: HashMap<String, u32> = HashMap::new();
         assert_eq!(
             emit_diameter_connections(
                 vec![connection],
                 &config,
                 &DiameterDecoder,
                 &key,
+                &mut key_ordinals,
                 &mut |event| {
                     events.push(event);
                     Ok(())
@@ -1192,11 +1239,13 @@ mod tests {
         let mut events = Vec::new();
         let mut count = 0;
         let mut error = None;
+        let mut key_ordinals: HashMap<String, u32> = HashMap::new();
         emit_diameter_connections(
             vec![connection],
             &config,
             &DiameterDecoder,
             &key,
+            &mut key_ordinals,
             &mut |event| {
                 events.push(event);
                 Ok(())

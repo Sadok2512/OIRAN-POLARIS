@@ -148,14 +148,31 @@ fn live_and_publish_paths_produce_identical_stable_event_keys_on_the_same_pcapng
         only_live.is_empty() && only_publish.is_empty(),
         "stable_event_key diverge (live-only={only_live:?}, publi-only={only_publish:?})"
     );
-    // Preuve 3b — parité stricte MULTISET : chaque paquet produit le
-    // même nombre d'events des deux côtés (NGAP parent + NAS enfant
-    // partagent la même clé par construction — voir `multiset_keys`).
+    // Preuve 3b — **UNICITÉ par event** (raffinement #9 7034553419) :
+    // `|protocol|ordinal` doit faire que chaque event porte une clé
+    // différente dans son chemin. Live et publi partagent exactement
+    // la même séquence d'émission donc la même famille d'ordinaux.
+    assert_eq!(
+        live_keys.len(),
+        live_output.events.len(),
+        "clé unique par event côté live attendue (collisions résiduelles — ordinal insuffisant)"
+    );
+    assert_eq!(
+        publish_keys.len(),
+        publish_output.events.len(),
+        "clé unique par event côté publi attendue (collisions résiduelles — ordinal insuffisant)"
+    );
+    // Preuve 3c — multiset == set puisque l'unicité est garantie, mais on
+    // conserve l'assertion pour détecter toute régression future.
     let live_mset = multiset_keys(&live_output.events);
     let publish_mset = multiset_keys(&publish_output.events);
     assert_eq!(
         live_mset, publish_mset,
         "multisets stable_event_key diffèrent live={live_mset:?} publi={publish_mset:?}"
+    );
+    assert!(
+        live_mset.values().all(|c| *c == 1),
+        "multiset doit être un ensemble (toutes multiplicités = 1)"
     );
 
     // Preuve 4 — `event_id` diverge bien (invariant du design : zero

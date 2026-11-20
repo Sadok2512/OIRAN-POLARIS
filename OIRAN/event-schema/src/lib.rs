@@ -339,16 +339,22 @@ impl NormalizedEvent {
         self.event_id = format!("evt-{:016x}", stable_hash(material.as_bytes()));
     }
 
-    /// 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772) — stamp
-    /// `stable_event_key` à partir de la première `packet_reference` et
-    /// du chemin dumpcap ORIGINAL fourni par le caller. Appelé par
-    /// `oiran-decode::emit_events` sur le chemin live ET le chemin
-    /// publication (après `assign_deterministic_id`). Si le caller ne
-    /// fournit pas le chemin dumpcap original (`dumpcap_file_path`
-    /// vide) ou que l'event est sans `packet_references`, le champ
-    /// reste vide — invariant non régressé pour les events synthétiques
-    /// de test.
-    pub fn assign_stable_event_key(&mut self, dumpcap_file_path: &str) {
+    /// 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772 + raffinement #9
+    /// 7034553419) — stamp `stable_event_key` à partir de la première
+    /// `packet_reference` du caller, en ajoutant `(protocol, ordinal)`
+    /// pour garantir l'**unicité par event**. `ordinal` = rang (0-based)
+    /// de l'event parmi ceux produits pour un même paquet dans l'ordre
+    /// d'émission d'`oiran-decode::emit_events`. Le même décodeur
+    /// produit la même séquence en live et en publication → mêmes
+    /// ordinaux, mêmes clés. Si le caller ne fournit pas le chemin
+    /// dumpcap (`dumpcap_file_path` vide) ou si l'event n'a pas de
+    /// `packet_references`, le champ reste vide — invariant non
+    /// régressé pour les tests synthétiques.
+    pub fn assign_stable_event_key(
+        &mut self,
+        dumpcap_file_path: &str,
+        ordinal: u32,
+    ) {
         if dumpcap_file_path.is_empty() {
             return;
         }
@@ -360,6 +366,8 @@ impl NormalizedEvent {
             packet.interface_id,
             packet.packet_number,
             packet.byte_offset,
+            self.protocol.as_str(),
+            ordinal,
         );
     }
     pub fn has_complete_provenance(&self) -> bool {
@@ -567,9 +575,9 @@ fn sbi_json(value: Option<&SbiMetadata>) -> String {
     format!("{{\"tcp_connection_id\":\"{}\",\"http2_stream_id\":{},\"service\":{},\"operation\":{},\"http_method\":{},\"request_uri\":{},\"http_status\":{},\"consumer_nf\":{},\"producer_nf\":{},\"scp_transit\":{},\"transaction_duration_ns\":{}}}", escape(&v.tcp_connection_id), v.http2_stream_id, option_string(v.service.as_deref()), option_string(v.operation.as_deref()), option_string(v.http_method.as_deref()), option_string(v.request_uri.as_deref()), option_num(v.http_status), option_string(v.consumer_nf.as_deref()), option_string(v.producer_nf.as_deref()), v.scp_transit, option_num(v.transaction_duration_ns))
 }
 
-/// 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772) — dérive la clé de
-/// corrélation live↔publié à partir du chemin dumpcap ORIGINAL et du
-/// triplet `(interface_id, packet_number, byte_offset)` du paquet.
+/// 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772 + raffinement #9
+/// 7034553419) — dérive la clé UNIQUE par event pour la corrélation
+/// live↔publié.
 ///
 /// Fonction UNIQUE appelée par les deux chemins :
 ///   * `apps/api::live_trace` (décodage du ring en live) ;
@@ -577,14 +585,37 @@ fn sbi_json(value: Option<&SbiMetadata>) -> String {
 ///     COPIE renommée du pcapng mais reçoit le basename original via
 ///     `DecodeConfig::stable_source_file`).
 ///
-/// Seul le `basename` du chemin est utilisé — le répertoire peut
-/// différer entre les deux chemins (ring vs staging) ; le basename
-/// dumpcap porte run_id + numéro de segment et est identique entre
-/// live et publication pour un même pcapng.
+/// Encodage stable, unique par event :
+///   `"{basename}|{interface_id}|{packet_number}|{byte_offset}|{protocol}|{ordinal}"`.
 ///
-/// Encodage stable : `"{basename}|{interface_id}|{packet_number}|{byte_offset}"`.
-/// Pur, déterministe, sans dépendance au `capture_id`.
+/// `ordinal` discrimine les events qui partagent un même paquet
+/// (ex. NGAP parent + NAS enfant). Rang 0-based dans l'ordre
+/// d'émission d'`oiran-decode::emit_events` — déterministe et
+/// identique entre les deux chemins pour un même pcapng. Voir aussi
+/// [`packet_lookup_key`] pour le prefix servant à compter les events
+/// par paquet côté caller.
 pub fn derive_stable_event_key(
+    dumpcap_file_path: &str,
+    interface_id: u32,
+    packet_number: u64,
+    byte_offset: u64,
+    protocol: &str,
+    ordinal: u32,
+) -> String {
+    format!(
+        "{}|{}|{}",
+        packet_lookup_key(dumpcap_file_path, interface_id, packet_number, byte_offset),
+        protocol,
+        ordinal,
+    )
+}
+
+/// 1.6.0 (POLARIS 2.21.91, #9 7034553419) — prefix de `stable_event_key`
+/// tronqué à `(basename, iid, pkt, off)`. Utilisé par
+/// `oiran-decode::emit_events` comme clé d'index du compteur
+/// d'ordinaux : tous les events qui partagent ce prefix reçoivent des
+/// ordinaux 0, 1, 2, … dans leur ordre d'émission.
+pub fn packet_lookup_key(
     dumpcap_file_path: &str,
     interface_id: u32,
     packet_number: u64,
@@ -1559,61 +1590,102 @@ mod tests {
         let _: serde_json::Value =
             serde_json::from_str(&after).expect("compact JSON must parse");
     }
-    // 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772) — `derive_stable_event_key`
-    // est la fonction UNIQUE utilisée par les deux chemins (live + publication).
-    // Ces tests valident :
+    // 1.6.0 (POLARIS 2.21.91, défaut #9 7033006772 + raffinement #9 7034553419)
+    // — `derive_stable_event_key` est la fonction UNIQUE utilisée par les deux
+    // chemins (live + publication). Ces tests valident :
     //   * basename extrait du chemin, indifférent au répertoire parent
     //     (live = ring dir, publi = staging dir ; même fichier → même clé) ;
-    //   * encodage stable `{basename}|{iid}|{pkt}|{off}` ;
-    //   * assign_stable_event_key no-op si chemin vide ou pas de ref.
+    //   * encodage stable `{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}` ;
+    //   * assign_stable_event_key no-op si chemin vide ou pas de ref ;
+    //   * `packet_lookup_key` est le préfixe qui regroupe les events d'un
+    //     même paquet (utilisé comme clé du compteur d'ordinaux côté
+    //     `oiran-decode::emit_events`).
     #[test]
     fn derive_stable_event_key_strips_parent_directory() {
         let live_path = "/var/lib/oiran/ring/n3/n3_live_00032_20261120.pcapng";
         let publish_path = "/tmp/base/staging/n3_live_00032_20261120.pcapng";
-        let a = derive_stable_event_key(live_path, 2, 42, 100);
-        let b = derive_stable_event_key(publish_path, 2, 42, 100);
+        let a = derive_stable_event_key(live_path, 2, 42, 100, "NGAP", 0);
+        let b = derive_stable_event_key(publish_path, 2, 42, 100, "NGAP", 0);
         assert_eq!(a, b, "basename identique → clé identique (live↔publi)");
-        assert_eq!(a, "n3_live_00032_20261120.pcapng|2|42|100");
+        assert_eq!(a, "n3_live_00032_20261120.pcapng|2|42|100|NGAP|0");
     }
 
     #[test]
     fn derive_stable_event_key_bare_basename() {
-        // Caller qui fournit uniquement le basename (sans répertoire) :
-        // la fonction renvoie bien `{basename}|{iid}|{pkt}|{off}`.
-        let key = derive_stable_event_key("ngap_00001.pcapng", 0, 1, 24);
-        assert_eq!(key, "ngap_00001.pcapng|0|1|24");
+        // Caller qui fournit uniquement le basename (sans répertoire).
+        let key = derive_stable_event_key("ngap_00001.pcapng", 0, 1, 24, "NGAP", 0);
+        assert_eq!(key, "ngap_00001.pcapng|0|1|24|NGAP|0");
     }
 
     #[test]
     fn derive_stable_event_key_different_packets_diverge() {
         let base = "/x/f.pcapng";
         assert_ne!(
-            derive_stable_event_key(base, 0, 1, 24),
-            derive_stable_event_key(base, 0, 2, 24)
+            derive_stable_event_key(base, 0, 1, 24, "NGAP", 0),
+            derive_stable_event_key(base, 0, 2, 24, "NGAP", 0)
         );
         assert_ne!(
-            derive_stable_event_key(base, 0, 1, 24),
-            derive_stable_event_key(base, 0, 1, 48)
+            derive_stable_event_key(base, 0, 1, 24, "NGAP", 0),
+            derive_stable_event_key(base, 0, 1, 48, "NGAP", 0)
         );
         assert_ne!(
-            derive_stable_event_key(base, 0, 1, 24),
-            derive_stable_event_key(base, 1, 1, 24)
+            derive_stable_event_key(base, 0, 1, 24, "NGAP", 0),
+            derive_stable_event_key(base, 1, 1, 24, "NGAP", 0)
         );
+    }
+
+    #[test]
+    fn derive_stable_event_key_discriminates_siblings_via_protocol_and_ordinal() {
+        // NGAP parent et NAS enfant au même paquet : même prefix, mais
+        // la clé complète diffère grâce à `(protocol, ordinal)`.
+        let base = "/x/f.pcapng";
+        let parent = derive_stable_event_key(base, 0, 7, 40, "NGAP", 0);
+        let child = derive_stable_event_key(base, 0, 7, 40, "NAS-5GMM", 1);
+        assert_ne!(
+            parent, child,
+            "clé doit discriminer parent (NGAP|0) et enfant (NAS|1)"
+        );
+        assert!(parent.ends_with("|NGAP|0"));
+        assert!(child.ends_with("|NAS-5GMM|1"));
+    }
+
+    #[test]
+    fn packet_lookup_key_is_prefix_shared_by_same_packet_events() {
+        // Le prefix sert au compteur d'ordinaux côté oiran-decode : tous
+        // les events qui partagent ce prefix sont numérotés 0, 1, 2, …
+        let lookup = packet_lookup_key("/x/f.pcapng", 0, 7, 40);
+        let parent = derive_stable_event_key("/x/f.pcapng", 0, 7, 40, "NGAP", 0);
+        let child = derive_stable_event_key("/x/f.pcapng", 0, 7, 40, "NAS-5GMM", 1);
+        assert_eq!(lookup, "f.pcapng|0|7|40");
+        assert!(parent.starts_with(&lookup));
+        assert!(child.starts_with(&lookup));
     }
 
     #[test]
     fn assign_stable_event_key_is_noop_on_empty_path() {
         let mut e = event();
-        e.assign_stable_event_key("");
+        e.assign_stable_event_key("", 0);
         assert!(e.stable_event_key.is_empty());
     }
 
     #[test]
     fn assign_stable_event_key_populates_from_first_packet_reference() {
         let mut e = event();
-        e.assign_stable_event_key("/ring/n2/n2_live_00007.pcapng");
-        // event() fournit interface_id=2, packet_number=7, byte_offset=40.
-        assert_eq!(e.stable_event_key, "n2_live_00007.pcapng|2|7|40");
+        e.assign_stable_event_key("/ring/n2/n2_live_00007.pcapng", 0);
+        // event() fournit iid=2, pkt=7, off=40, protocol=NGAP.
+        assert_eq!(e.stable_event_key, "n2_live_00007.pcapng|2|7|40|NGAP|0");
+    }
+
+    #[test]
+    fn assign_stable_event_key_honours_ordinal() {
+        // Même paquet, deux events — 2e event stampé avec ordinal=1.
+        let mut a = event();
+        let mut b = event();
+        a.assign_stable_event_key("/ring/n2/f.pcapng", 0);
+        b.assign_stable_event_key("/ring/n2/f.pcapng", 1);
+        assert_ne!(a.stable_event_key, b.stable_event_key);
+        assert!(a.stable_event_key.ends_with("|0"));
+        assert!(b.stable_event_key.ends_with("|1"));
     }
 
     #[test]

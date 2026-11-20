@@ -1,6 +1,34 @@
 # Changelog
 
-## OIRAN API 2.21.91 — 2026-11-20 — stable_event_key live↔publi (ordre #9 7033006772 défaut 3, CLAUDE1)
+## OIRAN API 2.21.91 — 2026-11-20 — stable_event_key live↔publi UNIQUE PAR EVENT (ordre #9 7033006772 défaut 3 + raffinement #9 7034553419, CLAUDE1)
+
+### Raffinement 7034553419 — unicité par event
+
+Revue cœur 2026-11-20 08:45 : 2.21.91 (`1bedff8`) acceptée **sous réserve** — la clé `(basename, iid, pkt, off)` n'étant pas unique par event (NGAP parent + NAS enfant partagent le même paquet), la correspondance live→publié reste 1→N et ambiguë pour l'UX « cliquer sur un event live ouvre l'event publié ».
+
+**Discriminant ajouté** : `…|{protocol}|{ordinal}`, où `ordinal` est le rang 0-based de l'event parmi ceux produits pour un même paquet dans l'ordre d'émission d'`oiran-decode::emit_events`. Déterministe et identique dans les deux chemins car le décodeur produit la même séquence pour un même pcapng.
+
+**Implémentation** :
+
+- `event_schema::derive_stable_event_key(dumpcap_file_path, iid, pkt, off, protocol, ordinal) -> String` — encode `"{basename}|{iid}|{pkt}|{off}|{protocol}|{ordinal}"` ;
+- `event_schema::packet_lookup_key(dumpcap_file_path, iid, pkt, off) -> String` — prefix servant au compteur d'ordinaux côté `oiran-decode` ;
+- `NormalizedEvent::assign_stable_event_key(dumpcap_file_path: &str, ordinal: u32)` — stampe à partir de `packet_references[0]` et du protocol de l'event ;
+- `oiran-decode::decode_capture_streaming_with_sbi_carry` tient un `HashMap<String, u32>` partagé entre toutes les invocations de `emit_events` (SCTP/UDP/SBI/Diameter) et la boucle RTP finish → incrément 0-based par `(basename, iid, pkt, off)`.
+
+### Audit lock Rust 1.83
+
+```
+python3 /tmp/audit.py OIRAN/Cargo.lock OIRAN/vtap/Cargo.lock
+→ 59 paquets OIRAN/Cargo.lock + 30 paquets OIRAN/vtap/Cargo.lock
+  Highest MSRV observé : indexmap 2.13.1 → rust-version = 1.82
+  Total violators MSRV > 1.83 : **0**
+```
+
+Les deux bumps internes du lot (event-schema 1.9.0, oiran-decode 0.9.0) sont des path-deps workspace → rust-version = workspace (1.75), aucun impact.
+
+### Scope d'origine (défaut 3 — inchangé)
+
+### Défaut adressé (arbitrage #9 7033006772)
 
 Upgrade **minor** sans déploiement, basé sur `fix/oiran-2.21.89-train` @ `f600174` (= train accepté #9 `7019778994`). Branche `fix/oiran-2.21.91-stable-event-key`. Numerology CLAUDE1 = impair.
 
