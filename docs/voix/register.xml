@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<scenario name="POLARIS IMS-lite REGISTER digest">
+  <!-- CSV local hors dépôt : field0=AoR, field1=utilisateur Digest, field2=secret Digest. -->
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@ims-lite.audit>;tag=[call_number]
+      To: <sip:[field0]@ims-lite.audit>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=udp>
+      Max-Forwards: 10
+      Expires: 300
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="401" auth="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@ims-lite.audit>;tag=[call_number]
+      To: <sip:[field0]@ims-lite.audit>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=udp>
+      Max-Forwards: 10
+      Expires: 300
+      [authentication username=[field1] password=[field2]]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" rtd="true"/>
+  <ResponseTimeRepartition value="10,20,50,100,150,500,1000"/>
+</scenario>

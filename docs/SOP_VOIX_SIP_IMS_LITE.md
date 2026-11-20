@@ -2,8 +2,8 @@
 
 | Champ | Valeur |
 |---|---|
-| Version | 1.0.0 (19/11/2026) |
-| Statut | **Brouillon** : les champs « À RELEVER » sont remplis par ANR1 en lecture seule avant la première exécution |
+| Version | 1.0.1 (20/11/2026) |
+| Statut | **Préparé, non exécuté** : relevés ANR1 effectués en lecture seule ; tout démarrage ou appel reste soumis aux accords §2 |
 | Périmètre | Campagne #10 7011914977, tests V1 à V4 (voix), avec L1/L2 (live trace) et T3 (vTAP plan usager) sur le trafic voix |
 | Exécutant | un seul agent ANR à la fois, sous LAB_LOCK |
 | Prérequis de version | oiran-api **≥ 2.21.83** en prod (jitter RTP corrigé, pseudonyme SIP = NAS, règle VoNR). Sur 2.21.74, le jitter est faux et l'appel n'est pas rattaché à l'abonné |
@@ -38,17 +38,19 @@ Si l'abonné de l'UE n'a pas le DNN `ims` autorisé dans son profil, **STOP** : 
 
 | Valeur | Commande (lecture seule) | Relevé |
 |---|---|---|
-| IP et port SIP de Kamailio (P-CSCF vu par l'UE) | `rg -n 'p-cscf' /root/POLARIS/config/open5gs` ; `docker exec <kamailio> ss -lunp \| rg 5060` | À RELEVER |
-| Domaine / realm SIP | `docker exec <kamailio> sh -lc "grep -nE 'alias\|domain\|realm' /etc/kamailio/*.cfg"` | À RELEVER |
-| Mode d'authentification REGISTER (aucun / digest / IMS-AKA) | même fichier, `www_authorize\|auth_check\|ims_auth` | À RELEVER |
-| Format des identités SIP acceptées (`sip:<imsi>@domaine`, `tel:+…`) | même fichier, `registrar` / `usrloc` | À RELEVER |
-| Rx/N5 vers le PCF présent ? (décide le gate 5QI 1) | même fichier, `ims_qos\|diameter\|rx` | À RELEVER |
-| RTPengine : mode (relais / ancrage), plage de ports | `docker exec <rtpengine> ps -o args= -C rtpengine` | À RELEVER |
-| Conteneur(s) UE et profil UERANSIM avec DNN `ims` | `rg -n 'apn\|dnn' /root/POLARIS/config/ueransim` | À RELEVER |
-| Profil abonné : DNN `ims` autorisé ? | lecture seule du profil (sans IMSI en clair dans #10) | À RELEVER |
-| Conteneur DN pour l'UAS (côté N6) | `docker ps` (`polaris-dn-sender` ?) | À RELEVER |
-| Points de capture actifs N2/N3/N4/N6/SBI | `curl :49152/api/v1/probes/oiran-vprobe-local-01/interfaces` | À RELEVER |
+| IP et port SIP de Kamailio (P-CSCF vu par l'UE) | `rg -n 'listen=' /root/POLARIS/compose/ims-lite/kamailio-lite.cfg` ; `docker exec oiran-ims-lite-rtpengine-1 ss -lunp` | `10.77.24.20:5060/UDP`, annoncé par Kamailio et joignable depuis le DNN `ims` via l'UPF N6 |
+| Domaine / realm SIP | `rg -n 'authenticate\|accounts' kamailio-lite.cfg baresip-vonr.sh` | domaine et realm `ims-lite.audit` |
+| Mode d'authentification REGISTER (aucun / digest / IMS-AKA) | `rg -n 'pv_www_authenticate\|www_challenge\|ims_auth' kamailio-lite.cfg` | Digest SIP (401 puis Authorization), utilisateur d'authentification statique ; **pas IMS-AKA** |
+| Format des identités SIP acceptées (`sip:<imsi>@domaine`, `tel:+…`) | `rg -n '\$au\|save\("location"\)' kamailio-lite.cfg` | AoR `sip:<alias>@ims-lite.audit`; seul l'utilisateur Digest est contrôlé. Aucun format IMSI/MSISDN n'est requis ni accepté comme convention de test |
+| Rx/N5 vers le PCF présent ? (décide le gate 5QI 1) | config Kamailio + services PCF annoncés au NRF | PCF expose `npcf-policyauthorization` (N5), mais Kamailio ne charge aucun client N5, `ims_qos` ou Diameter/Rx : **aucun chemin Rx/N5 P-CSCF→PCF**, gate 5QI 1 NON APPLICABLE |
+| RTPengine : mode (relais / ancrage), plage de ports | `docker inspect oiran-ims-lite-rtpengine-1` ; `ps` dans le conteneur | ancrage SDP (`offer`/`answer`, remplacement origine/connexion), interface `10.77.24.20`, contrôle `127.0.0.1:2223/UDP`, RTP `30000–30199/UDP` |
+| Conteneur(s) UE et profil UERANSIM avec DNN `ims` | `rg -n 'sessions\|apn' /var/lib/polaris-control/ue-profiles/*.yaml` | `UE-lab-201` et `UE-lab-05` disponibles mais arrêtés ; leur YAML n'établit initialement que `internet`. La PDU `ims` doit être établie explicitement ; interface attendue `uesimtun1`, à redétecter par l'adresse `10.47.0.0/16` |
+| Profil abonné : DNN `ims` autorisé ? | requête MongoDB en lecture seule, résultat agrégé sans identité | **oui** pour les deux UE candidats ; 4 profils sur 13 autorisent `ims`. Aucune modification d'abonné requise pour ces deux profils |
+| Conteneur DN pour l'UAS (côté N6) | `docker inspect polaris-dn-sender` | `polaris-dn-sender`, actif sur `10.77.24.30`, utilisable comme espace réseau UAS ; aucun client SIP n'y est installé |
+| Points de capture actifs N2/N3/N4/N6/SBI | `curl :49152/api/v1/probes/oiran-vprobe-local-01/interfaces` | N2, N3, N4, SBI et IMS/N6 déclarés disponibles et interfaces UP. IMS : `br-oiran-n6`, filtre `udp port 5060`; RTP est ajouté après négociation SDP |
 | État du vTAP | `systemctl is-active polaris-vtap` | arrêté depuis le 17/11 (décision séparée) |
+
+Contrôle historique au 20/11/2026 : les trois derniers segments IMS fermés contiennent chacun 0 trame SIP et 0 trame RTP ; le corpus `ims/` contient 0 trame SIP. Les journaux Kamailio des dernières 24 h ne contiennent ni REGISTER ni INVITE. `usrloc` est en mémoire (`db_mode=0`) et il n'existe pas de base d'abonnés SIP persistante.
 
 ## 4. Préflight (STOP si un point échoue)
 
