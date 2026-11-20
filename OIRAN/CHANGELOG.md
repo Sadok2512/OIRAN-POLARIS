@@ -1,5 +1,91 @@
 # Changelog
 
+## OIRAN API 2.21.103 — 2026-11-20 — volume SSE de la trace live (défaut ANR2 #10 7045891820, ordre #9 7046282778 CLAUDE2)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.101-train` @ `80d7527`. Branche `fix/oiran-2.21.103-sse-volume`. Numerology CLAUDE2 = pair (103 = impair historiquement mais c'est le prochain numéro libre après 2.21.102 pris par CLAUDE1). Référence terrain : ANR2 trace voix de moins de 4 min = 1,97 Go, 60 111 events — **deux causes mesurées** :
+
+  * `ue_info` = **98,7 % du poids** : 28 759 émissions ≈ 1 par message, 67 570 o en moyenne car `keys` renvoyé **en entier à chaque fois**.
+  * **PFCP 22 769 dont 99,92 % de Heartbeat** d'association N4 pris sur 22 `capture_id` : historique N4 global rejoué dans la trace d'un abonné.
+
+### Audit préalable (effet de 2.21.98)
+
+2.21.98 a changé le **contenu** de `ue_info.keys` : désormais `exposed_keys` (pseudonymes seuls), plus `state.keys` (chiffres canoniques + IE values non-pseudo). Taille moyenne attendue en post-2.21.98 : ~10-50 clés × 40 bytes ≈ 400-2 000 o au lieu de 67 Ko. **Mais la FRÉQUENCE est inchangée** : `ue_info` toujours émis 1 par message routé. 2.21.103 s'attaque à la fréquence.
+
+Les 67 Ko moyens pré-2.21.98 s'expliquent par l'accumulation dans `state.keys` de TOUS les `session_identifiers.value` non-IP ≥ 3 caractères appris depuis le début de la session, plus les chiffres canoniques amorcés à `create()`, plus les pseudonymes UE IP. Sur une trace voix de 4 min avec PFCP Heartbeat rejoués + N4 recovery_time_ntp apprises par erreur, le set gonfle à plusieurs centaines d'entrées.
+
+### Correctif (3 points)
+
+**1. `ue_info` émis seulement sur changement effectif des clés exposées.**
+Nouveau champ `TraceState::last_ue_info_signature: Option<Vec<String>>` (vecteur trié des `exposed_keys` lors de la dernière émission). Juste avant d'émettre `ue_info` :
+```rust
+let mut sorted_keys: Vec<String> = state.exposed_keys.iter().cloned().collect();
+sorted_keys.sort();
+let should_emit_ue_info = state.last_ue_info_signature.as_ref() != Some(&sorted_keys);
+if should_emit_ue_info {
+    state.last_ue_info_signature = Some(sorted_keys);
+    // … push ue_info …
+}
+```
+Réinitialisé à `None` en fin de session (`UE Context Release Complete` etc.) ⇒ le premier `ue_info` de la session suivante est toujours émis.
+
+**2. Messages PFCP de niveau nœud exclus de la trace abonné.**
+Nouveau helper `is_pfcp_node_message(&str) -> bool` qui retourne true pour Heartbeat (Req/Resp), Association Setup/Update/Release (Req/Resp), PFCP PFD Management (Req/Resp), PFCP Node Report (Req/Resp). Filtre en tête de `route_normalized` :
+```rust
+if event.protocol.as_str() == "PFCP" && is_pfcp_node_message(&event.message_name) {
+    return;
+}
+```
+Avant 2.21.103 : ces messages pouvaient être routés par match sur `match_keys` lorsque la trace avait appris des IE values communes (recovery_time_ntp, node_id). Après 2.21.103 : NULLEMENT routés, même si le pire cas théorique (pseudonyme abonné dans leurs session_identifiers) se présentait.
+
+**3. Explication de la taille 67 Ko** : cf. audit ci-dessus. Pas de borne numérique ajoutée — `exposed_keys` ne contient plus (depuis 2.21.98) que des pseudonymes `psn-…` (format fixe 34 chars) + pseudonymes UE IP ; le set reste borné naturellement par le nombre d'identités réellement vues sur la session.
+
+### Tests ajoutés (3, 12 runs × 247 passed / 0 failed)
+
+1. `is_pfcp_node_message_covers_heartbeat_association_pfd_2_21_103` — matrice complète : node-level retournent `true` (Heartbeat, Association Setup/Update/Release, PFD Management, Node Report), session-level retournent `false` (Establishment, Modification, Deletion, Session Report), nom inconnu retourne `false`.
+2. `pfcp_heartbeats_are_never_routed_into_subscriber_trace_2_21_103` — 1 000 heartbeats PFCP forgés avec le pseudonyme abonné dans leurs session_identifiers (pire cas) : 0 message routé, 0 event dans le buffer SSE. Prouve que le filtre protocol-level précède tout check de match.
+3. `ue_info_emitted_only_on_exposed_keys_change_2_21_103` — 50 messages avec le même `subscriber_pseudonym` → 1 seul `ue_info`. Message 51 ajoute un `msisdn_pseudonym` → 2e `ue_info` qui contient les 2 pseudonymes. Prouve que la dedup déclenche sur changement effectif (pas sur un simple nouveau message).
+
+Le test anti-fuite 2.21.98 (`anti_leak_route_imsi_clear_text_never_in_sse_buffer_2_21_98`) reste vert : `exposed_keys` n'a toujours que les pseudonymes.
+
+### Preuves (règle CPU + amendement #9 7034385961)
+
+Préflight final :
+```
+cat /proc/pressure/cpu    → some avg10=6.20 full avg10=0.00  (GO ; seuils amendés cpu some<10, full<1)
+cat /proc/pressure/memory → full avg10=0.00  (GO ; seuil amendé mem full<1)
+free -b (avail)           → 7 462 801 408 (≥ 4 GiB GO)
+df -B1 / (avail)          → 192 450 605 056 (≥ 25 Go GO)
+lslocks nsplus-heavy      → tenu par PID 1966197 au préflight (CLAUDE1 train / recette), attente dans flock -w 900
+```
+
+12 runs tests `oiran-api --lib` sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2` :
+
+```
+Run  1 → 247 passed; 0 failed; 3 ignored; 15.22 s
+Run  2 → 247 passed; 0 failed; 3 ignored; 15.41 s
+Run  3 → 247 passed; 0 failed; 3 ignored; 15.45 s
+Run  4 → 247 passed; 0 failed; 3 ignored; 15.67 s
+Run  5 → 247 passed; 0 failed; 3 ignored; 14.88 s
+Run  6 → 247 passed; 0 failed; 3 ignored; (ligne manquante du grep ; exit code de la boucle = 0)
+Run  7 → 247 passed; 0 failed; 3 ignored; 15.82 s
+Run  8 → 247 passed; 0 failed; 3 ignored; 16.26 s
+Run  9 → 247 passed; 0 failed; 3 ignored; 17.13 s
+Run 10 → 247 passed; 0 failed; 3 ignored; 19.43 s
+Run 11 → 247 passed; 0 failed; 3 ignored; 18.79 s
+Run 12 → 247 passed; 0 failed; 3 ignored; 20.13 s
+```
+
+247 = 244 (train 2.21.101) + 3 ajoutés 2.21.103. 3 `ignored` historiques, aucun `#[ignore]` ajouté. cpu some avg10 pendant la boucle : before Run 1 = 1.70 ; after Run 12 = 2.49 ; durées 14.88 – 20.13 s (CPU partagé avec ANR1 recette train, acceptable, jamais `full > 0`).
+
+Audit lock Rust 1.83 : `OIRAN/Cargo.lock` ligne 677 passée à `version = "2.21.103"` (seul changement). `cargo test --locked` passe ⇒ lock cohérent. OIRAN/vtap non concerné.
+
+### Scope et coordination #9
+
+- Base `fix/oiran-2.21.101-train` @ `80d7527` (train final CLAUDE1 validé 882/0, anti-fuite contre-vérifié par CLAUDE2). Zone touchée : `apps/api/src/live_trace.rs` + Cargo.toml + Cargo.lock + CHANGELOG.
+- **CLAUDE1 touche aussi `live_trace.rs` dans 2.21.102 (stable_event_key à la lecture pour données stockées)** — la zone de 2.21.102 est dans la chaîne de publication / read-time patch, orthogonale à mes changements (route_normalized, exposed_keys). Tout conflit sera résolu par le cœur au prochain train.
+- Lot 2.21.100 (SIP/RTP dans N3, perte RTP, pools UE) viendra APRÈS 2.21.103 (ordre explicite du cœur dans 7046402022).
+- Aucun bump de crate partagée. OIRAN/vtap non concerné.
+
 ## oiran-api 2.21.101 — 2026-11-20 — train final (cœur) : 2.21.97 + 2.21.98 (fuite `ue_info.keys`) + 2.21.99 (débit live)
 
 - Merge `--no-ff` de `fix/oiran-2.21.98-live-keys-leak` @ 922cf7f et de `fix/oiran-2.21.99-live-throughput` @ 5cfffa7 sur `fix/oiran-2.21.97-train` @ 37747ef.

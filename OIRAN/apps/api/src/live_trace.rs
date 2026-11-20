@@ -97,6 +97,14 @@ struct TraceState {
     /// `pseudonymized=true`) et le pseudonyme UE IP calculé (`pfcp-ue-ip`).
     /// Aucune valeur en clair, aucun chiffre canonique de la saisie.
     exposed_keys: HashSet<String>,
+    /// 2.21.103 (ordre #9 7046282778, défaut ANR2 #10 7045891820) — signature
+    /// (vecteur trié des `exposed_keys`) du dernier `ue_info` émis. Permet de
+    /// n'émettre un nouvel `ue_info` QUE quand `exposed_keys` change
+    /// effectivement — pas à chaque message routé. ANR2 a mesuré 28 759
+    /// émissions sur 60 111 events (≈ 98,7 % du poids de la trace voix 1,97 Go).
+    /// `None` initialement et après fin de session ⇒ le premier
+    /// `ue_info` est toujours émis.
+    last_ue_info_signature: Option<Vec<String>>,
     throughput_second: u64,
     ul_bytes: u64,
     dl_bytes: u64,
@@ -293,6 +301,32 @@ fn session_ids_named<'a>(value: &'a Value, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// 2.21.103 (ordre #9 7046282778, défaut ANR2 #10 7045891820) — vrai si le
+/// message PFCP est de **niveau nœud** (Heartbeat, Association, PFD
+/// Management) et ne porte PAS une session abonné. Ces messages sont exclus
+/// de la trace abonné : ANR2 a mesuré que 99,92 % des 22 769 PFCP d'une
+/// trace voix étaient des Heartbeat d'association N4 sans portée abonné,
+/// rejoués par le routage via IE values communes apprises (recovery_time_ntp,
+/// node_id). La liste est explicite — l'ajout d'un nouveau type PFCP côté
+/// décodeur n'autorise pas automatiquement son routage s'il est node-level.
+fn is_pfcp_node_message(message_name: &str) -> bool {
+    matches!(
+        message_name,
+        "PFCP Heartbeat Request"
+            | "PFCP Heartbeat Response"
+            | "PFCP Association Setup Request"
+            | "PFCP Association Setup Response"
+            | "PFCP Association Update Request"
+            | "PFCP Association Update Response"
+            | "PFCP Association Release Request"
+            | "PFCP Association Release Response"
+            | "PFCP PFD Management Request"
+            | "PFCP PFD Management Response"
+            | "PFCP Node Report Request"
+            | "PFCP Node Report Response"
+    )
+}
+
 pub(crate) struct LiveTraceRegistry {
     traces: Mutex<HashMap<String, TraceState>>,
     reader_running: AtomicBool,
@@ -426,6 +460,15 @@ impl LiveTraceRegistry {
     }
 
     fn route_normalized(&self, event: &event_schema::NormalizedEvent) {
+        // 2.21.103 (ordre #9 7046282778, défaut ANR2 #10 7045891820) — un
+        // PFCP de niveau nœud (Heartbeat/Association/PFD/Node-Report) n'est
+        // JAMAIS routé dans une trace abonné : ces messages n'ont pas de
+        // portée session et polluent le flux SSE (99,92 % des 22 769 PFCP
+        // observés par ANR2 sur une trace voix, rejoués via IE values
+        // communes apprises).
+        if event.protocol.as_str() == "PFCP" && is_pfcp_node_message(&event.message_name) {
+            return;
+        }
         let value = serde_json::from_str(&event.to_json()).unwrap_or(Value::Null);
         let encoded = value.to_string();
         // 2.21.90 défaut 2 — facts extraits une seule fois par event,
@@ -563,6 +606,9 @@ impl LiveTraceRegistry {
             ) {
                 state.match_keys.clear();
                 state.exposed_keys.clear();
+                // 2.21.103 — fin de session : la prochaine session (si la
+                // trace n'a pas expiré) a droit à un `ue_info` initial.
+                state.last_ue_info_signature = None;
                 // 2.21.90 défaut 2 — fin de session : on oublie aussi
                 // les tunnels/SEID appris, sinon un TEID/SEID réutilisé
                 // par un autre abonné serait routé à tort.
@@ -661,21 +707,34 @@ impl LiveTraceRegistry {
                 state.events.push_back(update.clone());
                 let _ = state.tx.send(update);
             }
-            state.next_id += 1;
-            let info = BufferedEvent {
-                id: state.next_id,
-                kind: "ue_info".into(),
-                // 2.21.98 (défaut privacy ANR1 #10 7043526474) — `keys`
-                // expose UNIQUEMENT `exposed_keys` (pseudonymes). Les
-                // chiffres canoniques de la saisie et les IE values non
-                // pseudonymisées restent dans `match_keys` (interne
-                // non-Serialize, `MatchKeys`), donc ne peuvent fuiter.
-                payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.exposed_keys,"capture_id":event.capture_id,"packet_number":packet}),
-            };
-            state.events.push_back(info.clone());
-            let _ = state.tx.send(info);
-            while state.events.len() > MAX_EVENTS {
-                state.events.pop_front();
+            // 2.21.103 (ordre #9 7046282778) — `ue_info` émis UNIQUEMENT
+            // quand la signature `exposed_keys` (vecteur trié) change. ANR2
+            // #10 7045891820 : 28 759 émissions / 60 111 events ≈ 98,7 %
+            // du poids de la trace voix (1,97 Go pour < 4 min) parce
+            // qu'on renvoyait le set entier à chaque message. La 2.21.98
+            // avait déjà réduit le CONTENU de `keys` (pseudonymes seuls) ;
+            // 2.21.103 réduit la FRÉQUENCE à « sur changement effectif ».
+            let mut sorted_keys: Vec<String> = state.exposed_keys.iter().cloned().collect();
+            sorted_keys.sort();
+            let should_emit_ue_info = state.last_ue_info_signature.as_ref() != Some(&sorted_keys);
+            if should_emit_ue_info {
+                state.last_ue_info_signature = Some(sorted_keys);
+                state.next_id += 1;
+                let info = BufferedEvent {
+                    id: state.next_id,
+                    kind: "ue_info".into(),
+                    // 2.21.98 (défaut privacy ANR1 #10 7043526474) — `keys`
+                    // expose UNIQUEMENT `exposed_keys` (pseudonymes). Les
+                    // chiffres canoniques de la saisie et les IE values non
+                    // pseudonymisées restent dans `match_keys` (interne
+                    // non-Serialize, `MatchKeys`), donc ne peuvent fuiter.
+                    payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.exposed_keys,"capture_id":event.capture_id,"packet_number":packet}),
+                };
+                state.events.push_back(info.clone());
+                let _ = state.tx.send(info);
+                while state.events.len() > MAX_EVENTS {
+                    state.events.pop_front();
+                }
             }
         }
     }
@@ -1100,6 +1159,7 @@ pub(crate) async fn create(
             tx,
             match_keys: initial_match_keys,
             exposed_keys: HashSet::new(),
+            last_ue_info_signature: None,
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
@@ -1476,6 +1536,7 @@ mod tests {
             tx,
             match_keys: initial_match_keys.into_iter().collect(),
             exposed_keys: HashSet::new(),
+            last_ue_info_signature: None,
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
@@ -3231,5 +3292,299 @@ mod tests {
         keys.insert("secret-123".into());
         assert!(keys.contains("secret-123"));
         assert_eq!(keys.len(), 1);
+    }
+
+    /// 2.21.103 (ordre #9 7046282778, défaut ANR2 #10 7045891820) —
+    /// `is_pfcp_node_message` couvre Heartbeat, Association (setup/update/
+    /// release), PFD Management, Node Report. Les messages de session
+    /// (Establishment/Modification/Deletion/Report) ne sont PAS node.
+    #[test]
+    fn is_pfcp_node_message_covers_heartbeat_association_pfd_2_21_103() {
+        // Node-level : exclus de la trace abonné.
+        assert!(is_pfcp_node_message("PFCP Heartbeat Request"));
+        assert!(is_pfcp_node_message("PFCP Heartbeat Response"));
+        assert!(is_pfcp_node_message("PFCP Association Setup Request"));
+        assert!(is_pfcp_node_message("PFCP Association Setup Response"));
+        assert!(is_pfcp_node_message("PFCP Association Update Request"));
+        assert!(is_pfcp_node_message("PFCP Association Release Request"));
+        assert!(is_pfcp_node_message("PFCP PFD Management Request"));
+        assert!(is_pfcp_node_message("PFCP Node Report Request"));
+        // Session-level : AUTORISÉS en trace abonné.
+        assert!(!is_pfcp_node_message("PFCP Session Establishment Request"));
+        assert!(!is_pfcp_node_message("PFCP Session Modification Request"));
+        assert!(!is_pfcp_node_message("PFCP Session Deletion Request"));
+        assert!(!is_pfcp_node_message("PFCP Session Report Request"));
+        // Nom inconnu : NON node (sûr : l'ajout d'un type session côté
+        // decoder-pfcp ne risque pas d'être exclu à tort).
+        assert!(!is_pfcp_node_message("Unknown PFCP Message"));
+    }
+
+    /// 2.21.103 — 1 000 PFCP Heartbeat « routés » dans route_normalized
+    /// donnent 0 event dans la trace abonné (filtre protocole-level).
+    #[test]
+    fn pfcp_heartbeats_are_never_routed_into_subscriber_trace_2_21_103() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces.lock().unwrap().insert(
+            "t".into(),
+            state_with_initial_keys(
+                u64::MAX,
+                false,
+                vec!["psn-supi-xyz".into()],
+                HashSet::from(["208930000000123".into()]),
+            ),
+        );
+        // 1 000 heartbeats avec un pseudonyme matching dans session_identifiers
+        // (pire cas : même si quelque chose matcherait côté
+        // match_pseudo/match_keys, le filtre node-level précède tout
+        // apprentissage et tout check).
+        let heartbeat = |packet: u64| NormalizedEvent {
+            event_id: format!("hb-{packet}"),
+            stable_event_key: String::new(),
+            parent_event_id: None,
+            probe_id: "test".into(),
+            capture_point_id: "N4".into(),
+            capture_id: "c".into(),
+            packet_references: vec![PacketReference {
+                source_file: "x".into(),
+                source_sha256: None,
+                packet_number: packet,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 60,
+                original_length: 60,
+            }],
+            timestamp: ExactTimestamp {
+                seconds: 10,
+                nanoseconds: packet as u32,
+                raw_ticks: 10_000_000_000 + packet,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "N4".into(),
+            protocol: Protocol::Pfcp,
+            message_name: "PFCP Heartbeat Request".into(),
+            message_type: 1,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.0.0.1".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.0.0.2".into(),
+                port: None,
+                network_function: None,
+            },
+            direction: Direction::Unknown,
+            // Pire cas : le pseudonyme ABONNÉ apparaît dans un session_identifier
+            // du heartbeat (impossible en prod mais prouve que le filtre
+            // node-level précède tout). Avant 2.21.103, ce heartbeat aurait
+            // été routé par `match_pseudo`.
+            session_identifiers: vec![NamedValue {
+                name: "subscriber_pseudonym".into(),
+                value: "psn-supi-xyz".into(),
+                pseudonymized: true,
+            }],
+            information_elements: vec![],
+            decoder_name: "decoder-pfcp".into(),
+            decoder_version: "0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: "sha256:x".into(),
+            evidence_references: vec![EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: "sha256:x".into(),
+            }],
+            sbi: None,
+        };
+        for packet in 1..=1000u64 {
+            r.route_normalized(&heartbeat(packet));
+        }
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(
+            t.trace.messages, 0,
+            "aucun heartbeat PFCP ne doit être routé dans la trace abonné"
+        );
+        assert_eq!(
+            t.events.len(),
+            0,
+            "le buffer SSE ne doit contenir aucun event issu des heartbeats"
+        );
+    }
+
+    /// 2.21.103 (ordre #9 7046282778) — N messages routés **sans changement
+    /// d'`exposed_keys`** n'émettent qu'UN SEUL `ue_info`. Un changement
+    /// effectif (nouveau pseudonyme appris) déclenche un deuxième `ue_info`.
+    #[test]
+    fn ue_info_emitted_only_on_exposed_keys_change_2_21_103() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference, Protocol,
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces.lock().unwrap().insert(
+            "t".into(),
+            state(u64::MAX, false, vec!["psn-supi-xyz".into()]),
+        );
+        fn make_event(
+            packet: u64,
+            msg: &str,
+            session_ids: Vec<(&str, &str, bool)>,
+        ) -> NormalizedEvent {
+            NormalizedEvent {
+                event_id: format!("ev-{packet}"),
+                stable_event_key: String::new(),
+                parent_event_id: None,
+                probe_id: "test".into(),
+                capture_point_id: "N2".into(),
+                capture_id: "c".into(),
+                packet_references: vec![PacketReference {
+                    source_file: "x".into(),
+                    source_sha256: None,
+                    packet_number: packet,
+                    byte_offset: 0,
+                    interface_id: 0,
+                    link_type: None,
+                    sll2_protocol_type: None,
+                    sll2_reserved: None,
+                    sll2_interface_index: None,
+                    sll2_arphrd_type: None,
+                    sll2_packet_type: None,
+                    sll2_address_length: None,
+                    sll2_address: None,
+                    captured_length: 100,
+                    original_length: 100,
+                }],
+                timestamp: ExactTimestamp {
+                    seconds: 10,
+                    nanoseconds: packet as u32,
+                    raw_ticks: 10_000_000_000 + packet,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: "N2".into(),
+                protocol: Protocol::Ngap,
+                message_name: msg.into(),
+                message_type: 0,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "10.0.0.1".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "10.0.0.2".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction: Direction::Uplink,
+                session_identifiers: session_ids
+                    .into_iter()
+                    .map(|(n, v, p)| NamedValue {
+                        name: n.into(),
+                        value: v.into(),
+                        pseudonymized: p,
+                    })
+                    .collect(),
+                information_elements: vec![InformationElement {
+                    id: None,
+                    name: "misc".into(),
+                    length: 1,
+                    value: Some("x=y".into()),
+                    raw_sha256: None,
+                    status: DecodeStatus::Decoded,
+                }],
+                decoder_name: "test".into(),
+                decoder_version: "0".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: "sha256:x".into(),
+                evidence_references: vec![EvidenceReference {
+                    state: EvidenceState::Exact,
+                    kind: "packet-provenance".into(),
+                    reference: "sha256:x".into(),
+                }],
+                sbi: None,
+            }
+        }
+        // Message 1 : apprend `psn-supi-xyz` (pseudonymized) → `exposed_keys`
+        // = {"psn-supi-xyz"} → 1er `ue_info` émis.
+        r.route_normalized(&make_event(
+            1,
+            "Registration Request",
+            vec![("subscriber_pseudonym", "psn-supi-xyz", true)],
+        ));
+        // Messages 2..=50 : même `subscriber_pseudonym`, aucune nouvelle
+        // clé exposable → aucun nouveau `ue_info`.
+        for packet in 2..=50u64 {
+            r.route_normalized(&make_event(
+                packet,
+                "Auth Request",
+                vec![("subscriber_pseudonym", "psn-supi-xyz", true)],
+            ));
+        }
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            let ue_info_count = t.events.iter().filter(|e| e.kind == "ue_info").count();
+            assert_eq!(
+                ue_info_count, 1,
+                "50 messages avec même pseudonyme ne doivent émettre qu'1 ue_info, got {ue_info_count}"
+            );
+        }
+        // Message 51 : apprend un NOUVEAU pseudonyme → 2e `ue_info`.
+        r.route_normalized(&make_event(
+            51,
+            "SDM Get Gpsis",
+            vec![
+                ("subscriber_pseudonym", "psn-supi-xyz", true),
+                ("msisdn_pseudonym", "psn-gpsi-abc", true),
+            ],
+        ));
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            let ue_info_count = t.events.iter().filter(|e| e.kind == "ue_info").count();
+            assert_eq!(
+                ue_info_count, 2,
+                "ajout d'un pseudonyme doit déclencher un 2e ue_info, got {ue_info_count}"
+            );
+            // Preuve que le dernier ue_info porte les 2 clés.
+            let last_info = t
+                .events
+                .iter()
+                .filter(|e| e.kind == "ue_info")
+                .last()
+                .unwrap();
+            let keys = last_info.payload["keys"].as_array().unwrap();
+            let keys_str: Vec<String> = keys
+                .iter()
+                .map(|k| k.as_str().unwrap().to_owned())
+                .collect();
+            assert!(keys_str.contains(&"psn-supi-xyz".to_string()));
+            assert!(keys_str.contains(&"psn-gpsi-abc".to_string()));
+        }
     }
 }
