@@ -1,5 +1,46 @@
 # Changelog
 
+## decoder-pfcp 0.3.0, decoder-sip 0.3.0, event-schema 1.11.0 — 2026-11-20 — lot 2.21.125 (décodeurs) : une seule forme pour le pseudonyme d'adresse IP d'UE, et les adresses du paquet SIP (ordre #9 7052828180, audit CLAUDE2 #9 7052919470)
+
+Branche `fix/oiran-2.21.125-ue-ip-pseudonym`, base train @ `8b0dcae` (2.21.122) ; numéro 2.21.125 fixé par le cœur (#9 7053030106), 2.21.123 et 2.21.124 étant pris par CLAUDE1. Ce commit ne touche ni `apps/api` ni la version d'`oiran-api` : la règle de rattachement d'un SIP par l'adresse de l'UE dans `live_trace.rs`, avec son compteur, est le lot 2.21.126 (CLAUDE1). Aucun déploiement.
+
+### Audit
+
+Donnée lab (ANR1 #10 7052813333) : les URI From / To du SIP réel sont des alias, ni IMSI ni MSISDN ; un SIP ne peut donc être rattaché à l'abonné que par l'adresse IP de l'UE.
+
+Le pseudonyme de cette adresse (domaine `pfcp-ue-ip`) était calculé à trois endroits sur trois entrées différentes :
+
+- `decoder-pfcp`, IE 93 : la valeur entière de l'IE, octet de drapeaux compris — donc deux pseudonymes pour une même adresse selon le sens du PDR ;
+- `decoder-sip`, ligne `c=` du SDP : le texte de l'adresse ;
+- `apps/api/src/live_trace.rs` : les octets de l'adresse.
+
+Aucune égalité n'était possible entre eux. Et `decoder-sip` n'exposait aucune adresse hors SDP : un REGISTER n'en portait pas.
+
+### Changement
+
+1. `event-schema` 1.11.0 : `UE_IP_PSEUDO_DOMAIN`, `pseudonym_ip_octets` (4 ou 16 octets, sinon `None`), `pseudonym_ip_text` (adresse en texte, normalisée par `normalize_ip`, sinon `None`). Forme unique : les octets de l'adresse — celle que la trace live utilisait déjà.
+2. `decoder-pfcp` 0.3.0 : IE 93 décodée selon TS 29.244 §8.2.62 (drapeaux, IPv4 si V4, IPv6 si V6). Valeur : `ue_ip=<pseudonyme>[,ue_ipv6=<pseudonyme>],ue_ip_flags=0x..`. Le pseudonyme est celui de l'adresse seule ; `ue_ip` et `ue_ipv6` sortent en `session_identifiers` pseudonymisés. Adresse absente ou tronquée : `ue_ip_flags` seul, aucun pseudonyme.
+3. `decoder-sip` 0.3.0 : `sdp.c_ue_ip_pseudonym` calculé sur les octets (absent si `c=` n'est pas une adresse IP) ; deux IE nouvelles sur chaque message, `packet_source_ip_pseudonym` et `packet_destination_ip_pseudonym`, mêmes octets, même domaine. En IE seulement, pas en `session_identifiers`. Pour le SIP extrait d'un tunnel (`N3-IMS`), ce sont les adresses du paquet interne.
+
+Aucune adresse en clair n'est ajoutée : les IE nouvelles sont des pseudonymes.
+
+### OUVERT
+
+- **Events déjà stockés** : ils gardent les anciens pseudonymes (PFCP `ue_ip`, SIP `sdp.c_ue_ip_pseudonym`) et n'ont pas les IE d'adresse du paquet. Pas de patch à la lecture possible : l'adresse en clair n'est pas stockée. Corrigé seulement par redécodage ; non planifié ici.
+- **Changement de valeur visible** : le pseudonyme `ue_ip` d'une session PFCP change à partir de cette version (et devient le même dans les deux sens). Tout ce qui comparait l'ancien au nouveau entre deux publications ne correspondra plus.
+- `correlation-engine`, règle `sip-pfcp-ue-ipv4-pseudonym-match` : elle cherche une IE **nommée** `ue_ip`, alors que l'IE PFCP réelle est nommée par son chemin (`…/UE IP Address`) et porte `ue_ip=…` dans sa valeur. Elle ne pouvait pas se déclencher sur données réelles avant ce lot, et ne le peut toujours pas pour cette seconde raison. Non corrigé ici (autre crate) ; son test n'utilise que des events synthétiques.
+- La règle de rattachement d'un SIP par l'adresse de l'UE n'est pas dans ce commit ; sans elle, ces IE ne rattachent un message que si la trace compare déjà les valeurs d'IE à ses clés.
+- Une adresse IP réattribuée à un autre abonné pendant la durée d'une trace rattacherait son SIP tant que la trace garde le pseudonyme.
+- Non vérifié sur capture réelle de SIP ni de PFCP : trames synthétiques.
+
+### Tests
+
+- `event-schema` `one_address_one_pseudonym_whatever_its_presentation_2_21_125` : octets, texte, texte avec espaces, IPv4 projetée en IPv6 → même pseudonyme ; IPv6 ; nom d'hôte et 5 octets → `None`.
+- `decoder-pfcp` `ue_ip_address_pseudonym_is_the_address_only_2_21_125` : drapeaux 0x02 et 0x06 → même pseudonyme, égal à `pseudonym_ip_octets`, différent de l'ancienne forme ; IPv4 + IPv6 ; IPv6 seule ; adresse tronquée et IE vide → aucun pseudonyme.
+- `decoder-pfcp` `ue_ip_session_identifier_carries_the_address_pseudonym_2_21_125` : message entier (Create PDR / PDI / IE 93) → `session_identifiers` `ue_ip` pseudonymisé, valeur de l'adresse seule.
+- `decoder-sip` `register_without_sdp_carries_packet_ip_pseudonyms_2_21_125` : REGISTER sans SDP, URI en alias → les deux IE d'adresse, égales aux pseudonymes des octets ; rien en `session_identifiers` ; pas de `subscriber_pseudonym`.
+- `decoder-sip` `sdp_connection_pseudonym_uses_address_octets_2_21_125` : `sdp.c_ue_ip_pseudonym` = forme octets, différent de la forme texte, égal à `packet_source_ip_pseudonym` quand l'UE annonce sa propre adresse.
+
 ## oiran-api 2.21.122 — 2026-11-20 — trace live : la voix rattachée par l'identifiant d'appel SIP, et l'appelant hors de la trace de l'appelé (ordres #9 7052446877 et 7052593612)
 
 Upgrade **patch** sans déploiement, un commit au-dessus du train 2.21.121 @ `d4d7781`. Branches `fix/oiran-2.21.122-trace-sip-call-id` et `fix/oiran-2.21.121-train` (avance rapide). Seul `apps/api/src/live_trace.rs` change.

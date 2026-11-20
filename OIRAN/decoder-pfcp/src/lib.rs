@@ -265,7 +265,7 @@ fn decode_value(
             *v.first().ok_or_else(|| format!("PFCP IE {t} is empty"))?
         )),
         89 => Some(format!("cp_function_features=0x{}", hex(v))),
-        93 => Some(format!("ue_ip={}", pseudonym(pseudonym_key, "pfcp-ue-ip", v))),
+        93 => Some(decode_ue_ip_address(v, pseudonym_key)),
         95 => Some(format!(
             "outer_header_removal={}",
             *v.first().ok_or_else(|| format!("PFCP IE {t} is empty"))?
@@ -392,12 +392,12 @@ fn flatten(
             let key = first.split('=').next().unwrap_or("");
             if matches!(
                 key,
-                "pdr_id" | "far_id" | "qer_id" | "teid" | "f_seid" | "ue_ip"
+                "pdr_id" | "far_id" | "qer_id" | "teid" | "f_seid" | "ue_ip" | "ue_ipv6"
             ) {
                 ids.push(NamedValue {
                     name: key.into(),
                     value: first.split_once('=').map(|x| x.1).unwrap_or("").into(),
-                    pseudonymized: key == "ue_ip",
+                    pseudonymized: matches!(key, "ue_ip" | "ue_ipv6"),
                 });
             }
         }
@@ -640,6 +640,36 @@ fn ipv4(v: &[u8]) -> String {
     format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3])
 }
 
+/// 2.21.125 — IE 93, UE IP Address (TS 29.244 §8.2.62) : un octet de
+/// drapeaux (bit 1 V6, bit 2 V4, bit 3 S/D, …), puis l'adresse IPv4 si V4,
+/// puis l'adresse IPv6 si V6. Le pseudonyme est calculé sur les OCTETS DE
+/// L'ADRESSE seulement (`event_schema::pseudonym_ip_octets`) : il est le
+/// même dans le PDR montant et le PDR descendant, et égal à celui que le
+/// SIP et la trace live calculent pour la même adresse. Avant 2.21.125
+/// la valeur entière de l'IE était hachée, drapeaux compris.
+/// Champs : `ue_ip` (IPv4), `ue_ipv6`, `ue_ip_flags`. Sans adresse
+/// lisible : `ue_ip_flags` seul, aucun pseudonyme.
+fn decode_ue_ip_address(v: &[u8], pseudonym_key: &PseudonymKey) -> String {
+    let Some((&flags, rest)) = v.split_first() else {
+        return "ue_ip_flags=absent".into();
+    };
+    let mut out = Vec::new();
+    let mut rest = rest;
+    if flags & 0x02 != 0 && rest.len() >= 4 {
+        if let Some(p) = event_schema::pseudonym_ip_octets(pseudonym_key, &rest[..4]) {
+            out.push(format!("ue_ip={p}"));
+        }
+        rest = &rest[4..];
+    }
+    if flags & 0x01 != 0 && rest.len() >= 16 {
+        if let Some(p) = event_schema::pseudonym_ip_octets(pseudonym_key, &rest[..16]) {
+            out.push(format!("ue_ipv6={p}"));
+        }
+    }
+    out.push(format!("ue_ip_flags=0x{flags:02x}"));
+    out.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,5 +765,88 @@ mod tests {
         let k = test_key();
         let bad = header(50, Some(1), &ie(29, &[1, 2]));
         assert!(parse(&bad, &k).is_err());
+    }
+    /// 2.21.125 (ordre #9 7052828180) — IE 93 UE IP Address : le
+    /// pseudonyme est celui des octets de l'adresse, indépendant de
+    /// l'octet de drapeaux. Le PDR montant (drapeaux 0x02) et le PDR
+    /// descendant (0x06, bit S/D) d'une même session donnent la même
+    /// valeur, égale à `event_schema::pseudonym_ip_octets` — la forme du
+    /// SIP et de la trace live. Avant 2.21.125 : deux valeurs différentes,
+    /// égales à aucune autre.
+    #[test]
+    fn ue_ip_address_pseudonym_is_the_address_only_2_21_125() {
+        let k = test_key();
+        let expected = event_schema::pseudonym_ip_octets(&k, &[10, 45, 0, 2]).unwrap();
+        let uplink = decode_ue_ip_address(&[0x02, 10, 45, 0, 2], &k);
+        let downlink = decode_ue_ip_address(&[0x06, 10, 45, 0, 2], &k);
+        assert_eq!(uplink, format!("ue_ip={expected},ue_ip_flags=0x02"));
+        assert_eq!(downlink, format!("ue_ip={expected},ue_ip_flags=0x06"));
+        // Forme d'avant : valeur entière de l'IE.
+        assert_ne!(expected, pseudonym(&k, "pfcp-ue-ip", &[0x02, 10, 45, 0, 2]));
+        // IPv4 + IPv6 : les deux, dans l'ordre de l'IE.
+        let mut both = vec![0x03, 10, 45, 0, 2];
+        let v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        both.extend_from_slice(&v6);
+        let expected_v6 = event_schema::pseudonym_ip_octets(&k, &v6).unwrap();
+        assert_eq!(
+            decode_ue_ip_address(&both, &k),
+            format!("ue_ip={expected},ue_ipv6={expected_v6},ue_ip_flags=0x03")
+        );
+        // IPv6 seule ; adresse tronquée ; IE vide : jamais de pseudonyme
+        // calculé sur autre chose qu'une adresse entière.
+        let mut only_v6 = vec![0x01];
+        only_v6.extend_from_slice(&v6);
+        assert_eq!(
+            decode_ue_ip_address(&only_v6, &k),
+            format!("ue_ipv6={expected_v6},ue_ip_flags=0x01")
+        );
+        assert_eq!(decode_ue_ip_address(&[0x02, 10, 45], &k), "ue_ip_flags=0x02");
+        assert_eq!(decode_ue_ip_address(&[], &k), "ue_ip_flags=absent");
+    }
+
+    /// 2.21.125 — dans un message entier, l'IE 93 d'un Create PDR sort en
+    /// `session_identifiers` `ue_ip`, pseudonymisée, avec la valeur de
+    /// l'adresse seule.
+    #[test]
+    fn ue_ip_session_identifier_carries_the_address_pseudonym_2_21_125() {
+        let k = test_key();
+        let pdi = ie(2, &ie(93, &[0x02, 10, 45, 0, 2]));
+        let create_pdr = ie(1, &pdi);
+        let message = header(50, Some(0), &create_pdr);
+        let input_refs: [event_schema::PacketReference; 0] = [];
+        let ts = event_schema::ExactTimestamp {
+            seconds: 1,
+            nanoseconds: 0,
+            raw_ticks: 0,
+            resolution_base: 10,
+            resolution_exponent: 9,
+        };
+        let out = PfcpDecoder.decode(&plugin_runtime::DecoderInput {
+            capture_id: "sha256:test",
+            packet_references: &input_refs,
+            timestamp: &ts,
+            interface: "N4",
+            source_endpoint: event_schema::Endpoint {
+                address: "10.77.23.10".into(),
+                port: Some(8805),
+                network_function: None,
+            },
+            destination_endpoint: event_schema::Endpoint {
+                address: "10.77.22.13".into(),
+                port: Some(8805),
+                network_function: None,
+            },
+            payload: &message,
+            raw_payload_reference: "sha256:test-ref",
+            pseudonym_key: &k,
+        });
+        let expected = event_schema::pseudonym_ip_octets(&k, &[10, 45, 0, 2]).unwrap();
+        let id = out.events[0]
+            .session_identifiers
+            .iter()
+            .find(|id| id.name == "ue_ip")
+            .expect("ue_ip en session_identifiers");
+        assert_eq!(id.value, expected);
+        assert!(id.pseudonymized);
     }
 }

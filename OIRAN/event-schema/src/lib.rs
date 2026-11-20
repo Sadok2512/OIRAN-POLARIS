@@ -1115,6 +1115,33 @@ pub const SUBSCRIBER_PSEUDO_DOMAIN: &str = "subscriber";
 /// presentation hash the canonical temporary component with this label.
 pub const TEMPORARY_IDENTITY_PSEUDO_DOMAIN: &str = "temporary-mobile-identity";
 
+/// 2.21.125 — domaine du pseudonyme d'une adresse IP d'UE. Une seule forme
+/// d'entrée pour tous les décodeurs et pour la trace live : les OCTETS de
+/// l'adresse (4 pour IPv4, 16 pour IPv6). Avant 2.21.125 le PFCP hachait
+/// la valeur entière de l'IE (drapeaux compris), le SIP le texte de
+/// l'adresse, la trace live les octets : trois pseudonymes différents
+/// pour une même adresse, donc aucune égalité possible.
+pub const UE_IP_PSEUDO_DOMAIN: &str = "pfcp-ue-ip";
+
+/// Pseudonyme d'une adresse IP donnée par ses octets (4 ou 16). `None`
+/// pour toute autre longueur.
+pub fn pseudonym_ip_octets(key: &PseudonymKey, octets: &[u8]) -> Option<String> {
+    match octets.len() {
+        4 | 16 => Some(pseudonym(key, UE_IP_PSEUDO_DOMAIN, octets)),
+        _ => None,
+    }
+}
+
+/// Pseudonyme d'une adresse IP donnée en texte. L'adresse est normalisée
+/// (`normalize_ip` : IPv4 projetée en IPv6, identifiant de zone) puis
+/// réduite à ses octets. `None` si le texte n'est pas une adresse.
+pub fn pseudonym_ip_text(key: &PseudonymKey, text: &str) -> Option<String> {
+    match normalize_ip(text).parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => pseudonym_ip_octets(key, &v4.octets()),
+        std::net::IpAddr::V6(v6) => pseudonym_ip_octets(key, &v6.octets()),
+    }
+}
+
 /// Converts one canonical decimal subscriber identity to the shared domain.
 /// Callers must decode transport-specific representations before invoking it.
 pub fn pseudonym_subscriber_digits(key: &PseudonymKey, digits: &[u8]) -> String {
@@ -2215,4 +2242,33 @@ mod tests {
         assert!(!stamped.contains("physical_link"));
     }
 
+}
+
+#[cfg(test)]
+mod ue_ip_pseudonym_tests {
+    use super::*;
+
+    /// 2.21.125 — une adresse donne le même pseudonyme quelle que soit sa
+    /// présentation (octets, texte, IPv4 projetée en IPv6), et deux
+    /// adresses différentes donnent deux pseudonymes.
+    #[test]
+    fn one_address_one_pseudonym_whatever_its_presentation_2_21_125() {
+        let key = PseudonymKey::from_bytes([7; 32]);
+        let octets = pseudonym_ip_octets(&key, &[10, 45, 0, 2]).unwrap();
+        assert_eq!(pseudonym_ip_text(&key, "10.45.0.2").as_deref(), Some(octets.as_str()));
+        assert_eq!(pseudonym_ip_text(&key, " 10.45.0.2 ").as_deref(), Some(octets.as_str()));
+        assert_eq!(pseudonym_ip_text(&key, "::ffff:10.45.0.2").as_deref(), Some(octets.as_str()));
+        assert_eq!(octets, pseudonym(&key, UE_IP_PSEUDO_DOMAIN, &[10, 45, 0, 2]));
+        assert_ne!(pseudonym_ip_text(&key, "10.45.0.3").unwrap(), octets);
+        let v6 = pseudonym_ip_text(&key, "2001:db8::1").unwrap();
+        let mut v6_octets = [0u8; 16];
+        v6_octets[0] = 0x20;
+        v6_octets[1] = 0x01;
+        v6_octets[2] = 0x0d;
+        v6_octets[3] = 0xb8;
+        v6_octets[15] = 1;
+        assert_eq!(pseudonym_ip_octets(&key, &v6_octets).as_deref(), Some(v6.as_str()));
+        assert_eq!(pseudonym_ip_text(&key, "sip.example.invalid"), None);
+        assert_eq!(pseudonym_ip_octets(&key, &[0x02, 10, 45, 0, 2]), None);
+    }
 }

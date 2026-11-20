@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-pfcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-sip"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "event-schema"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "serde_json",
 ]
