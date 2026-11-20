@@ -1,5 +1,81 @@
 # Changelog
 
+## oiran-api 2.21.116 — 2026-11-20 — trace live : la mise en veille ne ferme pas la session de données (relecture CLAUDE2 #9 7051364956)
+
+Upgrade **patch** sans déploiement, base 2.21.113 @ `2f7f77f`. Branche `fix/oiran-2.21.116-trace-idle-release`. Seul `apps/api/src/live_trace.rs` change. **2.21.113 ne doit pas être déployée sans ce correctif.**
+
+### Audit
+
+- **F1 — régression introduite par 2.21.113.** À la libération du contexte UE (`UEContextReleaseComplete`), 2.21.113 oubliait aussi les SEID, les couples (nœud, SEID), les IP UE et les références de contexte SM. Or cette libération est aussi le passage en veille : la session de données reste établie au SMF et à l'UPF, et la séquence normale place après elle l'`UpdateSMContext` puis la `Session Modification` (TS 23.502 §4.2.6), plus tard le `Session Report Request`. Ces messages n'étaient plus rattachés. À `33e544a` la branche ne se déclenchait jamais et gardait donc les SEID. Reproduit par la sonde RVB2 de CLAUDE2 à `2f7f77f` ; je ne l'ai pas rejouée.
+- **F2.** `parents_attached_after_child` comptait deux fois chaque parent : les décodeurs posent la même référence dans `parent_event_id` et dans `parent_ngap_event_id` / `parent_s1ap_event_id`, le parent était routé deux fois, la seconde écartée par la déduplication après incrément du compteur (et de `duplicates_dropped`).
+
+### Correctif
+
+Trois fins distinctes :
+- **libération du contexte UE** (`UEContextReleaseComplete`, NGAP et S1AP) : identifiants UE NGAP / S1AP, tunnels du plan usager et références d'event oubliés ; SEID, couples (nœud, SEID), références de contexte SM et IP UE **gardés** ;
+- **libération d'une session de données** : inchangé depuis 2.21.113 (ses tunnels seulement si elle est nommée) ;
+- **détachement** (`Detach Accept`) : tout est oublié.
+Les références de parent sont dédoublonnées.
+
+### Identité de l'abonné gardée en fin de session — bornée par l'expiration de la trace (décision cœur #9 7051448601)
+
+Depuis 2.21.113 les pseudonymes appris et les chiffres amorcés ne sont plus oubliés à la fin d'une session, pour rattacher la procédure suivante de l'abonné (Service Request après veille). Ce maintien est borné par la durée de vie de la trace : une trace expire à `expires_at` (durée demandée à l'ouverture, 3 600 s au plus) et tout son état, identité comprise, est supprimé par `purge` à l'expiration ou à sa suppression explicite. Rien n'en est écrit sur disque.
+
+### OUVERT
+
+- L'ordre réel des messages de mise en veille sur le lab (Open5GS) n'est pas vérifié : le correctif suit la norme, pas une capture.
+- Les tunnels N3 sont oubliés à la mise en veille et réappris à la reprise sur le message qui les redonne ; si la reprise ne les redonne pas dans un message rattaché, les G-PDU suivants sont rejetés (`gpdu.rejected_no_match`).
+- **Repli quand le nœud de cœur n'est pas reconnu** (limite relevée par CLAUDE2) : l'AMF / MME est reconnu par le port 38412 / 36412 ou par un rôle contenant `amf` / `mme`. Sur un cœur à port non standard et sans rôle, l'identifiant du cœur retombe sur l'association et le handover est de nouveau perdu.
+- Non vérifié sur une capture S1AP réelle que les extrémités portent le port 36412.
+- Retour de veille : la reprise n'est rattachée que par un message qui porte une identité connue de la trace (pseudonyme de l'abonné ou identité temporaire apprise sur un message déjà rattaché). Si l'identité temporaire n'a été attribuée que dans un message NAS chiffré, le Service Request ne peut pas être rattaché côté N2 ; N4 et SBI le restent par SEID et contexte SM. Non vérifié sur le lab.
+
+### Tests
+
+`idle_release_keeps_the_pdu_session_signalling_attached_2_21_116` (mise en veille, puis SBI de même contexte SM et PFCP de même SEID rattachés ; identifiants NGAP libérés rejetés ; `Detach Accept` oublie tout). `real_n2_capture_attaches_the_whole_dialogue_and_nothing_else_2_21_113` affirme maintenant exactement 1 parent rattaché après coup et 0 doublon écarté (il affirmait `>= 1`, ce qui laissait passer le double).
+
+## oiran-api 2.21.113 — 2026-11-20 — trace live : cinq écarts de rattachement relevés en relecture croisée (CLAUDE2 #9 7050861203)
+
+Upgrade **patch** sans déploiement, base 2.21.109 second commit @ `33e544a` (la version en cours de déploiement). Branche `fix/oiran-2.21.113-trace-attach-review`. Seul `apps/api/src/live_trace.rs` change.
+
+### Audit
+
+La relecture de CLAUDE2 a reproduit, par cinq sondes sur `33e544a`, deux défauts d'isolement restants (E2, E3) et trois pertes de messages légitimes (E1, E4, E5). Lot ordonné par le cœur (#9 7050925249).
+
+**Échec avant, succès après** : les sept tests synthétiques du lot, greffés sur le fichier de `33e544a` dans un worktree détaché (assertions sur les compteurs nouveaux retirées, le reste inchangé), donnent `0 passed; 7 failed` ; sur le code corrigé ils passent.
+
+**Noms de messages comparés en dur dans `live_trace.rs`, contre ceux émis par les décodeurs** (`git grep` dans `decoder-ngap`, `decoder-s1ap`, `decoder-nas`, `decoder-gtpv2c`, `decoder-pfcp`, `decoder-gtpu`) :
+- `UE Context Release Complete` : **faux**, les décodeurs NGAP et S1AP émettent `UEContextReleaseComplete` (E5) ;
+- `Delete Session Response` : **faux**, `decoder-gtpv2c` émet `DeleteSessionResponse` — la fin de session LTE ne se déclenchait jamais non plus ;
+- messages PFCP de niveau nœud : `decoder-pfcp` ne nomme que Heartbeat et Association Setup ; Association Update / Release, PFD Management et Node Report sortent en `Unknown PFCP Message` et **passaient le filtre** de 2.21.103 ;
+- `PDU Session Release Complete`, `Detach Accept`, `G-PDU`, `PFCP Heartbeat …`, `PFCP Association Setup …` : conformes.
+
+### Correctif
+
+- **E1 — handover avec changement de gNB.** `amf_ue_ngap_id` / `mme_ue_s1ap_id` sont qualifiés par l'adresse du nœud de cœur (extrémité au port 38412 ou 36412, ou dont le rôle est AMF / MME), plus par l'association. `ran_ue_ngap_id` / `enb_ue_s1ap_id` restent qualifiés par l'association.
+- **E2 — un identifiant sur deux ne suffit plus.** Event portant les deux identifiants : celui du cœur doit être celui de l'abonné, et celui de l'accès radio aussi, sauf sur une association jamais vue pour cet abonné (nouveau gNB). Exception : tant qu'aucun identifiant du cœur n'est appris, l'identifiant radio connu suffit (premier message descendant). Event portant un seul identifiant : il doit être connu.
+- **E3 — SEID avec son nœud.** Rattachement par le couple (adresse du nœud destinataire, SEID d'en-tête), appris sur les messages PFCP de l'abonné et sur ses IE F-SEID. La valeur seule n'est admise que si aucun couple n'est connu pour elle ; comptée dans `pfcp.attached_seid_only`.
+- **E4 — parent rejeté avant son enfant.** Les 64 derniers events de signalisation rejetés sont gardés ; quand un event rattaché cite un parent (`parent_event_id`, `parent_ngap_event_id`, `parent_s1ap_event_id`) qui s'y trouve, le parent est rattaché à la même trace. Compté dans `parents_attached_after_child`. Le parent est émis **après** son enfant.
+- **E5 — fins de session.** Les noms sont comparés sans espaces ni casse. Libération du contexte UE (`UEContextReleaseComplete`, `Detach Accept`) : identifiants UE, tunnels, SEID, IP UE et références d'event oubliés. Libération d'une session de données (`PDU Session Release Complete`, `DeleteSessionResponse`) : les tunnels sont rangés par `pdu_session_id` à l'apprentissage, et **seuls ceux de la session libérée** sont oubliés ; les identifiants UE sont gardés. Si l'event ne nomme pas la session ou si ses tunnels ne sont pas rangés, tous les tunnels, SEID et IP UE sont oubliés (choix de l'isolement). Un `PFCP Session Deletion Response` rattaché fait oublier le couple (nœud, SEID) de son en-tête.
+- **Messages PFCP de niveau nœud** : filtrés aussi par type (1 à 49), plus seulement par nom.
+- **Rejets par motif dans `stats`** : `rejects.ue_id_mismatch` (E2), `rejects.seid_endpoint_mismatch` (E3), `rejects.gpdu_endpoint_mismatch`, `rejects.gpdu_no_match`, `rejects.gpdu_interface_filter` ; plus `pfcp.attached_seid_only` et `parents_attached_after_child`.
+
+### Changement de comportement à connaître
+
+À la fin d'une session, **l'identité de l'abonné n'est plus oubliée** : pseudonymes appris, chiffres amorcés et `exposed_keys` sont gardés. Avant, la branche de fin de session vidait tout `match_keys` et `exposed_keys`, mais ne se déclenchait jamais sur une libération de contexte (mauvais nom). L'activer telle quelle aurait fait perdre le rattachement de la procédure suivante de l'abonné (Service Request par identité temporaire). Conséquence : `ue_info` n'est plus réémis après une fin de session, puisque les clés exposées ne changent pas.
+
+### OUVERT
+
+- Aucun test sur capture réelle pour E1 (un seul gNB au lab), E3 et E5 : events synthétiques. E2 et E4 sont aussi vérifiés sur la capture N2 réelle du dépôt.
+- E4 : le parent sort après son enfant dans le flux SSE ; le tri canonique du replay (`capture_id`, numéro de paquet) les remet dans l'ordre, pas le flux live.
+- E2 : deux AMF qui alloueraient le même `amf_ue_ngap_id` sont distingués par leur adresse ; un gNB qui réutilise un `ran_ue_ngap_id` avant la libération du contexte ne l'est pas.
+- S1AP : mêmes règles par construction, non testé séparément.
+- Libération d'une session PDU : le SEID PFCP de la session n'est oublié que sur son `Session Deletion Response` ; les SEID ne sont pas rangés par `pdu_session_id`.
+- Le filtre PFCP par type écarte tout type 1 à 49, y compris des types que le décodeur ne connaît pas ; aucun message de session PFCP n'a un type inférieur à 50 (TS 29.244).
+- La boucle `start_reader` n'a toujours pas de test.
+
+### Tests (`live_trace::tests`, suffixe `_2_21_113`)
+
+`handover_to_another_gnb_keeps_the_subscriber_attached`, `one_ue_id_out_of_two_does_not_attach_another_ue`, `pfcp_seid_is_matched_with_its_receiving_node`, `parent_rejected_before_its_child_is_attached_afterwards`, `context_release_and_pdu_release_forget_the_right_things`, `pdu_release_forgets_only_the_tunnels_of_that_session`, `rejects_are_counted_by_reason_and_unnamed_pfcp_node_messages_are_filtered`, `real_n2_capture_attaches_the_whole_dialogue_and_nothing_else` (capture N2 réelle : tout le dialogue de l'abonné, `InitialUEMessage` compris, et aucun des deux messages d'un autre contexte UE).
 ## oiran-api 2.21.115 — 2026-11-20 — clé stable sur les PFCP frères de la route `/events`, et test à travers le routeur (ordre #9 7050925249, suite de 2.21.112)
 
 Upgrade **patch** sans déploiement, base train `fix/oiran-2.21.114-train` @ `3f95d53`. Branche `fix/oiran-2.21.115-pfcp-sibling-items-key`. Seul `oiran-api` change.
