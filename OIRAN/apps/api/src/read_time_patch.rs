@@ -2110,6 +2110,21 @@ fn first_packet_reference(event: &Value) -> Option<(String, u32, u64, u64)> {
     ))
 }
 
+/// 2.21.118 (ordre #9 7051448601 point 2) — dérive `stable_event_key`
+/// à la lecture sur une liste d'events persistés, par la MÊME fonction
+/// que le callflow (`event_schema::backfill_stable_event_keys_in_callflow`),
+/// sans copier la liste. À appeler sur les events persistés, dans leur
+/// ordre de stockage, AVANT d'y insérer des frères. Retourne
+/// `(clés posées, events sans référence de paquet)`.
+pub fn backfill_stable_event_keys_in_items(items: &mut Vec<Value>) -> (usize, usize) {
+    let mut wrapper = serde_json::json!({ "events": Value::Array(std::mem::take(items)) });
+    let counts = event_schema::backfill_stable_event_keys_in_callflow(&mut wrapper);
+    if let Some(Value::Array(events)) = wrapper.get_mut("events").map(Value::take) {
+        *items = events;
+    }
+    counts
+}
+
 /// 2.21.112 — pose `stable_event_key` sur un event inséré à la lecture
 /// s'il n'en porte pas. Même formule que
 /// `event_schema::backfill_stable_event_keys_in_callflow` :

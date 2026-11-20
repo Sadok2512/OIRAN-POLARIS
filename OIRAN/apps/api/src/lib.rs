@@ -8101,6 +8101,12 @@ fn session_events_blocking(state: &AppState, id: &str, query: &ListQuery) -> Res
                 Err(error) => return lte_evidence_error(error),
             }
         };
+    // 2.21.118 (ordre #9 7051448601 point 2) — une correction couvre les
+    // données stockées : les events persistés d'un dataset d'avant
+    // 2.21.91 n'ont pas de `stable_event_key`. Elle est dérivée ici, à la
+    // lecture, par la même fonction que `/callflow`, sur la liste
+    // persistée dans son ordre de stockage et AVANT tout ajout.
+    read_time_patch::backfill_stable_event_keys_in_items(&mut items);
     let patch_status = if let Some(root) = dataset_root.as_deref() {
         apply_read_time_patch(state, &mut items, root, id)
     } else {
@@ -17422,6 +17428,7 @@ mod tests {
         config.callflow_html = dataset_dir.join("callflow.html");
         config.reference_dataset_enabled = true;
         let state = AppState::load(config).expect("AppState::load");
+        let mut keys_by_route: Vec<Vec<(String, String)>> = Vec::new();
         for route in ["callflow?limit=100", "events?page_size=100"] {
             let response = router(state.clone(), None)
                 .oneshot(req(&format!("/api/v1/sessions/{session_id}/{route}"), true))
@@ -17444,7 +17451,30 @@ mod tests {
                 expected_sibling_key.as_str(),
                 "{route} : clé du frère"
             );
+            // 2.21.118 — les events PERSISTÉS aussi portent leur clé, sur
+            // les deux routes, et les deux routes rendent les mêmes clés.
+            let mut keys: Vec<(String, String)> = events
+                .iter()
+                .map(|event| {
+                    (
+                        event["event_id"].as_str().unwrap_or("").to_owned(),
+                        event["stable_event_key"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+                .collect();
+            keys.sort();
+            assert_eq!(keys.len(), 3, "{route} : 2 persistés + 1 frère");
+            assert!(
+                keys.iter().all(|(_, key)| !key.is_empty()),
+                "{route} : chaque event porte une clé : {keys:?}"
+            );
+            keys_by_route.push(keys);
         }
+        assert_eq!(keys_by_route[0], keys_by_route[1], "mêmes clés sur /callflow et /events");
+        assert!(keys_by_route[0].contains(&(
+            "evt-pfcp-resp".to_owned(),
+            "n4_00007.pcapng|0|8|800|PFCP|0".to_owned()
+        )));
     }
 
     /// 2.21.102 (défaut ANR1 #9 7044712668, ordre #9 7045732954 point 2) —

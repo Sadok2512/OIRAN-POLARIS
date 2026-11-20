@@ -1,5 +1,26 @@
 # Changelog
 
+## oiran-api 2.21.118 — 2026-11-20 — `/events` : clé stable dérivée à la lecture pour les events persistés (ordre #9 7051448601 point 2)
+
+Upgrade **patch** sans déploiement, base train `fix/oiran-2.21.117-train` (ordre #9 7051620366). Branche `fix/oiran-2.21.118-events-read-time-key`. 2.21.117 est le numéro du train. Seul `oiran-api` change.
+
+### Audit
+
+Règle : une correction couvre les données stockées. `GET /sessions/:id/callflow` dérive `stable_event_key` à la lecture depuis 2.21.102 ; `GET /sessions/:id/events` (`session_events_blocking`) rendait les events persistés d'un dataset d'avant 2.21.91 **sans clé** — seul le PFCP frère inséré en recevait une depuis 2.21.115.
+
+### Correctif
+
+`read_time_patch::backfill_stable_event_keys_in_items` applique à la liste d'events de `/events` la même fonction que le callflow (`event_schema::backfill_stable_event_keys_in_callflow`), sans copier la liste, sur les events persistés dans leur ordre de stockage et avant l'ajout des frères.
+
+### OUVERT
+
+- L'ordinal d'un event suit l'ordre de la liste persistée ; il est identique à celui de `/callflow` tant que les deux routes lisent la même liste, ce que le test vérifie sur un cas à trois events. Non vérifié sur une session de prod.
+- Un event sans `packet_references` reste sans clé (compte ignoré par l'appelant, comme pour `/callflow`).
+
+### Test
+
+`inserted_pfcp_sibling_carries_a_stable_event_key_through_the_router_2_21_115` étendu : sur les deux routes, les 3 events (2 persistés + 1 frère) portent une clé non vide, et `/callflow` et `/events` rendent **les mêmes clés**.
+
 ## oiran-api 2.21.117 — 2026-11-20 — train (cœur) : 2.21.114 + 2.21.115 (clé sur PFCP frères, /events) + 2.21.113 et 2.21.116 (rattachement de la trace : E1 à E5, mise en veille) + tests capture-helper
 
 - Merge `--no-ff` de `fix/oiran-capture-helper-manual-stop-test` @ 9431c21 et de `fix/oiran-2.21.116-trace-idle-release` @ 7e0b1bb sur `fix/oiran-2.21.115-pfcp-sibling-items-key` @ 498767c.
