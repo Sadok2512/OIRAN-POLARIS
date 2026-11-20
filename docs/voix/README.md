@@ -6,7 +6,12 @@ Les identités et le secret Digest ne sont jamais versionnés. Les fichiers CSV 
 
 - `register.csv` : `[field0]=AoR`, `[field1]=utilisateur Digest`, `[field2]=secret Digest` ;
 - `uas.csv` : même format pour l'UAS ;
-- `uac.csv` : `[field0]=AoR appelant`, `[field1]=AoR appelé`, `[field2]=chemin du fichier PCMU brut`.
+- `uac.csv` : `[field0]=AoR appelant`, `[field1]=AoR appelé`.
+
+Le scénario UAC charge le média au chemin fixe `/run/local/pcmu-30s.raw`,
+fourni par le montage en lecture seule de `LOCAL_PROOF`. SIPp 3.5.1 charge le
+média au démarrage et n'interpole pas les variables dans l'attribut
+`rtp_stream`.
 
 Préparer un fichier média PCMU local de 30 s, hors dépôt : `head -c 240000 /dev/zero > "$LOCAL_PROOF/pcmu-30s.raw" && chmod 600 "$LOCAL_PROOF/pcmu-30s.raw"`.
 
@@ -55,7 +60,7 @@ docker run --rm --network container:polaris-dn-sender --cap-drop ALL \
   -v "$SCENARIOS:/scenarios:ro" -v "$LOCAL_PROOF:/run/local:ro" "$SIPP_IMAGE" \
   "$PROXY_IP:5060" -sf /scenarios/uas_echo.xml -inf /run/local/uas.csv \
   -i "$DN_IP" -p 5064 -mi "$DN_IP" -mp 6000 -rtp_echo -m 1 \
-  -set reply_code 200 -set reply_reason OK -set call_ms 30000 -trace_err -trace_msg -nostdin
+  -d 30000 -trace_err -trace_msg -nostdin
 ```
 
 Terminal UAC UE :
@@ -71,13 +76,18 @@ docker run --rm --network "container:$UE_CONTAINER" --cap-drop ALL \
 
 ## V3 — qualité RTP
 
-Rejouer V2 pendant 60 s (`call_ms=60000`, `-d 60000`) après l'ajout **autorisé** du `netem` décrit dans la SOP §6, puis retirer obligatoirement ce `netem`. Le fichier PCMU brut doit contenir au moins 60 s, soit 480000 octets à 8 kHz mono.
+Rejouer V2 pendant 60 s (`-d 60000` côté UAS et UAC) après l'ajout
+**autorisé** du `netem` décrit dans la SOP §6, puis retirer obligatoirement ce
+`netem`. Le fichier PCMU brut doit contenir au moins 60 s, soit 480000 octets
+à 8 kHz mono.
 
 ## V4 — échecs SIP
 
 Utilisateur inconnu (404) : placer un AoR non enregistré dans `[field1]` de `uac.csv`, puis exécuter la commande UAC V2 sans lancer l'UAS.
 
-Occupé (486) : lancer l'UAS V2 avec `-set reply_code 486 -set reply_reason 'Busy Here' -set call_ms 0`, puis lancer l'UAC V2.
+Occupé (486) : lancer l'UAS avec la commande V2 en remplaçant
+`/scenarios/uas_echo.xml` par `/scenarios/uas_busy.xml`, en retirant
+`-rtp_echo` et `-d 30000`, puis lancer l'UAC V2.
 
 Timeout (408) : enregistrer le futur appelé depuis le DN sur un port sans listener persistant :
 

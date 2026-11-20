@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 <scenario name="POLARIS IMS-lite UAC INVITE plus RTP PCMU">
-  <!-- CSV local hors dépôt : field0=AoR appelant, field1=AoR appelé, field2=fichier PCMU brut. -->
+  <!-- CSV local hors dépôt : field0=AoR appelant, field1=AoR appelé. Média monté à /run/local/pcmu-30s.raw. -->
   <send retrans="500" start_rtd="true">
     <![CDATA[
       INVITE sip:[field1]@ims-lite.audit SIP/2.0
@@ -51,7 +51,7 @@
   </send>
 
   <nop>
-    <action><exec rtp_stream="[field2],-1,0"/></action>
+    <action><exec rtp_stream="/run/local/pcmu-30s.raw,-1,0"/></action>
   </nop>
   <pause/>
   <nop>

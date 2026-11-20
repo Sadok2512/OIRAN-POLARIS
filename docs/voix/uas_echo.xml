@@ -2,7 +2,7 @@
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 <scenario name="POLARIS IMS-lite UAS RTP echo">
   <!-- CSV local hors dépôt : field0=AoR UAS, field1=utilisateur Digest, field2=secret Digest. -->
-  <!-- Variables CLI obligatoires : reply_code, reply_reason, call_ms. -->
+  <!-- La durée d'appel est fournie par l'option SIPp -d. -->
   <send retrans="500">
     <![CDATA[
       REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
@@ -60,7 +60,7 @@
 
   ]]></send>
   <send retrans="500"><![CDATA[
-      SIP/2.0 [$reply_code] [$reply_reason]
+      SIP/2.0 200 OK
       [last_Via:]
       [last_From:]
       [last_To:];tag=[call_number]
@@ -79,9 +79,9 @@
       a=rtpmap:0 PCMU/8000
       a=sendrecv
   ]]></send>
-  <recv request="ACK" optional="true"/>
-  <pause milliseconds="[$call_ms]"/>
-  <recv request="BYE" optional="true" timeout="1000" ontimeout="99"/>
+  <recv request="ACK"/>
+  <pause/>
+  <recv request="BYE" timeout="1000" ontimeout="99"/>
   <send><![CDATA[
       SIP/2.0 200 OK
       [last_Via:]
