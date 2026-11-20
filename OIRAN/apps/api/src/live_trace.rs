@@ -54,6 +54,15 @@ pub(crate) struct LiveTrace {
     gpdu_rejected_no_match: u64,
     #[serde(default)]
     gpdu_rejected_interface_filter: u64,
+    /// 2.21.109 — G-PDU rattachés par TEID seul : le TEID a été appris
+    /// sur la signalisation de l'abonné, sans adresse de point de
+    /// terminaison. Rattachement plus faible, compté à part.
+    #[serde(default)]
+    gpdu_attached_teid_only: u64,
+    /// 2.21.109 — G-PDU portant un TEID de l'abonné mais vers un autre
+    /// point de terminaison que celui appris : rejetés.
+    #[serde(default)]
+    gpdu_rejected_endpoint_mismatch: u64,
     /// 2.21.105 (donnée ANR1 #10 7048928345, ordre #9 7048974175) —
     /// alimentation de la trace **par interface** : events décodés
     /// présentés à la trace (`seen`), écartés par le filtre
@@ -307,6 +316,12 @@ struct TraceState {
     /// exportées via SSE/API/logs (invariant privacy « pas d'IP UE en
     /// clair hors identity vault »).
     ue_ips: HashSet<String>,
+    /// 2.21.109 (ordre #9 7050201220) — identifiants UE de signalisation
+    /// appris sur les events routés : `(nom, valeur, association)` avec
+    /// `nom` ∈ amf_ue_ngap_id / ran_ue_ngap_id / mme_ue_s1ap_id /
+    /// enb_ue_s1ap_id et `association` = les deux adresses du lien
+    /// SCTP. Rattachement EXACT, jamais par sous-chaîne.
+    ue_ids: HashSet<(String, String, String)>,
     /// 2.21.105 — la trace attend son amorçage depuis le ring.
     needs_seed: bool,
     /// 2.21.105 — la trace est dans la passe d'amorçage en cours :
@@ -333,7 +348,7 @@ fn pseudonym_key() -> Option<&'static event_schema::PseudonymKey> {
 /// MSISDN/IMEI/SUPI/TMSI. Strippe le préfixe `imsi-/msisdn-/imei-/supi-`
 /// (TS 29.571 §5.4.5) puis ne conserve que les ASCII digits. Retourne
 /// `None` sous 5 chiffres (seuil `identity_vault::lookup_keys`, évite
-/// les collisions arbitraires dans `encoded.contains`). Utilisé pour
+/// les collisions arbitraires). Utilisé pour
 /// amorcer `state.keys` : un event qui porte la valeur en clair dans
 /// n'importe quel IE (cas EPS/SUCI null-scheme) est routé.
 fn canonical_digits(value: &str) -> Option<String> {
@@ -357,6 +372,76 @@ fn canonical_digits(value: &str) -> Option<String> {
 /// 2.21.90 défaut 2 — itère les valeurs textuelles des IE d'un event
 /// déjà sérialisé en JSON. Chaque IE expose un champ `value` chaîné
 /// `key=value,key=value,…` (format produit par les decoders).
+/// 2.21.109 (exigence cœur #9 7050392981 point 2) — valeurs typées d'un
+/// event, comparées par ÉGALITÉ aux clés d'une trace. Remplace le test
+/// de sous-chaîne sur le JSON entier. Sources :
+///   * chaque `session_identifiers[].value` ;
+///   * chaque `information_elements[].value`, entière, puis découpée
+///     sur `,` `;` `&` en champs `nom=valeur` dont la valeur est gardée ;
+///   * `parent_event_id` ;
+///   * les chaînes de l'objet `sbi`, entières et découpées sur `/ ? & =`.
+/// Une valeur d'identité (`imsi-…`, `msisdn-…`, ou suite de chiffres)
+/// ajoute aussi ses chiffres canoniques, pour l'amorçage par saisie.
+fn event_tokens(value: &Value) -> HashSet<String> {
+    fn push(tokens: &mut HashSet<String>, raw: &str) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return;
+        }
+        tokens.insert(raw.to_owned());
+        let lower = raw.to_ascii_lowercase();
+        let identity = ["imsi-", "msisdn-", "imei-", "imeisv-", "supi-"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+            || raw.bytes().all(|b| b.is_ascii_digit());
+        if identity {
+            if let Some(digits) = canonical_digits(raw) {
+                tokens.insert(digits);
+            }
+        }
+    }
+    fn walk(tokens: &mut HashSet<String>, node: &Value) {
+        match node {
+            Value::String(text) => {
+                push(tokens, text);
+                for part in text.split(['/', '?', '&', '=']) {
+                    push(tokens, part);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(tokens, item)),
+            Value::Object(map) => map.values().for_each(|item| walk(tokens, item)),
+            _ => {}
+        }
+    }
+    let mut tokens = HashSet::new();
+    for id in value
+        .get("session_identifiers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(v) = id.get("value").and_then(Value::as_str) {
+            push(&mut tokens, v);
+        }
+    }
+    for ie in ie_values(value) {
+        push(&mut tokens, &ie);
+        for field in ie.split([',', ';', '&']) {
+            match field.split_once('=') {
+                Some((_, v)) => push(&mut tokens, v),
+                None => push(&mut tokens, field),
+            }
+        }
+    }
+    if let Some(parent) = value.get("parent_event_id").and_then(Value::as_str) {
+        push(&mut tokens, parent);
+    }
+    if let Some(sbi) = value.get("sbi") {
+        walk(&mut tokens, sbi);
+    }
+    tokens
+}
+
 fn ie_values(value: &Value) -> Vec<String> {
     value
         .get("information_elements")
@@ -478,6 +563,38 @@ fn session_ids_named<'a>(value: &'a Value, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// 2.21.109 (ordre #9 7050201220) — identifiants UE de signalisation qui
+/// rattachent un message à l'abonné d'une trace, par égalité exacte.
+const UE_ID_NAMES: [&str; 4] = [
+    "amf_ue_ngap_id",
+    "ran_ue_ngap_id",
+    "mme_ue_s1ap_id",
+    "enb_ue_s1ap_id",
+];
+
+/// 2.21.109 — référence de contexte SM (SBI `smContextRef`) : propre à
+/// une session, allouée par le SMF. Rattachement exact, sans portée
+/// d'association (requêtes et réponses la portent dans les deux sens).
+const SM_CONTEXT_NAME: &str = "sm_context_reference";
+
+/// 2.21.109 — vrai pour un identifiant hexadécimal nul (`0x0…0`). Un
+/// SEID ou un TEID nul n'identifie aucune session : c'est la valeur de
+/// l'en-tête d'un PFCP Session Establishment Request, commune à tous
+/// les abonnés.
+fn is_zero_hex(value: &str) -> bool {
+    let digits = value.trim_start_matches("0x").trim_start_matches("0X");
+    !digits.is_empty() && digits.bytes().all(|b| b == b'0')
+}
+
+/// 2.21.109 — vrai si une valeur de `session_identifiers` peut servir
+/// de clé de rattachement par sous-chaîne : un pseudonyme posé par le
+/// décodeur, ou une référence d'event (`evt-…`). Toute autre valeur
+/// (PLMN, TAC, cellule, sens du tunnel, numéros de séquence, …) est
+/// commune à plusieurs abonnés.
+fn is_subscriber_scoped_key(name: &str, value: &str, pseudonymized: bool) -> bool {
+    pseudonymized || name.ends_with("_pseudonym") || value.starts_with("evt-")
+}
+
 /// 2.21.103 (ordre #9 7046282778, défaut ANR2 #10 7045891820) — vrai si le
 /// message PFCP est de **niveau nœud** (Heartbeat, Association, PFD
 /// Management) et ne porte PAS une session abonné. Ces messages sont exclus
@@ -517,6 +634,11 @@ pub(crate) struct LiveTraceRegistry {
     resume_resets: AtomicU64,
     /// 2.21.109 — octets décodés / taille par plan, dernière passe.
     reader_io: Mutex<BTreeMap<String, ReaderIo>>,
+    /// 2.21.109 — segments du ring suivis par le lecteur.
+    reader_files_tracked: AtomicU64,
+    /// 2.21.109 — segments décodés pendant la dernière passe. En
+    /// régime établi : un par plan actif, pas tout le ring.
+    reader_files_decoded: AtomicU64,
 }
 
 impl LiveTraceRegistry {
@@ -528,6 +650,8 @@ impl LiveTraceRegistry {
             reader_pass_ms: AtomicU64::new(0),
             resume_resets: AtomicU64::new(0),
             reader_io: Mutex::new(BTreeMap::new()),
+            reader_files_tracked: AtomicU64::new(0),
+            reader_files_decoded: AtomicU64::new(0),
         }
     }
     pub(crate) fn audit(&self, entry: Value) {
@@ -603,6 +727,8 @@ impl LiveTraceRegistry {
             "reader_pass_ms": self.reader_pass_ms.load(Ordering::Relaxed),
             "reader": {
                 "resume_resets": self.resume_resets.load(Ordering::Relaxed),
+                "files_tracked": self.reader_files_tracked.load(Ordering::Relaxed),
+                "files_decoded_last_pass": self.reader_files_decoded.load(Ordering::Relaxed),
                 "full_redecode": full_redecode_requested(),
                 "interfaces": *self.reader_io.lock().unwrap(),
             },
@@ -612,6 +738,8 @@ impl LiveTraceRegistry {
                 "attached": trace.gpdu_attached,
                 "rejected_no_match": trace.gpdu_rejected_no_match,
                 "rejected_interface_filter": trace.gpdu_rejected_interface_filter,
+                "attached_teid_only": trace.gpdu_attached_teid_only,
+                "rejected_endpoint_mismatch": trace.gpdu_rejected_endpoint_mismatch,
             },
             "interfaces": trace.feed,
             "seed": trace.seed,
@@ -634,6 +762,14 @@ impl LiveTraceRegistry {
                 payload,
             });
         }
+    }
+
+    pub(crate) fn set_reader_files_tracked(&self, value: u64) {
+        self.reader_files_tracked.store(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_reader_files_decoded(&self, value: u64) {
+        self.reader_files_decoded.store(value, Ordering::Relaxed);
     }
 
     pub(crate) fn bump_resume_resets(&self) {
@@ -762,25 +898,80 @@ impl LiveTraceRegistry {
             return;
         }
         let value = serde_json::from_str(&event.to_json()).unwrap_or(Value::Null);
-        let encoded = value.to_string();
+        // 2.21.109 — rattachement par égalité sur champs typés ; plus
+        // aucun test de sous-chaîne sur le JSON de l'event.
+        let tokens = event_tokens(&value);
         // 2.21.90 défaut 2 — facts extraits une seule fois par event,
         // puis consultés et pour le match (SEID/TEID/(ip,teid) déjà
         // connus) et pour l'apprentissage après routage.
         let ev_ies: Vec<String> = ie_values(&value);
         let ev_tunnel_pairs: Vec<(String, String)> =
             ev_ies.iter().flat_map(|v| parse_tunnel_pairs(v)).collect();
-        let ev_teids: Vec<String> = ev_ies.iter().flat_map(|v| parse_teids(v)).collect();
-        let ev_seids_ie: Vec<String> = ev_ies.iter().flat_map(|v| parse_seids(v)).collect();
+        // 2.21.109 — un SEID ou un TEID nul n'est ni appris ni comparé.
+        let ev_tunnel_pairs: Vec<(String, String)> = ev_tunnel_pairs
+            .into_iter()
+            .filter(|pair| !is_zero_hex(&pair.1))
+            .collect();
+        let ev_teids: Vec<String> = ev_ies
+            .iter()
+            .flat_map(|v| parse_teids(v))
+            .filter(|t| !is_zero_hex(t))
+            .collect();
+        let ev_seids_ie: Vec<String> = ev_ies
+            .iter()
+            .flat_map(|v| parse_seids(v))
+            .filter(|s| !is_zero_hex(s))
+            .collect();
         let ev_session_seids: Vec<String> = session_ids_named(&value, "seid")
             .into_iter()
             .filter_map(|s| {
                 let hex = s.trim_start_matches("0x").trim_start_matches("0X");
                 u64::from_str_radix(hex, 16).ok().map(|n| format!("0x{n:016x}"))
             })
+            .filter(|s| !is_zero_hex(s))
             .collect();
         let ev_session_teids: Vec<String> = session_ids_named(&value, "teid")
             .into_iter()
             .filter_map(event_schema::normalize_teid_hex)
+            .filter(|t| !is_zero_hex(t))
+            .collect();
+        // 2.21.109 (ordre #9 7050201220) — un G-PDU (données du plan
+        // usager) : jamais émis en `message`, rattaché par le couple
+        // (adresse du point de terminaison, TEID).
+        let is_gpdu_data = event.protocol.as_str() == "GTP-U"
+            && (event.message_type == 255 || event.message_name == "G-PDU");
+        let gpdu_pairs: Vec<(String, String)> = if event.protocol.as_str() == "GTP-U" {
+            ev_session_teids
+                .iter()
+                .map(|teid| (event.destination_endpoint.address.clone(), teid.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // 2.21.109 — identifiants UE de signalisation portés par l'event,
+        // qualifiés par l'association (les deux adresses du lien).
+        let association = {
+            let a = event.source_endpoint.address.as_str();
+            let b = event.destination_endpoint.address.as_str();
+            if a <= b {
+                format!("{a}|{b}")
+            } else {
+                format!("{b}|{a}")
+            }
+        };
+        let ev_ue_ids: Vec<(String, String, String)> = UE_ID_NAMES
+            .iter()
+            .flat_map(|name| {
+                session_ids_named(&value, name)
+                    .into_iter()
+                    .map(|v| ((*name).to_string(), v.to_string(), association.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .chain(
+                session_ids_named(&value, SM_CONTEXT_NAME)
+                    .into_iter()
+                    .map(|v| (SM_CONTEXT_NAME.to_string(), v.to_string(), String::new())),
+            )
             .collect();
         let ev_pdu_address: Option<String> = ev_ies
             .iter()
@@ -852,20 +1043,42 @@ impl LiveTraceRegistry {
                 .trace
                 .subscriber_pseudonyms
                 .iter()
-                .any(|key| encoded.contains(key));
-            let match_keys = state.match_keys.iter().any(|key| encoded.contains(key));
+                .any(|pseudonym| tokens.contains(pseudonym));
+            let match_keys = state.match_keys.iter().any(|known| tokens.contains(known));
             let match_seid = ev_session_seids
                 .iter()
                 .chain(ev_seids_ie.iter())
                 .any(|s| state.seids.contains(s));
+            // 2.21.109 — un TEID seul ne rattache que si aucun couple
+            // (adresse, TEID) n'est connu pour ce TEID : gNB et UPF
+            // allouent leurs TEID chacun de leur côté, la même valeur
+            // peut désigner le tunnel d'un autre abonné.
+            // `tunnel_teids` ne contient que des TEID appris sur la
+            // signalisation de CET abonné (un G-PDU n'en apprend aucun).
+            let teid_without_known_endpoint = |t: &String| {
+                state.tunnel_teids.contains(t)
+                    && !state.tunnel_endpoints.iter().any(|pair| &pair.1 == t)
+            };
+            let gpdu_teid_known = event.protocol.as_str() == "GTP-U"
+                && ev_session_teids.iter().any(|t| state.tunnel_teids.contains(t));
+            // Vaut pour la signalisation comme pour les G-PDU : un PDU
+            // Session Resource Setup ou un PFCP d'un autre UE peut porter
+            // la même valeur de TEID vers un autre point de terminaison.
             let match_teid = ev_session_teids
                 .iter()
                 .chain(ev_teids.iter())
-                .any(|t| state.tunnel_teids.contains(t));
+                .any(teid_without_known_endpoint);
             let match_tunnel = ev_tunnel_pairs
                 .iter()
+                .chain(gpdu_pairs.iter())
                 .any(|pair| state.tunnel_endpoints.contains(pair));
-            let matched = match_pseudo || match_keys || match_seid || match_teid || match_tunnel;
+            let match_ue_id = ev_ue_ids.iter().any(|id| state.ue_ids.contains(id));
+            let matched = match_pseudo
+                || match_keys
+                || match_seid
+                || match_teid
+                || match_tunnel
+                || match_ue_id;
             if !matched {
                 // 2.21.105 — un G-PDU qui arrive APRÈS la trace mais
                 // dont le TEID / UE IP n'a pas été appris (parce que
@@ -874,13 +1087,25 @@ impl LiveTraceRegistry {
                 // `/live/traces/:id` pour que l'opérateur voie 0
                 // bucket = N rejets rattachement, pas 0 vu.
                 if is_gpdu {
-                    state.trace.gpdu_rejected_no_match =
-                        state.trace.gpdu_rejected_no_match.saturating_add(1);
+                    if gpdu_teid_known {
+                        // TEID de l'abonné, mais vers un autre point de
+                        // terminaison que celui appris : tunnel d'un
+                        // autre UE qui porte la même valeur.
+                        state.trace.gpdu_rejected_endpoint_mismatch =
+                            state.trace.gpdu_rejected_endpoint_mismatch.saturating_add(1);
+                    } else {
+                        state.trace.gpdu_rejected_no_match =
+                            state.trace.gpdu_rejected_no_match.saturating_add(1);
+                    }
                 }
                 continue;
             }
             if is_gpdu {
                 state.trace.gpdu_attached = state.trace.gpdu_attached.saturating_add(1);
+                if !match_tunnel && match_teid {
+                    state.trace.gpdu_attached_teid_only =
+                        state.trace.gpdu_attached_teid_only.saturating_add(1);
+                }
             }
             if !seed_only {
                 if let Some(feed) = state.trace.feed.get_mut(&event.interface) {
@@ -902,11 +1127,20 @@ impl LiveTraceRegistry {
                     // `pseudonymized=true` par le decoder (subscriber_pseudonym,
                     // msisdn_pseudonym, imei_pseudonym, …) sont AUSSI
                     // ajoutées à `exposed_keys` (sérialisable via `ue_info`).
-                    state.match_keys.insert(v.to_owned());
                     let pseudonymized = id
                         .get("pseudonymized")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    // 2.21.109 (ordre #9 7050201220) — seules les valeurs
+                    // propres à l'abonné deviennent des clés de
+                    // rattachement. Avant, toute valeur ≥ 3 caractères
+                    // (PLMN, TAC, cellule, sens du tunnel, séquences)
+                    // l'était : la trace rattachait alors les autres UE
+                    // de la cellule et leur trafic N3.
+                    let name = id.get("name").and_then(Value::as_str).unwrap_or("");
+                    if is_subscriber_scoped_key(name, v, pseudonymized) {
+                        state.match_keys.insert(v.to_owned());
+                    }
                     if pseudonymized {
                         state.exposed_keys.insert(v.to_owned());
                     }
@@ -920,12 +1154,26 @@ impl LiveTraceRegistry {
             // dépendre d'un subscriber_pseudonym (qui diffère entre
             // domaines pseudonymiques `subscriber`, `pfcp-user-id`,
             // etc.).
+            // 2.21.109 — identifiants UE exacts, et référence de l'event
+            // de signalisation routé : un event enfant (NAS porté par
+            // NGAP/S1AP) cite son parent par `parent_*_event_id`.
+            for id in &ev_ue_ids {
+                state.ue_ids.insert(id.clone());
+            }
+            if event.protocol.as_str() != "GTP-U" && event.event_id.starts_with("evt-") {
+                state.match_keys.insert(event.event_id.clone());
+            }
             for pair in &ev_tunnel_pairs {
                 state.tunnel_endpoints.insert(pair.clone());
                 state.tunnel_teids.insert(pair.1.clone());
             }
-            for t in ev_teids.iter().chain(ev_session_teids.iter()) {
-                state.tunnel_teids.insert(t.clone());
+            // 2.21.109 (exigence cœur 7050392981 point 1) — un G-PDU
+            // n'apprend aucun TEID : seule la signalisation de l'abonné
+            // en apprend.
+            if event.protocol.as_str() != "GTP-U" {
+                for t in ev_teids.iter().chain(ev_session_teids.iter()) {
+                    state.tunnel_teids.insert(t.clone());
+                }
             }
             for s in ev_seids_ie.iter().chain(ev_session_seids.iter()) {
                 state.seids.insert(s.clone());
@@ -935,7 +1183,7 @@ impl LiveTraceRegistry {
                 // Pseudonyme UE IP (domain `pfcp-ue-ip`) : correspond à
                 // `decoder-pfcp` IE 93. Un PFCP Session Establishment
                 // qui ne porte que cette UE IP pseudonymisée match via
-                // `state.keys` (`encoded.contains(pseudonym)`).
+                // `match_keys` (égalité sur la valeur de l'IE, cf. `event_tokens`).
                 if let Some(key) = pseudonym_key() {
                     if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
                         let bytes: Vec<u8> = match addr {
@@ -969,6 +1217,7 @@ impl LiveTraceRegistry {
                 state.tunnel_endpoints.clear();
                 state.seids.clear();
                 state.ue_ips.clear();
+                state.ue_ids.clear();
             }
             if seed_only {
                 // Amorçage : l'état de rattachement est appris, rien
@@ -982,42 +1231,48 @@ impl LiveTraceRegistry {
                 .first()
                 .map(|p| p.packet_number)
                 .unwrap_or(0);
-            // 2.18.6 (ANR1 #10 6901968948 : 19 doublons adjacents, 13
-            // inversions) — un même message (capture_id, packet_number,
-            // event_id) n'est émis qu'une fois ; une inversion dans une
-            // même capture est comptée (`out_of_order`) et marquée
-            // `late:true`, jamais masquée.
-            let message_key = (event.capture_id.clone(), packet, event.event_id.clone());
-            if !state.seen.insert(message_key) {
-                state.trace.duplicates_dropped += 1;
-                continue;
+            // 2.21.109 (décision cœur #9 7050201220 point 2) — un G-PDU
+            // n'est JAMAIS émis en `message` : il alimente les buckets de
+            // débit et les compteurs `gpdu.*`, c'est tout. Recette
+            // 2.21.104 : 768 912 messages GTP-U, 568 Mo de SSE par trace.
+            if !is_gpdu_data {
+                // 2.18.6 (ANR1 #10 6901968948 : 19 doublons adjacents, 13
+                // inversions) — un même message (capture_id, packet_number,
+                // event_id) n'est émis qu'une fois ; une inversion dans une
+                // même capture est comptée (`out_of_order`) et marquée
+                // `late:true`, jamais masquée.
+                let message_key = (event.capture_id.clone(), packet, event.event_id.clone());
+                if !state.seen.insert(message_key) {
+                    state.trace.duplicates_dropped += 1;
+                    continue;
+                }
+                if state.seen.len() > MAX_EVENTS * 4 {
+                    state.seen.clear();
+                }
+                let last = state.last_packet.get(&event.capture_id).copied();
+                let late = last.is_some_and(|last| packet < last);
+                if late {
+                    state.trace.out_of_order += 1;
+                } else {
+                    state.last_packet.insert(event.capture_id.clone(), packet);
+                }
+                state.next_id += 1;
+                state.trace.messages += 1;
+                // 2.21.91 (défaut #9 7033006772) — expose `stable_event_key`
+                // dans le payload SSE. Clé de corrélation live↔publi
+                // indépendante de `capture_id` (voir event-schema 1.6.0).
+                let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"stable_event_key":event.stable_event_key,"timestamp":{"seconds":event.timestamp.seconds,"nanoseconds":event.timestamp.nanoseconds},"decoded_ie_tree":value.get("information_elements"),"late":late});
+                let item = BufferedEvent {
+                    id: state.next_id,
+                    kind: "message".into(),
+                    payload,
+                };
+                state.events.push_back(item.clone());
+                while state.events.len() > MAX_EVENTS {
+                    state.events.pop_front();
+                }
+                let _ = state.tx.send(item);
             }
-            if state.seen.len() > MAX_EVENTS * 4 {
-                state.seen.clear();
-            }
-            let last = state.last_packet.get(&event.capture_id).copied();
-            let late = last.is_some_and(|last| packet < last);
-            if late {
-                state.trace.out_of_order += 1;
-            } else {
-                state.last_packet.insert(event.capture_id.clone(), packet);
-            }
-            state.next_id += 1;
-            state.trace.messages += 1;
-            // 2.21.91 (défaut #9 7033006772) — expose `stable_event_key`
-            // dans le payload SSE. Clé de corrélation live↔publi
-            // indépendante de `capture_id` (voir event-schema 1.6.0).
-            let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"stable_event_key":event.stable_event_key,"timestamp":{"seconds":event.timestamp.seconds,"nanoseconds":event.timestamp.nanoseconds},"decoded_ie_tree":value.get("information_elements"),"late":late});
-            let item = BufferedEvent {
-                id: state.next_id,
-                kind: "message".into(),
-                payload,
-            };
-            state.events.push_back(item.clone());
-            while state.events.len() > MAX_EVENTS {
-                state.events.pop_front();
-            }
-            let _ = state.tx.send(item);
             let second = event.timestamp.seconds.max(0) as u64;
             if event.protocol.as_str() == "GTP-U" {
                 if state.throughput_second != 0 && state.throughput_second != second {
@@ -1327,6 +1582,7 @@ pub(crate) fn start_reader(state: AppState) {
                         sessions.clear();
                     }
                     let mut pass_io: BTreeMap<String, ReaderIo> = BTreeMap::new();
+                    let mut files_decoded = 0u64;
                     // 2.21.105 (ordre #9 7048974175) — amorçage des
                     // traces ouvertes depuis la passe précédente : le
                     // ring de signalisation est relu sans émission
@@ -1455,6 +1711,7 @@ pub(crate) fn start_reader(state: AppState) {
                                 continue;
                             }
                             state2.inner.throughput.bump_file_decoded();
+                            files_decoded += 1;
                             let config = ring_decode_config(path, interface);
                             // 2.21.109 (ordre #9 7049845272) — reprise à
                             // l'offset sur les plans sans état (lot A) :
@@ -1553,10 +1810,19 @@ pub(crate) fn start_reader(state: AppState) {
                             }
                         }
                     }
-                    if states.len() > 1024 {
-                        states.clear();
-                        sessions.clear();
-                    }
+                    // 2.21.109 (donnée ANR1 #10 7050464161 : 768 912 G-PDU
+                    // émis pour 151 061 capturés) — jusqu'ici la table
+                    // était VIDÉE dès qu'elle dépassait 1 024 fichiers.
+                    // Le rattrapage y inscrit tous les segments du ring,
+                    // tous plans confondus : au-delà de 1 024 segments
+                    // sur disque elle était vidée à la fin de chaque
+                    // passe, et la passe suivante redécodait TOUT le
+                    // ring et rerouter chaque event. Elle n'est plus
+                    // vidée : les segments disparus en sont retirés un
+                    // par un (`gone`), sa taille est donc bornée par le
+                    // nombre de segments présents sur disque.
+                    state2.inner.live_traces.set_reader_files_tracked(states.len() as u64);
+                    state2.inner.live_traces.set_reader_files_decoded(files_decoded);
                     state2.inner.live_traces.set_reader_io(pass_io);
                     (states, sessions)
                 })
@@ -1719,6 +1985,8 @@ pub(crate) async fn create(
         gpdu_attached: 0,
         gpdu_rejected_no_match: 0,
         gpdu_rejected_interface_filter: 0,
+        gpdu_attached_teid_only: 0,
+        gpdu_rejected_endpoint_mismatch: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
     };
@@ -1742,6 +2010,7 @@ pub(crate) async fn create(
             tunnel_endpoints: HashSet::new(),
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
+            ue_ids: HashSet::new(),
             // 2.21.105 — le lecteur relit le ring de signalisation
             // pour cette trace à sa prochaine passe.
             needs_seed: true,
@@ -2110,6 +2379,8 @@ mod tests {
                 gpdu_attached: 0,
                 gpdu_rejected_no_match: 0,
                 gpdu_rejected_interface_filter: 0,
+                gpdu_attached_teid_only: 0,
+                gpdu_rejected_endpoint_mismatch: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
             },
@@ -2129,6 +2400,7 @@ mod tests {
             tunnel_endpoints: HashSet::new(),
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
+            ue_ids: HashSet::new(),
             needs_seed: true,
             seeding: false,
         }
@@ -2347,6 +2619,9 @@ mod tests {
             );
             event.session_identifiers[0].value =
                 if uplink { "0xf1240001".into() } else { "0xf1240002".into() };
+            // UL : vers l'adresse du tunnel UL (UPF) ; DL : vers le gNB.
+            event.destination_endpoint.address =
+                if uplink { "10.77.11.13".into() } else { "10.77.22.13".into() };
             injected += u64::from(bytes);
             r.route_normalized(&event);
         }
@@ -2380,9 +2655,18 @@ mod tests {
         assert_eq!(stats["interfaces"]["N3"]["seen"], 18);
         assert_eq!(stats["seed"]["events_learned"], 2);
         assert!(stats["reader_pass_ms"].is_u64() && stats["wall_clock_s"].is_u64());
-        // Chaque message porte l'horodatage de capture.
+        // 2.21.109 — aucun G-PDU n'est émis en `message`.
+        assert!(s.events.iter().all(|e| e.kind != "message"));
+        assert_eq!(s.trace.messages, 0);
+        drop(traces);
+        // Chaque message (signalisation) porte l'horodatage de capture.
+        let mut live_signalling = ngap_setup.clone();
+        live_signalling.event_id = "evt-sig-live".into();
+        r.route_normalized(&live_signalling);
+        let traces = r.traces.lock().unwrap();
+        let s = traces.get("t").unwrap();
         let message = s.events.iter().find(|e| e.kind == "message").unwrap();
-        assert_eq!(message.payload["timestamp"]["seconds"], 1_795_200_010i64);
+        assert_eq!(message.payload["timestamp"]["seconds"], 1_795_199_000i64);
         assert_eq!(message.payload["timestamp"]["nanoseconds"], 0);
     }
 
@@ -2590,6 +2874,399 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Event synthétique minimal pour les tests de rattachement.
+    fn mk_event(
+        interface: &str,
+        protocol: event_schema::Protocol,
+        message: &str,
+        packet: u64,
+        direction: event_schema::Direction,
+        session_ids: Vec<(&str, &str)>,
+        ies: Vec<(&str, &str)>,
+    ) -> event_schema::NormalizedEvent {
+        use event_schema::{
+            DecodeStatus, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference,
+        };
+        NormalizedEvent {
+            event_id: format!("ev-{interface}-{packet}"),
+            stable_event_key: String::new(),
+            parent_event_id: None,
+            probe_id: "test".into(),
+            capture_point_id: interface.into(),
+            capture_id: format!("cap-{interface}"),
+            packet_references: vec![PacketReference {
+                source_file: "x".into(),
+                source_sha256: None,
+                packet_number: packet,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 1_000,
+                original_length: 1_000,
+            }],
+            timestamp: ExactTimestamp {
+                seconds: 1_795_000_000 + (packet / 10) as i64,
+                nanoseconds: 0,
+                raw_ticks: 0,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: interface.into(),
+            protocol,
+            message_name: message.into(),
+            message_type: 0,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.77.11.13".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.77.22.13".into(),
+                port: None,
+                network_function: None,
+            },
+            direction,
+            session_identifiers: session_ids
+                .into_iter()
+                .map(|(n, v)| NamedValue {
+                    name: n.into(),
+                    value: v.into(),
+                    pseudonymized: n.ends_with("pseudonym"),
+                })
+                .collect(),
+            information_elements: ies
+                .into_iter()
+                .map(|(n, v)| InformationElement {
+                    id: None,
+                    name: n.into(),
+                    length: v.len() as u32,
+                    value: Some(v.into()),
+                    raw_sha256: None,
+                    status: DecodeStatus::Decoded,
+                })
+                .collect(),
+            decoder_name: "test".into(),
+            decoder_version: "0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: format!("sha256:{interface}-{packet}"),
+            evidence_references: vec![EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: "sha256:x".into(),
+            }],
+            sbi: None,
+        }
+    }
+
+    /// 2.21.109 (recette 2.21.104, ordres #9 7050201220 et 7050392981) —
+    /// isolement d'une trace. Trois UE : A et B dans la même cellule, C
+    /// dans une autre ; chacun son enregistrement, sa session PDU, sa
+    /// session PFCP et son trafic N3. La trace suit A.
+    ///
+    /// Avant correctif, les valeurs communes portées par les events de A
+    /// (PLMN, TAC, cellule, sens du tunnel, SEID nul d'un Establishment
+    /// Request) devenaient des clés de rattachement par sous-chaîne : la
+    /// signalisation et le trafic N3 des autres UE entraient dans la
+    /// trace de A et dans ses buckets (test en échec sur `fb7b721`).
+    ///
+    /// Attendu : 0 message et 0 octet de B et C ; somme des buckets de A
+    /// = octets de A, par sens. C réutilise la valeur du TEID UL de A
+    /// vers un autre point de terminaison : rejeté, compté à part.
+    #[test]
+    fn trace_isolation_three_ues_two_in_the_same_cell_2_21_109() {
+        use event_schema::{Direction, Protocol};
+        struct Ue {
+            pseudonym: &'static str,
+            amf_id: &'static str,
+            ran_id: &'static str,
+            cell: &'static str,
+            gnb: &'static str,
+            upf: &'static str,
+            teid_ul: &'static str,
+            teid_dl: &'static str,
+            setup: &'static str,
+            f_teid: &'static str,
+            bytes: u32,
+        }
+        let ue_a = Ue {
+            pseudonym: "psn-ue-a",
+            amf_id: "11",
+            ran_id: "21",
+            cell: "0x000000010",
+            gnb: "10.77.11.13",
+            upf: "10.77.22.13",
+            teid_ul: "0x0000a001",
+            teid_dl: "0x0000a002",
+            setup: "item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x0000a001,item_0_tunnel_ip_dl=10.77.11.13,item_0_gtp_teid_dl=0x0000a002",
+            f_teid: "teid=0x0000a001,v4=true,v6=false,ipv4=10.77.22.13",
+            bytes: 1_000,
+        };
+        let ue_b = Ue {
+            pseudonym: "psn-ue-b",
+            amf_id: "12",
+            ran_id: "22",
+            cell: "0x000000010",
+            gnb: "10.77.11.13",
+            upf: "10.77.22.13",
+            teid_ul: "0x0000b001",
+            teid_dl: "0x0000b002",
+            setup: "item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x0000b001,item_0_tunnel_ip_dl=10.77.11.13,item_0_gtp_teid_dl=0x0000b002",
+            f_teid: "teid=0x0000b001,v4=true,v6=false,ipv4=10.77.22.13",
+            bytes: 700,
+        };
+        // C : autre cellule, autre gNB, autre UPF — et la MÊME valeur de
+        // TEID UL que A, allouée par un autre UPF.
+        let ue_c = Ue {
+            pseudonym: "psn-ue-c",
+            amf_id: "13",
+            ran_id: "21",
+            cell: "0x000000020",
+            gnb: "10.77.11.14",
+            upf: "10.77.22.14",
+            teid_ul: "0x0000a001",
+            teid_dl: "0x0000c002",
+            setup: "item_0_tunnel_ip_ul=10.77.22.14,item_0_gtp_teid_ul=0x0000a001,item_0_tunnel_ip_dl=10.77.11.14,item_0_gtp_teid_dl=0x0000c002",
+            f_teid: "teid=0x0000a001,v4=true,v6=false,ipv4=10.77.22.14",
+            bytes: 300,
+        };
+        let amf = "10.77.21.20";
+        let mut packet = 0u64;
+        let mut next = || {
+            packet += 1;
+            packet
+        };
+        let signalling = |ue: &Ue, packets: [u64; 4]| {
+            let ngap = |packet: u64, with_pseudonym: bool, ie: Vec<(&'static str, &'static str)>| {
+                let mut ids: Vec<(&str, &str)> = vec![
+                    ("amf_ue_ngap_id", ue.amf_id),
+                    ("ran_ue_ngap_id", ue.ran_id),
+                    ("plmn", "001-01"),
+                    ("tac", "0x0000c8"),
+                    ("nr_cell_id", ue.cell),
+                ];
+                if with_pseudonym {
+                    ids.push(("subscriber_pseudonym", ue.pseudonym));
+                }
+                let mut event = mk_event(
+                    "N2",
+                    Protocol::Ngap,
+                    "DownlinkNASTransport",
+                    packet,
+                    Direction::Downlink,
+                    ids,
+                    ie,
+                );
+                event.source_endpoint.address = amf.into();
+                event.destination_endpoint.address = ue.gnb.into();
+                event
+            };
+            let mut pfcp = mk_event(
+                "N4",
+                Protocol::Pfcp,
+                "Session Establishment Request",
+                packets[3],
+                Direction::Unknown,
+                vec![("seid", "0x0000000000000000"), ("pfcp_sequence", "100")],
+                vec![("F-TEID", ue.f_teid)],
+            );
+            pfcp.destination_endpoint.address = ue.upf.into();
+            vec![
+                ngap(packets[0], true, vec![]),
+                ngap(packets[1], false, vec![]),
+                ngap(
+                    packets[2],
+                    false,
+                    vec![("PDUSessionResourceSetupRequestTransfer", ue.setup)],
+                ),
+                pfcp,
+            ]
+        };
+        let gpdu = |ue: &Ue, packet: u64, uplink: bool| {
+            let (teid, endpoint) = if uplink {
+                (ue.teid_ul, ue.upf)
+            } else {
+                (ue.teid_dl, ue.gnb)
+            };
+            let mut event = mk_event(
+                "N3",
+                Protocol::Gtpu,
+                "G-PDU",
+                packet,
+                if uplink { Direction::Uplink } else { Direction::Downlink },
+                vec![
+                    ("teid", teid),
+                    ("tunnel_endpoint_ip", endpoint),
+                    ("tunnel_direction", if uplink { "UPLINK" } else { "DOWNLINK" }),
+                    ("sequence_number", "4321"),
+                ],
+                vec![],
+            );
+            event.destination_endpoint.address = endpoint.into();
+            event.packet_references[0].original_length = ue.bytes;
+            event
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec!["psn-ue-a".into()]));
+        let mut a_event_ids = Vec::new();
+        for ue in [&ue_a, &ue_b, &ue_c] {
+            let packets = [next(), next(), next(), next()];
+            for event in signalling(ue, packets) {
+                if ue.pseudonym == "psn-ue-a" {
+                    a_event_ids.push(event.event_id.clone());
+                }
+                r.route_normalized(&event);
+            }
+        }
+        // N3 entrelacé : A 3 UL + 5 DL ; B 20 UL + 20 DL ; C 10 UL + 10 DL.
+        let (mut a_ul, mut a_dl) = (0u64, 0u64);
+        for round in 0..20u64 {
+            if round < 3 {
+                r.route_normalized(&gpdu(&ue_a, next(), true));
+                a_ul += u64::from(ue_a.bytes);
+            }
+            if round < 5 {
+                r.route_normalized(&gpdu(&ue_a, next(), false));
+                a_dl += u64::from(ue_a.bytes);
+            }
+            r.route_normalized(&gpdu(&ue_b, next(), true));
+            r.route_normalized(&gpdu(&ue_b, next(), false));
+            if round < 10 {
+                r.route_normalized(&gpdu(&ue_c, next(), true));
+                r.route_normalized(&gpdu(&ue_c, next(), false));
+            }
+        }
+        r.flush_idle_throughput_buckets();
+
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        let routed: Vec<String> = t
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(routed, a_event_ids, "0 message de B ni de C dans la trace de A");
+        assert_eq!(t.trace.messages, 4);
+        assert_eq!(t.trace.gpdu_seen, 8 + 40 + 20);
+        assert_eq!(t.trace.gpdu_attached, 8, "seuls les G-PDU de A sont rattachés");
+        assert_eq!(t.trace.gpdu_attached_teid_only, 0, "tous par (adresse, TEID)");
+        assert_eq!(
+            t.trace.gpdu_rejected_endpoint_mismatch, 10,
+            "les 10 UL de C portent le TEID UL de A vers un autre UPF"
+        );
+        assert_eq!(t.trace.gpdu_rejected_no_match, 40 + 10);
+        let sum = |field: &str| -> u64 {
+            t.events
+                .iter()
+                .filter(|e| e.kind == "throughput")
+                .map(|b| b.payload[field].as_u64().unwrap_or(0))
+                .sum()
+        };
+        assert_eq!(sum("ul_bytes_s"), a_ul, "débit UL = octets UL de A");
+        assert_eq!(sum("dl_bytes_s"), a_dl, "débit DL = octets DL de A");
+        assert_eq!(sum("unknown_bytes_s"), 0);
+        assert_eq!((a_ul, a_dl), (3_000, 5_000));
+        assert_eq!(t.trace.feed["N2"].attached, 3);
+        assert_eq!(t.trace.feed["N4"].attached, 1);
+        // Aucune valeur commune n'est devenue une clé de rattachement.
+        for shared in ["001-01", "0x0000c8", "0x000000010", "UPLINK", "DOWNLINK", "100", "4321"] {
+            assert!(!t.match_keys.contains(shared), "{shared} n'identifie pas l'abonné");
+        }
+        assert!(!t.seids.iter().any(|s| is_zero_hex(s)), "SEID nul jamais appris");
+    }
+
+    /// 2.21.109 (exigence cœur #9 7050392981 point 1) — repli « TEID
+    /// seul » : admis uniquement pour un TEID appris sur la signalisation
+    /// de l'abonné sans adresse de point de terminaison, et compté à
+    /// part. Un G-PDU n'apprend aucun TEID ; un TEID inconnu est rejeté.
+    #[test]
+    fn teid_only_fallback_is_limited_to_subscriber_signalling_and_counted_2_21_109() {
+        use event_schema::{Direction, Protocol};
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec!["psn-ue-a".into()]));
+        // Signalisation de l'abonné : un TEID sans adresse (IE `teid=`).
+        r.route_normalized(&mk_event(
+            "N4",
+            Protocol::Pfcp,
+            "Session Modification Request",
+            1,
+            Direction::Unknown,
+            vec![("subscriber_pseudonym", "psn-ue-a"), ("seid", "0x0000000000000042")],
+            vec![("Outer Header Creation", "outer_header_description=0x0100,teid=0x0000d001")],
+        ));
+        let gpdu = |packet: u64, teid: &'static str| {
+            mk_event("N3", Protocol::Gtpu, "G-PDU", packet, Direction::Uplink, vec![("teid", teid)], vec![])
+        };
+        r.route_normalized(&gpdu(2, "0x0000d001"));
+        r.route_normalized(&gpdu(3, "0x0000d001"));
+        // TEID jamais vu sur la signalisation de l'abonné : rejeté, et le
+        // G-PDU précédent ne l'a pas appris non plus.
+        r.route_normalized(&gpdu(4, "0x0000e999"));
+        r.route_normalized(&gpdu(5, "0x0000e999"));
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.gpdu_attached, 2);
+        assert_eq!(t.trace.gpdu_attached_teid_only, 2, "repli compté à part");
+        assert_eq!(t.trace.gpdu_rejected_no_match, 2);
+        assert!(!t.tunnel_teids.iter().any(|teid| teid.ends_with("e999")));
+        let stats = r.stats_payload(&t.trace);
+        assert_eq!(stats["gpdu"]["attached_teid_only"], 2);
+        assert_eq!(stats["gpdu"]["rejected_endpoint_mismatch"], 0);
+    }
+
+    /// 2.21.109 (exigence cœur #9 7050392981 point 2) — `event_tokens` :
+    /// égalité sur valeurs typées. Une clé n'est reconnue que si elle
+    /// est une valeur entière, jamais un fragment d'une autre.
+    #[test]
+    fn event_tokens_match_whole_typed_values_only_2_21_109() {
+        let value = json!({
+            "direction": "UPLINK",
+            "message_name": "contains psn-ue-a in a name",
+            "parent_event_id": "evt-00000000000000aa",
+            "session_identifiers": [
+                {"name": "subscriber_pseudonym", "value": "psn-ue-a-long"},
+                {"name": "supi", "value": "imsi-001010000000001"},
+                {"name": "plmn", "value": "001-01"}
+            ],
+            "information_elements": [
+                {"name": "ue_ip", "value": "psn-ip-1"},
+                {"name": "ids", "value": "amf_ue_ngap_id=12,subscriber_pseudonym=psn-ue-b"}
+            ],
+            "sbi": {"path": "/nsmf-pdusession/v1/sm-contexts/7/modify", "supi": "imsi-001010000000001"}
+        });
+        let tokens = event_tokens(&value);
+        for expected in [
+            "psn-ue-a-long", "imsi-001010000000001", "001010000000001", "psn-ip-1", "psn-ue-b",
+            "evt-00000000000000aa", "sm-contexts", "7",
+        ] {
+            assert!(tokens.contains(expected), "{expected}");
+        }
+        // Ni fragment d'une valeur, ni champ hors des sources typées.
+        for absent in ["psn-ue-a", "UPLINK", "0101", "psn-ue"] {
+            assert!(!tokens.contains(absent), "{absent} ne doit pas rattacher");
+        }
+    }
+
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
         let bytes = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2740,6 +3417,11 @@ mod tests {
         r.set_reader_io(BTreeMap::new());
         let stats = r.stats_payload(&state(u64::MAX, false, vec![]).trace);
         assert_eq!(stats["reader"]["resume_resets"], 1);
+        r.set_reader_files_tracked(2_713);
+        r.set_reader_files_decoded(3);
+        let stats = r.stats_payload(&state(u64::MAX, false, vec![]).trace);
+        assert_eq!(stats["reader"]["files_tracked"], 2_713);
+        assert_eq!(stats["reader"]["files_decoded_last_pass"], 3);
         assert_eq!(stats["reader"]["interfaces"]["N3"]["bytes_decoded"], 1_500);
         assert_eq!(stats["reader"]["interfaces"]["N3"]["bytes_file"], 30_000_000);
         assert_eq!(stats["reader"]["interfaces"]["N3"]["incremental"], true);
@@ -3113,6 +3795,16 @@ mod tests {
             .lock()
             .unwrap()
             .insert("t".into(), state(u64::MAX, false, vec!["psn-x".into()]));
+        // 2.21.109 — le rattachement se fait par égalité typée : le
+        // tunnel de l'abonné est connu de la trace (appris sur sa
+        // signalisation), les G-PDU le désignent par (adresse, TEID).
+        {
+            let teid = event_schema::normalize_teid_hex("0xabcd0001").unwrap();
+            let mut traces = r.traces.lock().unwrap();
+            let t = traces.get_mut("t").unwrap();
+            t.tunnel_teids.insert(teid.clone());
+            t.tunnel_endpoints.insert(("10.0.0.2".into(), teid));
+        }
         let base_event = |direction: Direction, packet_number: u64, seconds: i64| {
             let p = PacketReference {
                 source_file: "x".into(),
@@ -3150,7 +3842,7 @@ mod tests {
                 protocol: Protocol::Gtpu,
                 // Le pseudonyme doit apparaître dans le JSON encodé
                 // pour que `route_normalized` match.
-                message_name: "GTP-U psn-x".into(),
+                message_name: "G-PDU".into(),
                 message_type: 0xFF,
                 procedure_code: None,
                 procedure: None,
@@ -3167,7 +3859,11 @@ mod tests {
                     network_function: None,
                 },
                 direction,
-                session_identifiers: vec![],
+                session_identifiers: vec![event_schema::NamedValue {
+                    name: "teid".into(),
+                    value: "0xabcd0001".into(),
+                    pseudonymized: false,
+                }],
                 information_elements: vec![],
                 decoder_name: "decoder-gtpu".into(),
                 decoder_version: "0.2.2".into(),
@@ -3348,6 +4044,13 @@ mod tests {
         // en prod : decoder-gtpu n'en injecte jamais). session_identifiers
         // porte `teid` qui matche state.tunnel_teids via `match_teid`.
         let gtpu = |packet: u64, seconds: i64, direction: Direction, teid_hex: &str, bytes: u32| {
+            // 2.21.109 — un G-PDU UL va vers l'adresse du tunnel UL (UPF),
+            // un G-PDU DL vers celle du tunnel DL (gNB).
+            let tunnel_endpoint = if direction.as_str() == "UPLINK" {
+                "10.77.11.13"
+            } else {
+                "10.77.22.13"
+            };
             NormalizedEvent {
                 event_id: format!("evt-gtpu-{packet}"),
                 stable_event_key: String::new(),
@@ -3371,7 +4074,7 @@ mod tests {
                     network_function: None,
                 },
                 destination_endpoint: Endpoint {
-                    address: "10.77.22.13".into(),
+                    address: tunnel_endpoint.into(),
                     port: None,
                     network_function: None,
                 },
@@ -3384,7 +4087,7 @@ mod tests {
                     },
                     NamedValue {
                         name: "tunnel_endpoint_ip".into(),
-                        value: "10.77.22.13".into(),
+                        value: tunnel_endpoint.into(),
                         pseudonymized: false,
                     },
                 ],
@@ -3472,6 +4175,16 @@ mod tests {
             .lock()
             .unwrap()
             .insert("t".into(), state(u64::MAX, false, vec!["psn-stalled".into()]));
+        // 2.21.109 — le rattachement se fait par égalité typée : le
+        // tunnel de l'abonné est connu de la trace (appris sur sa
+        // signalisation), les G-PDU le désignent par (adresse, TEID).
+        {
+            let teid = event_schema::normalize_teid_hex("0xabcd0001").unwrap();
+            let mut traces = r.traces.lock().unwrap();
+            let t = traces.get_mut("t").unwrap();
+            t.tunnel_teids.insert(teid.clone());
+            t.tunnel_endpoints.insert(("10.0.0.2".into(), teid));
+        }
 
         // 3 events GTP-U sur la même seconde, dans le passé wall-clock
         // (now > throughput_second est garanti avec un timestamp = 1).
@@ -3510,7 +4223,7 @@ mod tests {
             protocol: Protocol::Gtpu,
             // Pseudo est présent dans message_name pour que match_pseudo
             // fire (le reste du JSON encodé doit contenir `psn-stalled`).
-            message_name: "GTP-U psn-stalled".into(),
+            message_name: "G-PDU".into(),
             message_type: 255,
             procedure_code: None,
             procedure: None,
@@ -3598,6 +4311,16 @@ mod tests {
             .lock()
             .unwrap()
             .insert("t".into(), state(u64::MAX, false, vec!["psn-total".into()]));
+        // 2.21.109 — le rattachement se fait par égalité typée : le
+        // tunnel de l'abonné est connu de la trace (appris sur sa
+        // signalisation), les G-PDU le désignent par (adresse, TEID).
+        {
+            let teid = event_schema::normalize_teid_hex("0xabcd0001").unwrap();
+            let mut traces = r.traces.lock().unwrap();
+            let t = traces.get_mut("t").unwrap();
+            t.tunnel_teids.insert(teid.clone());
+            t.tunnel_endpoints.insert(("10.0.0.2".into(), teid));
+        }
         let make = |packet: u64, seconds: i64, direction: Direction, bytes: u32| {
             NormalizedEvent {
                 event_id: format!("evt-gtpu-{packet}"),
@@ -3632,7 +4355,7 @@ mod tests {
                 },
                 interface: "N3".into(),
                 protocol: Protocol::Gtpu,
-                message_name: "GTP-U psn-total".into(),
+                message_name: "G-PDU".into(),
                 message_type: 255,
                 procedure_code: None,
                 procedure: None,
@@ -4094,8 +4817,9 @@ mod tests {
                 "outer_header_description=0x0100,teid=0x0000d4b7,ipv4=10.200.0.1",
             )],
         );
-        // 5) GTP-U UL (TEID = UL F-TEID appris).
-        let e_gtpu = ev(
+        // 5) GTP-U UL (TEID = UL F-TEID appris), vers l'adresse du
+        //    tunnel UL.
+        let mut e_gtpu = ev(
             "N3",
             Protocol::Gtpu,
             "G-PDU",
@@ -4103,6 +4827,7 @@ mod tests {
             vec![("teid", "0x0000d4a6")],
             vec![],
         );
+        e_gtpu.destination_endpoint.address = "10.100.0.1".into();
         let r = LiveTraceRegistry::new();
         r.traces.lock().unwrap().insert(
             "t".into(),
@@ -4119,11 +4844,15 @@ mod tests {
             .filter(|e| e.kind == "message")
             .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
             .collect();
+        // 2.21.109 (décision cœur #9 7050201220) — le G-PDU est rattaché
+        // et compté, mais n'est plus émis en `message`.
         assert_eq!(
             routed,
-            vec!["ev-1", "ev-2", "ev-3", "ev-4", "ev-5"],
-            "les 5 events doivent être routés dans l'ordre"
+            vec!["ev-1", "ev-2", "ev-3", "ev-4"],
+            "les 4 events de signalisation sont routés dans l'ordre"
         );
+        assert_eq!(t.trace.gpdu_attached, 1, "le G-PDU est rattaché");
+        assert_eq!(t.trace.messages, 4, "un G-PDU ne compte pas comme message");
         // Vérifie le rattachement appris : tunnel UL/DL, SEID.
         assert!(t.tunnel_teids.contains("0xd4a6"));
         assert!(t.tunnel_teids.contains("0xd4b7"));
@@ -4312,10 +5041,12 @@ mod tests {
         r.route_normalized(&ev);
         let traces = r.traces.lock().unwrap();
         let t = &traces["t"];
-        // match_keys contient tout (chiffres + les 2 session_identifiers).
+        // match_keys contient les chiffres amorcés et le pseudonyme.
         assert!(t.match_keys.contains(&imsi_digits));
         assert!(t.match_keys.contains("psn-supi-xyz"));
-        assert!(t.match_keys.contains("sess-00042"));
+        // 2.21.109 — `pdu_session_id` n'identifie pas un abonné (il vaut 1
+        // pour presque tous) : il n'est plus une clé de rattachement.
+        assert!(!t.match_keys.contains("sess-00042"));
         // exposed_keys NE contient QUE le pseudonyme (pseudonymized=true).
         assert!(t.exposed_keys.contains("psn-supi-xyz"));
         assert!(
