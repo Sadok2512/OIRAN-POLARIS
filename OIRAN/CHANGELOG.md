@@ -1,5 +1,48 @@
 # Changelog
 
+## oiran-api 2.21.126 — 2026-11-21 — trace live : SIP rattaché par l'adresse IP de l'UE, IP apprise aussi sur le PFCP et oubliée avec sa session ; ordre des events d'un même paquet indépendant du nom du segment (ordres #9 7053030106, 7053229737, 7053683830)
+
+Upgrade **patch** sans déploiement, un commit au-dessus de la fusion de 2.21.125 dans le train (`6606d91`). Branches `fix/oiran-2.21.126-sip-by-ue-ip` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change.
+
+### Constat
+
+Donnée lab (ANR1 #10 7052813333) : les URI From / To du SIP réel sont des alias, ni IMSI ni MSISDN ; le REGISTER n'a pas de SDP. Aucun SIP ne portait donc quoi que ce soit qui le rattache à la trace de l'abonné, et la règle de l'identifiant d'appel (2.21.122) n'avait aucun SIP sur lequel apprendre : la voix restait hors trace. Audit CLAUDE2 (#9 7052919470) : le pseudonyme d'IP UE avait trois formes ; 2.21.125 l'unifie dans les décodeurs.
+
+### Correctif 1 — règle explicite par IP UE
+
+1. **Règle** : un SIP est rattaché quand l'adresse source ou destination de son paquet, ou l'adresse de son SDP, est une IP UE de l'abonné (IE `packet_source_ip_pseudonym`, `packet_destination_ip_pseudonym`, `sdp.c_ue_ip_pseudonym` de `decoder-sip` 0.3.0). Un PFCP l'est quand son IE 93 porte cette IP. Égalité exacte sur ces champs nommés, plus par jeton d'IE quelconque : le pseudonyme d'IP UE **sort des clés génériques** et vit dans un ensemble à lui.
+2. **Apprentissage** : sur l'adresse PDU du NAS (comme avant, par `event_schema::pseudonym_ip_text`), et désormais sur l'**IE 93 d'un PFCP déjà rattaché** (NAS chiffré), et sur un identifiant de session `ue_ip`. Jamais sur un SIP : l'adresse de son paquet peut être celle du pair ou du P-CSCF.
+3. **Oubli** : chaque IP est rangée sous ce qui la porte (session PDU, SEID). Elle est oubliée, et retirée des clés exposées, à la libération de cette session PDU, à la suppression de cette session PFCP, et au détachement. Avant : elle restait une clé de la trace jusqu'à son expiration.
+4. **Compteurs** : `stats.sip.attached_by_ue_ip` et `stats.pfcp.attached_by_ue_ip` — events rattachés par l'IP **et par rien d'autre**.
+
+### Correctif 2 — ordre dans un même paquet (point à part)
+
+Le lecteur et l'amorçage triaient chaque lot par `(numéro de paquet, event_id)`. L'`event_id` dérive du `capture_id`, empreinte du **chemin** du segment : entre deux events d'un même paquet (parent NGAP / S1AP et son enfant NAS), l'ordre dépendait du nom du segment. Le tri est maintenant **stable par numéro de paquet seul** : dans un paquet, l'ordre d'émission du décodeur est conservé.
+
+### Changements de comportement à connaître
+
+- Un event qui ne porterait le pseudonyme d'IP UE que dans une IE autre que celles nommées ci-dessus n'est plus rattaché par lui.
+- Après la fin de la session, le pseudonyme d'IP UE disparaît de `ue_info`.
+- Dans le call flow live, un parent et son enfant du même paquet sortent toujours dans l'ordre du décodeur ; `parents_attached_after_child` ne dépend plus du nom du segment.
+
+### OUVERT
+
+- **Aucune capture réelle de voix dans le dépôt** : le gate est synthétique (events construits, IE aux noms de `decoder-sip` 0.3.0). `multi-imsi.pcap` ne porte pas de SIP. À constater au lab : `stats.sip.attached_by_ue_ip` > 0 sur un REGISTER.
+- **Appel entre deux abonnés** : la trace de l'appelé rattache la jambe qui lui arrive par son IP, apprend l'identifiant d'appel, puis rattache les autres messages du même appel, dont ceux émis par l'appelant. C'est le même appel ; l'identité de l'appelant n'est pas apprise (I1). Non testé avec la règle par IP.
+- Une IP apprise sur un PFCP dont la suppression n'est jamais vue reste connue jusqu'au détachement ou à l'expiration de la trace.
+- Libération d'une session nommée : les IP rangées sous aucune session ni aucun SEID sont oubliées aussi (choix de l'isolement) ; si l'abonné a deux sessions et que l'IP de l'autre a été apprise sans numéro de session, elle est perdue jusqu'à sa prochaine signalisation.
+- IPv6 : l'UE utilise un préfixe /64 ; l'adresse du paquet SIP n'est égale à celle de l'IE 93 ou du NAS que si elles sont identiques octet pour octet. Non traité, non testé.
+- En test, la trace utilise une clé de pseudonymisation fixe (`cfg(test)`) : le chemin par défaut n'existe pas sur la machine de test.
+- Les tris des callflows **publiés** départagent aussi par `event_id` (réponse #9 7053694010) : lot à part, instruit par CLAUDE2.
+
+### Tests — échec avant, succès après
+
+Règle coupée et ancien tri remis : les trois tests échouent.
+- `voice_with_alias_uris_attaches_by_ue_ip_and_stays_out_of_another_ue_2_21_126` : REGISTER (alias, sans SDP), sa réponse, INVITE, 200, flux RTP, BYE et sa réponse entrent dans la trace de l'abonné ; rien d'un autre UE qui s'enregistre et appelle en même temps, et rien de l'abonné dans la trace de cet autre UE ; compteur 2 ; alias et adresse du P-CSCF jamais appris ; après la libération de la session, la même adresse ne rattache plus et n'est plus exposée.
+- `ue_ip_is_learned_from_ie_93_of_an_attached_pfcp_and_ends_with_its_session_2_21_126` : IP apprise sur l'IE 93 d'un PFCP rattaché par son tunnel, pas sur celui d'un autre UE ; oubliée à la suppression de la session PFCP.
+- `capture_order_does_not_depend_on_the_segment_path_2_21_126` : la capture N2 réelle décodée sous deux chemins (identifiants différents) donne la même séquence.
+- `multi-imsi.pcap` : toujours **70 / 68 / 67 / 69 / 65**, 339 + 183 = 522.
+
 ## decoder-pfcp 0.3.0, decoder-sip 0.3.0, event-schema 1.11.0 — 2026-11-20 — lot 2.21.125 (décodeurs) : une seule forme pour le pseudonyme d'adresse IP d'UE, et les adresses du paquet SIP (ordre #9 7052828180, audit CLAUDE2 #9 7052919470)
 
 Branche `fix/oiran-2.21.125-ue-ip-pseudonym`, base train @ `8b0dcae` (2.21.122) ; numéro 2.21.125 fixé par le cœur (#9 7053030106), 2.21.123 et 2.21.124 étant pris par CLAUDE1. Ce commit ne touche ni `apps/api` ni la version d'`oiran-api` : la règle de rattachement d'un SIP par l'adresse de l'UE dans `live_trace.rs`, avec son compteur, est le lot 2.21.126 (CLAUDE1). Aucun déploiement.

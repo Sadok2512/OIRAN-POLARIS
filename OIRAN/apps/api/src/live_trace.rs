@@ -76,6 +76,14 @@ pub(crate) struct LiveTrace {
     /// fois ses SEID ou ses tunnels appris.
     #[serde(default)]
     pfcp_attached_after_the_fact: u64,
+    /// 2.21.126 — SIP rattachés par l'adresse IP de l'UE et par rien
+    /// d'autre (ni identité, ni identifiant d'appel).
+    #[serde(default)]
+    sip_attached_by_ue_ip: u64,
+    /// 2.21.126 — PFCP rattachés par l'IP UE de leur IE 93 et par rien
+    /// d'autre.
+    #[serde(default)]
+    pfcp_attached_by_ue_ip: u64,
     /// 2.21.113 (E2) — messages rejetés alors qu'ils portent un
     /// identifiant UE de l'abonné : l'autre identifiant est celui d'un
     /// autre contexte UE.
@@ -349,6 +357,12 @@ struct TraceState {
     /// exportées via SSE/API/logs (invariant privacy « pas d'IP UE en
     /// clair hors identity vault »).
     ue_ips: HashSet<String>,
+    /// 2.21.126 — pseudonymes d'adresse IP d'UE de l'abonné, avec ce
+    /// qui les porte : `pdu:<pdu_session_id>` (adresse PDU du NAS),
+    /// `seid:<valeur>` (IE 93 d'un PFCP rattaché). Rattachent le SIP par
+    /// l'adresse du paquet et le PFCP par son IE 93. Oubliés avec leur
+    /// session.
+    ue_ip_keys: HashMap<String, HashSet<String>>,
     /// 2.21.109 (ordre #9 7050201220) — identifiants UE de signalisation
     /// appris sur les events routés : `(nom, valeur, association)` avec
     /// `nom` ∈ amf_ue_ngap_id / ran_ue_ngap_id / mme_ue_s1ap_id /
@@ -398,6 +412,14 @@ struct TraceState {
 /// absence de clé ⇒ routage par (ip,teid)/SEID seulement.
 fn pseudonym_key() -> Option<&'static event_schema::PseudonymKey> {
     static KEY: OnceLock<Option<event_schema::PseudonymKey>> = OnceLock::new();
+    // 2.21.126 — en test, une clé fixe : le chemin par défaut n'existe
+    // pas sur la machine de test, et l'apprentissage de l'IP UE sur le
+    // NAS restait alors sans test.
+    #[cfg(test)]
+    return KEY
+        .get_or_init(|| Some(event_schema::PseudonymKey::from_bytes([7; 32])))
+        .as_ref();
+    #[cfg(not(test))]
     KEY.get_or_init(|| {
         event_schema::PseudonymKey::load_or_generate(
             &event_schema::PseudonymKey::resolve_default_path(),
@@ -755,6 +777,61 @@ fn forget_tunnel_pairs(state: &mut TraceState, pairs: &[(String, String)]) {
 /// Une trace ne les apprend pas : sinon tout UE du même modèle entre
 /// dans la trace d'un abonné, puis ses identifiants, ses tunnels et son
 /// trafic.
+/// 2.21.126 (ordres #9 7053030106, 7053229737) — IE du SIP qui portent
+/// le pseudonyme d'une adresse IP du paquet ou du SDP (`decoder-sip`
+/// 0.3.0).
+const SIP_IP_PSEUDONYM_IES: [&str; 3] = [
+    "packet_source_ip_pseudonym",
+    "packet_destination_ip_pseudonym",
+    "sdp.c_ue_ip_pseudonym",
+];
+
+/// 2.21.126 — pseudonymes d'adresse IP d'UE portés par un event, là où
+/// un décodeur les émet explicitement :
+///   * SIP — adresses source et destination du paquet, adresse du SDP ;
+///   * PFCP — IE 93 (UE IP Address), champs `ue_ip` et `ue_ipv6` ;
+///   * tout protocole — identifiant de session `ue_ip` pseudonymisé.
+/// Rattachement par égalité exacte avec une IP apprise pour l'abonné,
+/// jamais par jeton d'IE quelconque.
+fn ue_ip_pseudonyms(event: &event_schema::NormalizedEvent) -> Vec<String> {
+    let mut out = Vec::new();
+    match event.protocol.as_str() {
+        "SIP" => {
+            for ie in &event.information_elements {
+                if SIP_IP_PSEUDONYM_IES.contains(&ie.name.as_str()) {
+                    if let Some(value) = ie.value.as_deref() {
+                        out.push(value.trim().to_owned());
+                    }
+                }
+            }
+        }
+        "PFCP" => {
+            for ie in &event.information_elements {
+                if ie.id != Some(93) {
+                    continue;
+                }
+                for field in ie.value.as_deref().unwrap_or("").split(',') {
+                    if let Some((name, value)) = field.split_once('=') {
+                        if matches!(name.trim(), "ue_ip" | "ue_ipv6") {
+                            out.push(value.trim().to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    for id in &event.session_identifiers {
+        if id.name == "ue_ip" && id.pseudonymized {
+            out.push(id.value.clone());
+        }
+    }
+    out.retain(|value| value.starts_with("psn-"));
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn equipment_pseudonyms(event: &event_schema::NormalizedEvent) -> HashSet<String> {
     let mut out = HashSet::new();
     if event.protocol.as_str() == "NGAP" {
@@ -976,6 +1053,10 @@ impl LiveTraceRegistry {
             "pfcp": {
                 "attached_seid_only": trace.pfcp_attached_seid_only,
                 "attached_after_the_fact": trace.pfcp_attached_after_the_fact,
+                "attached_by_ue_ip": trace.pfcp_attached_by_ue_ip,
+            },
+            "sip": {
+                "attached_by_ue_ip": trace.sip_attached_by_ue_ip,
             },
             "parents_attached_after_child": trace.parents_attached_after_child,
             "session_releases_without_filed_tunnels": trace.session_releases_without_filed_tunnels,
@@ -1358,6 +1439,7 @@ impl LiveTraceRegistry {
                 .iter()
                 .any(|ie| ie.trim().to_ascii_uppercase().ends_with(" BYE"));
         let ev_equipment_pseudonyms = equipment_pseudonyms(event);
+        let ev_ue_ip_pseudonyms = ue_ip_pseudonyms(event);
         let mut parents_to_attach: Vec<(String, String)> = Vec::new();
         let mut rejected_by_a_trace = false;
         let ev_pdu_address: Option<String> = ev_ies
@@ -1522,8 +1604,17 @@ impl LiveTraceRegistry {
                     state.sip_call_ids.contains(call)
                         || (is_rtp && state.ended_sip_call_ids.contains(call))
                 });
+            // 2.21.126 — règle explicite : l'event porte l'adresse IP de
+            // l'UE de l'abonné. SIP : adresse du paquet ou du SDP (couvre
+            // REGISTER et tout message sans SDP, avec des URI qui ne sont
+            // ni IMSI ni MSISDN). PFCP : IE 93.
+            let match_ue_ip = (is_sip || is_pfcp)
+                && ev_ue_ip_pseudonyms
+                    .iter()
+                    .any(|ip| state.ue_ip_keys.contains_key(ip));
             let matched = forced
                 || match_call
+                || match_ue_ip
                 || match_pseudo
                 || match_keys
                 || match_seid
@@ -1592,6 +1683,47 @@ impl LiveTraceRegistry {
                     }
                 }
             }
+            if !seed_only
+                && match_ue_ip
+                && !(forced
+                    || match_call
+                    || match_pseudo
+                    || match_keys
+                    || match_seid
+                    || match_teid
+                    || match_tunnel
+                    || match_ue_id)
+            {
+                if is_sip {
+                    state.trace.sip_attached_by_ue_ip =
+                        state.trace.sip_attached_by_ue_ip.saturating_add(1);
+                } else {
+                    state.trace.pfcp_attached_by_ue_ip =
+                        state.trace.pfcp_attached_by_ue_ip.saturating_add(1);
+                }
+            }
+            // 2.21.126 — IP UE apprise sur un event rattaché : IE 93 d'un
+            // PFCP, identifiant de session `ue_ip`. Jamais sur un SIP :
+            // l'adresse de son paquet peut être celle du pair.
+            if !is_sip {
+                let mut owners: Vec<String> = Vec::new();
+                if let Some(session) = &ev_pdu_session {
+                    owners.push(format!("pdu:{session}"));
+                }
+                if is_pfcp {
+                    for seid in ev_session_seids.iter().chain(ev_seids_ie.iter()) {
+                        owners.push(format!("seid:{seid}"));
+                    }
+                }
+                for ip in &ev_ue_ip_pseudonyms {
+                    state
+                        .ue_ip_keys
+                        .entry(ip.clone())
+                        .or_default()
+                        .extend(owners.iter().cloned());
+                    state.exposed_keys.insert(ip.clone());
+                }
+            }
             if is_pfcp
                 && !seed_only
                 && match_seid_value_only
@@ -1656,6 +1788,12 @@ impl LiveTraceRegistry {
                     let already_known = state.match_keys.contains(v)
                         || state.trace.subscriber_pseudonyms.iter().any(|known| known == v);
                     if is_sip && is_pseudonym && !already_known {
+                        continue;
+                    }
+                    // 2.21.126 — l'IP UE pseudonymisée a sa règle et son
+                    // cycle de vie (`ue_ip_keys`) : elle n'entre plus dans
+                    // les clés génériques.
+                    if name == "ue_ip" && is_pseudonym {
                         continue;
                     }
                     // 2.21.124 — un pseudonyme d'équipement n'est ni
@@ -1778,18 +1916,18 @@ impl LiveTraceRegistry {
                 // `decoder-pfcp` IE 93. Un PFCP Session Establishment
                 // qui ne porte que cette UE IP pseudonymisée match via
                 // `match_keys` (égalité sur la valeur de l'IE, cf. `event_tokens`).
-                if let Some(key) = pseudonym_key() {
-                    if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                        let bytes: Vec<u8> = match addr {
-                            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
-                            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
-                        };
-                        // 2.21.98 — pseudonyme UE IP exposable (c'est un
-                        // `psn-…`, pas l'IP clair) : match_keys + exposed_keys.
-                        let pseudonym = event_schema::pseudonym(key, "pfcp-ue-ip", &bytes);
-                        state.match_keys.insert(pseudonym.clone());
-                        state.exposed_keys.insert(pseudonym);
+                // 2.21.126 — forme unique du pseudonyme
+                // (`event_schema::pseudonym_ip_text`, octets de
+                // l'adresse) ; rangé dans `ue_ip_keys`, plus dans les clés
+                // génériques : rattachement par la règle explicite.
+                if let Some(pseudonym) =
+                    pseudonym_key().and_then(|key| event_schema::pseudonym_ip_text(key, ip))
+                {
+                    let owners = state.ue_ip_keys.entry(pseudonym.clone()).or_default();
+                    if let Some(session) = &ev_pdu_session {
+                        owners.insert(format!("pdu:{session}"));
                     }
+                    state.exposed_keys.insert(pseudonym);
                 }
             }
             // 2.21.113 (E5) — deux fins distinctes. Avant, le nom testé
@@ -1946,6 +2084,28 @@ impl LiveTraceRegistry {
                 state.seids.clear();
                 state.seid_endpoints.clear();
                 state.ue_ips.clear();
+                // 2.21.126 — toutes les IP UE de l'abonné.
+                for (ip, _) in state.ue_ip_keys.drain() {
+                    state.exposed_keys.remove(&ip);
+                }
+            } else if session_release && !context_release {
+                // 2.21.126 — libération d'une session NOMMÉE : son IP UE
+                // est oubliée, et celles qu'aucune session ni aucun SEID
+                // ne porte (choix de l'isolement). Réattribuée à un autre
+                // abonné, elle rattacherait son SIP.
+                if let Some(session) = &ev_pdu_session {
+                    let tag = format!("pdu:{session}");
+                    let gone: Vec<String> = state
+                        .ue_ip_keys
+                        .iter()
+                        .filter(|(_, owners)| owners.is_empty() || owners.contains(&tag))
+                        .map(|(ip, _)| ip.clone())
+                        .collect();
+                    for ip in gone {
+                        state.ue_ip_keys.remove(&ip);
+                        state.exposed_keys.remove(&ip);
+                    }
+                }
             }
             // Suppression d'une session PFCP : son SEID ne vaut plus, ni
             // les couples côté cœur rangés sous lui (2.21.121, H1).
@@ -1953,6 +2113,23 @@ impl LiveTraceRegistry {
                 for pair in &ev_header_seid_pairs {
                     state.seid_endpoints.remove(pair);
                     state.seids.remove(&pair.1);
+                }
+                // 2.21.126 — l'IP UE apprise sur cette session PFCP finit
+                // avec elle.
+                let tags: Vec<String> = ev_session_seids
+                    .iter()
+                    .chain(ev_seids_ie.iter())
+                    .map(|seid| format!("seid:{seid}"))
+                    .collect();
+                let gone: Vec<String> = state
+                    .ue_ip_keys
+                    .iter()
+                    .filter(|(_, owners)| tags.iter().any(|tag| owners.contains(tag)))
+                    .map(|(ip, _)| ip.clone())
+                    .collect();
+                for ip in gone {
+                    state.ue_ip_keys.remove(&ip);
+                    state.exposed_keys.remove(&ip);
                 }
                 let released: Vec<(String, String)> = ev_session_seids
                     .iter()
@@ -2350,20 +2527,20 @@ fn ring_decode_config(path: &std::path::Path, interface: &str) -> oiran_decode::
     }
 }
 
-/// 2.18.10 — ordre canonique intra-capture d'un lot d'events :
-/// (packet_number du premier paquet, event_id). Tri stable.
+/// 2.18.10 — ordre canonique intra-capture d'un lot d'events : numéro
+/// du premier paquet. Tri stable.
+/// 2.21.126 (constat CLAUDE2 #9 7053217728, ordre #9 7053683830) — dans
+/// un même paquet, l'ordre d'émission du décodeur est conservé (parent
+/// puis enfant). Avant, l'`event_id` départageait : il dérive du
+/// `capture_id`, empreinte du chemin du segment, et l'ordre de deux
+/// events d'un même paquet dépendait donc du NOM du segment.
 fn sort_by_capture_order(events: &mut [event_schema::NormalizedEvent]) {
-    events.sort_by(|a, b| {
-        let packet = |event: &event_schema::NormalizedEvent| {
-            event
-                .packet_references
-                .first()
-                .map(|reference| reference.packet_number)
-                .unwrap_or(u64::MAX)
-        };
-        packet(a)
-            .cmp(&packet(b))
-            .then_with(|| a.event_id.cmp(&b.event_id))
+    events.sort_by_key(|event| {
+        event
+            .packet_references
+            .first()
+            .map(|reference| reference.packet_number)
+            .unwrap_or(u64::MAX)
     });
 }
 
@@ -2897,6 +3074,8 @@ pub(crate) async fn create(
         pfcp_attached_seid_only: 0,
         parents_attached_after_child: 0,
         pfcp_attached_after_the_fact: 0,
+        sip_attached_by_ue_ip: 0,
+        pfcp_attached_by_ue_ip: 0,
         rejected_ue_id_mismatch: 0,
         rejected_seid_endpoint_mismatch: 0,
         session_releases_without_filed_tunnels: 0,
@@ -2923,6 +3102,7 @@ pub(crate) async fn create(
             tunnel_endpoints: HashSet::new(),
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
+            ue_ip_keys: HashMap::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -3305,6 +3485,8 @@ mod tests {
                 pfcp_attached_seid_only: 0,
                 parents_attached_after_child: 0,
                 pfcp_attached_after_the_fact: 0,
+                sip_attached_by_ue_ip: 0,
+                pfcp_attached_by_ue_ip: 0,
                 rejected_ue_id_mismatch: 0,
                 rejected_seid_endpoint_mismatch: 0,
                 session_releases_without_filed_tunnels: 0,
@@ -3327,6 +3509,7 @@ mod tests {
             tunnel_endpoints: HashSet::new(),
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
+            ue_ip_keys: HashMap::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -5214,6 +5397,237 @@ mod tests {
             );
             assert_eq!(traces["t"].trace.duplicates_dropped, 0, "{label}");
         }
+    }
+
+    /// 2.21.126 — pseudonyme d'une adresse IP, comme les décodeurs.
+    fn ip_psn(address: &str) -> String {
+        event_schema::pseudonym_ip_text(pseudonym_key().unwrap(), address).unwrap()
+    }
+
+    fn sip_from(
+        packet: u64,
+        message: &str,
+        cseq: &str,
+        call: &str,
+        alias: &str,
+        source: &str,
+        destination: &str,
+    ) -> event_schema::NormalizedEvent {
+        use event_schema::{Direction, Protocol};
+        let (source, destination) = (ip_psn(source), ip_psn(destination));
+        let mut event = mk_event(
+            "IMS",
+            Protocol::Sip,
+            message,
+            packet,
+            Direction::Unknown,
+            vec![("sip_call_id", call), ("subscriber_pseudonym", alias)],
+            vec![
+                ("CSeq", cseq),
+                ("packet_source_ip_pseudonym", source.as_str()),
+                ("packet_destination_ip_pseudonym", destination.as_str()),
+            ],
+        );
+        event.event_id = format!("evt-sip-{packet:04}");
+        event
+    }
+
+    /// 2.21.126 (donnée lab ANR1 #10 7052813333, ordres #9 7053030106 et
+    /// 7053229737) — au lab, les URI du SIP sont des alias : ni IMSI ni
+    /// MSISDN. Aucune identité de l'abonné n'est donc portée par son
+    /// SIP ; le REGISTER n'a pas de SDP. Attendu : REGISTER, INVITE,
+    /// 200, BYE et le flux RTP entrent dans la trace de l'abonné par
+    /// l'adresse IP de son UE (apprise sur le NAS), et rien dans celle
+    /// d'un autre UE ; l'IP est oubliée à la fin de la session.
+    /// Avant 2.21.126 : aucun de ces messages n'est rattaché.
+    #[test]
+    fn voice_with_alias_uris_attaches_by_ue_ip_and_stays_out_of_another_ue_2_21_126() {
+        use event_schema::{Direction, Protocol};
+        let (ip_a, ip_c, pcscf) = ("10.45.0.7", "10.45.0.9", "10.46.0.2");
+        let accept = |packet: u64, pseudonym: &str, address: &str| {
+            let value = format!("type=IPv4,address={address}");
+            let mut event = mk_event(
+                "N2",
+                Protocol::Ngap,
+                "PDU Session Establishment Accept",
+                packet,
+                Direction::Unknown,
+                vec![("subscriber_pseudonym", pseudonym), ("pdu_session_id", "2")],
+                vec![("PDU address", value.as_str())],
+            );
+            event.event_id = format!("evt-nas-{packet:04}");
+            event
+        };
+        let rtp = |packet: u64, call: &str| {
+            let mut event = mk_event("N6", Protocol::Rtp, "RTP Flow", packet, Direction::Unknown, vec![("sip_call_id", call)], vec![("ssrc", "0x00001111")]);
+            event.event_id = format!("evt-rtp-{packet:04}");
+            event
+        };
+        let events = vec![
+            accept(1, "psn-ue-a", ip_a),
+            accept(2, "psn-ue-c", ip_c),
+            // A s'enregistre : alias, pas de SDP.
+            sip_from(3, "REGISTER", "1 REGISTER", "reg-a@ims", "psn-alias-a", ip_a, pcscf),
+            sip_from(4, "200 OK", "1 REGISTER", "reg-a@ims", "psn-alias-a", pcscf, ip_a),
+            // C s'enregistre et appelle.
+            sip_from(5, "REGISTER", "1 REGISTER", "reg-c@ims", "psn-alias-c", ip_c, pcscf),
+            sip_from(6, "INVITE", "1 INVITE", "call-c@ims", "psn-alias-c", ip_c, pcscf),
+            // A appelle.
+            sip_from(7, "INVITE", "1 INVITE", "call-a@ims", "psn-alias-a", ip_a, pcscf),
+            sip_from(8, "200 OK", "1 INVITE", "call-a@ims", "psn-alias-a", pcscf, ip_a),
+            rtp(9, "call-a@ims"),
+            rtp(10, "call-c@ims"),
+            sip_from(11, "BYE", "2 BYE", "call-a@ims", "psn-alias-a", ip_a, pcscf),
+            sip_from(12, "200 OK", "2 BYE", "call-a@ims", "psn-alias-a", pcscf, ip_a),
+        ];
+        let (a, c) = (trace_on("psn-ue-a"), trace_on("psn-ue-c"));
+        for event in &events {
+            a.route_normalized(event);
+            c.route_normalized(event);
+        }
+        assert_eq!(
+            routed_ids(&a),
+            ["evt-nas-0001", "evt-sip-0003", "evt-sip-0004", "evt-sip-0007", "evt-sip-0008", "evt-rtp-0009", "evt-sip-0011", "evt-sip-0012"],
+            "REGISTER, INVITE, 200, flux RTP et BYE de A, rien de C"
+        );
+        assert_eq!(
+            routed_ids(&c),
+            ["evt-nas-0002", "evt-sip-0005", "evt-sip-0006", "evt-rtp-0010"],
+            "la trace de C ne reçoit rien de A"
+        );
+        {
+            let traces = a.traces.lock().unwrap();
+            let t = &traces["t"];
+            // REGISTER et INVITE : rattachés par l'IP seule ; les réponses
+            // et le BYE le sont aussi par l'identifiant d'appel.
+            assert_eq!(t.trace.sip_attached_by_ue_ip, 2);
+            assert_eq!(a.stats_payload(&t.trace)["sip"]["attached_by_ue_ip"], 2);
+            assert!(t.exposed_keys.contains(&ip_psn(ip_a)));
+            assert!(!t.match_keys.contains("psn-alias-a"), "l'alias du SIP n'est pas appris (I1)");
+            assert!(!t.exposed_keys.contains(&ip_psn(pcscf)), "l'adresse du P-CSCF n'est jamais apprise");
+            assert!(!t.ue_ip_keys.contains_key(&ip_psn(pcscf)));
+            assert!(!t.ue_ip_keys.contains_key(&ip_psn(ip_c)));
+        }
+        // Fin de la session de données de A : son IP est oubliée. La même
+        // adresse, réattribuée, ne rattache plus rien.
+        let mut release = mk_event("N2", Protocol::Ngap, "PDU Session Release Complete", 13, Direction::Unknown, vec![("subscriber_pseudonym", "psn-ue-a"), ("pdu_session_id", "2")], vec![]);
+        release.event_id = "evt-nas-0013".into();
+        a.route_normalized(&release);
+        a.route_normalized(&sip_from(14, "REGISTER", "1 REGISTER", "reg-z@ims", "psn-alias-z", ip_a, pcscf));
+        assert!(!routed_ids(&a).contains(&"evt-sip-0014".to_string()), "IP oubliée avec la session");
+        let traces = a.traces.lock().unwrap();
+        assert!(traces["t"].ue_ip_keys.is_empty());
+        assert!(!traces["t"].exposed_keys.contains(&ip_psn(ip_a)));
+        assert!(!traces["t"].match_keys.contains(&ip_psn(ip_a)));
+    }
+
+    /// 2.21.126 — NAS chiffré : l'adresse PDU n'est pas lisible. L'IP de
+    /// l'UE est alors apprise sur l'IE 93 d'un PFCP déjà rattaché (ici
+    /// par son tunnel), et elle finit avec la session PFCP. Un PFCP qui
+    /// porte l'IP d'un autre UE n'apprend rien à la trace.
+    #[test]
+    fn ue_ip_is_learned_from_ie_93_of_an_attached_pfcp_and_ends_with_its_session_2_21_126() {
+        use event_schema::{Direction, Protocol};
+        let (ip_a, ip_b, pcscf) = ("10.45.0.7", "10.45.0.8", "10.46.0.2");
+        let pfcp = |packet: u64, message: &str, seid: &str, f_teid: &str, ue_ip: Option<&str>| {
+            let ue = ue_ip.map(|ip| format!("ue_ip={},ue_ip_flags=0x02", ip_psn(ip)));
+            let mut ies = vec![("F-TEID", f_teid)];
+            if let Some(ue) = ue.as_deref() {
+                ies.push(("UE IP Address", ue));
+            }
+            let mut event = mk_event("N4", Protocol::Pfcp, message, packet, Direction::Unknown, vec![("seid", seid)], ies);
+            for ie in event.information_elements.iter_mut() {
+                if ie.name == "UE IP Address" {
+                    ie.id = Some(93);
+                }
+            }
+            event.event_id = format!("evt-pfcp-{packet:04}");
+            event
+        };
+        let mut setup = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            1,
+            Direction::Unknown,
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+            vec![("PDUSessionResourceSetupRequestTransfer", "item_0_tunnel_ip_ul=10.100.0.1,item_0_gtp_teid_ul=0x0000d4a6")],
+        );
+        setup.event_id = "evt-ngap-0001".into();
+        let r = trace_on("psn-ue-a");
+        r.route_normalized(&setup);
+        // PFCP d'un autre UE, avant : autre tunnel, autre IP.
+        r.route_normalized(&pfcp(2, "Session Establishment Request", "0x0000000000002002", "teid=0x0000eeee,v4=true,v6=false,ipv4=10.100.0.1", Some(ip_b)));
+        // PFCP de l'abonné : rattaché par son tunnel, porte l'IE 93.
+        r.route_normalized(&pfcp(3, "Session Establishment Request", "0x0000000000001001", "teid=0x0000d4a6,v4=true,v6=false,ipv4=10.100.0.1", Some(ip_a)));
+        r.route_normalized(&sip_from(4, "REGISTER", "1 REGISTER", "reg-a@ims", "psn-alias-a", ip_a, pcscf));
+        r.route_normalized(&sip_from(5, "REGISTER", "1 REGISTER", "reg-b@ims", "psn-alias-b", ip_b, pcscf));
+        assert_eq!(routed_ids(&r), ["evt-ngap-0001", "evt-pfcp-0003", "evt-sip-0004"]);
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert_eq!(t.trace.sip_attached_by_ue_ip, 1);
+            assert!(t.ue_ip_keys.contains_key(&ip_psn(ip_a)));
+            assert!(!t.ue_ip_keys.contains_key(&ip_psn(ip_b)), "IP d'un PFCP non rattaché : pas apprise");
+        }
+        // Suppression de la session PFCP : l'IP finit avec elle.
+        r.route_normalized(&pfcp(6, "Session Deletion Response", "0x0000000000001001", "", None));
+        r.route_normalized(&sip_from(7, "REGISTER", "2 REGISTER", "reg-a2@ims", "psn-alias-a", ip_a, pcscf));
+        let routed = routed_ids(&r);
+        assert!(routed.contains(&"evt-pfcp-0006".to_string()));
+        assert!(!routed.contains(&"evt-sip-0007".to_string()), "IP oubliée avec la session PFCP");
+        assert!(r.traces.lock().unwrap()["t"].ue_ip_keys.is_empty());
+    }
+
+    /// 2.21.126 (constat CLAUDE2 #9 7053217728, ordre #9 7053683830) —
+    /// l'ordre des events d'un même paquet ne dépend plus du nom du
+    /// segment. La même capture, décodée sous deux chemins, donne la même
+    /// séquence, et dans chaque paquet le parent NGAP précède son enfant
+    /// NAS. Avant : l'`event_id`, dérivé du chemin, départageait.
+    #[test]
+    fn capture_order_does_not_depend_on_the_segment_path_2_21_126() {
+        let bytes = fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng"),
+        )
+        .unwrap();
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let root = std::env::temp_dir().join(format!(
+            "oiran-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let decode = |name: &str| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.pcapng"));
+            fs::write(&path, &bytes).unwrap();
+            let mut events = Vec::new();
+            oiran_decode::decode_capture_streaming(&ring_decode_config(&path, "N2"), &key, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .unwrap();
+            // Le lot arrive dans un ordre quelconque : le tri seul décide.
+            events.reverse();
+            sort_by_capture_order(&mut events);
+            events
+        };
+        let sequence = |events: &[event_schema::NormalizedEvent]| -> Vec<(u64, String, String)> {
+            events
+                .iter()
+                .map(|e| (e.packet_references[0].packet_number, e.protocol.as_str().to_owned(), e.message_name.clone()))
+                .collect()
+        };
+        let (first, second) = (decode("n2_00001_a"), decode("n2_00777_zz"));
+        assert_ne!(first[0].event_id, second[0].event_id, "les identifiants dépendent bien du chemin");
+        let _ = fs::remove_dir_all(&root);
+        // NB : le lot est inversé avant le tri, donc dans un paquet
+        // l'ordre est l'inverse de l'émission, le même sous les deux
+        // chemins. Seule l'égalité compte ici.
+        assert_eq!(sequence(&first), sequence(&second));
+        assert!(sequence(&first).windows(2).all(|pair| pair[0].0 <= pair[1].0));
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
