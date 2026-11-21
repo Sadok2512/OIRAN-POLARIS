@@ -1,5 +1,52 @@
 # Changelog
 
+## oiran-api 2.21.130 — 2026-11-21 — lecteur live : coût d'une passe et borne de l'amorçage (recette lab 2.21.114, ordres #9 7052731132 points 3 et 4, 7053683830)
+
+Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.129 @ `005a382`. Branches `fix/oiran-2.21.130-reader-pass-cost` et `fix/oiran-2.21.121-train`. Seul `oiran-api` change (`live_trace.rs`, `throughput.rs`). **Numéro** : l'ordre #9 7053683830 réservait 2.21.128 à ce lot ; il sort après 2.21.129, et une version ne redescend pas : il prend 2.21.130. 2.21.128 reste inutilisé ; 2.21.127 est à CLAUDE2.
+
+### Audit — où passait le temps d'une passe
+
+Recette lab : ring de 8 093 segments ; trace ouverte **sans trafic**, 83 % d'un cœur, `reader_pass_ms=643` pour 2 fichiers décodés ; sous trafic `reader_pass_ms=7459`. Amorçage : 201 Mo, 3 333 fichiers.
+
+Par le code de `reader_pass` @ `35571a0` :
+1. **Parcours du ring** : à chaque passe et pour chacun des 13 plans, liste du répertoire, tri des segments par date de modification (un `stat` par comparaison de tri), puis un `stat` de chaque segment, puis recherche des segments disparus en parcourant toute la table pour chaque plan.
+2. **Redécodage intégral du segment courant** des plans sans reprise à l'offset (SBI, S6a, IMS, N6) dès qu'il change. Le segment SBI change en continu (battements de cœur du NRF) : il était relu en entier toutes les 750 ms. C'est, par le code, le principal poste d'une passe « sans trafic » ; **non mesuré séparément en prod**.
+3. L'empreinte des 64 derniers octets ne coûte qu'une lecture de 64 octets par segment décodé ; l'amorçage n'est rejoué qu'à l'ouverture d'une trace. Écartés.
+
+### Changement
+
+1. **Segments triés par nom**, sans interroger leurs métadonnées : les noms du ring croissent avec le temps.
+2. **Un répertoire inchangé n'est pas relu** : sa date de modification ne bouge que si un segment y est créé ou supprimé. Tant qu'elle est la même (et vieille d'au moins 2 s), seuls sont considérés ses deux segments les plus récents et ceux dont une session de reprise est ouverte.
+3. **Seuls sont interrogés** : le segment courant, le précédent (derniers octets avant la rotation), un segment encore inconnu, un segment à session ouverte. Les segments fermés sont suivis par leur nom.
+4. **Redécodage intégral borné** : sur un plan sans reprise à l'offset, le segment courant n'est redécodé qu'une fois toutes les 3 s.
+5. **Cadence** : 750 ms après une passe qui a décodé, puis 1,5 s et 3 s après des passes à vide.
+6. **Amorçage** : seuls les 3 segments les plus récents de chaque plan de signalisation sont relus (plafond de 64 Mio conservé) ; `seed.duration_ms` ajouté.
+7. **Découpage du temps** dans `stats.reader` : `scan_ms`, `files_examined_last_pass`, et par plan `decode_ms`, `route_ms`, `throttled`.
+
+### Mesure
+
+Ring simulé de 8 100 segments sur trois plans, compilation de test **non optimisée**, disque local : passe à vide **0,09 ms** quand les répertoires n'ont pas changé ; **114 ms** quand ils sont relus (un segment créé ou supprimé). Ce n'est ni le lab ni un binaire de production : ordre de grandeur seulement. La cible « passe à vide < 50 ms » est à constater au lab dans `stats.reader.scan_ms` et `reader_pass_ms`.
+
+### Changements de comportement à connaître
+
+- **SBI, S6a, IMS, N6 en live** : un message peut apparaître jusqu'à 3 s plus tard qu'avant (cadence du redécodage intégral), tant que ces plans n'ont pas la reprise à l'offset.
+- Après des passes à vide, le premier message d'une reprise d'activité peut attendre jusqu'à 3 s au lieu de 750 ms.
+- Amorçage : une session dont la signalisation est plus ancienne que les 3 derniers segments d'un plan n'est plus retrouvée (`seed.truncated`).
+
+### OUVERT
+
+- **Ordre des noms** : si les noms d'un ring ne croissent pas avec le temps, le « segment courant » est mal choisi. Vrai pour le ring du lab (`<plan>_<horodatage>_<numéro>_<horodatage>.pcapng`) ; non vérifié ailleurs.
+- **Date de modification du répertoire** : repose sur le système de fichiers. Un système de fichiers qui ne la met pas à jour à la création d'un fichier masquerait les nouveaux segments ; non vérifié sur le volume du lab.
+- Deux rotations du même plan entre deux passes, avec des octets ajoutés à l'avant-dernier segment après sa dernière lecture : ces octets ne seraient pas lus. Tenu pour improbable (rotation horaire ou à 256 Mio), non testé.
+- Le coût par event du routage (`route_event` sérialise chaque event en JSON) n'est pas traité ; `route_ms` le mesure.
+- `start_reader` (boucle, cadence réelle) reste sans test ; `reader_interval` est testé seul.
+
+### Tests
+
+- `reader_pass_on_a_ring_over_1024_segments_…_2_21_123` étendu : 6 segments interrogés sur 1 160 à chaque passe ; répertoires suivis par leur date après le rattrapage ; un segment supprimé fait relire le répertoire.
+- `reader_pass_throttles_full_redecode_and_follows_rotation_2_21_130` : sur SBI (capture réelle `multi-imsi.pcap`), redécodage reporté 1 s après, fait après 4 s ; à la rotation, le dernier état du segment précédent et le nouveau segment sont lus tous les deux ; passe à vide : 2 segments interrogés.
+- `seed_from_ring_reads_only_the_newest_segments_of_each_plane_2_21_130` : 3 segments N2 relus sur 40, `truncated` signalé, octets et durée rapportés.
+
 ## oiran-api 2.21.129 — 2026-11-21 — trace live : une trace ne prend plus l'abonné qui reprend ses identifiants techniques (recette lab 2.21.124, G9 FAIL ; ordre #9 7053864526)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.126 @ `653bda0`. Branches `fix/oiran-2.21.129-foreign-subscriber` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change. 2.21.127 (CLAUDE2) et 2.21.128 (coût d'une passe du lecteur) sont réservés.

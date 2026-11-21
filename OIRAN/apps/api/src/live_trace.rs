@@ -153,6 +153,9 @@ pub(crate) struct SeedStats {
     /// `true` si au moins un fichier du ring a été laissé de côté par
     /// le plafond d'octets par interface.
     truncated: bool,
+    /// 2.21.130 — durée de la relecture, en ms.
+    #[serde(default)]
+    duration_ms: u64,
 }
 
 /// 2.21.105 — interfaces de signalisation relues à l'ouverture d'une
@@ -163,6 +166,42 @@ pub(crate) struct SeedStats {
 const SEED_INTERFACES: [&str; 6] = ["N2", "S1-MME", "N4", "S11", "S5-C", "Sxab"];
 /// 2.21.105 — plafond d'octets relus par interface pour un amorçage.
 const SEED_MAX_BYTES_PER_INTERFACE: u64 = 64 * 1024 * 1024;
+/// 2.21.130 (recette lab 2.21.114 : 643 ms par passe sans trafic, ordre
+/// #9 7052731132) — intervalle minimal entre deux redécodages intégraux
+/// d'un même segment, sur les plans sans reprise à l'offset (SBI, S6a,
+/// IMS, N6). Le segment SBI courant change en continu (battements de
+/// cœur du NRF) et était redécodé en entier à chaque passe.
+const FULL_REDECODE_MIN_INTERVAL: Duration = Duration::from_secs(3);
+/// 2.21.130 — segments les plus récents relus par plan à l'amorçage
+/// d'une trace. Recette lab : 201 Mo et 3 333 fichiers relus par
+/// ouverture de trace.
+const SEED_MAX_SEGMENTS_PER_INTERFACE: usize = 3;
+/// 2.21.130 — cadence du lecteur : 750 ms quand il vient de décoder,
+/// allongée jusqu'à 3 s après des passes à vide.
+const READER_BASE_INTERVAL: Duration = Duration::from_millis(750);
+const READER_MAX_INTERVAL: Duration = Duration::from_millis(3_000);
+
+/// 2.21.130 — ce que le lecteur retient d'un répertoire du ring entre
+/// deux passes : sa date de modification et ses deux segments les plus
+/// récents. Un répertoire ne change de date que si un segment y est créé
+/// ou supprimé ; tant qu'elle ne bouge pas, il n'est pas relu.
+#[derive(Default)]
+pub(crate) struct RingDirState {
+    mtime: Option<std::time::SystemTime>,
+    recent: Vec<std::path::PathBuf>,
+}
+
+/// 2.21.130 — une date de modification de répertoire plus jeune que
+/// cette marge est tenue pour encore mouvante : le répertoire est relu.
+const RING_DIR_SETTLE: Duration = Duration::from_secs(2);
+
+/// 2.21.130 — intervalle avant la prochaine passe, selon le nombre de
+/// passes consécutives qui n'ont rien décodé.
+fn reader_interval(idle_passes: u32) -> Duration {
+    let factor = 1u32 << idle_passes.min(2);
+    (READER_BASE_INTERVAL * factor).min(READER_MAX_INTERVAL)
+}
+
 /// 2.21.105 — période d'émission de l'event SSE `stats`.
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -207,6 +246,7 @@ pub(crate) struct SeedReport {
     files: u64,
     bytes: u64,
     truncated: bool,
+    duration_ms: u64,
 }
 
 /// 2.21.105 (ordre #9 7048974175) — relit le ring de signalisation et
@@ -221,16 +261,29 @@ fn seed_from_ring(
     key: &event_schema::PseudonymKey,
     registry: &LiveTraceRegistry,
 ) -> SeedReport {
+    let started = std::time::Instant::now();
     let mut report = SeedReport::default();
     for interface in SEED_INTERFACES {
         let dir = root.join(ring_directory(interface));
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
-        let files: Vec<_> = entries
+        // 2.21.130 — seuls les segments les plus récents du plan sont
+        // relus (noms du ring croissants avec le temps), et eux seuls
+        // sont interrogés : la session d'un abonné tient dans les
+        // derniers segments, pas dans le ring entier.
+        let mut names: Vec<std::path::PathBuf> = entries
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("pcapng"))
+            .collect();
+        names.sort();
+        if names.len() > SEED_MAX_SEGMENTS_PER_INTERFACE {
+            report.truncated = true;
+            names.drain(..names.len() - SEED_MAX_SEGMENTS_PER_INTERFACE);
+        }
+        let files: Vec<_> = names
+            .into_iter()
             .filter_map(|path| {
                 let meta = path.metadata().ok()?;
                 Some((path, meta.len(), meta.modified().ok()))
@@ -266,6 +319,7 @@ fn seed_from_ring(
             report.bytes = report.bytes.saturating_add(size);
         }
     }
+    report.duration_ms = started.elapsed().as_millis() as u64;
     report
 }
 
@@ -994,6 +1048,11 @@ pub(crate) struct LiveTraceRegistry {
     /// 2.21.109 — segments décodés pendant la dernière passe. En
     /// régime établi : un par plan actif, pas tout le ring.
     reader_files_decoded: AtomicU64,
+    /// 2.21.130 — temps de parcours du ring (listes de répertoires,
+    /// tri, segments disparus) pendant la dernière passe, en ms.
+    reader_scan_ms: AtomicU64,
+    /// 2.21.130 — segments interrogés (`stat`) pendant la dernière passe.
+    reader_files_examined: AtomicU64,
     /// 2.21.113 (E4) — derniers events de signalisation rejetés par au
     /// moins une trace : un parent NGAP/S1AP passe avant son enfant NAS,
     /// qui seul porte l'identité.
@@ -1014,6 +1073,8 @@ impl LiveTraceRegistry {
             reader_io: Mutex::new(BTreeMap::new()),
             reader_files_tracked: AtomicU64::new(0),
             reader_files_decoded: AtomicU64::new(0),
+            reader_scan_ms: AtomicU64::new(0),
+            reader_files_examined: AtomicU64::new(0),
             recent_rejected: Mutex::new(VecDeque::new()),
             recent_rejected_pfcp: Mutex::new(VecDeque::new()),
         }
@@ -1079,6 +1140,7 @@ impl LiveTraceRegistry {
                 state.trace.seed.files = report.files;
                 state.trace.seed.bytes = report.bytes;
                 state.trace.seed.truncated = report.truncated;
+                state.trace.seed.duration_ms = report.duration_ms;
             }
         }
     }
@@ -1093,6 +1155,8 @@ impl LiveTraceRegistry {
                 "resume_resets": self.resume_resets.load(Ordering::Relaxed),
                 "files_tracked": self.reader_files_tracked.load(Ordering::Relaxed),
                 "files_decoded_last_pass": self.reader_files_decoded.load(Ordering::Relaxed),
+                "files_examined_last_pass": self.reader_files_examined.load(Ordering::Relaxed),
+                "scan_ms": self.reader_scan_ms.load(Ordering::Relaxed),
                 "full_redecode": full_redecode_requested(),
                 "interfaces": *self.reader_io.lock().unwrap(),
             },
@@ -1150,6 +1214,15 @@ impl LiveTraceRegistry {
 
     pub(crate) fn set_reader_files_tracked(&self, value: u64) {
         self.reader_files_tracked.store(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_reader_scan(&self, scan_ms: u64, files_examined: u64) {
+        self.reader_scan_ms.store(scan_ms, Ordering::Relaxed);
+        self.reader_files_examined.store(files_examined, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reader_files_decoded_last_pass(&self) -> u64 {
+        self.reader_files_decoded.load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_reader_files_decoded(&self, value: u64) {
@@ -2566,6 +2639,16 @@ pub(crate) struct ReaderIo {
     bytes_decoded: u64,
     bytes_file: u64,
     incremental: bool,
+    /// 2.21.130 — temps passé à décoder ce plan pendant la passe.
+    #[serde(default)]
+    decode_ms: u64,
+    /// 2.21.130 — temps passé à router ses events vers les traces et
+    /// le débit.
+    #[serde(default)]
+    route_ms: u64,
+    /// 2.21.130 — redécodages intégraux reportés par la cadence minimale.
+    #[serde(default)]
+    throttled: u64,
 }
 
 /// 2.21.109 — session de reprise d'un segment du ring, gardée par le
@@ -2754,8 +2837,10 @@ pub(crate) fn reader_pass(
     traces: &LiveTraceRegistry,
     states: &mut HashMap<std::path::PathBuf, crate::throughput::PcapFileState>,
     sessions: &mut HashMap<std::path::PathBuf, ReaderSession>,
+    dirs: &mut HashMap<std::path::PathBuf, RingDirState>,
     catchup: bool,
     full_redecode: bool,
+    now: std::time::Instant,
     hooks: &mut dyn ReaderHooks,
 ) {
     if full_redecode {
@@ -2763,6 +2848,8 @@ pub(crate) fn reader_pass(
     }
     let mut pass_io: BTreeMap<String, ReaderIo> = BTreeMap::new();
     let mut files_decoded = 0u64;
+    let mut files_examined = 0u64;
+    let mut scan = Duration::ZERO;
     // 2.21.105 (ordre #9 7048974175) — amorçage des
     // traces ouvertes depuis la passe précédente : le
     // ring de signalisation est relu sans émission
@@ -2778,64 +2865,125 @@ pub(crate) fn reader_pass(
         // et RTP IMS, publiés `interface="IMS"`.
         "N6",
     ] {
+        let scan_started = std::time::Instant::now();
         let dir = root.join(ring_directory(interface));
-        let Ok(entries) = fs::read_dir(&dir) else {
+        let Ok(dir_meta) = fs::metadata(&dir) else {
+            scan += scan_started.elapsed();
             continue;
         };
-        // 2.21.78 (correction 7013902603) — énumère tous les
-        // pcapng, triés par mtime ancien → récent. La
-        // décision de redécoder est prise PAR FICHIER selon
-        // `(size, mtime)` vs `file_state`.
-        let mut paths: Vec<_> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().and_then(|v| v.to_str()) == Some("pcapng")
-            })
-            .collect();
-        paths.sort_by_key(|path| {
-            path.metadata().and_then(|m| m.modified()).ok()
+        let dir_mtime = dir_meta.modified().ok();
+        let settled = dir_mtime.is_some_and(|mtime| {
+            std::time::SystemTime::now()
+                .duration_since(mtime)
+                .map(|age| age >= RING_DIR_SETTLE)
+                .unwrap_or(false)
         });
-        // 2.21.78 (correction défaut 1) — détecte les fichiers
-        // précédemment vus qui ont DISPARU. Le gap n'est
-        // PAS la taille totale : c'est `last_size -
-        // consumed_bytes`. Un fichier lu en entier et GC'é
-        // par le ring dumpcap contribue 0 — pas d'alerte
-        // sur le régime normal du ring.
-        let present: std::collections::HashSet<std::path::PathBuf> =
-            paths.iter().cloned().collect();
-        let gone: Vec<_> = states
-            .keys()
-            .filter(|p| p.starts_with(&dir) && !present.contains(*p))
-            .cloned()
-            .collect();
-        for path in &gone {
-            sessions.remove(path);
-            if let Some(file_state) = states.remove(path) {
-                let gap = file_state
-                    .size
-                    .saturating_sub(file_state.consumed_bytes);
-                if gap > 0 {
-                    hooks.bytes_gap(gap);
+        let unchanged = !catchup
+            && settled
+            && dirs
+                .get(&dir)
+                .is_some_and(|known| known.mtime == dir_mtime && !known.recent.is_empty());
+        // Segments à considérer : (chemin, est le plus récent, fait
+        // partie des deux plus récents).
+        let candidates: Vec<(std::path::PathBuf, bool, bool)> = if unchanged {
+            // 2.21.130 — répertoire inchangé depuis la passe précédente :
+            // aucun segment créé ni supprimé. Il n'est pas relu ; seuls
+            // ses deux segments les plus récents et ceux dont une session
+            // de reprise est ouverte sont considérés.
+            let recent = &dirs[&dir].recent;
+            let newest = recent.last().cloned();
+            let mut list: Vec<(std::path::PathBuf, bool, bool)> = recent
+                .iter()
+                .map(|path| (path.clone(), Some(path) == newest.as_ref(), true))
+                .collect();
+            for path in sessions.keys() {
+                if path.parent() == Some(dir.as_path()) && !recent.contains(path) {
+                    list.push((path.clone(), false, false));
                 }
             }
-        }
-        // 2.21.78 (correction 7014327787) — rattrapage du
-        // ring au démarrage : tous les fichiers sauf le
-        // plus récent sont marqués consommés sans décodage.
-        // Le filigrane est au MAX pour que toute re-lecture
-        // ultérieure (très improbable : fichier passé) soit
-        // ignorée.
-        let last_idx = paths.len().saturating_sub(1);
-        for path in paths.iter().enumerate() {
-            let (idx, path) = path;
+            list
+        } else {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                scan += scan_started.elapsed();
+                continue;
+            };
+            // 2.21.130 (recette lab : 8 093 segments, 643 ms par passe
+            // sans trafic) — les segments sont triés par NOM, sans
+            // interroger leurs métadonnées : les noms du ring croissent
+            // avec le temps (`<plan>_<horodatage>_<numéro>_<horodatage>
+            // .pcapng`). Avant : tri par date de modification, soit
+            // plusieurs `stat` par fichier et par passe, puis un `stat` de
+            // chaque fichier.
+            let mut paths: Vec<_> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("pcapng"))
+                .collect();
+            paths.sort();
+            // 2.21.78 (correction défaut 1) — détecte les fichiers
+            // précédemment vus qui ont DISPARU. Le gap n'est PAS la
+            // taille totale : c'est `last_size - consumed_bytes`. Un
+            // fichier lu en entier et supprimé par le ring contribue 0.
+            let present: std::collections::HashSet<&std::path::PathBuf> = paths.iter().collect();
+            let gone: Vec<_> = states
+                .keys()
+                .filter(|p| p.parent() == Some(dir.as_path()) && !present.contains(*p))
+                .cloned()
+                .collect();
+            for path in &gone {
+                sessions.remove(path);
+                if let Some(file_state) = states.remove(path) {
+                    let gap = file_state.size.saturating_sub(file_state.consumed_bytes);
+                    if gap > 0 {
+                        hooks.bytes_gap(gap);
+                    }
+                }
+            }
+            let last_idx = paths.len().saturating_sub(1);
+            let known = dirs.entry(dir.clone()).or_default();
+            known.mtime = dir_mtime;
+            known.recent = paths[paths.len().saturating_sub(2)..].to_vec();
+            paths
+                .into_iter()
+                .enumerate()
+                .map(|(idx, path)| (path, idx == last_idx, idx + 1 >= last_idx))
+                .collect()
+        };
+        scan += scan_started.elapsed();
+        for (path, is_newest, is_recent) in &candidates {
+            let (is_newest, is_recent) = (*is_newest, *is_recent);
+            // 2.21.130 — un segment fermé ne change plus : seuls sont
+            // interrogés le segment courant, le précédent (il a pu
+            // recevoir ses derniers octets juste avant la rotation), un
+            // segment encore inconnu, et un segment dont la session de
+            // reprise est ouverte. Les autres sont suivis par leur nom.
+            if !is_recent && states.contains_key(path) && !sessions.contains_key(path) {
+                continue;
+            }
+            // Rattrapage : un segment ancien est inscrit sans être
+            // interrogé ; il ne sera jamais relu.
+            if catchup && !is_recent {
+                states.insert(
+                    path.clone(),
+                    crate::throughput::PcapFileState {
+                        size: 0,
+                        mtime: None,
+                        consumed_bytes: 0,
+                        last_packet_number: u64::MAX,
+                        last_event_id: String::new(),
+                        routed_event_ids: Default::default(),
+                        last_decoded_at: None,
+                    },
+                );
+                continue;
+            }
             let meta = match path.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            files_examined += 1;
             let size = meta.len();
             let mtime = meta.modified().ok();
-            let is_newest = idx == last_idx;
             // Rattrapage : au premier passage, tous les
             // fichiers sauf le plus récent sont ignorés.
             if catchup && !is_newest {
@@ -2848,6 +2996,7 @@ pub(crate) fn reader_pass(
                         last_packet_number: u64::MAX,
                         last_event_id: String::new(),
                         routed_event_ids: Default::default(),
+                        last_decoded_at: None,
                     },
                 );
                 continue;
@@ -2877,6 +3026,7 @@ pub(crate) fn reader_pass(
                         last_packet_number: prev.last_packet_number,
                         last_event_id: prev.last_event_id,
                         routed_event_ids: prev.routed_event_ids,
+                        last_decoded_at: prev.last_decoded_at,
                     },
                 );
                 // 2.21.109 — segment fermé et inchangé :
@@ -2888,6 +3038,18 @@ pub(crate) fn reader_pass(
                         traces.route_normalized(&event);
                     }
                 }
+                continue;
+            }
+            // 2.21.130 — plan sans reprise à l'offset : le segment n'est
+            // redécodé en entier qu'une fois par `FULL_REDECODE_MIN_INTERVAL`.
+            // Rien n'est noté : il sera repris à une passe suivante.
+            if !(!full_redecode && oiran_decode::supports_incremental(interface))
+                && is_newest
+                && prev
+                    .last_decoded_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < FULL_REDECODE_MIN_INTERVAL)
+            {
+                pass_io.entry(interface.to_string()).or_default().throttled += 1;
                 continue;
             }
             hooks.file_decoded();
@@ -2907,6 +3069,7 @@ pub(crate) fn reader_pass(
             let io = pass_io.entry(interface.to_string()).or_default();
             io.incremental = incremental;
             io.bytes_file = io.bytes_file.saturating_add(size);
+            let decode_started = std::time::Instant::now();
             if incremental {
                 let outcome = decode_increment(sessions, &config, key, size);
                 if outcome.reset {
@@ -2931,6 +3094,10 @@ pub(crate) fn reader_pass(
                 };
             }
             sort_by_capture_order(&mut fresh);
+            io.decode_ms = io
+                .decode_ms
+                .saturating_add(decode_started.elapsed().as_millis() as u64);
+            let route_started = std::time::Instant::now();
             // 2.21.78 (corrections 7014327787 + 7014783020)
             // — **deux dédoublonnages distincts** :
             //   - live trace : `route_once_for_live_trace`
@@ -2976,7 +3143,13 @@ pub(crate) fn reader_pass(
             file_state_entry.size = size;
             file_state_entry.mtime = mtime;
             file_state_entry.consumed_bytes = consumed_after;
+            file_state_entry.last_decoded_at = Some(now);
             states.insert(path.clone(), file_state_entry);
+            if let Some(io) = pass_io.get_mut(interface) {
+                io.route_ms = io
+                    .route_ms
+                    .saturating_add(route_started.elapsed().as_millis() as u64);
+            }
             if incremental && !is_newest {
                 for event in close_reader_session(sessions, &config) {
                     traces.route_normalized(&event);
@@ -2997,6 +3170,7 @@ pub(crate) fn reader_pass(
     // nombre de segments présents sur disque.
     traces.set_reader_files_tracked(states.len() as u64);
     traces.set_reader_files_decoded(files_decoded);
+    traces.set_reader_scan(scan.as_millis() as u64, files_examined);
     traces.set_reader_io(pass_io);
 }
 
@@ -3024,8 +3198,12 @@ pub(crate) fn start_reader(state: AppState) {
         let mut initial_catchup_done = false;
         // 2.21.109 — sessions de reprise à l'offset, par segment.
         let mut reader_sessions: HashMap<std::path::PathBuf, ReaderSession> = HashMap::new();
+        // 2.21.130 — état des répertoires du ring, d'une passe à l'autre.
+        let mut ring_dirs: HashMap<std::path::PathBuf, RingDirState> = HashMap::new();
         // 2.21.105 — dernier envoi de l'event SSE `stats`.
         let mut last_stats: Option<std::time::Instant> = None;
+        // 2.21.130 — passes consécutives qui n'ont rien décodé.
+        let mut idle_passes = 0u32;
         loop {
             {
                 let traces = state.inner.live_traces.traces.lock().unwrap();
@@ -3050,14 +3228,15 @@ pub(crate) fn start_reader(state: AppState) {
                 let state2 = state.clone();
                 let mut states = file_state;
                 let mut sessions = reader_sessions;
+                let mut dirs = ring_dirs;
                 let catchup = !initial_catchup_done;
                 let pass_started = std::time::Instant::now();
-                (file_state, reader_sessions) = tokio::task::spawn_blocking(move || {
+                (file_state, reader_sessions, ring_dirs) = tokio::task::spawn_blocking(move || {
                     let key = match event_schema::PseudonymKey::load_or_generate(
                         &event_schema::PseudonymKey::resolve_default_path(),
                     ) {
                         Ok(k) => k,
-                        Err(_) => return (states, sessions),
+                        Err(_) => return (states, sessions, dirs),
                     };
                     // 2.21.123 — le corps de la passe est `reader_pass`,
                     // testable sur un ring simulé.
@@ -3067,11 +3246,13 @@ pub(crate) fn start_reader(state: AppState) {
                         &state2.inner.live_traces,
                         &mut states,
                         &mut sessions,
+                        &mut dirs,
                         catchup,
                         full_redecode_requested(),
+                        std::time::Instant::now(),
                         &mut ThroughputHooks { state: &state2 },
                     );
-                    (states, sessions)
+                    (states, sessions, dirs)
                 })
                 .await
                 .unwrap_or_default();
@@ -3095,7 +3276,13 @@ pub(crate) fn start_reader(state: AppState) {
                 state.inner.live_traces.emit_stats();
                 last_stats = Some(std::time::Instant::now());
             }
-            tokio::time::sleep(Duration::from_millis(750)).await;
+            // 2.21.130 — cadence allongée quand rien ne change.
+            if state.inner.live_traces.reader_files_decoded_last_pass() == 0 {
+                idle_passes = idle_passes.saturating_add(1);
+            } else {
+                idle_passes = 0;
+            }
+            tokio::time::sleep(reader_interval(idle_passes)).await;
         }
     });
 }
@@ -3874,6 +4061,7 @@ mod tests {
             files: 2,
             bytes: 400,
             truncated: false,
+            duration_ms: 0,
         });
         assert!(!r.begin_seed(), "une trace n'est amorcée qu'une fois");
         {
@@ -6370,7 +6558,16 @@ mod tests {
         let registry = trace_on(&pseudonym);
         let mut states = HashMap::new();
         let mut sessions = HashMap::new();
+        let mut dirs = HashMap::new();
         let mut hooks = CountingHooks::default();
+        // 2.21.130 — les répertoires du ring n'ont pas bougé depuis
+        // longtemps : après le rattrapage, ils ne sont plus relus.
+        for plane in ["n3", "n2", "n4"] {
+            fs::File::open(root.join(plane))
+                .unwrap()
+                .set_modified(base + Duration::from_secs(10_000))
+                .unwrap();
+        }
         let gpdu = |registry: &LiveTraceRegistry| {
             let traces = registry.traces.lock().unwrap();
             let t = &traces["t"];
@@ -6382,20 +6579,32 @@ mod tests {
         };
 
         // Passe 1 — rattrapage : le plus récent de chaque plan seulement.
-        reader_pass(&root, &key, &registry, &mut states, &mut sessions, true, false, &mut hooks);
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, &mut dirs, true, false, std::time::Instant::now(), &mut hooks);
         assert_eq!(states.len(), 1_160, "la table suit tous les segments, sans être vidée");
         assert_eq!(hooks.files_decoded, 3, "un segment par plan actif");
         assert_eq!(gpdu(&registry), (gpdus_per_segment, gpdus_per_segment));
         assert_eq!(reader(&registry)["files_tracked"], 1_160);
         assert_eq!(reader(&registry)["files_decoded_last_pass"], 3);
+        // 2.21.130 — seuls les deux segments les plus récents de chaque
+        // plan sont interrogés : 6 sur 1 160.
+        assert_eq!(reader(&registry)["files_examined_last_pass"], 6);
+        assert!(reader(&registry)["scan_ms"].is_u64());
+        assert!(reader(&registry)["interfaces"]["N3"]["decode_ms"].is_u64());
+        assert!(reader(&registry)["interfaces"]["N3"]["route_ms"].is_u64());
 
         // Passe 2 — rien n'a changé : rien n'est redécodé, rien n'est
         // recompté. Avant le correctif : 1 160 segments redécodés.
-        reader_pass(&root, &key, &registry, &mut states, &mut sessions, false, false, &mut hooks);
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, &mut dirs, false, false, std::time::Instant::now(), &mut hooks);
         assert_eq!(states.len(), 1_160);
         assert_eq!(hooks.files_decoded, 3, "aucun segment redécodé");
         assert_eq!(gpdu(&registry), (gpdus_per_segment, gpdus_per_segment), "aucun G-PDU recompté");
         assert_eq!(reader(&registry)["files_decoded_last_pass"], 0);
+        assert_eq!(
+            reader(&registry)["files_examined_last_pass"], 6,
+            "passe à vide : 6 segments interrogés, pas 1 160"
+        );
+        assert_eq!(dirs.len(), 3, "les trois répertoires sont suivis par leur date");
+        assert!(dirs.values().all(|dir| dir.recent.len() == 2 && dir.mtime.is_some()));
 
         // Passe 3 — le segment N3 courant grossit d'une section.
         {
@@ -6404,7 +6613,7 @@ mod tests {
             file.write_all(&n3_bytes).unwrap();
             file.set_modified(base + Duration::from_secs(5_000)).unwrap();
         }
-        reader_pass(&root, &key, &registry, &mut states, &mut sessions, false, false, &mut hooks);
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, &mut dirs, false, false, std::time::Instant::now(), &mut hooks);
         assert_eq!(hooks.files_decoded, 4, "un seul segment décodé : celui qui a grossi");
         assert_eq!(states.len(), 1_160);
         let io = reader(&registry);
@@ -6428,7 +6637,7 @@ mod tests {
         // Un segment ancien disparaît (rotation du ring) : il quitte la
         // table, sans alerte d'octets perdus puisqu'il était consommé.
         fs::remove_file(root.join("n3").join("n3_00000.pcapng")).unwrap();
-        reader_pass(&root, &key, &registry, &mut states, &mut sessions, false, false, &mut hooks);
+        reader_pass(&root, &key, &registry, &mut states, &mut sessions, &mut dirs, false, false, std::time::Instant::now(), &mut hooks);
         assert_eq!(states.len(), 1_159);
         assert_eq!(hooks.gap_bytes, 0);
         assert_eq!(hooks.files_decoded, 4);
@@ -6676,6 +6885,121 @@ mod tests {
         assert_eq!(counts, vec![70, 68, 67, 69, 65], "comptes par abonné, stables");
     }
 
+    /// 2.21.130 (recette lab 2.21.114, ordre #9 7052731132) — un plan sans
+    /// reprise à l'offset (SBI) n'est redécodé en entier qu'une fois par
+    /// intervalle, et la rotation du ring ne perd rien : les derniers
+    /// octets du segment précédent sont lus après l'arrivée du suivant.
+    #[test]
+    fn reader_pass_throttles_full_redecode_and_follows_rotation_2_21_130() {
+        let capture = fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap",
+        ))
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "oiran-reader-throttle-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sbi")).unwrap();
+        let first = root.join("sbi").join("sbi_00000.pcapng");
+        fs::write(&first, &capture).unwrap();
+        // Un enregistrement pcap de plus : le segment grossit.
+        let grow = |path: &std::path::Path| {
+            use std::io::Write;
+            let mut file = fs::File::options().append(true).open(path).unwrap();
+            let mut record = Vec::new();
+            record.extend_from_slice(&1_795_000_000u32.to_le_bytes());
+            record.extend_from_slice(&0u32.to_le_bytes());
+            record.extend_from_slice(&20u32.to_le_bytes());
+            record.extend_from_slice(&20u32.to_le_bytes());
+            record.extend_from_slice(&[0u8; 20]);
+            file.write_all(&record).unwrap();
+        };
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let registry = trace_on("psn-none");
+        let mut states = HashMap::new();
+        let mut sessions = HashMap::new();
+        let mut dirs = HashMap::new();
+        let mut hooks = CountingHooks::default();
+        let t0 = std::time::Instant::now();
+        let mut pass = |after: Duration, catchup: bool, hooks: &mut CountingHooks| {
+            reader_pass(&root, &key, &registry, &mut states, &mut sessions, &mut dirs, catchup, false, t0 + after, hooks);
+            let traces = registry.traces.lock().unwrap();
+            registry.stats_payload(&traces["t"].trace)["reader"].clone()
+        };
+        let io = pass(Duration::ZERO, true, &mut hooks);
+        assert_eq!(hooks.files_decoded, 1, "le segment SBI courant est décodé au rattrapage");
+        assert_eq!(io["interfaces"]["SBI"]["incremental"], false);
+        // Le segment change 1 s plus tard : redécodage reporté.
+        grow(&first);
+        let io = pass(Duration::from_secs(1), false, &mut hooks);
+        assert_eq!(hooks.files_decoded, 1, "redécodage intégral reporté");
+        assert_eq!(io["interfaces"]["SBI"]["throttled"], 1);
+        assert_eq!(io["files_decoded_last_pass"], 0);
+        // Passé l'intervalle, il est redécodé.
+        let io = pass(Duration::from_secs(4), false, &mut hooks);
+        assert_eq!(hooks.files_decoded, 2);
+        assert_eq!(io["files_decoded_last_pass"], 1);
+        // Rotation : le segment précédent reçoit ses derniers octets, un
+        // nouveau segment arrive. Les deux sont lus ; le précédent n'est
+        // pas borné par la cadence (il n'est plus le segment courant).
+        grow(&first);
+        let second = root.join("sbi").join("sbi_00001.pcapng");
+        fs::write(&second, &capture).unwrap();
+        let _ = pass(Duration::from_secs(5), false, &mut hooks);
+        assert_eq!(hooks.files_decoded, 4, "dernier état du segment précédent + nouveau segment");
+        assert_eq!(hooks.gap_bytes, 0);
+        // Passe à vide.
+        let io = pass(Duration::from_secs(20), false, &mut hooks);
+        assert_eq!(hooks.files_decoded, 4);
+        assert_eq!(io["files_examined_last_pass"], 2);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(reader_interval(0), Duration::from_millis(750));
+        assert_eq!(reader_interval(1), Duration::from_millis(1_500));
+        assert_eq!(reader_interval(2), Duration::from_millis(3_000));
+        assert_eq!(reader_interval(40), Duration::from_millis(3_000));
+    }
+
+    /// 2.21.130 (recette lab : 201 Mo et 3 333 fichiers relus à chaque
+    /// ouverture de trace) — l'amorçage ne relit que les trois segments
+    /// les plus récents de chaque plan de signalisation, et le dit.
+    #[test]
+    fn seed_from_ring_reads_only_the_newest_segments_of_each_plane_2_21_130() {
+        let datasets = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let root = std::env::temp_dir().join(format!(
+            "oiran-seed-bound-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for (plane, count) in [("n2", 40u64), ("n4", 2)] {
+            let bytes = fs::read(datasets.join(format!("{}.pcapng", plane.to_ascii_uppercase()))).unwrap();
+            fs::create_dir_all(root.join(plane)).unwrap();
+            for index in 0..count {
+                fs::write(root.join(plane).join(format!("{plane}_{index:05}.pcapng")), &bytes).unwrap();
+            }
+        }
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let registry = trace_on("psn-none");
+        assert!(registry.begin_seed());
+        let report = seed_from_ring(&root, &key, &registry);
+        registry.finish_seed(&report);
+        assert_eq!(report.files, 3 + 2, "3 segments N2 sur 40, 2 segments N4 sur 2");
+        assert!(report.truncated, "des segments N2 plus anciens sont laissés de côté");
+        let n2_len = fs::metadata(root.join("n2").join("n2_00039.pcapng")).unwrap().len();
+        let n4_len = fs::metadata(root.join("n4").join("n4_00001.pcapng")).unwrap().len();
+        assert_eq!(report.bytes, 3 * n2_len + 2 * n4_len);
+        let traces = registry.traces.lock().unwrap();
+        let seed = &traces["t"].trace.seed;
+        assert!(seed.done && seed.truncated && seed.files == 5);
+        let stats = registry.stats_payload(&traces["t"].trace);
+        assert!(stats["seed"]["duration_ms"].is_u64());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// 2.21.120 (lot B1) — le lecteur reprend aussi à l'offset sur le
     /// plan N2 : capture N2 réelle du dépôt écrite en trois fois, somme
     /// des octets décodés = taille du fichier, events = décodage
@@ -6800,6 +7124,7 @@ mod tests {
                 bytes_decoded: 1_500,
                 bytes_file: 30_000_000,
                 incremental: true,
+                ..ReaderIo::default()
             },
         )]));
         // Une passe sans décodage garde le dernier relevé.

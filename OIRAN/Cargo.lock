@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.129"
+version = "2.21.130"
 dependencies = [
  "axum",
  "callflow-renderer",

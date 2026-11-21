@@ -217,6 +217,9 @@ pub(crate) struct PcapFileState {
     /// < filigrane, mais event_id nouveau) avec `late:true`, et ne le
     /// voit pas deux fois si le fichier est re-décodé.
     pub routed_event_ids: std::collections::HashSet<String>,
+    /// 2.21.130 — instant du dernier décodage intégral de ce segment
+    /// (plans sans reprise à l'offset) : borne la cadence du redécodage.
+    pub last_decoded_at: Option<std::time::Instant>,
 }
 
 impl PcapFileState {
@@ -895,6 +898,7 @@ mod tests {
             last_packet_number: 0,
             last_event_id: String::new(),
             routed_event_ids: Default::default(),
+            last_decoded_at: None,
         };
         // 3 polls avec (size, mtime) identiques → 0 incrément.
         for _ in 0..3 {
@@ -924,6 +928,7 @@ mod tests {
             last_packet_number: 0,
             last_event_id: String::new(),
             routed_event_ids: Default::default(),
+            last_decoded_at: None,
         };
         let gap = prev.size.saturating_sub(prev.consumed_bytes);
         if gap > 0 {
@@ -946,6 +951,7 @@ mod tests {
             last_packet_number: 0,
             last_event_id: String::new(),
             routed_event_ids: Default::default(),
+            last_decoded_at: None,
         };
         let gap = prev.size.saturating_sub(prev.consumed_bytes);
         if gap > 0 {
