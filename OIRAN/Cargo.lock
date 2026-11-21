@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-rtp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "event-schema",
 ]
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.131"
+version = "2.21.132"
 dependencies = [
  "axum",
  "callflow-renderer",

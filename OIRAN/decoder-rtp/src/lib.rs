@@ -113,6 +113,20 @@ pub struct RtpFlowAggregator {
     endpoint_clock_rate: BTreeMap<(String, u16), u32>,
 }
 
+/// 0.3.1 — écrit une ligne dans le journal du service (sortie d'erreur).
+/// En test, la ligne est aussi gardée, pour vérifier ce que le journal
+/// porte.
+fn journal(line: &str) {
+    #[cfg(test)]
+    JOURNAL.with(|lines| lines.borrow_mut().push(line.to_owned()));
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOURNAL: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Default for RtpFlowAggregator {
     fn default() -> Self {
         Self::new()
@@ -399,10 +413,16 @@ impl RtpFlowAggregator {
                 // `serde_json` depuis decoder-rtp. Tous les champs sont
                 // numériques ou ASCII déjà échappés par les décodeurs amont
                 // (ssrc hex, IPv4 dotted-quad, u16 ports).
-                eprintln!(
-                    "{{\"event\":\"RTP_LOSS_NEGATIVE_APPARENT\",\"capture_id\":\"{}\",\"interface\":\"{}\",\"ssrc\":\"0x{:08x}\",\"source_ip\":\"{}\",\"source_port\":{},\"destination_ip\":\"{}\",\"destination_port\":{},\"expected_packets\":{},\"observed_packets\":{},\"loss_apparent\":{},\"reason\":\"candidate_collision_or_double_count\"}}",
-                    capture_id, interface, ssrc, source_ip, source_port, destination_ip, destination_port, expected_packets, state.packets, loss_apparent_i64
-                );
+// 0.3.1 (oiran-api 2.21.132, ordre #9 7059947810) — le
+                // journal ne porte AUCUNE adresse : ni IP, ni port. Il
+                // désigne le flux par son SSRC, dans sa capture et sur son
+                // interface. Avant, les adresses source et destination
+                // (l'IP de l'UE) y étaient écrites en clair, et l'instantané
+                // de 2.21.131 aurait répété la ligne toutes les 5 s.
+                journal(&format!(
+                    "{{\"event\":\"RTP_LOSS_NEGATIVE_APPARENT\",\"capture_id\":\"{}\",\"interface\":\"{}\",\"ssrc\":\"0x{:08x}\",\"expected_packets\":{},\"observed_packets\":{},\"loss_apparent\":{},\"reason\":\"candidate_collision_or_double_count\"}}",
+                    capture_id, interface, ssrc, expected_packets, state.packets, loss_apparent_i64
+                ));
             }
             // 2.21.79 — conversion ticks RTP → ns pour l'émission. Si
             // l'horloge est inconnue, `jitter_ns` sort en `null` + une
@@ -1128,6 +1148,55 @@ mod tests {
             assert_eq!(loss_count, 0, "flux contigu ⇒ loss_count=0");
             assert_eq!(loss_apparent, 0, "flux contigu ⇒ loss_apparent=0");
         }
+    }
+
+    /// 0.3.1 (oiran-api 2.21.132, ordre #9 7059947810) — le journal d'une
+    /// perte apparente négative (ici : un paquet RTP reçu deux fois) ne
+    /// porte aucune adresse IP ni aucun port ; il garde le SSRC,
+    /// l'interface et les comptes. Avant : `source_ip` et `destination_ip`
+    /// en clair, soit l'adresse de l'UE.
+    #[test]
+    fn negative_apparent_loss_is_journaled_without_any_address_2_21_132() {
+        JOURNAL.with(|lines| lines.borrow_mut().clear());
+        let mut agg = RtpFlowAggregator::new();
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.45.0.7".into(),
+            port: 49170,
+            call_id: "cid-test".into(),
+            payload_type: Some(0),
+            clock_rate_hz: None,
+        });
+        // Séquences 0, 1, 1, 2 : quatre paquets observés pour trois attendus.
+        for (idx, seq) in [0u16, 1, 1, 2].iter().enumerate() {
+            let pkt = rtp_packet(0, *seq, 100 + *seq as u32 * 160, 0xcafebabe, &[0xcc; 160]);
+            agg.observe_rtp(
+                "10.46.0.9", 40000, "10.45.0.7", 49170,
+                &pkt, 1_000_000 * idx as u64,
+                &pr(1 + idx as u64), &ts(1_000_000 * idx as u64),
+            );
+        }
+        let events = agg.finish("sha256:cap", "IMS");
+        assert_eq!(events.len(), 1);
+        let apparent = events[0]
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "loss_apparent")
+            .and_then(|ie| ie.value.clone())
+            .unwrap();
+        assert_eq!(apparent, "-1");
+        let lines = JOURNAL.with(|lines| lines.borrow().clone());
+        assert_eq!(lines.len(), 1, "une ligne de journal : {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("\"event\":\"RTP_LOSS_NEGATIVE_APPARENT\""));
+        assert!(line.contains("\"ssrc\":\"0xcafebabe\""));
+        assert!(line.contains("\"interface\":\"IMS\""));
+        assert!(line.contains("\"expected_packets\":3") && line.contains("\"observed_packets\":4"));
+        assert!(line.contains("\"loss_apparent\":-1"));
+        for forbidden in ["10.45.0.7", "10.46.0.9", "49170", "40000", "_ip", "_port", "cid-test"] {
+            assert!(!line.contains(forbidden), "le journal porte {forbidden} : {line}");
+        }
+        // Le journal est du JSON sur une ligne.
+        assert!(line.starts_with('{') && line.ends_with('}') && !line.contains('\n'));
     }
 
     /// 2.21.100 — `loss_apparent` est signé et exposé en IE à côté de

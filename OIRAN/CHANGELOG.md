@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.132, decoder-rtp 0.3.1 — 2026-11-21 — journal RTP sans adresse IP (ordre #9 7059947810)
+
+Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.131 @ `4477c9d`. Branches `fix/oiran-2.21.132-rtp-journal-no-ip` et `fix/oiran-2.21.121-train`. Seul `decoder-rtp/src/lib.rs` change (plus versions et locks).
+
+### Défaut
+
+Depuis 2.21.100, `decoder-rtp` journalise `RTP_LOSS_NEGATIVE_APPARENT` (un flux dont on observe plus de paquets qu'attendu) avec `source_ip`, `source_port`, `destination_ip`, `destination_port` **en clair** : l'adresse de l'UE dans le journal du service. Avec l'instantané de 2.21.131, la ligne se serait répétée toutes les 5 s pour un flux concerné.
+
+### Correctif
+
+La ligne ne porte plus aucune adresse ni aucun port. Elle garde `capture_id`, `interface`, `ssrc`, `expected_packets`, `observed_packets`, `loss_apparent`, `reason`. Le flux reste désigné par son SSRC dans sa capture.
+
+### Audit des autres journaux (`git grep -n -E "eprintln!|println!|warn!\(|info!\(|error!\("`)
+
+- `decoder-sip`, `decoder-pfcp`, `decoder-gtpu`, `decoder-ngap`, `decoder-nas`, `decoder-sbi`, `decoder-s1ap`, `decoder-diameter`, `decoder-gtpv2c`, `transport-*`, `capture-pcap`, `correlation-engine` (bibliothèque) : **aucun journal**.
+- `live-probe/src/lib.rs`, `apps/api/src/*.rs`, `session-engine`, `capture-helper`, `oiran-decode`, `event-schema` : les journaux portent des chemins de segment, des tailles, des empreintes, des compteurs, des textes d'erreur. **Aucun n'écrit une adresse IP, un TEID ou un Call-ID.**
+- `apps/api/src/lib.rs` journalise un `session_id` (`SUBSCRIBER_JOURNEY_LTE_CALLFLOW_SKIPPED`) : il est construit sur le pseudonyme de l'abonné, pas sur une identité.
+- **Non vérifié** : le contenu des textes d'erreur (`reason={error}`, `"error": error`) passés tels quels au journal — ils viennent de `std::io`, du décodeur de capture et de `serde_json` ; je n'ai pas lu chaque message possible. Les binaires d'outillage (`ngap_decode_hex`, `evidence-replay`, exemples, bancs) écrivent ce qu'on leur donne : hors service.
+- `decoder-rtp` : c'était son seul journal.
+
+### Changement de comportement
+
+Le champ `decoder_version` des events de flux RTP passe de `0.3.0` à `0.3.1`. Un outil qui lisait `source_ip` / `destination_ip` dans cette ligne de journal ne les trouve plus.
+
+### Test — échec avant, succès après
+
+`negative_apparent_loss_is_journaled_without_any_address_2_21_132` : un paquet RTP reçu deux fois (4 observés pour 3 attendus) ; la ligne journalisée est capturée ; elle porte l'event, le SSRC, l'interface et les comptes, et aucune des deux adresses, aucun port, aucun champ `_ip` / `_port`, pas le Call-ID. Avec la ligne de 2.21.131 : le test échoue sur l'adresse.
+
 ## oiran-api 2.21.131, oiran-decode 0.12.0, decoder-rtp 0.3.0 — 2026-11-21 — lecteur live : reprise à l'offset sur IMS et N6, flux RTP montré toutes les 5 s (lot B2, design #9 7050841418, GO #9 7050925249)
 
 Upgrade **mineur** de `oiran-decode` et `decoder-rtp` (API ajoutée), **patch** de `oiran-api`, sans déploiement, un commit au-dessus de 2.21.130 @ `e5af59a`. Branches `fix/oiran-2.21.131-b2-ims-n6-rtp-snapshot` et `fix/oiran-2.21.121-train`.
