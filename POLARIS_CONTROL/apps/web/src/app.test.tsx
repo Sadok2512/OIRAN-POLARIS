@@ -78,6 +78,7 @@ describe('POLARIS Control shell', () => {
     const projected = maskSubscriberIdentity(raw);
     expect(projected).toBe('…0201');
     expect(projected).not.toContain(raw.replace(/^imsi-/, ''));
+    expect(maskSubscriberIdentity('…0201')).toBe('…0201');
     expect(maskSubscriberIdentity('not-an-identity')).toBe('PROTECTED');
   });
   it('B11 never invents an absent UERANSIM state', () => expect(reportedState('UNKNOWN')).toBe('-- (non rapporté par UERANSIM)'));

@@ -4,7 +4,7 @@
 
 - `/ues`, les profils UE, les vues abonnés et Activity JSON/SSE projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
 - `subscriber_identity_exposed` reste faux et aucun MSISDN n'est projeté par ces routes GET.
-- Le helper web remasque défensivement toute identité et refuse une valeur non conforme ; les tests scannent un corps multi-UE complet pour chaque rôle.
+- Le helper web conserve une valeur déjà masquée conforme, remasque défensivement toute identité brute et refuse une valeur non conforme ; les tests scannent un corps multi-UE complet pour chaque rôle.
 - Les secrets d'authentification restent protégés ; les mutations et la route POST de lookup existante sont inchangées.
 
 ## 0.36.19 — 2026-11-21 — Stop UE cohérent avec le contexte gNB (patch)
