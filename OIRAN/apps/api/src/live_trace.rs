@@ -109,6 +109,10 @@ pub(crate) struct LiveTrace {
     /// 2.21.131 — révisions de flux RTP émises après la première.
     #[serde(default)]
     rtp_flow_updates: u64,
+    /// 2.21.134 — établissements PFCP refusés parce qu'ils reprennent un
+    /// tunnel ou un SEID déjà connu de la trace (session antérieure).
+    #[serde(default)]
+    pfcp_establishment_reused_identifiers: u64,
     /// 2.21.119 — libérations d'une session nommée dont aucun tunnel
     /// n'était rangé par session : rien n'a pu être oublié.
     #[serde(default)]
@@ -276,6 +280,9 @@ fn seed_from_ring(
 ) -> SeedReport {
     let started = std::time::Instant::now();
     let mut report = SeedReport::default();
+    // 2.21.134 (question 1 du cœur, ordre #9 7060289296) — les events de
+    // tous les plans sont rejoués ensemble, dans l'ordre du temps.
+    let mut history: Vec<event_schema::NormalizedEvent> = Vec::new();
     for interface in SEED_INTERFACES {
         let dir = root.join(ring_directory(interface));
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -325,15 +332,30 @@ fn seed_from_ring(
                 Ok(())
             });
             sort_by_capture_order(&mut events);
-            for event in &events {
-                registry.learn_from_ring(event);
-            }
+            history.append(&mut events);
             report.files += 1;
             report.bytes = report.bytes.saturating_add(size);
         }
     }
+    learn_history(registry, history);
     report.duration_ms = started.elapsed().as_millis() as u64;
     report
+}
+
+/// 2.21.134 (question 1 du cœur, ordre #9 7060289296) — rejoue un
+/// historique de plusieurs plans dans l'ordre du TEMPS de capture, tri
+/// stable : à horodatage égal, l'ordre des plans puis l'ordre de la
+/// capture. Avant : plan par plan (N2 en entier, puis N4…) ; une fin de
+/// session vue sur un plan n'effaçait pas ce qu'un plan relu ensuite
+/// apprenait de la même session, et l'établissement PFCP passait APRÈS le
+/// N2 qui porte ses tunnels — il s'y rattachait directement, ce que la
+/// règle d'établissement de 2.21.134 interdit. Dans l'ordre réel, il est
+/// rattaché après coup, comme en live.
+fn learn_history(registry: &LiveTraceRegistry, mut history: Vec<event_schema::NormalizedEvent>) {
+    history.sort_by_key(|event| (event.timestamp.seconds, event.timestamp.nanoseconds));
+    for event in &history {
+        registry.learn_from_ring(event);
+    }
 }
 
 #[derive(Clone)]
@@ -458,6 +480,12 @@ struct TraceState {
     /// 2.21.131 (lot B2) — flux RTP déjà émis : `stable_event_key` →
     /// `(révision, event_id de cette révision)`.
     rtp_flow_revisions: HashMap<String, (u64, String)>,
+    /// 2.21.134 — établissements PFCP de l'abonné rattachés :
+    /// `(numéro de séquence, nœud, nœud)` ; leur réponse s'y rattache.
+    pfcp_establishments: HashSet<(String, String, String)>,
+    /// 2.21.134 — tunnel (TEID) ou SEID de l'abonné → seconde de capture
+    /// du dernier event rattaché qui le portait.
+    identifier_seen_at: HashMap<String, i64>,
     /// 2.21.109 (ordre #9 7050201220) — identifiants UE de signalisation
     /// appris sur les events routés : `(nom, valeur, association)` avec
     /// `nom` ∈ amf_ue_ngap_id / ran_ue_ngap_id / mme_ue_s1ap_id /
@@ -880,6 +908,70 @@ fn forget_technical_state(state: &mut TraceState) {
     state.match_keys.forget_event_references();
 }
 
+/// 2.21.134 (cas 4, ordre #9 7060289296) — oublie la session antérieure
+/// à laquelle appartiennent ces identifiants (TEID, SEID) : ses SEID, les
+/// tunnels rangés sous eux, et la session de données qui range l'un de
+/// ses tunnels, avec tous les tunnels de celle-ci.
+fn forget_earlier_session(state: &mut TraceState, identifiers: &HashSet<String>) {
+    let mut seids: HashSet<String> = identifiers
+        .iter()
+        .filter(|identifier| state.seids.contains(*identifier) || state.seid_tunnels.contains_key(*identifier))
+        .cloned()
+        .collect();
+    let mut teids: HashSet<String> = identifiers.clone();
+    // Tunnels rangés sous ces SEID.
+    for seid in &seids {
+        if let Some(pairs) = state.seid_tunnels.get(seid) {
+            teids.extend(pairs.iter().map(|pair| pair.1.clone()));
+        }
+    }
+    // Sessions de données qui rangent l'un de ces tunnels : tous leurs
+    // tunnels.
+    let sessions: Vec<String> = state
+        .session_tunnels
+        .iter()
+        .filter(|(_, tunnels)| tunnels.iter().any(|(_, teid)| teids.contains(teid)))
+        .map(|(session, _)| session.clone())
+        .collect();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for session in sessions {
+        if let Some(tunnels) = state.session_tunnels.remove(&session) {
+            for (address, teid) in tunnels {
+                teids.insert(teid.clone());
+                if let Some(address) = address {
+                    pairs.push((address, teid));
+                }
+            }
+        }
+    }
+    // SEID qui rangent l'un de ces tunnels.
+    for (seid, filed) in &state.seid_tunnels {
+        if filed.iter().any(|pair| teids.contains(&pair.1)) {
+            seids.insert(seid.clone());
+        }
+    }
+    for seid in &seids {
+        if let Some(filed) = state.seid_tunnels.remove(seid) {
+            pairs.extend(filed);
+        }
+        state.seids.remove(seid);
+        state.seid_endpoints.retain(|pair| &pair.1 != seid);
+        state.identifier_seen_at.remove(seid);
+    }
+    pairs.extend(
+        state
+            .tunnel_endpoints
+            .iter()
+            .filter(|pair| teids.contains(&pair.1))
+            .cloned(),
+    );
+    forget_tunnel_pairs(state, &pairs);
+    for teid in &teids {
+        state.tunnel_teids.remove(teid);
+        state.identifier_seen_at.remove(teid);
+    }
+}
+
 fn forget_tunnel_pairs(state: &mut TraceState, pairs: &[(String, String)]) {
     for pair in pairs {
         state.core_tunnel_endpoints.remove(pair);
@@ -1076,6 +1168,9 @@ pub(crate) struct LiveTraceRegistry {
     /// 2.21.124 — derniers messages PFCP de session rejetés par au moins
     /// une trace (l'établissement précède l'apprentissage des tunnels).
     recent_rejected_pfcp: Mutex<VecDeque<event_schema::NormalizedEvent>>,
+    /// 2.21.134 — même tampon, propre à l'amorçage : jamais mêlé au live,
+    /// vidé à chaque début et fin d'amorçage.
+    seed_rejected_pfcp: Mutex<VecDeque<event_schema::NormalizedEvent>>,
 }
 
 impl LiveTraceRegistry {
@@ -1093,6 +1188,7 @@ impl LiveTraceRegistry {
             reader_files_examined: AtomicU64::new(0),
             recent_rejected: Mutex::new(VecDeque::new()),
             recent_rejected_pfcp: Mutex::new(VecDeque::new()),
+            seed_rejected_pfcp: Mutex::new(VecDeque::new()),
         }
     }
     pub(crate) fn audit(&self, entry: Value) {
@@ -1133,6 +1229,7 @@ impl LiveTraceRegistry {
     /// `needs_seed` et sera amorcée à la passe suivante. Retourne
     /// `true` si au moins une trace est à amorcer.
     pub(crate) fn begin_seed(&self) -> bool {
+        self.seed_rejected_pfcp.lock().unwrap().clear();
         let mut traces = self.traces.lock().unwrap();
         let mut any = false;
         for state in traces.values_mut() {
@@ -1148,6 +1245,7 @@ impl LiveTraceRegistry {
     /// 2.21.105 — clôt la passe d'amorçage et publie son bilan dans
     /// l'état de chaque trace amorcée.
     pub(crate) fn finish_seed(&self, report: &SeedReport) {
+        self.seed_rejected_pfcp.lock().unwrap().clear();
         let mut traces = self.traces.lock().unwrap();
         for state in traces.values_mut() {
             if state.seeding {
@@ -1189,6 +1287,7 @@ impl LiveTraceRegistry {
                 "attached_seid_only": trace.pfcp_attached_seid_only,
                 "attached_after_the_fact": trace.pfcp_attached_after_the_fact,
                 "attached_by_ue_ip": trace.pfcp_attached_by_ue_ip,
+                "establishment_reused_identifiers": trace.pfcp_establishment_reused_identifiers,
             },
             "sip": {
                 "attached_by_ue_ip": trace.sip_attached_by_ue_ip,
@@ -1249,15 +1348,6 @@ impl LiveTraceRegistry {
     }
 
     /// 2.21.124 — compteur des PFCP rattachés après coup d'une trace.
-    fn pfcp_after_the_fact(&self, trace_id: &str) -> u64 {
-        self.traces
-            .lock()
-            .unwrap()
-            .get(trace_id)
-            .map(|state| state.trace.pfcp_attached_after_the_fact)
-            .unwrap_or(0)
-    }
-
     pub(crate) fn bump_resume_resets(&self) {
         self.resume_resets.fetch_add(1, Ordering::Relaxed);
     }
@@ -1391,6 +1481,19 @@ impl LiveTraceRegistry {
         force_trace: Option<&str>,
         forced: bool,
     ) {
+        self.route_event_with(event, seed_only, force_trace, forced);
+    }
+
+    /// 2.21.134 — même rattachement ; rend le nombre de traces qui ont pris
+    /// l'event (mesure du rattachement après coup, amorçage compris).
+    fn route_event_with(
+        &self,
+        event: &event_schema::NormalizedEvent,
+        seed_only: bool,
+        force_trace: Option<&str>,
+        forced: bool,
+    ) -> usize {
+        let mut attached_here = 0usize;
         let targeted = force_trace.is_some();
         let forced = forced && targeted;
         let mut retry_pfcp_for: Vec<String> = Vec::new();
@@ -1408,7 +1511,7 @@ impl LiveTraceRegistry {
         if event.protocol.as_str() == "PFCP"
             && (is_pfcp_node_message(&event.message_name) || (1..50).contains(&event.message_type))
         {
-            return;
+            return attached_here;
         }
         let value = serde_json::from_str(&event.to_json()).unwrap_or(Value::Null);
         // 2.21.109 — rattachement par égalité sur champs typés ; plus
@@ -1590,6 +1693,23 @@ impl LiveTraceRegistry {
                 .any(|ie| ie.trim().to_ascii_uppercase().ends_with(" BYE"));
         let ev_equipment_pseudonyms = equipment_pseudonyms(event);
         let ev_ue_ip_pseudonyms = ue_ip_pseudonyms(event);
+        // 2.21.134 (cas 4, ordre #9 7060289296) — établissement d'une
+        // session PFCP, et sa clé `(séquence, nœud, nœud)`.
+        let pfcp_name = compact_name(&event.message_name);
+        let is_establishment_request = event.protocol.as_str() == "PFCP"
+            && pfcp_name.ends_with("sessionestablishmentrequest");
+        let is_establishment_response = event.protocol.as_str() == "PFCP"
+            && pfcp_name.ends_with("sessionestablishmentresponse");
+        let establishment_key: Option<(String, String, String)> =
+            session_ids_named(&value, "pfcp_sequence").first().map(|sequence| {
+                let mut nodes = [
+                    event.source_endpoint.address.clone(),
+                    event.destination_endpoint.address.clone(),
+                ];
+                nodes.sort();
+                let [a, b] = nodes;
+                ((*sequence).to_owned(), a, b)
+            });
         // 2.21.129 — identités d'abonné portées par l'event (hors
         // pseudonymes d'équipement), et ouverture d'un nouveau contexte UE.
         let ev_subscriber_pseudonyms: Vec<String> = session_ids_named(&value, "subscriber_pseudonym")
@@ -1780,6 +1900,70 @@ impl LiveTraceRegistry {
                 || match_teid
                 || match_tunnel
                 || match_ue_id;
+            // 2.21.134 (cas 4 de la sonde CLAUDE2 #9 7060169092, ordre #9
+            // 7060289296) — un établissement PFCP crée une session NEUVE.
+            // S'il porte un tunnel ou un SEID que la trace connaît d'un event
+            // de l'abonné vieux de plus de 10 s, c'est l'identifiant d'une
+            // session antérieure, réattribué : il ne rattache pas
+            // l'établissement, et la trace l'oublie. L'établissement entre
+            // alors par une identité de l'abonné, par l'IP de son UE (IE 93),
+            // ou après coup par les identifiants frais qu'apporte le N2 de
+            // l'abonné ; sa réponse, aussi quand la requête de même
+            // séquence a été rattachée. Un tunnel appris dans les 10 s (le
+            // N2 de la même procédure) reste admis.
+            let is_establishment = is_establishment_request || is_establishment_response;
+            // Identifiants portés par l'établissement que la trace connaît
+            // d'un event de l'abonné vieux de plus de 10 s.
+            let carries_reused_identifier = is_establishment
+                && ev_header_seid_pairs
+                    .iter()
+                    .chain(ev_ie_seid_pairs.iter())
+                    .chain(ev_tunnel_pairs.iter())
+                    .map(|pair| &pair.1)
+                    .chain(ev_seids_ie.iter())
+                    .chain(ev_session_seids.iter())
+                    .chain(ev_teids.iter())
+                    .chain(ev_session_teids.iter())
+                    .any(|identifier| {
+                        state.identifier_seen_at.get(identifier).is_some_and(|seen| {
+                            (event.timestamp.seconds - seen).abs() > AFTER_THE_FACT_MAX_AGE_S
+                        })
+                    });
+            let establishment_ok = forced
+                || match_pseudo
+                || match_ue_ip
+                || state.match_keys.any_identity_in(&tokens)
+                || (is_establishment_response
+                    && establishment_key
+                        .as_ref()
+                        .is_some_and(|key| state.pfcp_establishments.contains(key)))
+                || !carries_reused_identifier;
+            let reused_identifiers = is_establishment && matched && !establishment_ok;
+            let matched = matched && (!is_establishment || establishment_ok);
+            if reused_identifiers && !targeted {
+                // Les identifiants repris appartiennent désormais à une
+                // autre session : la session antérieure de la trace qui les
+                // portait est finie sans que la trace l'ait vu. Elle est
+                // oubliée en entier — ses tunnels côté accès radio compris,
+                // qu'un message de la nouvelle session reprendrait aussi.
+                let carried: HashSet<String> = ev_header_seid_pairs
+                    .iter()
+                    .chain(ev_ie_seid_pairs.iter())
+                    .chain(ev_tunnel_pairs.iter())
+                    .map(|pair| pair.1.clone())
+                    .chain(ev_seids_ie.iter().cloned())
+                    .chain(ev_session_seids.iter().cloned())
+                    .chain(ev_teids.iter().cloned())
+                    .chain(ev_session_teids.iter().cloned())
+                    .collect();
+                forget_earlier_session(state, &carried);
+                if !seed_only {
+                    state.trace.pfcp_establishment_reused_identifiers = state
+                        .trace
+                        .pfcp_establishment_reused_identifiers
+                        .saturating_add(1);
+                }
+            }
             // 2.21.129 (recette lab 2.21.124, G9 ; ordre #9 7053864526) —
             // garde d'identité. Un event reconnu SANS identité de
             // l'abonné (identifiant technique, ou parent déjà rattaché)
@@ -1887,18 +2071,27 @@ impl LiveTraceRegistry {
                         state.trace.fresh_registrations.saturating_add(1);
                 }
             }
+            attached_here += 1;
             if forced {
                 state.trace.parents_attached_after_child =
                     state.trace.parents_attached_after_child.saturating_add(1);
-            } else if targeted {
+            } else if targeted && !seed_only {
                 state.trace.pfcp_attached_after_the_fact =
                     state.trace.pfcp_attached_after_the_fact.saturating_add(1);
+            }
+            if is_establishment_request {
+                if let Some(key) = &establishment_key {
+                    if state.pfcp_establishments.len() >= 256 {
+                        state.pfcp_establishments.clear();
+                    }
+                    state.pfcp_establishments.insert(key.clone());
+                }
             }
             // 2.21.124 — cet event apporte des SEID ou des tunnels : des
             // messages PFCP de la session, rejetés plus tôt, peuvent
             // maintenant être reconnus.
-            if !seed_only
-                && !(ev_header_seid_pairs.is_empty()
+            // 2.21.134 — aussi pendant l'amorçage, sur son propre tampon.
+            if !(ev_header_seid_pairs.is_empty()
                     && ev_ie_seid_pairs.is_empty()
                     && ev_tunnel_pairs.is_empty())
             {
@@ -2064,6 +2257,27 @@ impl LiveTraceRegistry {
             }
             for pair in ev_header_seid_pairs.iter().chain(ev_ie_seid_pairs.iter()) {
                 state.seid_endpoints.insert(pair.clone());
+            }
+            // 2.21.134 — dernière fois qu'un event de l'abonné a porté
+            // chacun de ses tunnels et SEID.
+            if state.identifier_seen_at.len() >= 8_192 {
+                state.identifier_seen_at.clear();
+            }
+            if event.protocol.as_str() != "GTP-U" {
+                for identifier in ev_header_seid_pairs
+                    .iter()
+                    .chain(ev_ie_seid_pairs.iter())
+                    .chain(ev_tunnel_pairs.iter())
+                    .map(|pair| &pair.1)
+                    .chain(ev_seids_ie.iter())
+                    .chain(ev_session_seids.iter())
+                    .chain(ev_teids.iter())
+                    .chain(ev_session_teids.iter())
+                {
+                    state
+                        .identifier_seen_at
+                        .insert(identifier.clone(), event.timestamp.seconds);
+                }
             }
             for pair in &ev_core_tunnel_pairs {
                 state.core_tunnel_endpoints.insert(pair.clone());
@@ -2583,7 +2797,7 @@ impl LiveTraceRegistry {
         }
         drop(traces);
         if seed_only {
-            return;
+            return attached_here;
         }
         // 2.21.124 (capture réelle à cinq abonnés) — rattachement après
         // coup des messages PFCP de la session. Dans la séquence réelle,
@@ -2592,10 +2806,15 @@ impl LiveTraceRegistry {
         // reconnaître. Dès qu'un event rattaché apporte des SEID ou des
         // tunnels, les PFCP rejetés récemment sont représentés à cette
         // trace, avec le test de rattachement ordinaire (pas de force).
+        let buffer = if seed_only { &self.seed_rejected_pfcp } else { &self.recent_rejected_pfcp };
+        // Un event représenté après coup ne relance pas lui-même de
+        // représentation : les enchaînements (la réponse après sa requête)
+        // sont couverts par les tours successifs ci-dessous.
+        let retry_pfcp_for = if targeted { Vec::new() } else { retry_pfcp_for };
         for trace_id in retry_pfcp_for {
             for _round in 0..4 {
                 let candidates: Vec<event_schema::NormalizedEvent> = {
-                    let recent = self.recent_rejected_pfcp.lock().unwrap();
+                    let recent = buffer.lock().unwrap();
                     let traces = self.traces.lock().unwrap();
                     match traces.get(&trace_id) {
                         Some(state) => recent
@@ -2617,17 +2836,18 @@ impl LiveTraceRegistry {
                 if candidates.is_empty() {
                     break;
                 }
-                let attached_before = self.pfcp_after_the_fact(&trace_id);
+                let mut attached = 0usize;
                 for candidate in &candidates {
-                    self.route_event_for(candidate, false, Some(&trace_id), false);
+                    attached +=
+                        self.route_event_with(candidate, seed_only, Some(&trace_id), false);
                 }
-                if self.pfcp_after_the_fact(&trace_id) == attached_before {
+                if attached == 0 {
                     break;
                 }
             }
         }
         if targeted {
-            return;
+            return attached_here;
         }
         // 2.21.129 (recette lab 2.21.124, G9) — l'AMORÇAGE n'alimente pas
         // les tampons du rattachement après coup. Avant : les PFCP de
@@ -2637,8 +2857,8 @@ impl LiveTraceRegistry {
         // représenter le PFCP d'une ANCIENNE session — émis comme un
         // message du moment — et en apprenait les tunnels et l'IP UE,
         // devenus ceux d'un autre abonné.
-        if rejected_by_a_trace && !seed_only && event.protocol.as_str() == "PFCP" {
-            let mut recent = self.recent_rejected_pfcp.lock().unwrap();
+        if rejected_by_a_trace && event.protocol.as_str() == "PFCP" {
+            let mut recent = buffer.lock().unwrap();
             recent.push_back(event.clone());
             while recent.len() > RECENT_REJECTED_PFCP {
                 recent.pop_front();
@@ -2665,12 +2885,14 @@ impl LiveTraceRegistry {
         for (trace_id, parent) in pending {
             self.route_event_for(&parent, false, Some(&trace_id), true);
         }
+        attached_here
     }
 }
 
 /// 2.21.124 — nombre de messages PFCP de session rejetés gardés pour un
 /// rattachement après coup.
 const RECENT_REJECTED_PFCP: usize = 256;
+
 
 /// 2.21.129 — écart maximal, en secondes de capture, entre un PFCP
 /// rejeté et l'event qui le fait reconnaître après coup.
@@ -3553,6 +3775,7 @@ pub(crate) async fn create(
         stale_state_resets: 0,
         fresh_registrations: 0,
         rtp_flow_updates: 0,
+        pfcp_establishment_reused_identifiers: 0,
         session_releases_without_filed_tunnels: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
@@ -3580,6 +3803,8 @@ pub(crate) async fn create(
             ue_ip_keys: HashMap::new(),
             parents_of_attached: HashSet::new(),
             rtp_flow_revisions: HashMap::new(),
+            pfcp_establishments: HashSet::new(),
+            identifier_seen_at: HashMap::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -3970,6 +4195,7 @@ mod tests {
                 stale_state_resets: 0,
                 fresh_registrations: 0,
                 rtp_flow_updates: 0,
+                pfcp_establishment_reused_identifiers: 0,
                 session_releases_without_filed_tunnels: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
@@ -3993,6 +4219,8 @@ mod tests {
             ue_ip_keys: HashMap::new(),
             parents_of_attached: HashSet::new(),
             rtp_flow_revisions: HashMap::new(),
+            pfcp_establishments: HashSet::new(),
+            identifier_seen_at: HashMap::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -4461,13 +4689,26 @@ mod tests {
                         .sum::<u64>()
                 })
                 .sum();
-            (s.trace.gpdu_seen, s.trace.gpdu_attached, total, report, s.trace.seed.clone())
+            (
+                s.trace.gpdu_seen,
+                s.trace.gpdu_attached,
+                total,
+                report,
+                s.trace.seed.clone(),
+                (s.seids.len(), s.seid_endpoints.len(), s.trace.pfcp_attached_after_the_fact),
+            )
         };
-        let (seen, attached, total, _, _) = run(false);
+        let (seen, attached, total, _, _, _) = run(false);
         assert_eq!(seen, gpdus.len() as u64);
         assert_eq!((attached, total), (0, 0), "sans amorçage : N vus, 0 rattaché, 0 bucket");
-        let (seen, attached, total, report, seed) = run(true);
+        let (seen, attached, total, report, seed, (seids, seid_pairs, after_the_fact)) = run(true);
         assert_eq!(report.files, 2, "N2 et N4 relus, jamais N3");
+        // 2.21.134 — amorçage dans l'ordre du temps : l'établissement PFCP
+        // passe avant le N2 qui porte ses tunnels, et il est rattaché après
+        // coup pendant l'amorçage. Les SEID de la session sont appris ; le
+        // compteur du rattachement après coup ne compte que le live.
+        assert!(seids > 0 && seid_pairs > 0, "SEID de la session appris à l'amorçage : {seids} / {seid_pairs}");
+        assert_eq!(after_the_fact, 0);
         assert!(!report.truncated);
         assert!(seed.done && seed.events_learned > 0);
         assert_eq!(seen, gpdus.len() as u64);
@@ -6211,9 +6452,14 @@ mod tests {
             }
             if let Some(history) = history {
                 assert!(r.begin_seed());
-                for e in history.iter().filter(|e| e.interface == "N2" || e.interface == "N4") {
-                    r.learn_from_ring(e);
-                }
+                learn_history(
+                    &r,
+                    history
+                        .iter()
+                        .filter(|e| e.interface == "N2" || e.interface == "N4")
+                        .cloned()
+                        .collect(),
+                );
                 r.finish_seed(&SeedReport::default());
             }
             for e in sequence {
@@ -6273,6 +6519,25 @@ mod tests {
         );
 
         // Cas 2 et 3 — rejeu avec les abonnés décalés d'un rang.
+        // Le rejeu est une autre capture : ses références d'event, y
+        // compris celles qu'une IE porte (le NAS cite son message NGAP),
+        // sont renommées comme ses `event_id`.
+        let rename_event_refs = |text: &str| -> String {
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text;
+            while let Some(at) = rest.find("evt-") {
+                out.push_str(&rest[..at]);
+                let id: String = rest[at..].chars().take(4 + 16).collect();
+                let is_ref = id.len() == 20 && id[4..].bytes().all(|b| b.is_ascii_hexdigit());
+                out.push_str(&id);
+                if is_ref {
+                    out.push_str("-bis");
+                }
+                rest = &rest[at + id.len()..];
+            }
+            out.push_str(rest);
+            out
+        };
         let swap = |text: &str| -> String {
             let mut out = text.to_owned();
             for (k, sub) in subs.iter().enumerate() {
@@ -6283,20 +6548,22 @@ mod tests {
             }
             out
         };
+        // Le rejeu est postérieur à l'historique : une heure plus tard.
         let replay: Vec<event_schema::NormalizedEvent> = events
             .iter()
             .map(|e| {
                 let mut e = e.clone();
+                e.timestamp.seconds += 3_600;
                 e.event_id = format!("{}-bis", e.event_id);
                 if let Some(parent) = e.parent_event_id.as_mut() {
                     *parent = format!("{parent}-bis");
                 }
                 for id in e.session_identifiers.iter_mut() {
-                    id.value = swap(&id.value);
+                    id.value = rename_event_refs(&swap(&id.value));
                 }
                 for ie in e.information_elements.iter_mut() {
                     if let Some(v) = ie.value.as_mut() {
-                        *v = swap(v);
+                        *v = rename_event_refs(&swap(v));
                     }
                 }
                 e
@@ -6322,6 +6589,41 @@ mod tests {
         // L'abonné dont l'ancien contexte UE est repris avant son propre
         // enregistrement voit son état périmé oublié.
         assert_eq!(seeded[0].4, 1);
+
+        // Cas 4 (sonde CLAUDE2 #9 7060169092, ordre #9 7060289296) — même
+        // rejeu, mais les identifiants UE NGAP sont NEUFS : ne restent
+        // repris que les tunnels et les SEID de l'historique. À 2.21.132,
+        // la trace de l'abonné dont l'historique porte ces tunnels prend
+        // les deux messages d'établissement PFCP de l'abonné suivant.
+        let fresh_ngap: Vec<event_schema::NormalizedEvent> = replay
+            .iter()
+            .map(|e| {
+                let mut e = e.clone();
+                for id in e.session_identifiers.iter_mut() {
+                    if id.name == "amf_ue_ngap_id" || id.name == "ran_ue_ngap_id" {
+                        id.value = format!("{}000", id.value);
+                    }
+                }
+                // Les IE NGAP portent aussi ces identifiants.
+                for ie in e.information_elements.iter_mut() {
+                    if let Some(v) = ie.value.as_mut() {
+                        for name in ["amf_ue_ngap_id", "ran_ue_ngap_id"] {
+                            let prefix = format!("{name}=");
+                            if let Some(rest) = v.strip_prefix(&prefix) {
+                                *v = format!("{prefix}{rest}000");
+                            }
+                        }
+                    }
+                }
+                e
+            })
+            .collect();
+        let case4 = run(&fresh_ngap, Some(&events), &truth_bis);
+        for (k, (_, foreign, missing, exposed, _)) in case4.iter().enumerate() {
+            assert_eq!(*foreign, 0, "cas 4, trace {k} : events d'un autre abonné : {case4:?}");
+            assert_eq!(*exposed, 0, "cas 4, trace {k} : pseudonyme d'un autre abonné : {case4:?}");
+            assert_eq!(*missing, 0, "cas 4, trace {k} : events de l'abonné perdus : {case4:?}");
+        }
     }
 
     /// 2.21.129 (recette lab 2.21.124, G9 : `pfcp.attached_after_the_fact`

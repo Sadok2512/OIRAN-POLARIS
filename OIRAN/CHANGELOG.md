@@ -1,5 +1,41 @@
 # Changelog
 
+## oiran-api 2.21.134 — 2026-11-21 — trace live : un établissement PFCP ne reprend plus la session antérieure de l'abonné (cas 4) ; amorçage dans l'ordre du temps (ordre #9 7060289296, design #9 7060312186)
+
+Upgrade **patch** sans déploiement, au-dessus du train @ `3159aad` (2.21.132 + fusion de 2.21.127). Branches `fix/oiran-2.21.134-train-next` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change.
+
+### Constat — cas 4 (sonde CLAUDE2 #9 7060169092)
+
+Historique amorcé, puis un autre abonné reprend les tunnels et les SEID d'une session antérieure de l'abonné tracé, avec des identifiants NGAP neufs : la trace de cet abonné prend des messages de l'autre (2 à 2.21.132 sur la sonde de CLAUDE2). Reproduit dans le dépôt sur `multi-imsi.pcap` : **2 events étrangers dans une trace sur cinq**. Dans la sonde de CLAUDE2, ce sont les deux messages d'établissement PFCP ; dans ma reproduction (amorçage dans l'ordre du temps, établissements déjà refusés), ce sont le `PDUSessionResourceSetupResponse` et la `Session Modification Request` de la nouvelle session, rattachés par le tunnel côté accès radio de l'ancienne session. Même cause : des identifiants d'une session antérieure, appris à l'amorçage, repris par la nouvelle.
+
+### Correctif
+
+1. **Règle d'établissement** : un `Session Establishment Request` / `Response` crée une session neuve. S'il porte un tunnel ou un SEID que la trace connaît d'un event de l'abonné **vieux de plus de 10 s** (temps de capture), c'est un identifiant réattribué : il ne rattache pas l'établissement. L'établissement entre par une identité de l'abonné, par l'IP de son UE (IE 93), par des identifiants frais (le N2 de la même procédure, dans les 10 s, directement ou après coup), et la réponse aussi quand sa requête — même numéro de séquence, mêmes nœuds — a été rattachée.
+2. **Oubli de la session antérieure** : un établissement refusé pour ce motif prouve que la session antérieure de la trace est finie sans qu'elle l'ait vu. Elle est oubliée en entier : ses SEID, les tunnels rangés sous eux, la session de données qui range l'un de ses tunnels avec tous les tunnels de celle-ci — **côté accès radio compris**, que la nouvelle session reprend aussi (c'est par lui qu'entraient les 2 events). Compteur `stats.pfcp.establishment_reused_identifiers`.
+3. Chaque tunnel et SEID de l'abonné garde la seconde de capture du dernier event rattaché qui le portait (`identifier_seen_at`, borné à 8 192).
+4. **Amorçage dans l'ordre du temps** (question 1 du cœur) : les events des segments retenus de tous les plans d'amorçage sont réunis et rejoués triés par horodatage de capture (tri stable : à égalité, ordre des plans puis de la capture). Les fins de session s'appliquent dans l'ordre réel, tous plans confondus.
+5. **Rattachement après coup pendant l'amorçage** : sur un tampon propre à l'amorçage, jamais mêlé au live, vidé au début et à la fin de chaque amorçage ; même borne de 10 s. `pfcp.attached_after_the_fact` ne compte que le live.
+6. Un event représenté après coup ne relance plus lui-même une représentation ; les enchaînements (la réponse après sa requête) passent par les tours successifs. La fin des tours se mesure au nombre d'events effectivement rattachés.
+
+### Écart avec le design posté (#9 7060312186), déclaré
+
+Le design interdisait **tout** rattachement direct d'un établissement par un tunnel ou un SEID déjà connu. Codé ainsi, quatre tests existants cassaient (`gpdu_rejected_when_pdu_session_established_before_trace_2_21_105`, `session_nas_ngap_pfcp_gtpu_all_routed_in_order_2_21_90`, `trace_isolation_three_ues_two_in_the_same_cell_2_21_109`, `ue_ip_is_learned_from_ie_93_of_an_attached_pfcp_and_ends_with_its_session_2_21_126`) : leurs séquences synthétiques placent le N2 juste avant l'établissement PFCP. L'ordre réel 5G est l'inverse, mais je n'ai pas vérifié l'ordre de tous les cœurs (Sxab, CUPS 4G). J'ai donc retenu une règle par **âge** : un identifiant connu d'un event de moins de 10 s reste admis. Les quatre tests sont inchangés et verts. Le déclencheur « seulement par les couples de l'event déclencheur » est devenu inutile et n'est pas codé.
+
+### OUVERT
+
+- La règle repose sur le temps de capture : une horloge de capture qui saute fausserait l'âge.
+- Un abonné dont **une autre** session reste vivante perd aussi les tunnels de celle-ci si l'un d'eux est rangé sous la session de données oubliée ; sinon non. Non testé à deux sessions.
+- Events d'une nouvelle session qui reprend des identifiants **sans établissement PFCP visible** (plan N4 absent de la capture) : la règle ne joue pas. Seule la garde d'identité de 2.21.129 reste.
+- 4G : `Create Session` S11 / S5 non concerné ; Sxab concerné par les mêmes noms de message, non testé sur capture réelle.
+- Mémoire de l'amorçage : tous les events des segments retenus sont en mémoire le temps du tri (3 segments, 64 Mio par plan). Non mesuré au lab.
+- Les fenêtres couvertes par 3 segments diffèrent d'un plan à l'autre : un plan peut remonter plus loin qu'un autre.
+
+### Tests — échec avant, succès après
+
+- `simultaneous_traces_and_reassigned_identifiers_never_cross_subscribers_2_21_129` étendu au **cas 4** : rejeu une heure après l'historique, abonnés décalés d'un rang, identifiants NGAP neufs (identifiants de session et IE). Attendu : 0 étranger, 0 pseudonyme tiers, 0 manquant sur les cinq traces. Règle coupée : `[(67, 2 étrangers, …), …]`. Le rejeu renomme aussi les références d'event portées par les IE et les identifiants de session (le NAS cite son message NGAP) : sans cela, le test rattachait un enfant par la référence de son parent appris à l'amorçage — artefact du test, pas du code.
+- `seed_from_ring_attaches_gpdu_of_a_session_older_than_the_trace_2_21_105` : vérifie en plus que les SEID de la session sont appris à l'amorçage dans l'ordre du temps, et que `pfcp.attached_after_the_fact` reste à 0.
+- `multi-imsi.pcap` : toujours 70 / 68 / 67 / 69 / 65, 339 + 183 = 522, N4 4 / 4 par abonné.
+
 ## oiran-api 2.21.132, decoder-rtp 0.3.1 — 2026-11-21 — journal RTP sans adresse IP (ordre #9 7059947810)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.131 @ `4477c9d`. Branches `fix/oiran-2.21.132-rtp-journal-no-ip` et `fix/oiran-2.21.121-train`. Seul `decoder-rtp/src/lib.rs` change (plus versions et locks).
