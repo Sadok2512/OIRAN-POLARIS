@@ -5,7 +5,7 @@ use serde::Deserialize;
 use session_engine::{
     component, discover_lte_sessions, Association, DiscoveryResult, EventRecord, Reconstruction,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RULE_VERSION: &str = "1.0.0";
@@ -407,49 +407,76 @@ fn ims_edges_from_events(events: &[EventRecord]) -> Vec<CorrelationEdge> {
     let mut edges: Vec<CorrelationEdge> = Vec::new();
 
     // --- Règle 1 : sip-pfcp-ue-ipv4-pseudonym-match --------------------
-    // SIP events émettent `sdp.c_ue_ip_pseudonym` dans leurs IE
-    // (decoder-sip 2.17.0). PFCP events émettent `ue_ip` dans leurs
-    // IE, pseudonymisé avec le même domain `"pfcp-ue-ip"`
-    // (decoder-pfcp, voir `src/lib.rs:268` et `src/lib.rs:400`).
-    // On relie par égalité stricte de ces deux pseudonymes + même
-    // `capture_scope`. L'arête produite est (IMS ↔ N4).
-    let sip_events: Vec<(&EventRecord, String)> = events
+    // 0.6.13 (POLARIS 2.21.127, ordre #9 7053229737) — la règle lisait
+    // côté PFCP une IE NOMMÉE `ue_ip`. Le décodeur PFCP réel ne produit
+    // pas cette IE : il nomme l'IE par son chemin
+    // (`Create PDR/PDI/UE IP Address`) et porte `ue_ip=<pseudonyme>` dans
+    // sa VALEUR, ainsi qu'un identifiant de session `ue_ip`. La règle ne
+    // pouvait donc pas se déclencher sur données réelles. Elle lit
+    // désormais les trois formes (`pfcp_ue_ip_pseudonyms`).
+    //
+    // Côté SIP, trois porteurs possibles du pseudonyme d'adresse de l'UE,
+    // dans cet ordre : l'adresse de connexion du SDP
+    // (`sdp.c_ue_ip_pseudonym`), puis l'adresse source et l'adresse
+    // destination du paquet (`packet_*_ip_pseudonym`, decoder-sip 0.3.0).
+    // Les deux dernières relient aussi un message sans SDP (REGISTER,
+    // réponses, BYE). L'adresse de l'autre extrémité (P-CSCF, pair) n'est
+    // l'adresse d'UE d'aucune session PFCP : elle ne relie rien.
+    //
+    // Égalité stricte du pseudonyme, même `capture_scope`. Une arête au
+    // plus par event SIP. Si plusieurs events PFCP portent la même
+    // adresse, seul l'établissement de session (`Session Establishment
+    // Request`, qui alloue l'adresse) est retenu ; s'il en reste plus
+    // d'un — adresse réattribuée dans la capture — aucune arête :
+    // l'ambiguïté n'est pas tranchée par proximité de temps.
+    let sip_events: Vec<(&EventRecord, Vec<(&'static str, String)>)> = events
         .iter()
         .filter(|e| e.interface == "IMS" && protocol_is(e, "SIP"))
-        .filter_map(|e| ie_value(e, "sdp.c_ue_ip_pseudonym").map(|v| (e, v.to_owned())))
+        .map(|e| (e, sip_ue_ip_candidates(e)))
+        .filter(|(_, candidates)| !candidates.is_empty())
         .collect();
-    let pfcp_ue_ip: Vec<(&EventRecord, String)> = events
+    let pfcp_ue_ip: Vec<(&EventRecord, BTreeSet<String>)> = events
         .iter()
         .filter(|e| e.interface == "N4" && protocol_is(e, "PFCP"))
-        .filter_map(|e| ie_value(e, "ue_ip").map(|v| (e, v.to_owned())))
+        .map(|e| (e, pfcp_ue_ip_pseudonyms(e)))
+        .filter(|(_, values)| !values.is_empty())
         .collect();
-    for (sip, sip_hash) in &sip_events {
-        let matches: Vec<&(&EventRecord, String)> = pfcp_ue_ip
-            .iter()
-            .filter(|(pfcp, pfcp_hash)| {
-                pfcp_hash == sip_hash && capture_scope(pfcp) == capture_scope(sip)
-            })
-            .collect();
-        if matches.len() == 1 {
-            let (pfcp_event, _) = matches[0];
+    for (sip, candidates) in &sip_events {
+        for (field, sip_hash) in candidates {
+            let mut matches: Vec<&EventRecord> = pfcp_ue_ip
+                .iter()
+                .filter(|(pfcp, values)| {
+                    values.contains(sip_hash) && capture_scope(pfcp) == capture_scope(sip)
+                })
+                .map(|(pfcp, _)| *pfcp)
+                .collect();
+            if matches.len() > 1 {
+                matches.retain(|pfcp| pfcp.message_name.contains("Session Establishment Request"));
+            }
+            if matches.len() != 1 {
+                continue;
+            }
+            let pfcp_event = matches[0];
             let mut found = edge(
                 sip,
                 pfcp_event,
                 vec![
                     format!("ue_ip_pseudonym={}", sip_hash),
+                    format!("sip_field={field}"),
                     format!("capture_scope={}", capture_scope(sip)),
                 ],
                 "sip-pfcp-ue-ipv4-pseudonym-match",
                 "EXACT",
-                "The SIP SDP connection address pseudonym equals the PFCP UE IP pseudonym in the same capture scope",
+                "A SIP UE address pseudonym (SDP connection address or packet address) equals the PFCP UE IP pseudonym in the same capture scope",
             );
             found.rule_version = E2E_EVIDENCE_RULE_VERSION.into();
             found.evidence_type = "EXACT_UE_IP_MATCH".into();
             found.scope = "ue-ip-only".into();
             found.limitations = vec![
-                "The UE IP pseudonym match binds the IMS SIP call to the N4 PFCP session on the same UE allocation; it does not by itself prove end-user identity".into(),
+                "The UE IP pseudonym match binds the IMS SIP message to the N4 PFCP session on the same UE allocation; it does not by itself prove end-user identity".into(),
             ];
             edges.push(found);
+            break;
         }
     }
 
@@ -1073,6 +1100,56 @@ fn ie_value<'a>(event: &'a EventRecord, name: &str) -> Option<&'a str> {
                 .then(|| ie.get("value")?.as_str())
                 .flatten()
         })
+}
+
+/// 0.6.13 — pseudonymes d'adresse IP d'UE portés par un event PFCP, sous
+/// les trois formes existantes : identifiant de session `ue_ip` /
+/// `ue_ipv6` ; champ `ue_ip=` / `ue_ipv6=` dans la valeur d'une IE (forme
+/// réelle de `decoder-pfcp`, IE nommée par son chemin) ; IE nommée
+/// `ue_ip` dont la valeur est le pseudonyme (ancienne forme des tests).
+fn pfcp_ue_ip_pseudonyms(event: &EventRecord) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for name in ["ue_ip", "ue_ipv6"] {
+        for value in event.identifier_values(name) {
+            out.insert(value.to_owned());
+        }
+        if let Some(value) = ie_value(event, name) {
+            out.insert(value.to_owned());
+        }
+    }
+    if let Some(ies) = event.information_elements.as_array() {
+        for ie in ies {
+            let Some(value) = ie.get("value").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            for name in ["ue_ip", "ue_ipv6"] {
+                if let Some(found) = component(value, name) {
+                    out.insert(found);
+                }
+            }
+        }
+    }
+    out.retain(|value| !value.is_empty());
+    out
+}
+
+/// 0.6.13 — pseudonymes d'adresse portés par un event SIP qui peuvent
+/// être celui de l'UE, avec le nom du champ : SDP d'abord, puis adresse
+/// source et destination du paquet. Sans doublon de valeur.
+fn sip_ue_ip_candidates(event: &EventRecord) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    for field in [
+        "sdp.c_ue_ip_pseudonym",
+        "packet_source_ip_pseudonym",
+        "packet_destination_ip_pseudonym",
+    ] {
+        if let Some(value) = ie_value(event, field) {
+            if !value.is_empty() && !out.iter().any(|(_, known)| known == value) {
+                out.push((field, value.to_owned()));
+            }
+        }
+    }
+    out
 }
 
 fn ie_component(event: &EventRecord, name: &str) -> Option<String> {
@@ -3872,5 +3949,223 @@ mod tests {
             !edges.iter().any(|e| e.rule_id == "sip-pdu-ims-5qi1-vonr-exact"),
             "aucune arête VoNR EXACT sans DNN=ims ; got {edges:?}"
         );
+    }
+    /// 0.6.13 (POLARIS 2.21.127, ordre #9 7053229737) — la règle
+    /// `sip-pfcp-ue-ipv4-pseudonym-match` sur des trames PFCP RÉELLES du
+    /// dépôt (`datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N4.pcapng`, décodées
+    /// par `oiran-decode`) et des messages SIP passés par le vrai
+    /// `decoder-sip`.
+    ///
+    /// Le PFCP réel porte l'adresse de l'UE dans une IE nommée par son
+    /// chemin (`Create PDR/PDI/UE IP Address`, valeur `ue_ip=…`), pas dans
+    /// une IE nommée `ue_ip` : avant 0.6.13 la règle ne produisait aucune
+    /// arête sur ces events.
+    ///
+    /// Attendu : un REGISTER sans SDP émis par l'UE et un INVITE avec SDP
+    /// sont chacun reliés à l'établissement de la session PFCP ; un SIP
+    /// d'une autre adresse ne l'est pas.
+    #[test]
+    fn sip_is_linked_to_the_real_pfcp_session_by_ue_address_2_21_127() {
+        use plugin_runtime::ProtocolDecoder;
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let dataset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N4.pcapng");
+        let config = oiran_decode::DecodeConfig {
+            input: dataset,
+            capture_id: format!("sha256:{}", "a".repeat(64)),
+            interface: "N4".into(),
+            endpoints: Default::default(),
+            stable_source_file: String::new(),
+        };
+        let mut normalized = Vec::new();
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            normalized.push(event);
+            Ok(())
+        })
+        .unwrap();
+        // Le pseudonyme d'adresse d'UE de la session, tel que le PFCP réel
+        // le porte.
+        let ue_ip_pseudonym = normalized
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "ue_ip")
+            .map(|id| id.value.clone())
+            .expect("le jeu réel porte une IE UE IP Address");
+        let carrier = normalized
+            .iter()
+            .find(|e| e.session_identifiers.iter().any(|id| id.name == "ue_ip"))
+            .unwrap();
+        assert!(carrier.message_name.contains("Session Establishment Request"));
+        assert!(
+            carrier
+                .information_elements
+                .iter()
+                .all(|ie| ie.name != "ue_ip"),
+            "le PFCP réel n'a pas d'IE nommée `ue_ip` : c'est ce que la règle supposait"
+        );
+        // L'adresse en clair n'est pas dans les events : on la retrouve en
+        // essayant le pool d'adresses d'UE du lab (10.45 à 10.47 /16).
+        let ue_address = (45u8..=47)
+            .flat_map(|b| (0u8..=255).flat_map(move |c| (0u8..=255).map(move |d| [10, b, c, d])))
+            .find(|octets| {
+                event_schema::pseudonym_ip_octets(&key, octets).as_deref()
+                    == Some(ue_ip_pseudonym.as_str())
+            })
+            .map(|o| format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]))
+            .expect("adresse d'UE du jeu dans le pool du lab");
+        let pcscf = "10.77.24.20";
+        let packet_refs = [event_schema::PacketReference {
+            // Même répertoire de capture que le PFCP : même `capture_scope`.
+            source_file: carrier.packet_references[0]
+                .source_file
+                .replace("N4.pcapng", "IMS.pcapng"),
+            source_sha256: None,
+            packet_number: 1,
+            byte_offset: 0,
+            interface_id: 0,
+            link_type: None,
+            sll2_protocol_type: None,
+            sll2_reserved: None,
+            sll2_interface_index: None,
+            sll2_arphrd_type: None,
+            sll2_packet_type: None,
+            sll2_address_length: None,
+            sll2_address: None,
+            captured_length: 1,
+            original_length: 1,
+        }];
+        let timestamp = carrier.timestamp.clone();
+        let sip = |payload: &[u8], source: &str, destination: &str| {
+            let reference = format!("sha256:{}", event_schema::sha256_hex(payload));
+            let out = decoder_sip::SipDecoder.decode(&plugin_runtime::DecoderInput {
+                capture_id: &config.capture_id,
+                packet_references: &packet_refs,
+                timestamp: &timestamp,
+                interface: "IMS",
+                source_endpoint: event_schema::Endpoint {
+                    address: source.into(),
+                    port: Some(5060),
+                    network_function: None,
+                },
+                destination_endpoint: event_schema::Endpoint {
+                    address: destination.into(),
+                    port: Some(5060),
+                    network_function: None,
+                },
+                payload,
+                raw_payload_reference: &reference,
+                pseudonym_key: &key,
+            });
+            out.events.into_iter().next().expect("un event SIP")
+        };
+        let register = sip(
+            b"REGISTER sip:ims.example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP ue.example.invalid:5060;branch=z9hG4bK-r\r\n\
+From: <sip:alias-a@ims.example.invalid>;tag=r\r\n\
+To: <sip:alias-a@ims.example.invalid>\r\n\
+Call-ID: reg-2-21-127\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\
+\r\n",
+            &ue_address,
+            pcscf,
+        );
+        let invite_payload = format!(
+            "INVITE sip:alias-b@ims.example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP ue.example.invalid:5060;branch=z9hG4bK-i\r\n\
+From: <sip:alias-a@ims.example.invalid>;tag=i\r\n\
+To: <sip:alias-b@ims.example.invalid>\r\n\
+Call-ID: inv-2-21-127\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: 0\r\n\
+\r\n\
+v=0\r\n\
+o=- 1 1 IN IP4 {ue_address}\r\n\
+s=-\r\n\
+c=IN IP4 {ue_address}\r\n\
+t=0 0\r\n\
+m=audio 49170 RTP/AVP 0\r\n"
+        );
+        // INVITE vu depuis le P-CSCF vers l'UE d'un tiers : ni l'adresse du
+        // paquet ni le SDP ne sont ceux de l'UE de la session.
+        let foreign = sip(
+            b"OPTIONS sip:alias-c@ims.example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP other.example.invalid:5060;branch=z9hG4bK-o\r\n\
+From: <sip:alias-c@ims.example.invalid>;tag=o\r\n\
+To: <sip:alias-c@ims.example.invalid>\r\n\
+Call-ID: opt-2-21-127\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\
+\r\n",
+            "10.47.255.254",
+            pcscf,
+        );
+        let invite = sip(invite_payload.as_bytes(), &ue_address, pcscf);
+        let sip_ids = [register.event_id.clone(), invite.event_id.clone(), foreign.event_id.clone()];
+        let jsonl: String = normalized
+            .iter()
+            .chain([&register, &invite, &foreign])
+            .map(|e| e.to_json())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let records = session_engine::load_jsonl(std::io::Cursor::new(jsonl.into_bytes())).unwrap();
+        let edges = correlate_cross_interface_evidence(&records);
+        let linked: Vec<&CorrelationEdge> = edges
+            .iter()
+            .filter(|e| e.rule_id == "sip-pfcp-ue-ipv4-pseudonym-match")
+            .collect();
+        let touches = |edge: &CorrelationEdge, id: &str| {
+            edge.source_event_id == id || edge.target_event_id == id
+        };
+        assert_eq!(linked.len(), 2, "REGISTER et INVITE reliés, rien d'autre : {linked:?}");
+        for edge in &linked {
+            assert_eq!(edge.confidence, "EXACT");
+            assert!(touches(edge, &carrier.event_id), "relié à l'établissement PFCP");
+            assert!(!touches(edge, &sip_ids[2]), "le SIP d'une autre adresse n'est pas relié");
+        }
+        assert!(linked.iter().any(|e| touches(e, &sip_ids[0])), "REGISTER sans SDP relié");
+        assert!(linked.iter().any(|e| touches(e, &sip_ids[1])), "INVITE avec SDP relié");
+        // Le REGISTER est relié par l'adresse du paquet, l'INVITE par le SDP.
+        let field = |id: &str| {
+            linked
+                .iter()
+                .find(|e| touches(e, id))
+                .and_then(|e| e.matching_identifiers.iter().find(|k| k.starts_with("sip_field=")).cloned())
+        };
+        assert_eq!(field(&sip_ids[0]).as_deref(), Some("sip_field=packet_source_ip_pseudonym"));
+        assert_eq!(field(&sip_ids[1]).as_deref(), Some("sip_field=sdp.c_ue_ip_pseudonym"));
+    }
+
+    /// 0.6.13 — adresse d'UE réattribuée dans la capture : deux
+    /// établissements PFCP portent le même pseudonyme → aucune arête
+    /// (l'ambiguïté n'est pas tranchée). Une modification de la même
+    /// session qui répète l'adresse ne crée pas d'ambiguïté.
+    #[test]
+    fn reused_ue_address_links_nothing_but_a_repeat_in_the_same_session_does_2_21_127() {
+        let hash = "psn-ue-ip-reused";
+        let sip = e("sip-1", "IMS", "SIP", "REGISTER", 1, &[],
+            json!([{"name":"packet_source_ip_pseudonym","value":hash}]));
+        let pfcp = |id: &str, name: &str, packet: u64| {
+            e(id, "N4", "PFCP", name, packet, &[],
+                json!([{"name":"Create PDR/PDI/UE IP Address","value":format!("ue_ip={hash},ue_ip_flags=0x06")}]))
+        };
+        let count = |events: &[EventRecord]| {
+            correlate_cross_interface_evidence(events)
+                .iter()
+                .filter(|e| e.rule_id == "sip-pfcp-ue-ipv4-pseudonym-match")
+                .count()
+        };
+        assert_eq!(
+            count(&[sip.clone(), pfcp("p1", "PFCP Session Establishment Request", 2), pfcp("p2", "PFCP Session Modification Request", 3)]),
+            1,
+            "établissement + modification de la même adresse : une arête, vers l'établissement"
+        );
+        assert_eq!(
+            count(&[sip.clone(), pfcp("p1", "PFCP Session Establishment Request", 2), pfcp("p3", "PFCP Session Establishment Request", 4)]),
+            0,
+            "deux établissements : ambigu, aucune arête"
+        );
+        assert_eq!(count(&[sip, pfcp("p4", "PFCP Session Modification Request", 5)]), 1);
     }
 }

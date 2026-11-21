@@ -1,6 +1,6 @@
 [package]
 name = "correlation-engine"
-version = "0.6.12"
+version = "0.6.13"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -17,3 +17,7 @@ decoder-diameter = { path = "../decoder-diameter" }
 decoder-gtpv2c = { path = "../decoder-gtpv2c" }
 decoder-s1ap = { path = "../decoder-s1ap" }
 plugin-runtime = { path = "../plugin-runtime" }
+decoder-pfcp = { path = "../decoder-pfcp" }
+decoder-sip = { path = "../decoder-sip" }
+oiran-decode = { path = "../oiran-decode" }
+event-schema = { path = "../event-schema" }
