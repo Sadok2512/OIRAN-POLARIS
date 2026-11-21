@@ -576,19 +576,23 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
         // identifiant qui permet la corrélation EXACT SIP↔N4 via UE
         // IP sans jamais exposer l'IP UE en clair hors de la trame
         // dissequée. Nom canonique : `sdp.c_ue_ip_pseudonym`.
-        let ue_ip_pseudo = pseudonym(
-            input.pseudonym_key,
-            "pfcp-ue-ip",
-            sdp.connection_address.as_bytes(),
-        );
-        ies.push(InformationElement {
-            id: None,
-            name: "sdp.c_ue_ip_pseudonym".into(),
-            length: ue_ip_pseudo.len() as u32,
-            value: Some(ue_ip_pseudo),
-            raw_sha256: None,
-            status: DecodeStatus::Decoded,
-        });
+        // 2.21.125 — calculé sur les OCTETS de l'adresse
+        // (`event_schema::pseudonym_ip_text`), la forme commune au PFCP
+        // (IE 93) et à la trace live. Avant, le texte de l'adresse était
+        // haché : le pseudonyme ne pouvait égaler aucun des deux autres.
+        // Si `c=` n'est pas une adresse IP (nom d'hôte), l'IE est absente.
+        if let Some(ue_ip_pseudo) =
+            event_schema::pseudonym_ip_text(input.pseudonym_key, &sdp.connection_address)
+        {
+            ies.push(InformationElement {
+                id: None,
+                name: "sdp.c_ue_ip_pseudonym".into(),
+                length: ue_ip_pseudo.len() as u32,
+                value: Some(ue_ip_pseudo),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            });
+        }
         ies.push(InformationElement {
             id: None,
             name: "sdp.m.audio.port".into(),
@@ -620,6 +624,29 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
                 name: "sdp.m.audio.rtpmap_clock_rate_hz".into(),
                 length: 4,
                 value: Some(rate.to_string()),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            });
+        }
+    }
+
+    // 2.21.125 (ordre #9 7052828180) — adresses IP du PAQUET qui porte le
+    // message, en pseudonymes du domaine d'IP UE. Un message SIP émis ou
+    // reçu par l'UE porte ainsi le pseudonyme de son adresse même sans
+    // SDP (REGISTER, réponses, BYE) et quelles que soient ses URI : c'est
+    // ce qui permet de le rattacher à l'abonné quand les URI sont des
+    // alias. En IE seulement, jamais en `session_identifiers` : l'autre
+    // extrémité (P-CSCF, pair) n'est pas une identité de l'abonné.
+    for (name, endpoint) in [
+        ("packet_source_ip_pseudonym", &input.source_endpoint),
+        ("packet_destination_ip_pseudonym", &input.destination_endpoint),
+    ] {
+        if let Some(value) = event_schema::pseudonym_ip_text(input.pseudonym_key, &endpoint.address) {
+            ies.push(InformationElement {
+                id: None,
+                name: name.into(),
+                length: value.len() as u32,
+                value: Some(value),
                 raw_sha256: None,
                 status: DecodeStatus::Decoded,
             });
@@ -981,5 +1008,86 @@ Content-Length: 0\r\n\
             .information_elements
             .iter()
             .any(|ie| ie.name == "from_uri_pseudonym"));
+    }
+    /// 2.21.125 (ordre #9 7052828180) — un REGISTER sans SDP, aux URI en
+    /// alias, porte les pseudonymes des adresses IP de son paquet ; celui
+    /// de l'UE est égal au pseudonyme calculé sur les octets de l'adresse
+    /// (la forme de la trace live et du PFCP). Ils sont en IE, jamais en
+    /// `session_identifiers`. Avant 2.21.125 : aucune IE d'adresse.
+    #[test]
+    fn register_without_sdp_carries_packet_ip_pseudonyms_2_21_125() {
+        let k = key();
+        let payload = b"\
+REGISTER sip:ims.example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.77.20.1:5060;branch=z9hG4bK-reg\r\n\
+From: <sip:alias-a@ims.example.invalid>;tag=r1\r\n\
+To: <sip:alias-a@ims.example.invalid>\r\n\
+Call-ID: reg-2-21-124\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\
+\r\n";
+        let out = SipDecoder.decode(&input(payload, &k, "IMS"));
+        let event = &out.events[0];
+        let ie = |name: &str| {
+            event
+                .information_elements
+                .iter()
+                .find(|ie| ie.name == name)
+                .and_then(|ie| ie.value.clone())
+        };
+        let ue = event_schema::pseudonym(&k, "pfcp-ue-ip", &[10, 77, 20, 1]);
+        let pcscf = event_schema::pseudonym(&k, "pfcp-ue-ip", &[10, 77, 20, 2]);
+        assert_eq!(ie("packet_source_ip_pseudonym").as_deref(), Some(ue.as_str()));
+        assert_eq!(ie("packet_destination_ip_pseudonym").as_deref(), Some(pcscf.as_str()));
+        assert!(ie("sdp.c_ue_ip_pseudonym").is_none(), "pas de SDP");
+        assert!(ie("subscriber_pseudonym").is_none(), "URI en alias : pas de pseudonyme d'abonné");
+        assert!(
+            event
+                .session_identifiers
+                .iter()
+                .all(|id| id.value != ue && id.value != pcscf),
+            "les adresses du paquet ne sont pas des identités de session"
+        );
+        // Aucune adresse en clair ajoutée par ces IE.
+        assert!(ie("packet_source_ip_pseudonym").unwrap().starts_with("psn-"));
+    }
+
+    /// 2.21.125 — le pseudonyme de la ligne `c=` du SDP est calculé sur
+    /// les octets de l'adresse : égal à celui de l'adresse du paquet quand
+    /// l'UE annonce sa propre adresse, et à la forme du PFCP et de la
+    /// trace live. Avant 2.21.125 le texte de l'adresse était haché.
+    #[test]
+    fn sdp_connection_pseudonym_uses_address_octets_2_21_125() {
+        let k = key();
+        let payload = b"\
+INVITE sip:alias-b@ims.example.invalid SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.77.20.1:5060;branch=z9hG4bK-inv\r\n\
+From: <sip:alias-a@ims.example.invalid>;tag=i1\r\n\
+To: <sip:alias-b@ims.example.invalid>\r\n\
+Call-ID: inv-2-21-124\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: 95\r\n\
+\r\n\
+v=0\r\n\
+o=- 1 1 IN IP4 10.77.20.1\r\n\
+s=-\r\n\
+c=IN IP4 10.77.20.1\r\n\
+t=0 0\r\n\
+m=audio 49170 RTP/AVP 0\r\n";
+        let out = SipDecoder.decode(&input(payload, &k, "IMS"));
+        let event = &out.events[0];
+        let ie = |name: &str| {
+            event
+                .information_elements
+                .iter()
+                .find(|ie| ie.name == name)
+                .and_then(|ie| ie.value.clone())
+        };
+        let octets = event_schema::pseudonym(&k, "pfcp-ue-ip", &[10, 77, 20, 1]);
+        let text = event_schema::pseudonym(&k, "pfcp-ue-ip", b"10.77.20.1");
+        assert_eq!(ie("sdp.c_ue_ip_pseudonym").as_deref(), Some(octets.as_str()));
+        assert_ne!(ie("sdp.c_ue_ip_pseudonym").as_deref(), Some(text.as_str()), "plus la forme texte");
+        assert_eq!(ie("sdp.c_ue_ip_pseudonym"), ie("packet_source_ip_pseudonym"));
     }
 }
