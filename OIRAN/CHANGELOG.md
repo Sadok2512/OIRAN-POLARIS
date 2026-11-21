@@ -1,5 +1,36 @@
 # Changelog
 
+## oiran-api 2.21.135 — 2026-11-21 — trace live : une trace ne reçoit aucun event capturé avant son ouverture (lab G9 bis, débit doublé ; #10 7060875172, #9 7060893472)
+
+Upgrade **patch** sans déploiement, au-dessus de la fusion de 2.21.133 @ `db8a3a5` (branche `fix/oiran-2.21.134-train-next`). Seul `apps/api/src/live_trace.rs` change. Train non déplacé.
+
+### Constat lab (ANR1 #10 7060875172)
+
+G9 bis, traces neuves ouvertes 74 s après la fin de la première passe : `gpdu.seen=12121` (les deux passes), `gpdu.attached` = les G-PDU de l'abonné des **deux** passes, buckets aux secondes de la première passe. Signalisation isolée.
+
+### Cause, par le code @ `5f21967`
+
+`start_reader` s'arrête quand plus aucune trace n'est ouverte (`traces_empty && !has_active_streams() → break`). Son état — segments lus, sessions de reprise à l'offset, `initial_catchup_done` — est local à la tâche et disparaît. À l'ouverture suivante, un lecteur neuf démarre en rattrapage : tous les segments sauf le plus récent sont marqués lus ; **le plus récent est décodé depuis l'octet 0** et ses events sont routés dans les traces neuves avec leurs horodatages d'origine. Mon hypothèse précédente (#9 7060769604, tunnels réattribués) est un autre chemin, fermé par 2.21.134 ; ce n'était pas celui du lab.
+
+### Correctif
+
+Pour chaque trace, un event dont l'horodatage de capture est **antérieur à la seconde d'ouverture** de la trace n'est ni émis, ni compté dans les buckets, ni appris, ni compté dans `gpdu.seen` ni dans les flux par interface. Ce qui précède l'ouverture est appris par l'amorçage, qui relit le ring. Compteur `stats.events_before_open`. L'amorçage n'est pas concerné.
+
+### Changements de comportement à connaître
+
+- Un event capturé dans la seconde qui précède l'ouverture, mais décodé après, n'apparaît plus dans la trace (il est appris par l'amorçage s'il est dans un plan d'amorçage).
+- L'état du lecteur n'est toujours pas gardé entre deux arrêts : le segment courant est encore redécodé à chaque redémarrage (coût), mais ses events anciens n'entrent plus dans les traces. Garder l'état : question posée au cœur (#9 7060893472), non fait.
+
+### OUVERT
+
+- **Horloges** : la règle compare l'horodatage de capture à l'horloge de l'API. Même hôte au lab. Si la capture est en retard de plus d'une seconde, le début de la trace est perdu ; `events_before_open` le montre.
+- Les traces de test (`created_at = 0`) ne sont pas concernées par la règle : seuls les tests qui posent une heure d'ouverture l'exercent.
+- Le throughput global (`ThroughputHooks`, hors trace) n'est pas modifié : il recompte encore le segment courant à chaque redémarrage du lecteur. Non mesuré.
+
+### Test — échec avant, succès après
+
+`seed_from_ring_attaches_gpdu_of_a_session_older_than_the_trace_2_21_105` étendu : la même trace, ouverte **après** la capture des G-PDU (cas du lecteur neuf qui relit le segment courant) : `gpdu.seen` et `gpdu.attached` à 0, aucun bucket, `events_before_open` = nombre de G-PDU, et l'amorçage a bien appris la session. Exclusion retirée : `(10, 10)` au lieu de `(0, 0)`. La première partie du test (trace sans heure d'ouverture, G-PDU d'une session établie avant elle) reste verte.
+
 ## oiran-api 2.21.134 — 2026-11-21 — trace live : un établissement PFCP ne reprend plus la session antérieure de l'abonné (cas 4) ; amorçage dans l'ordre du temps (ordre #9 7060289296, design #9 7060312186)
 
 Upgrade **patch** sans déploiement, au-dessus du train @ `3159aad` (2.21.132 + fusion de 2.21.127). Branches `fix/oiran-2.21.134-train-next` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change.

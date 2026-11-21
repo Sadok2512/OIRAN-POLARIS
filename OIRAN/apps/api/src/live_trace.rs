@@ -113,6 +113,9 @@ pub(crate) struct LiveTrace {
     /// tunnel ou un SEID déjà connu de la trace (session antérieure).
     #[serde(default)]
     pfcp_establishment_reused_identifiers: u64,
+    /// 2.21.135 — events capturés avant l'ouverture de la trace, écartés.
+    #[serde(default)]
+    events_before_open: u64,
     /// 2.21.119 — libérations d'une session nommée dont aucun tunnel
     /// n'était rangé par session : rien n'a pu être oublié.
     #[serde(default)]
@@ -1295,6 +1298,7 @@ impl LiveTraceRegistry {
             "parents_attached_after_child": trace.parents_attached_after_child,
             "session_releases_without_filed_tunnels": trace.session_releases_without_filed_tunnels,
             "fresh_registrations": trace.fresh_registrations,
+            "events_before_open": trace.events_before_open,
             "rtp": {
                 "flow_updates": trace.rtp_flow_updates,
             },
@@ -1742,6 +1746,21 @@ impl LiveTraceRegistry {
         };
         for state in traces.values_mut() {
             if force_trace.is_some_and(|id| id != state.trace.trace_id) {
+                continue;
+            }
+            // 2.21.135 (lab G9 bis, ANR1 #10 7060875172 ; #9 7060893472) —
+            // une trace ne reçoit aucun event capturé AVANT son ouverture :
+            // ce qui précède est l'affaire de l'amorçage, qui relit le
+            // ring. Avant : quand la dernière trace se fermait, le lecteur
+            // s'arrêtait et perdait son état ; à l'ouverture suivante, un
+            // lecteur neuf relisait depuis l'octet 0 le segment le plus
+            // récent, et la passe précédente (G-PDU, signalisation) entrait
+            // dans la trace neuve avec ses horodatages d'origine.
+            if !seed_only
+                && state.trace.created_at > 0
+                && event.timestamp.seconds < state.trace.created_at as i64
+            {
+                state.trace.events_before_open = state.trace.events_before_open.saturating_add(1);
                 continue;
             }
             // 2.21.124 — un pseudonyme d'équipement est retenu comme tel
@@ -3776,6 +3795,7 @@ pub(crate) async fn create(
         fresh_registrations: 0,
         rtp_flow_updates: 0,
         pfcp_establishment_reused_identifiers: 0,
+        events_before_open: 0,
         session_releases_without_filed_tunnels: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
@@ -4196,6 +4216,7 @@ mod tests {
                 fresh_registrations: 0,
                 rtp_flow_updates: 0,
                 pfcp_establishment_reused_identifiers: 0,
+                events_before_open: 0,
                 session_releases_without_filed_tunnels: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
@@ -4714,6 +4735,31 @@ mod tests {
         assert_eq!(seen, gpdus.len() as u64);
         assert_eq!(attached, gpdus.len() as u64, "tous les G-PDU rattachés après amorçage");
         assert_eq!(total, injected, "somme des buckets = octets des G-PDU");
+
+        // 2.21.135 (lab G9 bis) — la même trace, ouverte APRÈS la capture
+        // de ces G-PDU (comme quand un lecteur neuf relit le segment
+        // courant depuis l'octet 0) : aucun n'entre, aucun octet compté.
+        let opened_after = gpdus.iter().map(|e| e.timestamp.seconds).max().unwrap() + 1;
+        let r = LiveTraceRegistry::new();
+        let mut late = state(u64::MAX, false, vec![pseudonym.clone()]);
+        late.trace.created_at = opened_after as u64;
+        r.traces.lock().unwrap().insert("t".into(), late);
+        assert!(r.begin_seed());
+        let _ = seed_from_ring(&root, &key, &r);
+        r.finish_seed(&SeedReport::default());
+        for event in &gpdus {
+            r.route_normalized(event);
+        }
+        r.flush_idle_throughput_buckets();
+        {
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert_eq!((t.trace.gpdu_seen, t.trace.gpdu_attached), (0, 0));
+            assert_eq!(t.trace.events_before_open, gpdus.len() as u64);
+            assert!(t.events.iter().all(|e| e.kind != "throughput"), "aucun bucket");
+            assert!(t.seids.len() > 0, "l'amorçage, lui, a appris la session");
+            assert_eq!(r.stats_payload(&t.trace)["events_before_open"], gpdus.len() as u64);
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
