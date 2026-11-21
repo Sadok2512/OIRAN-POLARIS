@@ -175,6 +175,38 @@ Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.126 @ `653bda0`
 - `a_pfcp_of_an_older_session_is_never_attached_after_the_fact_2_21_129` : le PFCP d'une ancienne session portant le même tunnel n'est ni émis ni appris ; celui du moment l'est. Sans la borne : le PFCP ancien est émis, l'IP UE de l'autre abonné apprise, son SIP rattaché.
 - `multi-imsi.pcap` : toujours 70 / 68 / 67 / 69 / 65, 339 + 183 = 522.
 
+## correlation-engine 0.6.13 — 2026-11-20 — lot 2.21.127 : la règle voix ↔ session `sip-pfcp-ue-ipv4-pseudonym-match` lit le PFCP réel (ordre #9 7053229737)
+
+Branche `fix/oiran-2.21.127-sip-pfcp-ue-ip-rule`, base 2.21.125 @ `1805f84` (le train après 2.21.126 n'était pas paru ; à fusionner). Seul `correlation-engine` change (code, tests, dépendances de test). Ne touche ni `apps/api` ni la version d'`oiran-api`. Aucun déploiement.
+
+### Audit
+
+La règle relie un message SIP du plan IMS à la session PFCP de l'UE par le pseudonyme de son adresse IP. Elle cherchait côté PFCP une IE **nommée** `ue_ip`. Le décodeur PFCP réel n'en produit pas : l'IE est nommée par son chemin (`Create PDR/PDI/UE IP Address`), sa valeur est `ue_ip=<pseudonyme>,ue_ip_flags=…`, et un identifiant de session `ue_ip` l'accompagne. Vérifié sur les trames réelles du dépôt : `datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N4.pcapng` → 1 IE de ce nom, dans le `PFCP Session Establishment Request` ; `multi-imsi.pcap` → 5, une par abonné. La règle ne pouvait donc se déclencher que sur les events synthétiques de son propre test.
+
+S'y ajoutait la différence de forme du pseudonyme entre PFCP et SIP, corrigée en 2.21.125.
+
+### Changement
+
+1. Côté PFCP, la règle lit les trois formes : identifiant de session `ue_ip` / `ue_ipv6`, champ `ue_ip=` / `ue_ipv6=` dans la valeur d'une IE, et IE nommée `ue_ip` (forme des tests antérieurs, conservée).
+2. Côté SIP, trois porteurs, dans cet ordre : `sdp.c_ue_ip_pseudonym`, `packet_source_ip_pseudonym`, `packet_destination_ip_pseudonym` (ces deux derniers : `decoder-sip` 0.3.0). Un message sans SDP est ainsi relié aussi. Une arête au plus par event SIP ; le champ qui a relié est donné dans `matching_identifiers` (`sip_field=…`).
+3. Plusieurs events PFCP de même adresse : seul l'établissement de session est retenu. S'il en reste plus d'un (adresse réattribuée dans la capture), aucune arête : l'ambiguïté n'est pas tranchée par proximité de temps. Avant, deux events PFCP portant l'adresse suffisaient à ne rien relier.
+
+Inchangé : égalité stricte, même `capture_scope`, plan `IMS` seulement (`N3-IMS` reste une preuve tunnel, non reliée), confiance `EXACT`, type `EXACT_UE_IP_MATCH`.
+
+### OUVERT
+
+- **Volume d'arêtes** : la règle relie désormais chaque message SIP de l'UE, pas seulement ceux qui portent un SDP. Un appel produit une arête par message. Effet sur les sessions publiées et l'interface non mesuré.
+- **Données stockées** : les events PFCP et SIP publiés avant 2.21.125 portent les anciens pseudonymes, qui ne peuvent pas être égaux ; la règle ne relie rien sur eux. Corrigé seulement par redécodage.
+- Adresse d'UE réattribuée dans une même capture : aucune arête pour cette adresse, même pour l'appel qui serait sans ambiguïté par le temps.
+- Aucune trame SIP réelle dans le dépôt : le SIP du test passe par le vrai `decoder-sip`, sur des messages écrits pour le test ; seul le PFCP vient d'une capture.
+- Le test retrouve l'adresse d'UE du jeu en essayant le pool du lab (10.45 à 10.47) : si le jeu change de pool, le test échoue avec un message explicite.
+
+### Tests
+
+- `sip_is_linked_to_the_real_pfcp_session_by_ue_address_2_21_127` : PFCP réel du dépôt décodé par `oiran-decode` ; REGISTER sans SDP et INVITE avec SDP émis depuis l'adresse de l'UE → 2 arêtes `EXACT` vers le `Session Establishment Request`, la première par l'adresse du paquet, la seconde par le SDP ; un SIP d'une autre adresse → aucune. Avec l'ancienne lecture du PFCP : 0 arête (test en échec).
+- `reused_ue_address_links_nothing_but_a_repeat_in_the_same_session_does_2_21_127` : établissement + modification de même adresse → 1 arête ; deux établissements → 0 ; modification seule → 1.
+- Tests antérieurs de la règle inchangés et verts (`sip_pfcp_ue_ipv4_pseudonym_match_emits_ims_n4_edge_on_exact_pseudonym`, `n3_ims_twin_of_an_n6_sip_event_is_not_counted_twice_2_21_107`).
+
 ## oiran-api 2.21.126 — 2026-11-21 — trace live : SIP rattaché par l'adresse IP de l'UE, IP apprise aussi sur le PFCP et oubliée avec sa session ; ordre des events d'un même paquet indépendant du nom du segment (ordres #9 7053030106, 7053229737, 7053683830)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de la fusion de 2.21.125 dans le train (`6606d91`). Branches `fix/oiran-2.21.126-sip-by-ue-ip` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change.
