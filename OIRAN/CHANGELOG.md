@@ -1,5 +1,30 @@
 # Changelog
 
+## oiran-api 2.21.137 — 2026-11-21 — lecteur live : le débit global ne recompte pas le segment courant au redémarrage du lecteur (ordre #9 7061820250)
+
+Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.136 @ `6f4fcd3`. Branche `fix/oiran-2.21.137-throughput-hooks`. Seul `apps/api/src/live_trace.rs` change. Train et branche du déploiement en cours non déplacés.
+
+### Défaut
+
+Même cause que G9 bis (2.21.135), côté débit global hors trace (`ThroughputHooks` → `ThroughputRegistry`) : quand la dernière trace se ferme et qu'aucun flux de débit n'est ouvert, le lecteur s'arrête et perd son état ; le lecteur suivant relit le segment courant depuis l'octet 0 et **recompte** dans le débit global les G-PDU que la passe précédente avait déjà comptés.
+
+### Correctif
+
+Même règle qu'en 2.21.135 : un event capturé avant la seconde de démarrage du lecteur ne compte pas dans le débit global. Le filigrane `(paquet, event_id)` du segment avance quand même : l'event écarté n'est pas compté plus tard non plus. Compteur `stats.reader.throughput_before_reader_start`. La borne passe par le crochet du lecteur (`ReaderHooks::counts_since`, 0 par défaut) : la passe reste testable sans l'état de l'application.
+
+### Changements de comportement à connaître
+
+- Le débit global d'un flux de débit ouvert pendant que le lecteur était arrêté ne contient que ce qui est capturé après le redémarrage.
+
+### OUVERT
+
+- Même dépendance aux horloges que 2.21.135 (capture et API sur le même hôte au lab).
+- Le segment courant est toujours redécodé à chaque redémarrage (coût) ; garder l'état du lecteur reste hors lot (décision #9 7060917832).
+
+### Test — échec avant, succès après
+
+`a_restarted_reader_does_not_recount_the_current_segment_in_the_global_throughput_2_21_137` : ring N3 réel du dépôt, lecteur neuf démarré après la capture → 0 event compté, et chaque event écarté compté une fois dans `throughput_before_reader_start` ; sans borne, tout le segment est compté. Borne retirée : 10 au lieu de 0.
+
 ## oiran-api 2.21.136 — 2026-11-21 — trace live : l'amorçage apprend l'IP de l'UE ; une IP d'UE réattribuée ne rattache pas une autre session (constat CLAUDE2 #9 7060850616, écart déclaré #9 7060953472, ordre #9 7060917832)
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.135 @ `fbc8072` (branche `fix/oiran-2.21.134-train-next`). Seul `apps/api/src/live_trace.rs` change.

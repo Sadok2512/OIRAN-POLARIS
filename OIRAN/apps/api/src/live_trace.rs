@@ -1179,6 +1179,9 @@ pub(crate) struct LiveTraceRegistry {
     reader_scan_ms: AtomicU64,
     /// 2.21.130 — segments interrogés (`stat`) pendant la dernière passe.
     reader_files_examined: AtomicU64,
+    /// 2.21.137 — events que le lecteur n'a pas comptés dans le débit
+    /// global : capturés avant son démarrage.
+    throughput_before_reader_start: AtomicU64,
     /// 2.21.113 (E4) — derniers events de signalisation rejetés par au
     /// moins une trace : un parent NGAP/S1AP passe avant son enfant NAS,
     /// qui seul porte l'identité.
@@ -1204,6 +1207,7 @@ impl LiveTraceRegistry {
             reader_files_decoded: AtomicU64::new(0),
             reader_scan_ms: AtomicU64::new(0),
             reader_files_examined: AtomicU64::new(0),
+            throughput_before_reader_start: AtomicU64::new(0),
             recent_rejected: Mutex::new(VecDeque::new()),
             recent_rejected_pfcp: Mutex::new(VecDeque::new()),
             seed_rejected_pfcp: Mutex::new(VecDeque::new()),
@@ -1288,6 +1292,7 @@ impl LiveTraceRegistry {
                 "files_tracked": self.reader_files_tracked.load(Ordering::Relaxed),
                 "files_decoded_last_pass": self.reader_files_decoded.load(Ordering::Relaxed),
                 "files_examined_last_pass": self.reader_files_examined.load(Ordering::Relaxed),
+                "throughput_before_reader_start": self.throughput_before_reader_start.load(Ordering::Relaxed),
                 "scan_ms": self.reader_scan_ms.load(Ordering::Relaxed),
                 "full_redecode": full_redecode_requested(),
                 "interfaces": *self.reader_io.lock().unwrap(),
@@ -1356,6 +1361,10 @@ impl LiveTraceRegistry {
     pub(crate) fn set_reader_scan(&self, scan_ms: u64, files_examined: u64) {
         self.reader_scan_ms.store(scan_ms, Ordering::Relaxed);
         self.reader_files_examined.store(files_examined, Ordering::Relaxed);
+    }
+
+    pub(crate) fn bump_throughput_before_reader_start(&self) {
+        self.throughput_before_reader_start.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn reader_files_decoded_last_pass(&self) -> u64 {
@@ -3175,6 +3184,12 @@ pub(crate) trait ReaderHooks {
     fn bytes_gap(&mut self, gap: u64);
     /// Un segment va être décodé.
     fn file_decoded(&mut self);
+    /// 2.21.137 (ordre #9 7061820250) — seconde de capture à partir de
+    /// laquelle un event compte dans le débit global : le démarrage du
+    /// lecteur. 0 = aucune borne.
+    fn counts_since(&self) -> i64 {
+        0
+    }
     /// Un event à compter dans le débit (déjà dédoublonné).
     fn observe(&mut self, event: &event_schema::NormalizedEvent);
 }
@@ -3182,6 +3197,8 @@ pub(crate) trait ReaderHooks {
 /// Branche la passe sur le registre de débit de l'application.
 struct ThroughputHooks<'a> {
     state: &'a AppState,
+    /// 2.21.137 — seconde de démarrage de ce lecteur.
+    started_at: i64,
 }
 
 impl ReaderHooks for ThroughputHooks<'_> {
@@ -3190,6 +3207,9 @@ impl ReaderHooks for ThroughputHooks<'_> {
     }
     fn file_decoded(&mut self) {
         self.state.inner.throughput.bump_file_decoded();
+    }
+    fn counts_since(&self) -> i64 {
+        self.started_at
     }
     fn observe(&mut self, event: &event_schema::NormalizedEvent) {
         let session_id = crate::throughput::resolve_session_id_for_event(self.state, event);
@@ -3516,10 +3536,20 @@ pub(crate) fn reader_pass(
                 {
                     traces.route_normalized(event);
                 }
+                // 2.21.137 (ordre #9 7061820250) — même règle que pour les
+                // traces (2.21.135) : rien d'antérieur au démarrage du
+                // lecteur ne compte dans le débit global. Un lecteur neuf
+                // relit le segment courant depuis l'octet 0 ; avant, il
+                // recomptait la passe précédente. Le filigrane avance quand
+                // même, pour ne pas recompter plus tard.
                 if file_state_entry.should_count_in_throughput(
                     packet_number,
                     &event.event_id,
                 ) {
+                    if event.timestamp.seconds < hooks.counts_since() {
+                        traces.bump_throughput_before_reader_start();
+                        continue;
+                    }
                     hooks.observe(event);
                 }
             }
@@ -3589,6 +3619,9 @@ pub(crate) fn start_reader(state: AppState) {
         let mut last_stats: Option<std::time::Instant> = None;
         // 2.21.130 — passes consécutives qui n'ont rien décodé.
         let mut idle_passes = 0u32;
+        // 2.21.137 — seconde de démarrage de ce lecteur : rien d'antérieur
+        // ne compte dans le débit global.
+        let reader_started_at = epoch_seconds() as i64;
         loop {
             {
                 let traces = state.inner.live_traces.traces.lock().unwrap();
@@ -3635,7 +3668,7 @@ pub(crate) fn start_reader(state: AppState) {
                         catchup,
                         full_redecode_requested(),
                         std::time::Instant::now(),
-                        &mut ThroughputHooks { state: &state2 },
+                        &mut ThroughputHooks { state: &state2, started_at: reader_started_at },
                     );
                     (states, sessions, dirs)
                 })
@@ -7332,6 +7365,57 @@ mod tests {
         }
     }
 
+    /// 2.21.137 (ordre #9 7061820250) — le débit global hors trace ne
+    /// recompte pas, au redémarrage du lecteur, ce que le segment courant
+    /// contenait déjà : seuls les G-PDU capturés après le démarrage
+    /// comptent. Le filigrane avance quand même : les G-PDU écartés ne
+    /// sont pas comptés à la passe suivante non plus.
+    #[test]
+    fn a_restarted_reader_does_not_recount_the_current_segment_in_the_global_throughput_2_21_137() {
+        let (dir, bytes) = n3_ring_file("restart");
+        let root = dir.parent().unwrap().join("ring");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(ring_directory("N3"))).unwrap();
+        let path = root.join(ring_directory("N3")).join("n3_00001.pcapng");
+        fs::write(&path, &bytes).unwrap();
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&path, "N3"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let gpdus: Vec<i64> = events
+            .iter()
+            .filter(|e| e.protocol.as_str() == "GTP-U")
+            .map(|e| e.timestamp.seconds)
+            .collect();
+        assert!(gpdus.len() >= 2);
+        let registry = LiveTraceRegistry::new();
+        let run = |since: i64| {
+            let mut states = HashMap::new();
+            let mut sessions = HashMap::new();
+            let mut dirs = HashMap::new();
+            let mut hooks = CountingHooks { since, ..CountingHooks::default() };
+            // Premier passage d'un lecteur neuf : le segment courant est
+            // relu depuis l'octet 0.
+            reader_pass(&root, &key, &registry, &mut states, &mut sessions, &mut dirs, true, false, std::time::Instant::now(), &mut hooks);
+            // Passe suivante, rien de neuf.
+            reader_pass(&root, &key, &registry, &mut states, &mut sessions, &mut dirs, false, false, std::time::Instant::now(), &mut hooks);
+            hooks.observed
+        };
+        let all = run(0);
+        assert!(all >= gpdus.len() as u64, "sans borne : tout le segment courant est compté");
+        let after_last = *gpdus.iter().max().unwrap() + 1;
+        assert_eq!(run(after_last), 0, "lecteur démarré après la capture : rien n'est recompté");
+        assert_eq!(
+            registry.throughput_before_reader_start.load(Ordering::Relaxed),
+            all,
+            "chaque event écarté est compté une fois"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
         let bytes = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7526,6 +7610,8 @@ mod tests {
         files_decoded: u64,
         observed: u64,
         gap_bytes: u64,
+        /// 2.21.137 — démarrage simulé du lecteur.
+        since: i64,
     }
 
     impl ReaderHooks for CountingHooks {
@@ -7537,6 +7623,9 @@ mod tests {
         }
         fn observe(&mut self, _event: &event_schema::NormalizedEvent) {
             self.observed += 1;
+        }
+        fn counts_since(&self) -> i64 {
+            self.since
         }
     }
 
