@@ -686,6 +686,7 @@ dependencies = [
  "safety-guard",
  "scenario-engine",
  "serde",
+ "serde_json",
  "traffic-engine",
  "ueransim-adapter",
 ]

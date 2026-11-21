@@ -1820,15 +1820,15 @@ trait UeRuntime: Send + Sync {
         let _ = job;
         Err("UE_DEREGISTER_COMMAND_UNSUPPORTED".into())
     }
-    fn snapshot_gnb_contexts_before_stop(&self) -> Result<Vec<GnbUeContext>, String> {
+    fn snapshot_gnb_contexts(&self) -> Result<Vec<GnbUeContext>, String> {
         Ok(Vec::new())
     }
     fn reconcile_gnb_contexts_after_stop(
         &self,
-        contexts_before_stop: &[GnbUeContext],
+        mapped_ran_ngap_id: Option<u32>,
         timeout_seconds: u64,
     ) -> Result<(), String> {
-        let _ = contexts_before_stop;
+        let _ = mapped_ran_ngap_id;
         let _ = timeout_seconds;
         Ok(())
     }
@@ -3032,65 +3032,22 @@ impl UeRuntime for DockerUeRuntime {
         Self::execute_ue_cli(target, "deregister switch-off".into())
     }
 
-    fn snapshot_gnb_contexts_before_stop(&self) -> Result<Vec<GnbUeContext>, String> {
+    fn snapshot_gnb_contexts(&self) -> Result<Vec<GnbUeContext>, String> {
         DockerGnbNgapChecker::ue_contexts()
     }
 
     fn reconcile_gnb_contexts_after_stop(
         &self,
-        contexts_before_stop: &[GnbUeContext],
+        mapped_ran_ngap_id: Option<u32>,
         timeout_seconds: u64,
     ) -> Result<(), String> {
-        const ORPHAN_MIN_AGE_SECONDS: u64 = 31;
+        let ran_ngap_id = mapped_ran_ngap_id.ok_or("GNB_STOPPED_CONTEXT_AMBIGUOUS")?;
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(timeout_seconds);
-        let first_after_stop = DockerGnbNgapChecker::ue_contexts()?;
-        let newly_orphaned = newly_orphaned_gnb_context_ids(
-            contexts_before_stop,
-            &first_after_stop,
-        )?;
-        if let Some(ue_id) = newly_orphaned.first().copied() {
-            let ran_ngap_id = first_after_stop
-                .iter()
-                .find(|context| context.ue_id == ue_id)
-                .map(|context| context.ran_ngap_id)
-                .ok_or("GNB_STOPPED_CONTEXT_NOT_FOUND")?;
-            DockerGnbNgapChecker::release_ue_context(ue_id)?;
-            return DockerGnbNgapChecker::wait_until_context_absent(ran_ngap_id, deadline);
-        }
-
-        let disappeared_attached = contexts_before_stop
-            .iter()
-            .filter(|before| before.amf_ngap_id >= 0)
-            .filter(|before| {
-                !first_after_stop
-                    .iter()
-                    .any(|after| after.ran_ngap_id == before.ran_ngap_id)
-            })
-            .count();
-        if disappeared_attached == 1 || (contexts_before_stop.is_empty() && first_after_stop.is_empty()) {
+        let contexts = DockerGnbNgapChecker::ue_contexts()?;
+        let Some(ue_id) = mapped_release_target(ran_ngap_id, &contexts)? else {
             return Ok(());
-        }
-        if disappeared_attached > 1 {
-            return Err("GNB_STOPPED_CONTEXT_AMBIGUOUS".into());
-        }
-
-        let age_window = std::time::Duration::from_secs(ORPHAN_MIN_AGE_SECONDS);
-        if std::time::Instant::now() + age_window > deadline {
-            return Err("GNB_UE_CONTEXT_RELEASE_INCOMPLETE".into());
-        }
-        std::thread::sleep(age_window);
-        let aged_after_stop = DockerGnbNgapChecker::ue_contexts()?;
-        let aged_orphans = stable_orphan_gnb_context_ids(&first_after_stop, &aged_after_stop)?;
-        let ue_id = aged_orphans
-            .first()
-            .copied()
-            .ok_or("GNB_UE_CONTEXT_RELEASE_INCOMPLETE")?;
-        let ran_ngap_id = aged_after_stop
-            .iter()
-            .find(|context| context.ue_id == ue_id)
-            .map(|context| context.ran_ngap_id)
-            .ok_or("GNB_STOPPED_CONTEXT_NOT_FOUND")?;
+        };
         DockerGnbNgapChecker::release_ue_context(ue_id)?;
         DockerGnbNgapChecker::wait_until_context_absent(ran_ngap_id, deadline)
     }
@@ -4551,42 +4508,36 @@ fn parse_gnb_ue_contexts(output: &str) -> Result<Vec<GnbUeContext>, String> {
     Ok(contexts)
 }
 
-fn unique_context_ids(contexts: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
-    let ids: Vec<u32> = contexts.collect();
-    if ids.len() > 1 {
-        return Err("GNB_STOPPED_CONTEXT_AMBIGUOUS".into());
-    }
-    Ok(ids)
-}
-
-fn newly_orphaned_gnb_context_ids(
-    before_stop: &[GnbUeContext],
-    after_stop: &[GnbUeContext],
-) -> Result<Vec<u32>, String> {
-    unique_context_ids(after_stop
+fn unique_new_ran_ngap_id(
+    before_start: &[GnbUeContext],
+    after_start: &[GnbUeContext],
+) -> Option<u32> {
+    let appeared = after_start
         .iter()
-        .filter(|after| after.amf_ngap_id < 0)
         .filter(|after| {
-            before_stop.iter().any(|before| {
-                before.ran_ngap_id == after.ran_ngap_id && before.amf_ngap_id >= 0
-            })
+            !before_start
+                .iter()
+                .any(|before| before.ran_ngap_id == after.ran_ngap_id)
         })
-        .map(|context| context.ue_id))
+        .map(|context| context.ran_ngap_id)
+        .collect::<Vec<_>>();
+    (appeared.len() == 1).then(|| appeared[0])
 }
 
-fn stable_orphan_gnb_context_ids(
-    first_sample: &[GnbUeContext],
-    second_sample: &[GnbUeContext],
-) -> Result<Vec<u32>, String> {
-    unique_context_ids(second_sample
+fn mapped_release_target(
+    mapped_ran_ngap_id: u32,
+    contexts: &[GnbUeContext],
+) -> Result<Option<u32>, String> {
+    let matches = contexts
         .iter()
-        .filter(|second| second.amf_ngap_id < 0)
-        .filter(|second| {
-            first_sample.iter().any(|first| {
-                first.ran_ngap_id == second.ran_ngap_id && first.amf_ngap_id < 0
-            })
-        })
-        .map(|context| context.ue_id))
+        .filter(|context| context.ran_ngap_id == mapped_ran_ngap_id)
+        .map(|context| context.ue_id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [ue_id] => Ok(Some(*ue_id)),
+        _ => Err("GNB_STOPPED_CONTEXT_AMBIGUOUS".into()),
+    }
 }
 
 impl DockerGnbNgapChecker {
@@ -11104,6 +11055,7 @@ fn start_one_live_inner(
         }
     };
     let approved_runtime = state.ue_runtime.approve_launch(&profile, &profile_sha256)?;
+    let gnb_contexts_before_start = state.ue_runtime.snapshot_gnb_contexts().ok();
     let operation_id = random_hex(16);
     {
         let mut controller = state
@@ -11218,6 +11170,17 @@ fn start_one_live_inner(
             return Err(error);
         }
     };
+    let gnb_ran_ngap_id = if observation.registration_state == "REGISTERED" {
+        gnb_contexts_before_start.as_ref().and_then(|before| {
+            state
+                .ue_runtime
+                .snapshot_gnb_contexts()
+                .ok()
+                .and_then(|after| unique_new_ran_ngap_id(before, &after))
+        })
+    } else {
+        None
+    };
     let mut controller = state
         .multi_ue
         .lock()
@@ -11230,6 +11193,7 @@ fn start_one_live_inner(
         &observation.pdu_session_state,
         observation.ue_ip.as_deref(),
     )?;
+    controller.set_gnb_ran_ngap_id(ue_id, gnb_ran_ngap_id)?;
     if let Err(error) = persist_ue_registry(state, &controller) {
         drop(controller);
         let cleanup = state.ue_runtime.stop(&approved_runtime, &handle);
@@ -11324,11 +11288,11 @@ fn finalize_stop_after_gnb_reconciliation(
     state: &AppState,
     ue_id: &str,
     operation_id: &str,
-    contexts_before_stop: &[GnbUeContext],
+    mapped_ran_ngap_id: Option<u32>,
 ) -> Result<simulator_controller::UeJob, String> {
     if let Err(error) = state
         .ue_runtime
-        .reconcile_gnb_contexts_after_stop(contexts_before_stop, 40)
+        .reconcile_gnb_contexts_after_stop(mapped_ran_ngap_id, 40)
     {
         let response_error = error.clone();
         let mut controller = state.multi_ue.lock().map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
@@ -11356,7 +11320,7 @@ fn stop_one_live_inner(
     // container removes the namespace in either case.
     let policy_target = resolve_controller_traffic_target(state, ue_id).ok();
     let operation_id = random_hex(16);
-    let (approved_runtime, handle, release_job) = {
+    let (approved_runtime, handle, release_job, mapped_ran_ngap_id) = {
         let mut controller = state
             .multi_ue
             .lock()
@@ -11370,8 +11334,27 @@ fn stop_one_live_inner(
         // this function obtains the stop reservation.  Runtime observation
         // then legitimately clears the launch approval and process handle.
         // Treat that terminal observation as an idempotent successful stop
-        // instead of reporting a false LIVE_RUNTIME_APPROVAL_MISSING error.
+        // only after the durable gNB mapping has also been reconciled.
         if is_terminal_stop_state(&job.process_state) {
+            let mapped_ran_ngap_id = job.gnb_ran_ngap_id;
+            drop(controller);
+            if let Err(error) = state
+                .ue_runtime
+                .reconcile_gnb_contexts_after_stop(mapped_ran_ngap_id, 40)
+            {
+                let response_error = error.clone();
+                let mut controller = state
+                    .multi_ue
+                    .lock()
+                    .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
+                controller.mark_terminal_stop_incomplete(ue_id, &error)?;
+                persist_ue_registry(state, &controller)?;
+                return Err(response_error);
+            }
+            let mut controller = state
+                .multi_ue
+                .lock()
+                .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
             let stopped = controller.stop_offline(ue_id)?.clone();
             persist_ue_registry(state, &controller)?;
             return Ok(stopped);
@@ -11385,7 +11368,8 @@ fn stop_one_live_inner(
             .process_handle
             .or_else(|| job_approval.and_then(|approved| approved.process_handle.clone()))
             .ok_or("UE_NOT_STARTED")?;
-        let result = (approved_runtime, handle, release_job);
+        let mapped_ran_ngap_id = job.gnb_ran_ngap_id;
+        let result = (approved_runtime, handle, release_job, mapped_ran_ngap_id);
         // 0.19.5 — Stop reclaims an expired lock instead of returning
         // 409: pass the current clock and the max age so the controller
         // can decide.
@@ -11405,13 +11389,12 @@ fn stop_one_live_inner(
     // stop_offline must not strand the lock on this UE.
     let _lock_guard = OperationLockGuard::new(state, ue_id, &operation_id);
     let discovered = state.ue_runtime.discover(&approved_runtime)?;
-    let contexts_before_stop = state.ue_runtime.snapshot_gnb_contexts_before_stop()?;
     if discovered.is_none() {
         return finalize_stop_after_gnb_reconciliation(
             state,
             ue_id,
             &operation_id,
-            &contexts_before_stop,
+            mapped_ran_ngap_id,
         );
     }
     // 0.19.4 — Policy-route cleanup is best-effort on Stop: if the
@@ -11461,7 +11444,7 @@ fn stop_one_live_inner(
         state,
         ue_id,
         &operation_id,
-        &contexts_before_stop,
+        mapped_ran_ngap_id,
     )
 }
 
@@ -16691,7 +16674,7 @@ mod p0_tests {
         fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String> { self.0.stop(spec, handle) }
         fn request_pdu_release_for_detach(&self, job: &simulator_controller::UeJob) -> Result<(), String> { self.0.request_pdu_release_for_detach(job) }
         fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> { self.0.deregister_switch_off(job) }
-        fn reconcile_gnb_contexts_after_stop(&self, _: &[GnbUeContext], _: u64) -> Result<(), String> { Err("GNB_UE_CONTEXT_RELEASE_INCOMPLETE".into()) }
+        fn reconcile_gnb_contexts_after_stop(&self, _: Option<u32>, _: u64) -> Result<(), String> { Err("GNB_UE_CONTEXT_RELEASE_INCOMPLETE".into()) }
     }
 
     struct PostRunInspectionFailureRuntime {
@@ -22648,7 +22631,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         let output = "- ue-id: 51\n  ran-ngap-id: 52\n  amf-ngap-id: -1\n- ue-id: 49\n  ran-ngap-id: 50\n  amf-ngap-id: 91\n";
         let contexts = parse_gnb_ue_contexts(output).unwrap();
         assert_eq!(contexts.len(), 2);
-        assert_eq!(stable_orphan_gnb_context_ids(&contexts, &contexts).unwrap(), vec![51]);
+        assert_eq!(mapped_release_target(52, &contexts).unwrap(), Some(51));
     }
 
     #[test]
@@ -22659,26 +22642,53 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
 
     #[test]
     fn gnb_stop_targets_only_the_context_that_became_orphan() {
-        let before = vec![
-            GnbUeContext { ue_id: 51, ran_ngap_id: 52, amf_ngap_id: 91 },
-            GnbUeContext { ue_id: 50, ran_ngap_id: 51, amf_ngap_id: -1 },
-        ];
         let after = vec![
             GnbUeContext { ue_id: 51, ran_ngap_id: 52, amf_ngap_id: -1 },
             GnbUeContext { ue_id: 50, ran_ngap_id: 51, amf_ngap_id: -1 },
         ];
-        assert_eq!(newly_orphaned_gnb_context_ids(&before, &after).unwrap(), vec![51]);
+        assert_eq!(mapped_release_target(52, &after).unwrap(), Some(51));
     }
 
     #[test]
     fn gnb_stop_never_ages_a_recent_orphan_in_one_sample() {
-        let first = Vec::new();
-        let second = vec![GnbUeContext {
+        let contexts = vec![GnbUeContext {
             ue_id: 50,
             ran_ngap_id: 51,
             amf_ngap_id: -1,
         }];
-        assert!(stable_orphan_gnb_context_ids(&first, &second).unwrap().is_empty());
+        assert_eq!(mapped_release_target(52, &contexts).unwrap(), None);
+    }
+
+    #[test]
+    fn gnb_stop_does_not_target_another_ue_that_becomes_orphan_concurrently() {
+        let mapped_ran_ngap_id = 52;
+        let after_stop = vec![GnbUeContext {
+            ue_id: 50,
+            ran_ngap_id: 51,
+            amf_ngap_id: -1,
+        }];
+        assert_eq!(
+            mapped_release_target(mapped_ran_ngap_id, &after_stop).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn simultaneous_new_contexts_do_not_create_a_start_mapping() {
+        let before = Vec::new();
+        let after = vec![
+            GnbUeContext {
+                ue_id: 50,
+                ran_ngap_id: 51,
+                amf_ngap_id: 90,
+            },
+            GnbUeContext {
+                ue_id: 51,
+                ran_ngap_id: 52,
+                amf_ngap_id: 91,
+            },
+        ];
+        assert_eq!(unique_new_ran_ngap_id(&before, &after), None);
     }
 
     #[test]
