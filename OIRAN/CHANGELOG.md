@@ -1,5 +1,35 @@
 # Changelog
 
+## oiran-api 2.21.136 — 2026-11-21 — trace live : l'amorçage apprend l'IP de l'UE ; une IP d'UE réattribuée ne rattache pas une autre session (constat CLAUDE2 #9 7060850616, écart déclaré #9 7060953472, ordre #9 7060917832)
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.135 @ `fbc8072` (branche `fix/oiran-2.21.134-train-next`). Seul `apps/api/src/live_trace.rs` change.
+
+### Écart de 2.21.134, déclaré
+
+2.21.134 annonçait le rattachement après coup pendant l'amorçage. **Il n'a jamais tourné** : `route_event_with` sortait pour l'amorçage (`if seed_only { return }`) avant la boucle de représentation. Le tampon d'amorçage était rempli, jamais rejoué. Le test de 2.21.134 vérifiait un effet (des SEID appris), obtenu par un autre chemin (la `Session Modification Request`, rattachée par le tunnel côté accès radio). Conséquence (CLAUDE2) : une trace ouverte après l'établissement de la session n'apprenait jamais l'IP de l'UE, portée seulement par l'IE 93 de l'établissement PFCP : 0 SIP, 0 RTP.
+
+### Correctif
+
+1. La sortie anticipée est retirée : la représentation après coup tourne aussi pendant l'amorçage, sur son tampon propre (vidé au début et à la fin), sans rien émettre ni compter dans `pfcp.attached_after_the_fact`. L'établissement PFCP de l'historique est rattaché, son IE 93 lue, l'IP de l'UE apprise. La passe d'appariement proposée par CLAUDE2 n'a pas été nécessaire : le test le montre.
+2. **L'IP de l'UE est un identifiant réattribuable**, comme les tunnels et les SEID. Un établissement PFCP qui porte une IP d'UE connue de la trace depuis plus de 10 s ne se rattache pas par elle ; la session antérieure est oubliée **avec son IP** (rangée sous sa session de données ou sous l'un de ses SEID). L'IP de l'UE ne suffit plus, seule, à admettre un établissement : il faut une identité, ou des identifiants frais. Sans cette règle, l'apprentissage de l'IP à l'amorçage rouvrait le cas 4 (2 events étrangers : une nouvelle session reprenait l'IP d'une session antérieure de l'abonné).
+
+### Changements de comportement à connaître
+
+- Une trace ouverte après l'établissement d'une session apprend désormais, à l'amorçage, l'IP de l'UE (exposée dans `ue_info`) et les SEID de l'établissement.
+- Un SIP depuis une IP d'UE réattribuée n'entre plus dans la trace de l'ancien porteur dès que l'établissement de la nouvelle session est vu.
+
+### OUVERT
+
+- **G7 au lab n'est pas expliqué par ce défaut** : ANR1 (#10 7060969074) montre que les traces étaient ouvertes **avant** l'établissement IMS — chemin live. Trois relevés demandés (#9 7060987467) : l'établissement IMS est-il dans la trace, l'IP d'UE dans `ue_info`, l'adresse source du SIP sur N6 = l'IE 93 ?
+- Sans établissement PFCP visible, une IP réattribuée n'est pas détectée.
+- IPv6 : préfixe /64 de l'UE contre adresse du paquet SIP : non traité (inchangé depuis 2.21.126).
+
+### Tests — échec avant, succès après
+
+- `seed_alone_learns_the_ue_ip_and_attaches_the_register_2_21_136` (capture réelle `multi-imsi.pcap`, cinq traces ouvertes après la capture, amorçage seul) : chaque trace apprend l'IP de **son** UE (celle de l'IE 93 de l'établissement que sa trace rattache en live) et aucune autre ; l'amorçage n'émet rien ; un REGISTER depuis l'IP de chaque UE (URI en alias, sans SDP, identifiants d'appel distincts) entre dans la trace de son abonné et dans aucune autre ; `sip.attached_by_ue_ip` = 1. Sortie anticipée remise : échec, « IP de son UE apprise à l'amorçage ».
+- Cas 4 (`simultaneous_traces_…_2_21_129`) : avec l'amorçage corrigé mais sans la règle sur l'IP de l'UE, 2 events étrangers (les deux messages d'établissement de la nouvelle session, admis par l'IP de l'UE reprise) ; avec : 0.
+- `multi-imsi.pcap` : toujours 70 / 68 / 67 / 69 / 65.
+
 ## oiran-api 2.21.135 — 2026-11-21 — trace live : une trace ne reçoit aucun event capturé avant son ouverture (lab G9 bis, débit doublé ; #10 7060875172, #9 7060893472)
 
 Upgrade **patch** sans déploiement, au-dessus de la fusion de 2.21.133 @ `db8a3a5` (branche `fix/oiran-2.21.134-train-next`). Seul `apps/api/src/live_trace.rs` change. Train non déplacé.
@@ -45,7 +75,7 @@ Historique amorcé, puis un autre abonné reprend les tunnels et les SEID d'une 
 2. **Oubli de la session antérieure** : un établissement refusé pour ce motif prouve que la session antérieure de la trace est finie sans qu'elle l'ait vu. Elle est oubliée en entier : ses SEID, les tunnels rangés sous eux, la session de données qui range l'un de ses tunnels avec tous les tunnels de celle-ci — **côté accès radio compris**, que la nouvelle session reprend aussi (c'est par lui qu'entraient les 2 events). Compteur `stats.pfcp.establishment_reused_identifiers`.
 3. Chaque tunnel et SEID de l'abonné garde la seconde de capture du dernier event rattaché qui le portait (`identifier_seen_at`, borné à 8 192).
 4. **Amorçage dans l'ordre du temps** (question 1 du cœur) : les events des segments retenus de tous les plans d'amorçage sont réunis et rejoués triés par horodatage de capture (tri stable : à égalité, ordre des plans puis de la capture). Les fins de session s'appliquent dans l'ordre réel, tous plans confondus.
-5. **Rattachement après coup pendant l'amorçage** : sur un tampon propre à l'amorçage, jamais mêlé au live, vidé au début et à la fin de chaque amorçage ; même borne de 10 s. `pfcp.attached_after_the_fact` ne compte que le live.
+5. **Rattachement après coup pendant l'amorçage** : sur un tampon propre à l'amorçage, jamais mêlé au live, vidé au début et à la fin de chaque amorçage ; même borne de 10 s. `pfcp.attached_after_the_fact` ne compte que le live. **Correction (2.21.136) : ce point n'a jamais tourné** — une sortie anticipée de l'amorçage précédait la représentation après coup ; voir 2.21.136.
 6. Un event représenté après coup ne relance plus lui-même une représentation ; les enchaînements (la réponse après sa requête) passent par les tours successifs. La fin des tours se mesure au nombre d'events effectivement rattachés.
 
 ### Écart avec le design posté (#9 7060312186), déclaré

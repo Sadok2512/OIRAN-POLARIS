@@ -937,6 +937,7 @@ fn forget_earlier_session(state: &mut TraceState, identifiers: &HashSet<String>)
         .map(|(session, _)| session.clone())
         .collect();
     let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut owners: HashSet<String> = sessions.iter().map(|session| format!("pdu:{session}")).collect();
     for session in sessions {
         if let Some(tunnels) = state.session_tunnels.remove(&session) {
             for (address, teid) in tunnels {
@@ -952,6 +953,20 @@ fn forget_earlier_session(state: &mut TraceState, identifiers: &HashSet<String>)
         if filed.iter().any(|pair| teids.contains(&pair.1)) {
             seids.insert(seid.clone());
         }
+    }
+    owners.extend(seids.iter().map(|seid| format!("seid:{seid}")));
+    // 2.21.136 — l'IP de l'UE de cette session : portée par l'un de ces
+    // identifiants, ou rangée sous cette session ou l'un de ces SEID.
+    let gone_ips: Vec<String> = state
+        .ue_ip_keys
+        .iter()
+        .filter(|(ip, by)| identifiers.contains(*ip) || by.iter().any(|owner| owners.contains(owner)))
+        .map(|(ip, _)| ip.clone())
+        .collect();
+    for ip in gone_ips {
+        state.ue_ip_keys.remove(&ip);
+        state.exposed_keys.remove(&ip);
+        state.identifier_seen_at.remove(&ip);
     }
     for seid in &seids {
         if let Some(filed) = state.seid_tunnels.remove(seid) {
@@ -1933,6 +1948,8 @@ impl LiveTraceRegistry {
             let is_establishment = is_establishment_request || is_establishment_response;
             // Identifiants portés par l'établissement que la trace connaît
             // d'un event de l'abonné vieux de plus de 10 s.
+            // 2.21.136 — l'IP de l'UE aussi : elle est réattribuée comme
+            // les tunnels quand la session antérieure finit.
             let carries_reused_identifier = is_establishment
                 && ev_header_seid_pairs
                     .iter()
@@ -1943,6 +1960,7 @@ impl LiveTraceRegistry {
                     .chain(ev_session_seids.iter())
                     .chain(ev_teids.iter())
                     .chain(ev_session_teids.iter())
+                    .chain(ev_ue_ip_pseudonyms.iter())
                     .any(|identifier| {
                         state.identifier_seen_at.get(identifier).is_some_and(|seen| {
                             (event.timestamp.seconds - seen).abs() > AFTER_THE_FACT_MAX_AGE_S
@@ -1950,7 +1968,6 @@ impl LiveTraceRegistry {
                     });
             let establishment_ok = forced
                 || match_pseudo
-                || match_ue_ip
                 || state.match_keys.any_identity_in(&tokens)
                 || (is_establishment_response
                     && establishment_key
@@ -1974,6 +1991,7 @@ impl LiveTraceRegistry {
                     .chain(ev_session_seids.iter().cloned())
                     .chain(ev_teids.iter().cloned())
                     .chain(ev_session_teids.iter().cloned())
+                    .chain(ev_ue_ip_pseudonyms.iter().cloned())
                     .collect();
                 forget_earlier_session(state, &carried);
                 if !seed_only {
@@ -2164,6 +2182,7 @@ impl LiveTraceRegistry {
                         .or_default()
                         .extend(owners.iter().cloned());
                     state.exposed_keys.insert(ip.clone());
+                    state.identifier_seen_at.insert(ip.clone(), event.timestamp.seconds);
                 }
             }
             if is_pfcp
@@ -2815,9 +2834,13 @@ impl LiveTraceRegistry {
             }
         }
         drop(traces);
-        if seed_only {
-            return attached_here;
-        }
+        // 2.21.136 (constat CLAUDE2 #9 7060850616, écart déclaré #9
+        // 7060953472) — la représentation après coup tourne aussi pendant
+        // l'amorçage, sur son propre tampon. En 2.21.134, une sortie ici
+        // pour l'amorçage la rendait inopérante : l'établissement PFCP de
+        // l'historique n'était jamais rattaché, son IE 93 jamais lue, et
+        // une trace ouverte après l'établissement n'apprenait jamais l'IP
+        // de l'UE (0 SIP).
         // 2.21.124 (capture réelle à cinq abonnés) — rattachement après
         // coup des messages PFCP de la session. Dans la séquence réelle,
         // l'établissement PFCP précède le message N2 qui fait connaître
@@ -7172,6 +7195,141 @@ mod tests {
             .sum();
         assert_eq!(total, 3 * 500, "la seconde trace ne compte que son trafic");
         assert_eq!(traces["second"].trace.gpdu_attached, 3);
+    }
+
+    /// 2.21.136 (constat CLAUDE2 #9 7060850616, ordre #9 7060917832) —
+    /// trace ouverte APRÈS l'établissement de la session : l'amorçage seul
+    /// (capture réelle `multi-imsi.pcap` comme historique) doit apprendre
+    /// l'IP de l'UE de chaque abonné, portée par l'IE 93 de son
+    /// `Session Establishment Request`, rattaché après coup pendant
+    /// l'amorçage. Puis un REGISTER envoyé depuis cette IP (URI en alias,
+    /// sans SDP) entre dans la trace de son abonné, et jamais dans une
+    /// autre. Avant : 0 IP apprise, 0 REGISTER rattaché.
+    #[test]
+    fn seed_alone_learns_the_ue_ip_and_attaches_the_register_2_21_136() {
+        use event_schema::{Direction, Protocol};
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap",
+        );
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events: Vec<event_schema::NormalizedEvent> = Vec::new();
+        for interface in ["N2", "N4", "SBI"] {
+            let config = oiran_decode::DecodeConfig {
+                input: capture.clone(),
+                capture_id: format!("sha256:{}", sha256_hex(interface.as_bytes())),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "multi-imsi.pcap".into(),
+            };
+            let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            });
+        }
+        events.sort_by_key(|e| e.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        let id_of = |event: &event_schema::NormalizedEvent, name: &str| -> Option<String> {
+            event.session_identifiers.iter().find(|id| id.name == name).map(|id| id.value.clone())
+        };
+        let mut contexts: Vec<(String, Vec<String>)> = Vec::new();
+        for event in events.iter().filter(|e| e.interface == "N2") {
+            if let (Some(pseudonym), Some(ran)) =
+                (id_of(event, "subscriber_pseudonym"), id_of(event, "ran_ue_ngap_id"))
+            {
+                match contexts.iter_mut().find(|(known, _)| known == &ran) {
+                    Some((_, list)) if !list.contains(&pseudonym) => list.push(pseudonym),
+                    Some(_) => {}
+                    None => contexts.push((ran, vec![pseudonym])),
+                }
+            }
+        }
+        let shared: HashSet<String> = contexts
+            .iter()
+            .flat_map(|(_, list)| list.iter().cloned())
+            .filter(|p| contexts.iter().filter(|(_, list)| list.contains(p)).count() > 1)
+            .collect();
+        let subs: Vec<String> = contexts
+            .iter()
+            .map(|(_, list)| list.iter().find(|p| !shared.contains(*p)).unwrap().clone())
+            .collect();
+        // L'IP d'UE de chaque abonné : l'IE 93 de l'établissement que sa
+        // trace rattache en live (vérité terrain).
+        let mut ue_ip_of: Vec<String> = Vec::new();
+        for sub in &subs {
+            let r = trace_on(sub);
+            for e in &events {
+                r.route_normalized(e);
+            }
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            let attached: HashSet<String> = t
+                .events
+                .iter()
+                .filter(|e| e.kind == "message")
+                .filter_map(|e| e.payload["event_id"].as_str().map(str::to_owned))
+                .collect();
+            let est = events
+                .iter()
+                .find(|e| {
+                    attached.contains(&e.event_id)
+                        && compact_name(&e.message_name).ends_with("sessionestablishmentrequest")
+                })
+                .expect("établissement PFCP rattaché en live");
+            let ips = ue_ip_pseudonyms(est);
+            assert_eq!(ips.len(), 1, "une IP d'UE dans l'IE 93");
+            ue_ip_of.push(ips[0].clone());
+        }
+        assert_eq!(ue_ip_of.iter().collect::<HashSet<_>>().len(), 5, "cinq IP distinctes");
+        // Amorçage seul : cinq traces ouvertes après la capture.
+        let r = LiveTraceRegistry::new();
+        for (k, sub) in subs.iter().enumerate() {
+            let mut st = state(u64::MAX, false, vec![sub.clone()]);
+            st.trace.trace_id = format!("t{k}");
+            r.traces.lock().unwrap().insert(format!("t{k}"), st);
+        }
+        assert!(r.begin_seed());
+        learn_history(&r, events.iter().filter(|e| e.interface != "SBI").cloned().collect());
+        r.finish_seed(&SeedReport::default());
+        {
+            let traces = r.traces.lock().unwrap();
+            for k in 0..subs.len() {
+                let t = &traces[&format!("t{k}")];
+                assert!(t.events.is_empty(), "l'amorçage n'émet rien");
+                assert!(t.ue_ip_keys.contains_key(&ue_ip_of[k]), "trace {k} : IP de son UE apprise à l'amorçage");
+                for (o, ip) in ue_ip_of.iter().enumerate() {
+                    if o != k {
+                        assert!(!t.ue_ip_keys.contains_key(ip), "trace {k} : IP de l'UE {o}");
+                    }
+                }
+                assert_eq!(t.trace.pfcp_attached_after_the_fact, 0, "le compteur ne compte que le live");
+            }
+        }
+        // Un REGISTER par UE, depuis son IP, URI en alias, sans SDP.
+        for (k, ip) in ue_ip_of.iter().enumerate() {
+            let call = format!("reg-{k}@ims");
+            let mut register = mk_event(
+                "IMS",
+                Protocol::Sip,
+                "REGISTER",
+                10_000 + k as u64,
+                Direction::Unknown,
+                vec![("sip_call_id", call.as_str()), ("subscriber_pseudonym", "psn-alias")],
+                vec![("CSeq", "1 REGISTER"), ("packet_source_ip_pseudonym", ip.as_str())],
+            );
+            register.event_id = format!("evt-register-{k}");
+            r.route_normalized(&register);
+        }
+        let traces = r.traces.lock().unwrap();
+        for k in 0..subs.len() {
+            let t = &traces[&format!("t{k}")];
+            let routed: Vec<String> = t
+                .events
+                .iter()
+                .filter(|e| e.kind == "message")
+                .filter_map(|e| e.payload["event_id"].as_str().map(str::to_owned))
+                .collect();
+            assert_eq!(routed, [format!("evt-register-{k}")], "trace {k} : son REGISTER, et lui seul");
+            assert_eq!(t.trace.sip_attached_by_ue_ip, 1);
+        }
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
