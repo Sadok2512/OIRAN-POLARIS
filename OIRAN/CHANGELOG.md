@@ -1,5 +1,48 @@
 # Changelog
 
+## oiran-api 2.21.131, oiran-decode 0.12.0, decoder-rtp 0.3.0 — 2026-11-21 — lecteur live : reprise à l'offset sur IMS et N6, flux RTP montré toutes les 5 s (lot B2, design #9 7050841418, GO #9 7050925249)
+
+Upgrade **mineur** de `oiran-decode` et `decoder-rtp` (API ajoutée), **patch** de `oiran-api`, sans déploiement, un commit au-dessus de 2.21.130 @ `e5af59a`. Branches `fix/oiran-2.21.131-b2-ims-n6-rtp-snapshot` et `fix/oiran-2.21.121-train`.
+
+### Audit avant code — le contrat « même `event_id` » n'est pas tenable
+
+Le GO demandait : instantané RTP toutes les 5 s, champ `revision`, **même `event_id`**, la trace remplace. Or l'`event_id` d'un flux RTP est l'empreinte de `capture_id | protocole | type | horodatage | raw_payload_reference | paquets` (`event-schema`, `assign_deterministic_id`), et `raw_payload_reference` porte le **nombre de paquets du flux** (`decoder-rtp`). Il change dès que le flux grossit. Question posée au cœur (#9 7054512200), **sans réponse au moment du commit** : j'ai codé la voie (a) annoncée — la clé de remplacement est **`stable_event_key`** (dérivée du premier paquet du flux, elle ne bouge pas), plus `revision`. Aucun identifiant existant ne change : la révision finale est, event pour event, celle que la clôture émettait déjà. Si le cœur choisit (b) (retirer `packets=` de la référence pour stabiliser l'`event_id`), c'est un lot à part qui change les `event_id` publiés.
+
+### Changement
+
+1. **`oiran-decode` 0.12.0** : `supports_incremental` admet **IMS** et **N6** (SIP sur UDP : un datagramme, un message ; RTP agrégé en session ; le TCP n'est pas décodé sur ces plans). Nouvelle fonction `snapshot_rtp_flows(config, &session, sink)` : un event par flux en cours, tel que la clôture l'émettrait si le fichier s'arrêtait là ; la session n'est pas modifiée (copie de l'agrégateur, aucun ordinal consommé).
+2. **`decoder-rtp` 0.3.0** : `RtpFlowAggregator` devient `Clone`. Le champ `decoder_version` des events de flux RTP passe donc de `0.2.1` à `0.3.0`.
+3. **Lecteur** : sur les plans qui agrègent du RTP (N3, S1-U, S5-U, IMS, N6), instantané des flux du segment courant **au plus toutes les 5 s**, et seulement si des octets ont été décodés depuis le précédent — y compris quand le segment a cessé de grossir. `stats.reader.interfaces.<plan>.rtp_snapshots`.
+4. **Trace** : un flux RTP est reconnu par `stable_event_key`. Première émission : `revision: 0`. Une révision au contenu inchangé n'est pas réémise ; une révision nouvelle porte `revision` croissant et **remplace** la précédente dans le tampon de la trace (rejeu à la reconnexion). Elle ne compte ni comme un message de plus, ni comme une inversion. `stats.rtp.flow_updates`.
+
+### Contrat SSE — ajout
+
+L'event `message` d'un flux RTP porte un champ **`revision`** (entier, 0 puis croissant). **Le front doit remplacer** la ligne de même `stable_event_key` quand il reçoit une révision supérieure ; s'il ne le fait pas, il affiche une ligne par révision. Les autres messages ne portent pas `revision`.
+
+### Changements de comportement à connaître
+
+- IMS et N6 en live : plus de redécodage intégral du segment courant. Avant, chaque redécodage réémettait les flux RTP avec un nouvel `event_id` : une ligne de plus par passe où le flux avait grossi.
+- Tunnel (N3, S1-U, S5-U) : un flux RTP apparaît dans les 5 s, au lieu d'attendre la rotation du segment.
+- Le repli `OIRAN_LIVE_READER_FULL_REDECODE=1` remet IMS et N6 en redécodage intégral, sans instantané.
+
+### OUVERT
+
+- **Décision du cœur sur la clé** (ci-dessus). **Non vérifié** : que le front remplace par `stable_event_key`.
+- **Aucune capture réelle de voix dans le dépôt** : parité et instantané prouvés sur captures synthétiques (SIP et RTP en UDP, sans et avec tunnel).
+- **SIP sur TCP** (gros messages) : non décodé sur IMS / N6, ni avant ni après ce lot.
+- Un flux dont la clé stable est vide (pas de nom de segment) n'a pas de révision : chaque instantané serait une ligne. Le lecteur fournit toujours le nom du segment.
+- `decoder-rtp` journalise `RTP_LOSS_NEGATIVE_APPARENT` avec les **adresses IP du flux en clair** (présent depuis 2.21.100). Avec l'instantané, la ligne se répète toutes les 5 s pour un flux concerné. Non corrigé ici : à trancher (pseudonymiser ou retirer les adresses du journal).
+- Coût : une copie de l'agrégateur RTP par instantané (par segment courant et par 5 s) ; non mesuré sous charge.
+- S6a et SBI restent en redécodage intégral (B3 non engagé).
+
+### Tests
+
+- Gate de parité (`incremental_decode_matches_full_decode_for_any_split_2_21_109`) étendu à IMS et N6 sur une capture synthétique (REGISTER, INVITE, 200, deux flux RTP, BYE) : 12 graines × 2 pas, JSON complet identique au décodage intégral ; un instantané pris à chaque découpage ne change rien ; l'instantané pris en fin de fichier est identique à la clôture.
+- `rtp_snapshot_follows_a_growing_flow_with_a_constant_stable_key_2_21_131` (`oiran-decode`) : deux flux à chaque instantané, clé stable constante, `event_id` qui change, compte de paquets croissant.
+- `a_growing_rtp_flow_is_replaced_by_its_next_revision_2_21_131` (trace) : révisions 0, 1, 2 ; contenu inchangé non réémis ; le tampon ne garde que la dernière révision de chaque flux ; un message compté par flux.
+- `reader_pass_shows_a_live_rtp_flow_every_five_seconds_on_ims_2_21_131` (lecteur, ring simulé) : IMS en reprise ; instantané à la première passe ; pas d'instantané 2 s plus tard ; révision 1 à 6 s sur un segment qui ne grossit plus ; rien à 12 s ; révision finale à la rotation ; une ligne par flux.
+- `incremental_decode_is_refused_on_stateful_planes_2_21_109` : IMS et N6 passent du côté admis ; SBI et S6a restent refusés.
+
 ## oiran-api 2.21.130 — 2026-11-21 — lecteur live : coût d'une passe et borne de l'amorçage (recette lab 2.21.114, ordres #9 7052731132 points 3 et 4, 7053683830)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.129 @ `005a382`. Branches `fix/oiran-2.21.130-reader-pass-cost` et `fix/oiran-2.21.121-train`. Seul `oiran-api` change (`live_trace.rs`, `throughput.rs`). **Numéro** : l'ordre #9 7053683830 réservait 2.21.128 à ce lot ; il sort après 2.21.129, et une version ne redescend pas : il prend 2.21.130. 2.21.128 reste inutilisé ; 2.21.127 est à CLAUDE2.

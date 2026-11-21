@@ -357,6 +357,10 @@ pub fn supports_incremental(interface: &str) -> bool {
         interface,
         "N3" | "S1-U" | "S5-U" | "N4" | "Sxab" | "S11" | "S5-C"
     ) || is_incremental_sctp_plane(interface)
+        // 0.12.0 (oiran-api 2.21.131, lot B2) — IMS et N6 : SIP sur UDP
+        // (un datagramme, un message) et RTP agrégé en session. Le TCP
+        // n'est pas décodé sur ces plans.
+        || carries_ims_media(interface)
 }
 
 /// 0.11.0 (oiran-api 2.21.120, lot B1) — plans SCTP admis en reprise.
@@ -417,6 +421,39 @@ where
     Ok(event_count)
 }
 
+/// 0.12.0 (oiran-api 2.21.131, lot B2, GO #9 7050925249) — instantané
+/// des flux RTP en cours d'une session incrémentale : un event par flux,
+/// tel que la clôture l'émettrait si le fichier s'arrêtait ici. La
+/// session n'est pas modifiée : ni l'agrégateur, ni les ordinaux. Un
+/// instantané pris quand tout le fichier est lu est identique, event
+/// pour event, à ce que [`finish_incremental`] émet.
+/// Retourne le nombre d'events émis.
+pub fn snapshot_rtp_flows<F>(
+    config: &DecodeConfig,
+    session: &DecodeSession,
+    mut sink: F,
+) -> Result<usize, String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    let state = &session.state;
+    // Les ordinaux que la clôture verrait : ceux des paquets qui ont
+    // ouvert un flux, plus ceux du paquet en cours s'il en ouvre un.
+    let mut ordinals = state.retained_ordinals.clone();
+    if state.retain_current_packet {
+        ordinals.extend(state.key_ordinals.iter().map(|(key, value)| (key.clone(), *value)));
+    }
+    let mut event_count = 0usize;
+    emit_rtp_flow_events(
+        config,
+        state.rtp_aggregator.clone(),
+        &mut ordinals,
+        &mut sink,
+        &mut event_count,
+    )?;
+    Ok(event_count)
+}
+
 /// Émet un event par flux RTP agrégé et vide l'agrégateur.
 fn emit_rtp_flows<F>(
     config: &DecodeConfig,
@@ -428,6 +465,19 @@ where
     F: FnMut(NormalizedEvent) -> Result<(), String>,
 {
     let aggregator = std::mem::replace(&mut state.rtp_aggregator, RtpFlowAggregator::new());
+    emit_rtp_flow_events(config, aggregator, &mut state.key_ordinals, sink, event_count)
+}
+
+fn emit_rtp_flow_events<F>(
+    config: &DecodeConfig,
+    aggregator: RtpFlowAggregator,
+    key_ordinals: &mut HashMap<String, u32>,
+    sink: &mut F,
+    event_count: &mut usize,
+) -> Result<(), String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
     let rtp_events = aggregator.finish(&config.capture_id, ims_event_interface(&config.interface));
     for mut event in rtp_events {
         // 2.21.91 (défaut #9 7033006772 raffiné #9 7034553419) — stamper
@@ -441,8 +491,7 @@ where
                     packet.packet_number,
                     packet.byte_offset,
                 );
-                let ordinal = *state
-                    .key_ordinals
+                let ordinal = *key_ordinals
                     .entry(lookup)
                     .and_modify(|v| *v = v.saturating_add(1))
                     .or_insert(0);
@@ -1550,6 +1599,60 @@ Content-Length: 0\r\n\
         classic_pcap(&frames)
     }
 
+    /// Trame Ethernet/IPv4/UDP, sans tunnel.
+    fn udp_frame(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, payload: &[u8]) -> Vec<u8> {
+        let udp = (8 + payload.len()) as u16;
+        let ip = 20 + udp;
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&[0x08, 0x00, 0x45, 0x00]);
+        f.extend_from_slice(&ip.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+        f.extend_from_slice(&src);
+        f.extend_from_slice(&dst);
+        f.extend_from_slice(&sport.to_be_bytes());
+        f.extend_from_slice(&dport.to_be_bytes());
+        f.extend_from_slice(&udp.to_be_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Capture IMS / N6 synthétique, sans tunnel : REGISTER (sans SDP),
+    /// INVITE avec SDP, 200 OK avec SDP, deux flux RTP négociés, BYE.
+    fn synthetic_ims_voice_capture() -> Vec<u8> {
+        let ue = [10, 47, 0, 2];
+        let pcscf = [10, 77, 24, 20];
+        let peer = [10, 77, 24, 30];
+        let sip = |start: &str, cseq: &str, sdp: Option<&str>| {
+            let body = sdp.unwrap_or("");
+            let content_type = if sdp.is_some() { "Content-Type: application/sdp\r\n" } else { "" };
+            format!(
+                "{start}\r\nVia: SIP/2.0/UDP 10.47.0.2:5060;branch=z9hG4bKb2\r\nMax-Forwards: 70\r\nFrom: <sip:caller@example.invalid>;tag=a\r\nTo: <sip:callee@example.invalid>\r\nCall-ID: synthetic-2-21-131@oiran\r\nCSeq: {cseq}\r\n{content_type}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let offer = "v=0\r\no=- 1 1 IN IP4 10.47.0.2\r\ns=-\r\nc=IN IP4 10.47.0.2\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let answer = "v=0\r\no=- 2 2 IN IP4 10.77.24.30\r\ns=-\r\nc=IN IP4 10.77.24.30\r\nt=0 0\r\nm=audio 50000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let rtp = |ssrc: u32, seq: u16| {
+            let mut p = vec![0x80, 0x00];
+            p.extend_from_slice(&seq.to_be_bytes());
+            p.extend_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+            p.extend_from_slice(&ssrc.to_be_bytes());
+            p.extend_from_slice(&[0x55; 20]);
+            p
+        };
+        let mut frames = Vec::new();
+        frames.push(udp_frame(ue, 5060, pcscf, 5060, sip("REGISTER sip:example.invalid SIP/2.0", "1 REGISTER", None).as_bytes()));
+        frames.push(udp_frame(ue, 5060, pcscf, 5060, sip("INVITE sip:callee@example.invalid SIP/2.0", "2 INVITE", Some(offer)).as_bytes()));
+        frames.push(udp_frame(pcscf, 5060, ue, 5060, sip("SIP/2.0 200 OK", "2 INVITE", Some(answer)).as_bytes()));
+        for seq in 0..40u16 {
+            frames.push(udp_frame(ue, 40_000, peer, 50_000, &rtp(0x1111, seq)));
+            frames.push(udp_frame(peer, 50_000, ue, 40_000, &rtp(0x2222, seq)));
+        }
+        frames.push(udp_frame(ue, 5060, pcscf, 5060, sip("BYE sip:callee@example.invalid SIP/2.0", "3 BYE", None).as_bytes()));
+        classic_pcap(&frames)
+    }
+
     fn seeded_cuts(len: usize, seed: u64, max_step: usize) -> Vec<usize> {
         let mut state = seed;
         let mut cuts = Vec::new();
@@ -1579,6 +1682,9 @@ Content-Length: 0\r\n\
             ("N3", "pcapng", std::fs::read(datasets.join("N3.pcapng")).unwrap()),
             ("N4", "pcapng", std::fs::read(datasets.join("N4.pcapng")).unwrap()),
             ("N3", "pcap", synthetic_n3_voice_capture()),
+            // 0.12.0 (oiran-api 2.21.131, lot B2) — plans IMS et N6.
+            ("IMS", "pcap", synthetic_ims_voice_capture()),
+            ("N6", "pcap", synthetic_ims_voice_capture()),
         ];
         let key = PseudonymKey::from_bytes([3; 32]);
         for (interface, extension, bytes) in &inputs {
@@ -1606,8 +1712,13 @@ Content-Length: 0\r\n\
             assert!(!full.is_empty(), "{interface}.{extension} : des events");
             if *extension == "pcap" {
                 let count = |needle: &str| full.iter().filter(|e| e.contains(needle)).count();
-                assert_eq!(count("\"protocol\":\"RTP\""), 2, "deux flux RTP du tunnel");
-                assert!(count("\"interface\":\"N3-IMS\"") >= 1, "le SIP du tunnel");
+                assert_eq!(count("\"protocol\":\"RTP\""), 2, "{interface} : deux flux RTP");
+                if *interface == "N3" {
+                    assert!(count("\"interface\":\"N3-IMS\"") >= 1, "le SIP du tunnel");
+                } else {
+                    assert_eq!(count("\"protocol\":\"SIP\""), 4, "{interface} : REGISTER, INVITE, 200, BYE");
+                    assert_eq!(count("\"interface\":\"IMS\""), 6, "{interface} publié IMS");
+                }
             }
             for seed in 0..12u64 {
                 for max_step in [61usize, 3000] {
@@ -1625,8 +1736,21 @@ Content-Length: 0\r\n\
                             session.state.key_ordinals.len() <= 1,
                             "les ordinaux d'un paquet clos sont oubliés"
                         );
+                        // 0.12.0 (lot B2) — un instantané pris à chaque
+                        // découpage ne change rien à la suite.
+                        snapshot_rtp_flows(&config, &session, |_| Ok(())).unwrap();
                     }
                     assert_eq!(session.consumed_bytes(), bytes.len() as u64);
+                    // 0.12.0 (lot B2) — l'instantané pris quand tout le
+                    // fichier est lu est la révision finale : identique à
+                    // ce que la clôture émet.
+                    let mut last_snapshot = Vec::new();
+                    snapshot_rtp_flows(&config, &session, |event| {
+                        last_snapshot.push(event.to_json());
+                        Ok(())
+                    })
+                    .unwrap();
+                    let already = incremental.len();
                     assert!(
                         session.state.retained_ordinals.len() <= 2,
                         "au plus un ordinal gardé par flux RTP"
@@ -1637,6 +1761,11 @@ Content-Length: 0\r\n\
                     })
                     .unwrap();
                     assert_eq!(
+                        &incremental[already..],
+                        &last_snapshot[..],
+                        "{interface}.{extension} graine {seed} pas {max_step} : instantané final = clôture"
+                    );
+                    assert_eq!(
                         incremental, full,
                         "{interface}.{extension} graine {seed} pas {max_step}"
                     );
@@ -1644,6 +1773,63 @@ Content-Length: 0\r\n\
             }
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// 0.12.0 (oiran-api 2.21.131, lot B2, GO #9 7050925249) — l'instantané
+    /// suit le flux qui grossit : mêmes flux, même `stable_event_key` d'un
+    /// instantané à l'autre, compte de paquets croissant ; et la session
+    /// n'est pas modifiée (la clôture reste identique au décodage
+    /// intégral, vérifié par le gate de parité).
+    #[test]
+    fn rtp_snapshot_follows_a_growing_flow_with_a_constant_stable_key_2_21_131() {
+        let bytes = synthetic_ims_voice_capture();
+        let path = std::env::temp_dir().join(format!(
+            "oiran-snap-{}-{:?}.pcap",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let config = DecodeConfig {
+            input: path.clone(),
+            capture_id: format!("sha256:{}", "e".repeat(64)),
+            interface: "IMS".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: "ims_00001_20261121.pcapng".into(),
+        };
+        let key = PseudonymKey::from_bytes([3; 32]);
+        let mut session = DecodeSession::new();
+        let mut history: Vec<Vec<NormalizedEvent>> = Vec::new();
+        for fraction in [3usize, 2, 1] {
+            std::fs::write(&path, &bytes[..bytes.len() / fraction]).unwrap();
+            decode_capture_incremental(&config, &key, &mut session, |_| Ok(())).unwrap();
+            let mut snapshot = Vec::new();
+            snapshot_rtp_flows(&config, &session, |event| {
+                snapshot.push(event);
+                Ok(())
+            })
+            .unwrap();
+            // Deux instantanés de suite sans octet nouveau sont identiques.
+            let mut again = Vec::new();
+            snapshot_rtp_flows(&config, &session, |event| {
+                again.push(event);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(snapshot, again);
+            history.push(snapshot);
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(history.iter().all(|snapshot| snapshot.len() == 2), "deux flux à chaque instantané");
+        let keys = |snapshot: &[NormalizedEvent]| -> Vec<String> {
+            snapshot.iter().map(|e| e.stable_event_key.clone()).collect()
+        };
+        assert!(keys(&history[0]).iter().all(|key| !key.is_empty()));
+        assert_eq!(keys(&history[0]), keys(&history[1]));
+        assert_eq!(keys(&history[1]), keys(&history[2]));
+        // Le flux grossit : l'`event_id` change (il porte le nombre de
+        // paquets), la clé stable non.
+        assert_ne!(history[0][0].event_id, history[2][0].event_id);
+        assert_ne!(history[0][0].raw_payload_reference, history[2][0].raw_payload_reference);
+        assert!(history[2][0].raw_payload_reference.ends_with("packets=40"));
     }
 
     /// Trame Ethernet/IPv4/SCTP portant les chunks donnés.
@@ -1796,7 +1982,7 @@ Content-Length: 0\r\n\
     /// 0.11.0 (lot B1), N2 et S1-MME l'acceptent.
     #[test]
     fn incremental_decode_is_refused_on_stateful_planes_2_21_109() {
-        for interface in ["SBI", "S6a", "IMS", "N6"] {
+        for interface in ["SBI", "S6a"] {
             assert!(!supports_incremental(interface));
             let config = DecodeConfig {
                 input: "unused.pcap".into(),
@@ -1809,7 +1995,7 @@ Content-Length: 0\r\n\
             let mut session = DecodeSession::new();
             assert!(decode_capture_incremental(&config, &key, &mut session, |_| Ok(())).is_err());
         }
-        for interface in ["N3", "S1-U", "S5-U", "N4", "Sxab", "S11", "S5-C", "N2", "S1-MME"] {
+        for interface in ["N3", "S1-U", "S5-U", "N4", "Sxab", "S11", "S5-C", "N2", "S1-MME", "IMS", "N6"] {
             assert!(supports_incremental(interface));
         }
     }

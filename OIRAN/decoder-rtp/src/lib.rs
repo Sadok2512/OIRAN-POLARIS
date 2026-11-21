@@ -98,6 +98,9 @@ pub struct SdpFlowRegistration {
     pub clock_rate_hz: Option<u32>,
 }
 
+/// 0.3.0 (oiran-api 2.21.131, lot B2) — `Clone` : un instantané des flux
+/// en cours se calcule sur une copie, l'agrégateur continue.
+#[derive(Clone)]
 pub struct RtpFlowAggregator {
     flows: BTreeMap<FlowKey, FlowState>,
     /// `(ip, port) → Call-ID` — populé par `register_sdp_flow` dès qu'un

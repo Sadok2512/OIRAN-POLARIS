@@ -106,6 +106,9 @@ pub(crate) struct LiveTrace {
     /// permanente : la trace est repartie de cette procédure.
     #[serde(default)]
     fresh_registrations: u64,
+    /// 2.21.131 — révisions de flux RTP émises après la première.
+    #[serde(default)]
+    rtp_flow_updates: u64,
     /// 2.21.119 — libérations d'une session nommée dont aucun tunnel
     /// n'était rangé par session : rien n'a pu être oublié.
     #[serde(default)]
@@ -200,6 +203,16 @@ const RING_DIR_SETTLE: Duration = Duration::from_secs(2);
 fn reader_interval(idle_passes: u32) -> Duration {
     let factor = 1u32 << idle_passes.min(2);
     (READER_BASE_INTERVAL * factor).min(READER_MAX_INTERVAL)
+}
+
+/// 2.21.131 (lot B2, GO #9 7050925249) — période de l'instantané des
+/// flux RTP en cours.
+const RTP_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 2.21.131 — plans dont le décodage agrège des flux RTP : le tunnel du
+/// plan usager, et les plans IMS et N6.
+fn carries_rtp_flows(interface: &str) -> bool {
+    matches!(interface, "N3" | "S1-U" | "S5-U" | "IMS" | "N6")
 }
 
 /// 2.21.105 — période d'émission de l'event SSE `stats`.
@@ -442,6 +455,9 @@ struct TraceState {
     /// 2.21.129 — `event_id` des parents des events rattachés : un
     /// InitialUEMessage qui en fait partie est celui de l'abonné.
     parents_of_attached: HashSet<String>,
+    /// 2.21.131 (lot B2) — flux RTP déjà émis : `stable_event_key` →
+    /// `(révision, event_id de cette révision)`.
+    rtp_flow_revisions: HashMap<String, (u64, String)>,
     /// 2.21.109 (ordre #9 7050201220) — identifiants UE de signalisation
     /// appris sur les events routés : `(nom, valeur, association)` avec
     /// `nom` ∈ amf_ue_ngap_id / ran_ue_ngap_id / mme_ue_s1ap_id /
@@ -1180,6 +1196,9 @@ impl LiveTraceRegistry {
             "parents_attached_after_child": trace.parents_attached_after_child,
             "session_releases_without_filed_tunnels": trace.session_releases_without_filed_tunnels,
             "fresh_registrations": trace.fresh_registrations,
+            "rtp": {
+                "flow_updates": trace.rtp_flow_updates,
+            },
             "rejects": {
                 "ue_id_mismatch": trace.rejected_ue_id_mismatch,
                 "seid_endpoint_mismatch": trace.rejected_seid_endpoint_mismatch,
@@ -2408,27 +2427,70 @@ impl LiveTraceRegistry {
                 // event_id) n'est émis qu'une fois ; une inversion dans une
                 // même capture est comptée (`out_of_order`) et marquée
                 // `late:true`, jamais masquée.
+                // 2.21.131 (lot B2, GO #9 7050925249) — flux RTP : le même
+                // flux est émis plusieurs fois pendant qu'il grossit
+                // (instantané toutes les 5 s, puis clôture). Le flux est
+                // reconnu par `stable_event_key`, qui ne bouge pas ; son
+                // `event_id` change avec le nombre de paquets. Une
+                // révision au contenu inchangé n'est pas réémise ; une
+                // révision nouvelle porte `revision` croissant et
+                // REMPLACE la précédente dans le tampon de la trace.
+                let flow_revision: Option<u64> = if is_rtp && !event.stable_event_key.is_empty() {
+                    match state.rtp_flow_revisions.get(&event.stable_event_key) {
+                        Some((_, last_event_id)) if last_event_id == &event.event_id => continue,
+                        Some((revision, _)) => Some(revision + 1),
+                        None => Some(0),
+                    }
+                } else {
+                    None
+                };
                 let message_key = (event.capture_id.clone(), packet, event.event_id.clone());
                 if !state.seen.insert(message_key) {
                     state.trace.duplicates_dropped += 1;
                     continue;
                 }
+                if let Some(revision) = flow_revision {
+                    if state.rtp_flow_revisions.len() >= 4_096 {
+                        state.rtp_flow_revisions.clear();
+                    }
+                    state
+                        .rtp_flow_revisions
+                        .insert(event.stable_event_key.clone(), (revision, event.event_id.clone()));
+                    if revision > 0 {
+                        state.trace.rtp_flow_updates = state.trace.rtp_flow_updates.saturating_add(1);
+                        state.events.retain(|buffered| {
+                            buffered.kind != "message"
+                                || buffered.payload["stable_event_key"].as_str()
+                                    != Some(event.stable_event_key.as_str())
+                        });
+                    }
+                }
+                let is_flow_update = flow_revision.is_some_and(|revision| revision > 0);
                 if state.seen.len() > MAX_EVENTS * 4 {
                     state.seen.clear();
                 }
                 let last = state.last_packet.get(&event.capture_id).copied();
                 let late = last.is_some_and(|last| packet < last);
-                if late {
+                if is_flow_update {
+                    // Mise à jour d'un message déjà compté : ni message de
+                    // plus, ni inversion de plus.
+                } else if late {
                     state.trace.out_of_order += 1;
                 } else {
                     state.last_packet.insert(event.capture_id.clone(), packet);
                 }
                 state.next_id += 1;
-                state.trace.messages += 1;
+                if !is_flow_update {
+                    state.trace.messages += 1;
+                }
                 // 2.21.91 (défaut #9 7033006772) — expose `stable_event_key`
                 // dans le payload SSE. Clé de corrélation live↔publi
                 // indépendante de `capture_id` (voir event-schema 1.6.0).
                 let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"stable_event_key":event.stable_event_key,"timestamp":{"seconds":event.timestamp.seconds,"nanoseconds":event.timestamp.nanoseconds},"decoded_ie_tree":value.get("information_elements"),"late":late});
+                let mut payload = payload;
+                if let Some(revision) = flow_revision {
+                    payload["revision"] = json!(revision);
+                }
                 let item = BufferedEvent {
                     id: state.next_id,
                     kind: "message".into(),
@@ -2649,6 +2711,9 @@ pub(crate) struct ReaderIo {
     /// 2.21.130 — redécodages intégraux reportés par la cadence minimale.
     #[serde(default)]
     throttled: u64,
+    /// 2.21.131 — instantanés des flux RTP pris pendant la passe.
+    #[serde(default)]
+    rtp_snapshots: u64,
 }
 
 /// 2.21.109 — session de reprise d'un segment du ring, gardée par le
@@ -2660,6 +2725,49 @@ pub(crate) struct ReaderSession {
     /// Détecte un fichier réécrit sur place sous le même inode.
     tail: Option<(u64, String)>,
     session: oiran_decode::DecodeSession,
+    /// 2.21.131 (lot B2) — dernier instantané des flux RTP de ce segment.
+    last_rtp_snapshot: Option<std::time::Instant>,
+    /// 2.21.131 — des octets ont été décodés depuis ce dernier instantané.
+    rtp_dirty: bool,
+}
+
+/// 2.21.131 (lot B2, GO #9 7050925249) — segment courant d'un plan qui
+/// agrège des flux RTP : instantané des flux en cours, au plus toutes
+/// les 5 s et seulement si des octets ont été décodés depuis le
+/// précédent. La trace remplace la révision précédente du même flux ; la
+/// clôture du segment émet la dernière.
+fn snapshot_rtp_flows_if_due(
+    sessions: &mut HashMap<std::path::PathBuf, ReaderSession>,
+    path: &std::path::Path,
+    config: &oiran_decode::DecodeConfig,
+    interface: &str,
+    now: std::time::Instant,
+    traces: &LiveTraceRegistry,
+    pass_io: &mut BTreeMap<String, ReaderIo>,
+) {
+    if !carries_rtp_flows(interface) {
+        return;
+    }
+    let Some(open) = sessions.get_mut(path) else {
+        return;
+    };
+    let due = open
+        .last_rtp_snapshot
+        .is_none_or(|at| now.saturating_duration_since(at) >= RTP_SNAPSHOT_INTERVAL);
+    if !open.rtp_dirty || !due {
+        return;
+    }
+    open.last_rtp_snapshot = Some(now);
+    open.rtp_dirty = false;
+    let mut flows = Vec::new();
+    let _ = oiran_decode::snapshot_rtp_flows(config, &open.session, |event| {
+        flows.push(event);
+        Ok(())
+    });
+    pass_io.entry(interface.to_string()).or_default().rtp_snapshots += 1;
+    for event in &flows {
+        traces.route_normalized(event);
+    }
 }
 
 pub(crate) struct IncrementOutcome {
@@ -2716,6 +2824,8 @@ pub(crate) fn decode_increment(
         }
     }
     let entry = sessions.entry(path.clone()).or_insert_with(|| ReaderSession {
+        last_rtp_snapshot: None,
+        rtp_dirty: false,
         device_inode: identity,
         tail: None,
         session: oiran_decode::DecodeSession::new(),
@@ -2727,6 +2837,9 @@ pub(crate) fn decode_increment(
         Ok(())
     });
     let consumed_bytes = entry.session.consumed_bytes();
+    if consumed_bytes != before {
+        entry.rtp_dirty = true;
+    }
     entry.tail = tail_fingerprint(path, consumed_bytes);
     IncrementOutcome {
         events,
@@ -3037,6 +3150,12 @@ pub(crate) fn reader_pass(
                     for event in close_reader_session(sessions, &config) {
                         traces.route_normalized(&event);
                     }
+                } else if sessions.contains_key(path) {
+                    // 2.21.131 — segment courant inchangé : les derniers
+                    // octets décodés depuis le dernier instantané sont
+                    // encore à montrer.
+                    let config = ring_decode_config(path, interface);
+                    snapshot_rtp_flows_if_due(sessions, path, &config, interface, now, traces, &mut pass_io);
                 }
                 continue;
             }
@@ -3154,6 +3273,8 @@ pub(crate) fn reader_pass(
                 for event in close_reader_session(sessions, &config) {
                     traces.route_normalized(&event);
                 }
+            } else if incremental {
+                snapshot_rtp_flows_if_due(sessions, path, &config, interface, now, traces, &mut pass_io);
             }
         }
     }
@@ -3431,6 +3552,7 @@ pub(crate) async fn create(
         rejected_foreign_subscriber: 0,
         stale_state_resets: 0,
         fresh_registrations: 0,
+        rtp_flow_updates: 0,
         session_releases_without_filed_tunnels: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
@@ -3457,6 +3579,7 @@ pub(crate) async fn create(
             ue_ips: HashSet::new(),
             ue_ip_keys: HashMap::new(),
             parents_of_attached: HashSet::new(),
+            rtp_flow_revisions: HashMap::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -3846,6 +3969,7 @@ mod tests {
                 rejected_foreign_subscriber: 0,
                 stale_state_resets: 0,
                 fresh_registrations: 0,
+                rtp_flow_updates: 0,
                 session_releases_without_filed_tunnels: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
@@ -3868,6 +3992,7 @@ mod tests {
             ue_ips: HashSet::new(),
             ue_ip_keys: HashMap::new(),
             parents_of_attached: HashSet::new(),
+            rtp_flow_revisions: HashMap::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -6273,6 +6398,216 @@ mod tests {
             assert!(t.ue_ip_keys.is_empty(), "amorçage={from_seed} : IP UE d'une ancienne session apprise");
             assert!(!t.seids.contains("0x0000000000002002"), "amorçage={from_seed}");
         }
+    }
+
+    /// 2.21.131 (lot B2, GO #9 7050925249 ; clé : question #9 7054512200)
+    /// — un flux RTP émis plusieurs fois pendant qu'il grossit : même
+    /// `stable_event_key`, `revision` croissant, la trace REMPLACE. Une
+    /// révision au contenu inchangé n'est pas réémise. Les autres
+    /// messages ne portent pas `revision`.
+    #[test]
+    fn a_growing_rtp_flow_is_replaced_by_its_next_revision_2_21_131() {
+        use event_schema::{Direction, Protocol};
+        let flow = |packets: u64, key: &str| {
+            let mut event = mk_event("IMS", Protocol::Rtp, "RTP Flow", 5, Direction::Unknown, vec![("sip_call_id", "call-a@ims")], vec![("ssrc", "0x00001111")]);
+            event.event_id = format!("evt-rtp-{key}-{packets}");
+            event.stable_event_key = format!("sek-{key}");
+            event
+        };
+        let r = trace_on("psn-ue-a");
+        let mut invite = mk_event("IMS", Protocol::Sip, "INVITE", 1, Direction::Unknown, vec![("sip_call_id", "call-a@ims"), ("subscriber_pseudonym", "psn-ue-a")], vec![("CSeq", "1 INVITE")]);
+        invite.event_id = "evt-sip-0001".into();
+        invite.stable_event_key = "sek-invite".into();
+        r.route_normalized(&invite);
+        r.route_normalized(&flow(10, "a"));
+        r.route_normalized(&flow(10, "a")); // même contenu : rien
+        r.route_normalized(&flow(10, "b")); // autre flux
+        r.route_normalized(&flow(25, "a"));
+        r.route_normalized(&flow(40, "a"));
+        r.route_normalized(&flow(40, "a")); // clôture identique au dernier instantané
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        let buffered: Vec<(String, Option<u64>)> = t
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| (e.payload["event_id"].as_str().unwrap().to_owned(), e.payload["revision"].as_u64()))
+            .collect();
+        assert_eq!(
+            buffered,
+            [
+                ("evt-sip-0001".to_string(), None),
+                ("evt-rtp-b-10".to_string(), Some(0)),
+                ("evt-rtp-a-40".to_string(), Some(2)),
+            ],
+            "le tampon ne garde que la dernière révision de chaque flux"
+        );
+        assert_eq!(t.trace.messages, 3, "un flux compte pour un message, quelle que soit sa révision");
+        assert_eq!(t.trace.rtp_flow_updates, 2);
+        assert_eq!(t.trace.duplicates_dropped, 0);
+        assert_eq!(t.trace.out_of_order, 0);
+        assert_eq!(r.stats_payload(&t.trace)["rtp"]["flow_updates"], 2);
+    }
+
+    /// Capture IMS synthétique, sans tunnel : INVITE et 200 OK avec SDP,
+    /// puis `rtp_packets` paquets RTP dans chaque sens. L'URI From porte
+    /// l'identité de test du PLMN 001/01, pour que le SIP ait un
+    /// pseudonyme d'abonné.
+    fn ims_voice_capture(rtp_packets: u16) -> Vec<u8> {
+        let frame = |src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, payload: &[u8]| {
+            let udp = (8 + payload.len()) as u16;
+            let mut f = vec![0u8; 12];
+            f.extend_from_slice(&[0x08, 0x00, 0x45, 0x00]);
+            f.extend_from_slice(&(20 + udp).to_be_bytes());
+            f.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+            f.extend_from_slice(&src);
+            f.extend_from_slice(&dst);
+            f.extend_from_slice(&sport.to_be_bytes());
+            f.extend_from_slice(&dport.to_be_bytes());
+            f.extend_from_slice(&udp.to_be_bytes());
+            f.extend_from_slice(&[0, 0]);
+            f.extend_from_slice(payload);
+            f
+        };
+        let (ue, pcscf, peer) = ([10, 47, 0, 2], [10, 77, 24, 20], [10, 77, 24, 30]);
+        let sip = |start: &str, sdp: &str| {
+            format!(
+                "{start}\r\nVia: SIP/2.0/UDP 10.47.0.2:5060;branch=z9hG4bKb2\r\nMax-Forwards: 70\r\nFrom: <sip:001010000000001@example.invalid>;tag=a\r\nTo: <sip:callee@example.invalid>\r\nCall-ID: synthetic-2-21-131@oiran\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                sdp.len()
+            )
+        };
+        let offer = "v=0\r\no=- 1 1 IN IP4 10.47.0.2\r\ns=-\r\nc=IN IP4 10.47.0.2\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let answer = "v=0\r\no=- 2 2 IN IP4 10.77.24.30\r\ns=-\r\nc=IN IP4 10.77.24.30\r\nt=0 0\r\nm=audio 50000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let rtp = |ssrc: u32, seq: u16| {
+            let mut p = vec![0x80, 0x00];
+            p.extend_from_slice(&seq.to_be_bytes());
+            p.extend_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+            p.extend_from_slice(&ssrc.to_be_bytes());
+            p.extend_from_slice(&[0x55; 20]);
+            p
+        };
+        let mut frames = vec![
+            frame(ue, 5060, pcscf, 5060, sip("INVITE sip:callee@example.invalid SIP/2.0", offer).as_bytes()),
+            frame(pcscf, 5060, ue, 5060, sip("SIP/2.0 200 OK", answer).as_bytes()),
+        ];
+        for seq in 0..rtp_packets {
+            frames.push(frame(ue, 40_000, peer, 50_000, &rtp(0x1111, seq)));
+            frames.push(frame(peer, 50_000, ue, 40_000, &rtp(0x2222, seq)));
+        }
+        let mut file = Vec::new();
+        file.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+        file.extend_from_slice(&2u16.to_le_bytes());
+        file.extend_from_slice(&4u16.to_le_bytes());
+        file.extend_from_slice(&[0u8; 8]);
+        file.extend_from_slice(&65_535u32.to_le_bytes());
+        file.extend_from_slice(&1u32.to_le_bytes());
+        for (index, frame) in frames.iter().enumerate() {
+            file.extend_from_slice(&(1_795_000_000u32 + index as u32 / 50).to_le_bytes());
+            file.extend_from_slice(&((index as u32 % 50) * 20_000).to_le_bytes());
+            file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            file.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            file.extend_from_slice(frame);
+        }
+        file
+    }
+
+    /// 2.21.131 (lot B2) — le lecteur sur le plan IMS : reprise à
+    /// l'offset, instantané des flux RTP toutes les 5 s tant que le
+    /// segment grossit, et clôture à la rotation. Avant ce lot : IMS en
+    /// redécodage intégral, et un flux RTP n'apparaissait qu'à la
+    /// rotation du segment (jusqu'à une heure plus tard).
+    #[test]
+    fn reader_pass_shows_a_live_rtp_flow_every_five_seconds_on_ims_2_21_131() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let root = std::env::temp_dir().join(format!(
+            "oiran-reader-b2-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ims")).unwrap();
+        let segment = root.join("ims").join("ims_00000.pcapng");
+        // Le fichier grossit : 10, puis 25, puis 40 paquets RTP par sens
+        // (chaque état est un préfixe du suivant).
+        let states: Vec<Vec<u8>> = [10u16, 25, 40].iter().map(|n| ims_voice_capture(*n)).collect();
+        assert!(states[1].starts_with(&states[0]) && states[2].starts_with(&states[1]));
+        fs::write(&segment, &states[0]).unwrap();
+        // L'abonné : le pseudonyme que le SIP porte.
+        let mut probe = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&segment, "IMS"), &key, |event| {
+            probe.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let pseudonym = probe
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let registry = trace_on(&pseudonym);
+        let mut file_states = HashMap::new();
+        let mut sessions = HashMap::new();
+        let mut dirs = HashMap::new();
+        let mut hooks = CountingHooks::default();
+        let t0 = std::time::Instant::now();
+        let flows = |registry: &LiveTraceRegistry| -> Vec<(u64, String)> {
+            registry.traces.lock().unwrap()["t"]
+                .events
+                .iter()
+                .filter(|e| e.kind == "message" && e.payload["protocol"] == "RTP")
+                .map(|e| {
+                    let packets = e.payload["decoded_ie_tree"].to_string();
+                    (e.payload["revision"].as_u64().unwrap(), packets)
+                })
+                .collect()
+        };
+        let mut pass = |after: u64, hooks: &mut CountingHooks| {
+            reader_pass(&root, &key, &registry, &mut file_states, &mut sessions, &mut dirs, after == 0, false, t0 + Duration::from_secs(after), hooks);
+            let traces = registry.traces.lock().unwrap();
+            registry.stats_payload(&traces["t"].trace)["reader"]["interfaces"]["IMS"].clone()
+        };
+        // Passe 1 : SIP rattaché, premier instantané (révision 0).
+        let io = pass(0, &mut hooks);
+        assert_eq!(io["incremental"], true, "IMS en reprise à l'offset");
+        assert_eq!(io["rtp_snapshots"], 1);
+        let first = flows(&registry);
+        assert_eq!(first.iter().map(|f| f.0).collect::<Vec<_>>(), [0, 0], "deux flux, révision 0");
+        // 2 s plus tard, le segment a grossi : décodé, pas d'instantané.
+        fs::write(&segment, &states[1]).unwrap();
+        let io = pass(2, &mut hooks);
+        assert!(io["bytes_decoded"].as_u64().unwrap() > 0);
+        assert!(io["bytes_decoded"].as_u64().unwrap() < states[1].len() as u64, "seuls les octets nouveaux");
+        assert_eq!(io["rtp_snapshots"], 0);
+        assert_eq!(flows(&registry), first);
+        // 6 s : segment inchangé, mais des octets décodés depuis le
+        // dernier instantané → révision 1, qui remplace.
+        let _ = pass(6, &mut hooks);
+        let second = flows(&registry);
+        assert_eq!(second.iter().map(|f| f.0).collect::<Vec<_>>(), [1, 1]);
+        assert_ne!(second[0].1, first[0].1, "le contenu du flux a changé");
+        // 12 s : rien de nouveau → pas d'instantané, rien réémis.
+        let _ = pass(12, &mut hooks);
+        assert_eq!(flows(&registry), second);
+        // Le segment grossit encore, puis rotation : la clôture émet la
+        // révision finale (40 paquets par sens).
+        fs::write(&segment, &states[2]).unwrap();
+        fs::write(root.join("ims").join("ims_00001.pcapng"), ims_voice_capture(0)).unwrap();
+        let _ = pass(13, &mut hooks);
+        let last = flows(&registry);
+        assert_eq!(last.iter().map(|f| f.0).collect::<Vec<_>>(), [2, 2]);
+        assert!(!sessions.contains_key(&segment), "session du segment fermé clôturée");
+        let traces = registry.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.rtp_flow_updates, 4);
+        assert_eq!(
+            t.events.iter().filter(|e| e.kind == "message" && e.payload["protocol"] == "RTP").count(),
+            2,
+            "une seule ligne par flux dans le tampon"
+        );
+        assert_eq!(hooks.gap_bytes, 0);
+        drop(traces);
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
