@@ -33,6 +33,27 @@ export const maskSubscriberIdentity = (value:string|undefined|null) => {
 };
 export const reportedState = (value:string|undefined|null) => value && value !== 'UNKNOWN' ? value : '-- (non rapporté par UERANSIM)';
 export const eventFailureDetail = (event:{detail?:{error?:string};error?:string}) => event.detail?.error ?? event.error ?? '';
+export const humanActionReason = (code:string|undefined|null) => {
+  if (!code) return 'Action indisponible';
+  const messages:Record<string,string> = {
+    UE_CONTROL_VALIDATION_REQUIRED: 'Validation Control requise (UE_CONTROL_VALIDATION_REQUIRED) : ouvrir UE Manager et vérifier le profil abonné.',
+    ATTESTATION_INCOMPLETE: 'Attestation incomplète : demander à un agent lab de vérifier le profil en lecture seule.',
+    PROVISIONING_PROFILE_INVALID: 'Profil de provisioning invalide : demander à un agent lab de comparer le profil et la base.',
+  };
+  return messages[code] ?? code.replaceAll('_',' ');
+};
+export const filterScenarioDefinitions = (items:ScenarioDefinition[], scope:'SYSTEM'|'USER', query:string) => {
+  const needle=query.trim().toLocaleLowerCase();
+  return items.filter(item => item.catalog_scope===scope && (!needle || item.id.toLocaleLowerCase().includes(needle) || item.name.toLocaleLowerCase().includes(needle)));
+};
+export const filterAndSortHistory = (items:ScenarioState[], query:string, state:string) => {
+  const needle=query.trim().toLocaleLowerCase();
+  return [...items].filter(item => {
+    const matchesState=!state||item.state===state;
+    const haystack=[item.scenario_id,item.job_id,item.target_ue_pseudonym,item.terminal_result].filter(Boolean).join(' ').replaceAll('_',' ').toLocaleLowerCase();
+    return matchesState&&(!needle||haystack.includes(needle));
+  }).sort((left,right)=>(right.started_at_epoch_s??0)-(left.started_at_epoch_s??0));
+};
 
 export const eligibleTrafficTargets = (items: UeState[]) => items.filter(item =>
   item.controller_owned &&

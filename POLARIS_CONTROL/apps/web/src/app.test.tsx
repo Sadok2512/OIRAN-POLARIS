@@ -2,7 +2,7 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { api, eligibleTrafficTargets, eventFailureDetail, maskSubscriberIdentity, reportedState, secondsToDurationMs, targetedTrafficStartRequest, type UeState } from './api';
+import { api, eligibleTrafficTargets, eventFailureDetail, filterAndSortHistory, filterScenarioDefinitions, humanActionReason, maskSubscriberIdentity, reportedState, secondsToDurationMs, targetedTrafficStartRequest, type ScenarioDefinition, type ScenarioState, type UeState } from './api';
 import { Scenarios } from './main';
 
 describe('POLARIS Control shell', () => {
@@ -85,6 +85,20 @@ describe('POLARIS Control shell', () => {
   it('B12 renders the failure cause from timeline detail', () => expect(eventFailureDetail({detail:{error:'SHARED_UE_PROTECTED'}})).toBe('SHARED_UE_PROTECTED'));
   it('C13 requires both measured directions', () => expect({ul_bytes:544,dl_bytes:1024}).toMatchObject({ul_bytes:expect.any(Number),dl_bytes:expect.any(Number)}));
 
+  it('C5 searches templates by exact identifier and explains validation failures', () => {
+    const item = { id:'tpl-small-traffic', name:'Petit trafic', catalog_scope:'SYSTEM' } as ScenarioDefinition;
+    expect(filterScenarioDefinitions([item], 'SYSTEM', 'tpl-small')).toEqual([item]);
+    expect(humanActionReason('UE_CONTROL_VALIDATION_REQUIRED')).toContain('ouvrir UE Manager');
+  });
+
+  it('C5 sorts History newest first and filters target or cause', () => {
+    const row = (overrides:Partial<ScenarioState>):ScenarioState => ({ scenario_id:'scn', technology:'5G SA', simulator:'UERANSIM', started_at:'', started_at_epoch_s:1, ended_at_epoch_s:2, duration_seconds:1, configured_ues:1, registered_ues:1, active_pdu_sessions:1, traffic_state:'IDLE', packets_requested:0, packets_sent:0, terminal_result:null, cpu:'BOUNDED', memory:'BOUNDED', state:'COMPLETED', controller_owned:true, ...overrides });
+    const rows=[row({job_id:'old',started_at_epoch_s:1}),row({job_id:'new',started_at_epoch_s:2,target_ue_pseudonym:'UE-LAB',terminal_result:'CAUSE_LISIBLE'})];
+    expect(filterAndSortHistory(rows,'','').map(item=>item.job_id)).toEqual(['new','old']);
+    expect(filterAndSortHistory(rows,'cause lisible','')).toHaveLength(1);
+    expect(filterAndSortHistory(rows,'ue-lab','COMPLETED')).toHaveLength(1);
+  });
+
   it('C5a Run launches the selected definition on the selected eligible UE', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
@@ -96,7 +110,6 @@ describe('POLARIS Control shell', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<MemoryRouter initialEntries={['/scenarios']}><Routes><Route path="/scenarios" element={<Scenarios/>}/><Route path="/console" element={<div>Suivi du job courant</div>}/></Routes></MemoryRouter>);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Templates' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Run Small traffic' }));
     fireEvent.click(await screen.findByRole('radio', { name: /UE-LAB-02/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Lancer le scénario' }));
@@ -116,9 +129,10 @@ describe('POLARIS Control shell', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<MemoryRouter initialEntries={['/scenarios']}><Routes><Route path="/scenarios" element={<Scenarios/>}/><Route path="/ues" element={<div>UE Manager</div>}/></Routes></MemoryRouter>);
 
+    fireEvent.click(await screen.findByRole('button', { name: 'Mes scénarios' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Run My blocked scenario' }));
-    expect((await screen.findAllByText(/UE CONTROL VALIDATION REQUIRED/)).length).toBeGreaterThan(0);
-    expect(screen.getByRole('link', { name: 'Ouvrir UE Manager' })).toBeTruthy();
+    expect((await screen.findAllByText(/UE_CONTROL_VALIDATION_REQUIRED/)).length).toBeGreaterThan(0);
+    expect(screen.getByRole('link', { name: 'Ouvrir la gestion des UE' })).toBeTruthy();
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/scenarios/start'))).toBe(false);
   });
 });

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.23 — 2026-11-21 — Ergonomie Control C5
+
+- Les modèles sont visibles par défaut, recherchables par nom ou identifiant, avec l'état réel du backend et un bouton Run direct.
+- History trie du plus récent au plus ancien, filtre par état ou texte, pagine par dix et affiche la cible, le job et la cause terminale.
+- Les refus de démarrage connus sont expliqués en français avec la marche à suivre ; `Open5GS UNKNOWN` est présenté comme une absence de télémétrie, jamais comme un arrêt prouvé.
+- La liste des nœuds de la Console et la page dédiée utilisent toujours le même composant et la table UE conserve les états propres à chaque UE.
+
 ## 0.36.22 — 2026-11-21 — Attestation C3 autoritative au démarrage
 
 - Le démarrage vérifie en lecture seule les profils contrôlés directement contre les abonnés Open5GS marqués POLARIS, y compris l'identité, les secrets d'authentification et le réseau servi.
