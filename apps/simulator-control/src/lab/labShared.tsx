@@ -46,6 +46,8 @@ export function reasonFr(code: string | null | undefined): string {
     UE_CONTROL_VALIDATION_REQUIRED: 'Autorisation live demandée au lancement',
     UE_NOT_RUNNING: 'UE arrêté',
     SUBSCRIBER_NOT_PROVISIONED: 'Abonné absent d’Open5GS',
+    GNB_STOPPED_CONTEXT_AMBIGUOUS:
+      'Arrêt incomplet : demande à un agent lab de redémarrer le gNB quand aucun UE n’est actif',
   };
   return map[code] ? `${map[code]} · ${code}` : code;
 }

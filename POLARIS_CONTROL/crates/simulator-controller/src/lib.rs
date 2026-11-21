@@ -51,6 +51,10 @@ pub struct UeJob {
     pub generation: u64,
     #[serde(default)]
     pub approved_runtime: Option<LiveLaunchSpec>,
+    /// Durable correlation between this owned UE and its gNB NGAP context.
+    /// It is set only when exactly one context appears during Start.
+    #[serde(default)]
+    pub gnb_ran_ngap_id: Option<u32>,
     pub started_at_epoch_s: Option<u64>,
     pub last_error: Option<String>,
 }
@@ -125,6 +129,7 @@ impl MultiUeController {
                     operation_locked_at_epoch_s: None,
                     generation: 0,
                     approved_runtime: None,
+                    gnb_ran_ngap_id: None,
                     started_at_epoch_s: None,
                     last_error: (!profile.subscription_verified)
                         .then(|| "SUBSCRIBER_PROVISIONING_REQUIRED".into()),
@@ -326,6 +331,7 @@ impl MultiUeController {
                 operation_locked_at_epoch_s: None,
                 generation: 0,
                 approved_runtime: None,
+                gnb_ran_ngap_id: None,
                 started_at_epoch_s: Some(now),
                 last_error: None,
             },
@@ -417,6 +423,7 @@ impl MultiUeController {
                 operation_locked_at_epoch_s: None,
                 generation: 0,
                 approved_runtime: None,
+                gnb_ran_ngap_id: None,
                 started_at_epoch_s: Some(now),
                 last_error: None,
             },
@@ -530,6 +537,7 @@ impl MultiUeController {
                 operation_locked_at_epoch_s: Some(now),
                 generation,
                 approved_runtime: Some(approved_runtime),
+                gnb_ran_ngap_id: None,
                 started_at_epoch_s: Some(now),
                 last_error: None,
             },
@@ -578,6 +586,16 @@ impl MultiUeController {
             return Err("UE_OPERATION_MISMATCH".into());
         }
         job.process_handle = Some(process_handle.into());
+        Ok(job)
+    }
+
+    pub fn set_gnb_ran_ngap_id(
+        &mut self,
+        ue_id: &str,
+        ran_ngap_id: Option<u32>,
+    ) -> Result<&UeJob, String> {
+        let job = self.jobs.get_mut(ue_id).ok_or("UE_NOT_STARTED")?;
+        job.gnb_ran_ngap_id = ran_ngap_id;
         Ok(job)
     }
 
@@ -635,6 +653,29 @@ impl MultiUeController {
         let job = self.jobs.get_mut(ue_id).ok_or("UE_NOT_RESERVED")?;
         if job.operation_id.as_deref() != Some(operation_id) {
             return Err("UE_OPERATION_MISMATCH".into());
+        }
+        job.operation_id = None;
+        job.operation_locked_at_epoch_s = None;
+        job.lifecycle = UeLifecycle::Failed;
+        job.process_state = "STOP_INCOMPLETE".into();
+        job.registration_state = "NOT_OBSERVED".into();
+        job.pdu_session_state = "INACTIVE".into();
+        job.ue_ip = None;
+        job.traffic_state = "STOPPED".into();
+        job.last_error = Some(error.into());
+        Ok(job)
+    }
+
+    /// Records an incomplete gNB cleanup when the UE process was already
+    /// terminal before Stop could reserve a runtime operation.
+    pub fn mark_terminal_stop_incomplete(
+        &mut self,
+        ue_id: &str,
+        error: &str,
+    ) -> Result<&UeJob, String> {
+        let job = self.jobs.get_mut(ue_id).ok_or("UE_NOT_STARTED")?;
+        if !matches!(job.process_state.as_str(), "STOPPED" | "EXITED") {
+            return Err("UE_PROCESS_NOT_TERMINAL".into());
         }
         job.operation_id = None;
         job.operation_locked_at_epoch_s = None;
@@ -875,6 +916,7 @@ impl MultiUeController {
         job.operation_locked_at_epoch_s = None;
         job.generation = job.generation.saturating_add(1);
         job.approved_runtime = None;
+        job.gnb_ran_ngap_id = None;
         Ok(job)
     }
 
@@ -1317,6 +1359,47 @@ mod tests {
         recovered
             .reserve_live_start("UE-02", "operation-c", approved_runtime("UE-02"))
             .unwrap();
+    }
+
+    #[test]
+    fn gnb_ran_ngap_mapping_is_durable_and_cleared_only_after_complete_stop() {
+        let mut controller = MultiUeController::new(ready_profiles(3), 3).unwrap();
+        let handle = format!("container:{}", "e".repeat(64));
+        controller
+            .reserve_live_start("UE-02", "operation-a", approved_runtime("UE-02"))
+            .unwrap();
+        controller
+            .complete_live_start("UE-02", "operation-a", &handle)
+            .unwrap();
+        controller.set_gnb_ran_ngap_id("UE-02", Some(52)).unwrap();
+        let serialized = serde_json::to_vec(&controller.snapshot()).unwrap();
+        let restored: Vec<UeJob> = serde_json::from_slice(&serialized).unwrap();
+        assert_eq!(restored[0].gnb_ran_ngap_id, Some(52));
+
+        controller.stop_offline("UE-02").unwrap();
+        assert_eq!(controller.snapshot()[0].gnb_ran_ngap_id, None);
+    }
+
+    #[test]
+    fn terminal_process_with_incomplete_gnb_cleanup_retains_mapping_for_recovery() {
+        let mut controller = MultiUeController::new(ready_profiles(3), 3).unwrap();
+        let handle = format!("container:{}", "e".repeat(64));
+        controller
+            .reserve_live_start("UE-02", "operation-a", approved_runtime("UE-02"))
+            .unwrap();
+        controller
+            .complete_live_start("UE-02", "operation-a", &handle)
+            .unwrap();
+        controller.set_gnb_ran_ngap_id("UE-02", Some(52)).unwrap();
+        controller
+            .apply_observation("UE-02", "STOPPED", "NOT_OBSERVED", "INACTIVE", None)
+            .unwrap();
+        let job = controller
+            .mark_terminal_stop_incomplete("UE-02", "GNB_STOPPED_CONTEXT_AMBIGUOUS")
+            .unwrap();
+        assert_eq!(job.process_state, "STOP_INCOMPLETE");
+        assert_eq!(job.gnb_ran_ngap_id, Some(52));
+        assert!(job.approved_runtime.is_some());
     }
 
     #[test]

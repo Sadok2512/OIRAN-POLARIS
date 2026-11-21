@@ -31,6 +31,7 @@ export function ueKey(row: Row): string {
 
 export function rowState(row: Row, run: LocalRun | undefined): { tone: Tone; label: string; pulse?: boolean } {
   if (run && !TERMINAL.has(run.state)) return { tone: 'run', label: `En cours · ${run.scenarioName}`, pulse: true };
+  if (row.process_state === 'STOP_INCOMPLETE') return { tone: 'bad', label: 'Arrêt incomplet' };
   if (row.process_state === 'RUNNING' || row.registration_state === 'REGISTERED') {
     return { tone: 'ok', label: row.registration_state === 'REGISTERED' ? 'Enregistré' : 'Démarré' };
   }
@@ -167,7 +168,9 @@ export function LabUesPage() {
               const pilotable = row.controller_owned && verified && !lte;
               const selected = choice[id] ?? row.scenario_id ?? '';
               const selectable = runnable.some((d) => d.id === selected);
-              const reason = !row.controller_owned
+              const reason = row.last_event
+                ? reasonFr(row.last_event)
+                : !row.controller_owned
                 ? reasonFr(row.actions?.reason)
                 : lte
                   ? reasonFr(row.actions?.reason || 'LTE_E2E_CERTIFICATION_REQUIRED')

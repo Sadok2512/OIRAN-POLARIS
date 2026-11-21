@@ -6,7 +6,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { LabUesPage, rowState } from './LabUes';
 import { DEFAULT_FORM, LabScenariosPage, buildSteps, callScenarios, isListed, slugify } from './LabScenarios';
 import { LabUeMonitorPage, lastRun, nextSamples, rrcView, toneFor } from './LabUeMonitor';
-import { needsTwoUes, stepsSummary } from './labShared';
+import { needsTwoUes, reasonFr, stepsSummary } from './labShared';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
 
 const json = (status: number, body: unknown) =>
@@ -56,6 +56,8 @@ describe('lab helpers', () => {
     const row = { id: 'UE-201', registration_state: 'DEREGISTERED', pdu_session: 'NONE', ue_ip: null, traffic_state: 'IDLE', last_event: null, controller_owned: true };
     expect(rowState(row, { jobId: 'j', scenarioName: 'Données', state: 'RUNNING' }).label).toBe('En cours · Données');
     expect(rowState(row, undefined).label).toBe('Arrêté');
+    expect(rowState({ ...row, process_state: 'STOP_INCOMPLETE' }, undefined).label).toBe('Arrêt incomplet');
+    expect(reasonFr('GNB_STOPPED_CONTEXT_AMBIGUOUS')).toContain('quand aucun UE n’est actif');
   });
 });
 
