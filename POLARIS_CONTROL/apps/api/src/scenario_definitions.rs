@@ -72,6 +72,9 @@ pub struct ScenarioDefinition {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_definition_id: Option<String>,
+    /// Reversible operator archive. Missing in older catalogues means active.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -236,6 +239,7 @@ impl ScenarioDefinitionStore {
             simulator: input.simulator.unwrap_or_else(default_definition_simulator),
             description: input.description.unwrap_or_default(),
             source_definition_id: None,
+            archived: false,
         };
         let original = catalog.clone();
         catalog.definitions.push(definition.clone());
@@ -284,6 +288,7 @@ impl ScenarioDefinitionStore {
                 .description
                 .unwrap_or_else(|| previous.description.clone()),
             source_definition_id: previous.source_definition_id.clone(),
+            archived: previous.archived,
         };
         catalog.definitions[index] = updated.clone();
         if let Err(error) = self.persist(catalog) {
@@ -313,6 +318,31 @@ impl ScenarioDefinitionStore {
             return Err(error);
         }
         Ok(deleted)
+    }
+
+    pub fn set_archived(
+        &self,
+        catalog: &mut ScenarioCatalog,
+        id: &str,
+        archived: bool,
+    ) -> Result<ScenarioDefinition, String> {
+        if template_id(id) {
+            return Err("SCENARIO_TEMPLATE_READ_ONLY".into());
+        }
+        let index = catalog
+            .definitions
+            .iter()
+            .position(|item| item.id == id)
+            .ok_or("SCENARIO_DEFINITION_NOT_FOUND")?;
+        let original = catalog.clone();
+        catalog.definitions[index].archived = archived;
+        catalog.definitions[index].updated_at_epoch_s = epoch_seconds();
+        let updated = catalog.definitions[index].clone();
+        if let Err(error) = self.persist(catalog) {
+            *catalog = original;
+            return Err(error);
+        }
+        Ok(updated)
     }
 
     pub fn clone_definition(
@@ -363,6 +393,7 @@ impl ScenarioDefinitionStore {
                 .unwrap_or_else(default_definition_simulator),
             description: mutation.description.unwrap_or_default(),
             source_definition_id: Some(source.id),
+            archived: false,
         };
         let original = catalog.clone();
         catalog.definitions.push(clone.clone());
@@ -740,6 +771,7 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             simulator: "UERANSIM".into(),
             description: "Long IMS voice workload".into(),
             source_definition_id: None,
+            archived: false,
         },
         ScenarioDefinition {
             id: "tpl-voice-short".into(),
@@ -765,6 +797,7 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             simulator: "UERANSIM".into(),
             description: "Short repeated IMS voice workload".into(),
             source_definition_id: None,
+            archived: false,
         },
         // 0.19.2 — Small traffic now interleaves a 1 MiB SHA-256
         // transfer_verify BEFORE each iperf3 burst. The verify step
@@ -807,6 +840,7 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             simulator: "UERANSIM".into(),
             description: "Integrity-verified bounded traffic workload".into(),
             source_definition_id: None,
+            archived: false,
         },
         ScenarioDefinition {
             id: "tpl-high-runner".into(),
@@ -827,6 +861,7 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             simulator: "UERANSIM".into(),
             description: "High-volume bounded runner".into(),
             source_definition_id: None,
+            archived: false,
         },
     ];
     templates.extend(
@@ -844,6 +879,7 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
                 simulator: template.simulator,
                 description: template.description,
                 source_definition_id: None,
+                archived: false,
             }),
     );
     templates
@@ -1421,6 +1457,34 @@ mod tests {
     }
 
     #[test]
+    fn archive_is_reversible_persistent_and_refuses_system_templates() {
+        let root = std::env::temp_dir().join(format!("polaris-archive-{}", epoch_seconds()));
+        let store = ScenarioDefinitionStore::new(root.join("catalog.json"));
+        let mut catalog = store.load().unwrap();
+        store.create(&mut catalog, mutation("operator-scenario")).unwrap();
+
+        let archived = store
+            .set_archived(&mut catalog, "operator-scenario", true)
+            .unwrap();
+        assert!(archived.archived);
+        assert!(store.load().unwrap().definitions.iter().any(|item| {
+            item.id == "operator-scenario" && item.archived
+        }));
+
+        let restored = store
+            .set_archived(&mut catalog, "operator-scenario", false)
+            .unwrap();
+        assert!(!restored.archived);
+        assert_eq!(
+            store
+                .set_archived(&mut catalog, "tpl-voice-long", true)
+                .unwrap_err(),
+            "SCENARIO_TEMPLATE_READ_ONLY"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unsupported_steps_and_invalid_random_ranges_are_rejected() {
         let mut unsupported = mutation("bad");
         unsupported.steps[0].step_type = "rrc_idle".into();
@@ -1469,6 +1533,7 @@ mod tests {
             simulator: "UERANSIM".into(),
             description: "test".into(),
             source_definition_id: None,
+            archived: false,
         };
         let resolved = resolve_steps(&definition).unwrap();
         assert_eq!(resolved.len(), 4);
@@ -1568,7 +1633,8 @@ mod tests {
                 rat: "5G_SA".into(),
                 simulator: "UERANSIM".into(),
                 description: "nested test".into(),
-                source_definition_id: None
+                source_definition_id: None,
+                archived: false
             })
             .unwrap()
             .len(),
@@ -1735,6 +1801,7 @@ mod tests {
             simulator: "UERANSIM".into(),
             description: String::new(),
             source_definition_id: None,
+            archived: false,
         };
         assert_eq!(estimate_duration_ms(&definition).unwrap(), 2_000);
     }
@@ -1752,6 +1819,7 @@ mod tests {
         let mut catalog: ScenarioCatalog = serde_json::from_value(legacy).unwrap();
         let original = catalog.definitions[0].clone();
         assert_eq!(original.source_definition_id, None);
+        assert!(!original.archived);
         let report = migrate_builtin_templates(&mut catalog).unwrap();
         assert_eq!(report.added_ids.len(), 17);
         assert_eq!(
@@ -1799,6 +1867,7 @@ mod tests {
             simulator: "UERANSIM".into(),
             description: "Ops smoke clone".into(),
             source_definition_id: Some("tpl-small-traffic".into()),
+            archived: false,
         };
         catalog.definitions.push(operator_clone.clone());
 

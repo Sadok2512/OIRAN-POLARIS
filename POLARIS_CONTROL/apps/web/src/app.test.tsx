@@ -88,7 +88,7 @@ describe('POLARIS Control shell', () => {
   it('C5a Run launches the selected definition on the selected eligible UE', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
-      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [{ id: 'tpl-small-traffic', name: 'Small traffic', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 1, catalog_scope: 'SYSTEM', mutable: false, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: true, execution_block_reason: null, execution_message: null }], total: 1, schema_version: 1 }) };
+      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [{ id: 'tpl-small-traffic', name: 'Small traffic', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 1, catalog_scope: 'SYSTEM', mutable: false, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: true, execution_block_reason: null, execution_message: null, archived: false }], total: 1, archived_total: 0, include_archived: false, schema_version: 1 }) };
       if (path.endsWith('/ues')) return { ok: true, json: async () => ({ items: [{ id: 'UE-LAB-02', internal_ue_id: 'UE-02', registration_state: 'DEREGISTERED', pdu_session: 'INACTIVE', ue_ip: null, traffic_state: 'IDLE', last_event: null, controller_owned: true, actions: { start: true, start_reason: 'READY', stop: false, pdu_start: false, pdu_stop: false, traffic: false, reason: 'READY' } }], configured_profiles: [], configured_count: 1, active_count: 0, registered_count: 0, source: 'test' }) };
       if (path.endsWith('/scenarios/start') && init?.method === 'POST') return { ok: true, json: async () => ({ job_id: 'job-test' }) };
       throw new Error(`unexpected request ${path}`);
@@ -109,7 +109,7 @@ describe('POLARIS Control shell', () => {
   it('C5a explains when no UE is eligible and sends no launch request', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
-      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [{ id: 'my-scenario', name: 'My blocked scenario', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 1, catalog_scope: 'USER', mutable: true, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: true, execution_block_reason: null, execution_message: null }], total: 1, schema_version: 1 }) };
+      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [{ id: 'my-scenario', name: 'My blocked scenario', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 1, catalog_scope: 'USER', mutable: true, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: true, execution_block_reason: null, execution_message: null, archived: false }], total: 1, archived_total: 0, include_archived: false, schema_version: 1 }) };
       if (path.endsWith('/ues')) return { ok: true, json: async () => ({ items: [{ id: 'UE-LAB-02', internal_ue_id: 'UE-02', registration_state: 'DEREGISTERED', pdu_session: 'INACTIVE', ue_ip: null, traffic_state: 'IDLE', last_event: null, controller_owned: true, actions: { start: false, start_reason: 'UE_CONTROL_VALIDATION_REQUIRED', stop: false, pdu_start: false, pdu_stop: false, traffic: false, reason: 'UE_CONTROL_VALIDATION_REQUIRED' } }], configured_profiles: [], configured_count: 1, active_count: 0, registered_count: 0, source: 'test' }) };
       throw new Error(`unexpected request ${path}`);
     });
@@ -120,5 +120,26 @@ describe('POLARIS Control shell', () => {
     expect((await screen.findAllByText(/UE CONTROL VALIDATION REQUIRED/)).length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: 'Ouvrir UE Manager' })).toBeTruthy();
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/scenarios/start'))).toBe(false);
+  });
+
+  it('C7 reveals archived user scenarios explicitly and restores without deleting', async () => {
+    const archived = { id: 'old-user-scenario', name: 'Ancien scénario', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 2, catalog_scope: 'USER', mutable: true, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: false, execution_block_reason: 'SCENARIO_ARCHIVED', execution_message: 'Scénario archivé : restaurez-le avant de l’exécuter.', archived: true };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes('/scenario-definitions?include_archived=true')) return { ok: true, json: async () => ({ items: [archived], total: 1, archived_total: 1, include_archived: true, schema_version: 1 }) };
+      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [], total: 0, archived_total: 1, include_archived: false, schema_version: 1 }) };
+      if (path.endsWith('/scenario-definitions/old-user-scenario/restore') && init?.method === 'POST') return { ok: true, json: async () => ({ id: archived.id, archived: false }) };
+      if (path.endsWith('/ues')) return { ok: true, json: async () => ({ items: [], configured_profiles: [], configured_count: 0, active_count: 0, registered_count: 0, source: 'test' }) };
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<MemoryRouter initialEntries={['/scenarios']}><Routes><Route path="/scenarios" element={<Scenarios/>}/></Routes></MemoryRouter>);
+
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Afficher les archives/ }));
+    const restore = await screen.findByRole('button', { name: 'Restaurer' });
+    expect((screen.getByRole('button', { name: 'Run Ancien scénario' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(restore);
+    expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith('/restore') && init?.method === 'POST')).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Supprimer' })).toBeNull();
   });
 });

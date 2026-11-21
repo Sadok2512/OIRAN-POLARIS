@@ -21,8 +21,8 @@ export type ScenarioState = { scenario_id: string; job_id?: string; target_ue_id
 export type ScenarioRuntime = { active_job: ScenarioState | null; latest_terminal_job: ScenarioState | null; active_count: number; history_count: number; observed_at_epoch_s: number; source: string };
 export type TrafficState = { state: string; packets_requested: number; packets_sent: number | null; packets_received: number | null; bytes: number | null; current_rate_pps?: number | null; accounting_source: string; target_ue_id?: string | null; target_ue_pseudonym?: string | null; tun_interface?: string | null; last_result: ScenarioState | null; approved_destinations: string[] };
 export type ValidationResult = { valid: boolean; execution?: string; next?: string; scenario_type?: string; error?: string };
-export type ScenarioDefinition = { id:string; name:string; version:number; loop_count:number; steps:{type:string;parameters?:Record<string,unknown>}[]; created_at_epoch_s:number; updated_at_epoch_s:number; catalog_scope:'SYSTEM'|'USER'; mutable:boolean; cloneable:boolean; assigned_ues:number; backend_support:string; executable:boolean; execution_block_reason:string|null; execution_message:string|null };
-export type ScenarioDefinitions = { items:ScenarioDefinition[]; total:number; schema_version:number };
+export type ScenarioDefinition = { id:string; name:string; version:number; loop_count:number; steps:{type:string;parameters?:Record<string,unknown>}[]; created_at_epoch_s:number; updated_at_epoch_s:number; catalog_scope:'SYSTEM'|'USER'; mutable:boolean; cloneable:boolean; assigned_ues:number; backend_support:string; executable:boolean; execution_block_reason:string|null; execution_message:string|null; archived:boolean };
+export type ScenarioDefinitions = { items:ScenarioDefinition[]; total:number; archived_total:number; include_archived:boolean; schema_version:number };
 
 export const secondsToDurationMs = (seconds:number) => Math.round(seconds * 1000);
 export const maskSubscriberIdentity = (value:string|undefined|null) => {

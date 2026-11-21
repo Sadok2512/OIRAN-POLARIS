@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.36.24 — 2026-11-21 — Archivage réversible du catalogue
+
+- Les définitions utilisateur portent un état `archived`, rétrocompatible avec les catalogues existants (`false` par défaut) et persisté atomiquement.
+- La liste masque les archives par défaut ; `include_archived=true` les rend visibles avec leur état et leur motif de non-exécution.
+- Les mutations opérateur `archive` et `restore` sont protégées par rôle et CSRF, refusent les modèles système et écrivent l'audit.
+- Un scénario archivé ne peut pas être exécuté ; sa restauration le rend à nouveau visible sans changer son identifiant, et les références historiques ne sont pas réécrites.
+- Aucun identifiant n'est archivé automatiquement et aucune donnée du catalogue n'est supprimée.
+
 ## 0.36.20 — 2026-11-21 — Identités abonné masquées sur les GET Control
 
 - `/ues`, les profils UE, les vues abonnés et Activity JSON/SSE projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
