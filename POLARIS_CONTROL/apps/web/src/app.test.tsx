@@ -1,10 +1,12 @@
 import React from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, eligibleTrafficTargets, eventFailureDetail, maskSubscriberIdentity, reportedState, secondsToDurationMs, targetedTrafficStartRequest, type UeState } from './api';
+import { Scenarios } from './main';
 
 describe('POLARIS Control shell', () => {
+  afterEach(cleanup);
   beforeEach(() => {
     sessionStorage.clear();
     vi.restoreAllMocks();
@@ -75,4 +77,41 @@ describe('POLARIS Control shell', () => {
   it('B11 never invents an absent UERANSIM state', () => expect(reportedState('UNKNOWN')).toBe('-- (non rapporté par UERANSIM)'));
   it('B12 renders the failure cause from timeline detail', () => expect(eventFailureDetail({detail:{error:'SHARED_UE_PROTECTED'}})).toBe('SHARED_UE_PROTECTED'));
   it('C13 requires both measured directions', () => expect({ul_bytes:544,dl_bytes:1024}).toMatchObject({ul_bytes:expect.any(Number),dl_bytes:expect.any(Number)}));
+
+  it('C5a Run launches the selected definition on the selected eligible UE', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [{ id: 'tpl-small-traffic', name: 'Small traffic', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 1, catalog_scope: 'SYSTEM', mutable: false, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: true, execution_block_reason: null, execution_message: null }], total: 1, schema_version: 1 }) };
+      if (path.endsWith('/ues')) return { ok: true, json: async () => ({ items: [{ id: 'UE-LAB-02', internal_ue_id: 'UE-02', registration_state: 'DEREGISTERED', pdu_session: 'INACTIVE', ue_ip: null, traffic_state: 'IDLE', last_event: null, controller_owned: true, actions: { start: true, start_reason: 'READY', stop: false, pdu_start: false, pdu_stop: false, traffic: false, reason: 'READY' } }], configured_profiles: [], configured_count: 1, active_count: 0, registered_count: 0, source: 'test' }) };
+      if (path.endsWith('/scenarios/start') && init?.method === 'POST') return { ok: true, json: async () => ({ job_id: 'job-test' }) };
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<MemoryRouter initialEntries={['/scenarios']}><Routes><Route path="/scenarios" element={<Scenarios/>}/><Route path="/console" element={<div>Suivi du job courant</div>}/></Routes></MemoryRouter>);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Templates' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Run Small traffic' }));
+    fireEvent.click(await screen.findByRole('radio', { name: /UE-LAB-02/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le scénario' }));
+
+    await screen.findByText('Suivi du job courant');
+    const start = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/scenarios/start') && init?.method === 'POST');
+    expect(JSON.parse(String(start?.[1]?.body))).toEqual({ scenario_definition_id: 'tpl-small-traffic', ue_ids: ['UE-02'] });
+  });
+
+  it('C5a explains when no UE is eligible and sends no launch request', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [{ id: 'my-scenario', name: 'My blocked scenario', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 1, catalog_scope: 'USER', mutable: true, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: true, execution_block_reason: null, execution_message: null }], total: 1, schema_version: 1 }) };
+      if (path.endsWith('/ues')) return { ok: true, json: async () => ({ items: [{ id: 'UE-LAB-02', internal_ue_id: 'UE-02', registration_state: 'DEREGISTERED', pdu_session: 'INACTIVE', ue_ip: null, traffic_state: 'IDLE', last_event: null, controller_owned: true, actions: { start: false, start_reason: 'UE_CONTROL_VALIDATION_REQUIRED', stop: false, pdu_start: false, pdu_stop: false, traffic: false, reason: 'UE_CONTROL_VALIDATION_REQUIRED' } }], configured_profiles: [], configured_count: 1, active_count: 0, registered_count: 0, source: 'test' }) };
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<MemoryRouter initialEntries={['/scenarios']}><Routes><Route path="/scenarios" element={<Scenarios/>}/><Route path="/ues" element={<div>UE Manager</div>}/></Routes></MemoryRouter>);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Run My blocked scenario' }));
+    expect((await screen.findAllByText(/UE CONTROL VALIDATION REQUIRED/)).length).toBeGreaterThan(0);
+    expect(screen.getByRole('link', { name: 'Ouvrir UE Manager' })).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/scenarios/start'))).toBe(false);
+  });
 });

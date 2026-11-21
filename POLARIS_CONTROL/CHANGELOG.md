@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.18 — 2026-11-21 — Run depuis la bibliothèque de scénarios
+
+- Le bouton Run des scénarios utilisateur et des modèles ouvre un choix explicite d’UE.
+- Seuls les UE que l’API déclare démarrables sont sélectionnables ; chaque refus expose sa cause et renvoie vers UE Manager.
+- Le lancement réutilise `POST /scenarios/start`, puis ouvre le suivi du job courant.
+
 ## 0.36.17 — 2026-11-16 — Garde CPU : PSI mesurée sur les conteneurs du lab, pas sur tout system.slice (patch)
 
 - Essai vTAP 5 d'ANR2 (#10, 21:14) : sans agent, la PSI de `system.slice` a une médiane de 10,34 avec des pointes à 22, au-dessus du seuil de reprise (10). Observation : l'Analyzer 2.21.9, dans `system.slice`, tourne à 65,6 % de CPU, mémoire au plafond (4 GiB). Le garde, censé protéger le trafic du lab, mesurait l'Analyzer avec.
