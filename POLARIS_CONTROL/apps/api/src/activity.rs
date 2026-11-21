@@ -12,8 +12,8 @@
 //   * SUCI, GUTI and TMSI tokens are stripped from every stringified
 //     payload we touch — the Activity surface MUST NOT echo them.
 //   * Authentication key / OPc material is stripped the same way.
-//   * IMSI is returned only when the caller is operator or
-//     administrator. Viewer sees the solid mask.
+//   * IMSI is masked for every role. No Activity JSON or SSE payload
+//     may contain the complete subscriber identity.
 //
 // UE stopped (no live job, no container) → `{"running": false, …}`
 // with a short reason string. We never surface a 5xx from this
@@ -142,17 +142,15 @@ pub fn filter_identity_fields(input: &str) -> String {
     out
 }
 
-/// 0.19.0 — Role-aware IMSI projection. Operators see the raw IMSI;
-/// viewers see a mask. `None` becomes `None` regardless of role.
+/// 0.36.20 — Activity uses the same irreversible display projection for
+/// every role. `None` becomes `None` regardless of role.
 pub fn imsi_for_role(imsi: Option<&str>, role: &str) -> Option<String> {
     let value = imsi?.trim();
     if value.is_empty() {
         return None;
     }
-    match role {
-        "operator" | "administrator" => Some(value.into()),
-        _ => Some("•••••••••••••••".into()),
-    }
+    let _ = role;
+    Some(crate::subscriber_provisioning::mask_subscriber_identity(value))
 }
 
 /// 0.19.0 — Compose the final payload. `nr_cli_status`, `pdu`,
@@ -465,20 +463,34 @@ rrc-state: RRC-CONNECTED\n\
     }
 
     #[test]
-    fn imsi_projection_mask_viewer_but_reveal_operator() {
-        assert_eq!(
-            imsi_for_role(Some("imsi-001010000000042"), "operator").as_deref(),
-            Some("imsi-001010000000042"),
-        );
-        assert_eq!(
-            imsi_for_role(Some("imsi-001010000000042"), "administrator").as_deref(),
-            Some("imsi-001010000000042"),
-        );
-        let masked = imsi_for_role(Some("imsi-001010000000042"), "viewer").unwrap();
-        assert!(masked.chars().all(|c| c == '•'));
-        assert_eq!(masked.chars().count(), 15);
+    fn imsi_projection_is_masked_for_every_role() {
+        for role in ["viewer", "operator", "administrator"] {
+            assert_eq!(
+                imsi_for_role(Some("imsi-001010000000042"), role).as_deref(),
+                Some("…0042"),
+            );
+        }
         assert_eq!(imsi_for_role(None, "operator"), None);
         assert_eq!(imsi_for_role(Some("   "), "operator"), None);
+    }
+
+    #[test]
+    fn complete_multi_ue_activity_body_contains_no_raw_identity_for_any_role() {
+        let raw = ["imsi-001010000000042", "imsi-001010000000043"];
+        for role in ["viewer", "operator", "administrator"] {
+            let body = json!({
+                "items": raw
+                    .iter()
+                    .map(|identity| json!({"imsi": imsi_for_role(Some(identity), role)}))
+                    .collect::<Vec<_>>()
+            });
+            let serialized = serde_json::to_string(&body).unwrap();
+            assert!(raw.iter().all(|identity| !serialized.contains(identity)));
+            assert!(!serialized.contains("001010000000042"));
+            assert!(!serialized.contains("001010000000043"));
+            assert!(serialized.contains("…0042"));
+            assert!(serialized.contains("…0043"));
+        }
     }
 
     #[test]

@@ -27,7 +27,8 @@ export type ScenarioDefinitions = { items:ScenarioDefinition[]; total:number; sc
 export const secondsToDurationMs = (seconds:number) => Math.round(seconds * 1000);
 export const maskSubscriberIdentity = (value:string|undefined|null) => {
   if (!value || value === 'PROTECTED') return 'PROTECTED';
-  return value.replace(/^imsi-/i,'');
+  const digits = value.replace(/^imsi-/i,'');
+  return /^\d{4,}$/.test(digits) ? `…${digits.slice(-4)}` : 'PROTECTED';
 };
 export const reportedState = (value:string|undefined|null) => value && value !== 'UNKNOWN' ? value : '-- (non rapporté par UERANSIM)';
 export const eventFailureDetail = (event:{detail?:{error?:string};error?:string}) => event.detail?.error ?? event.error ?? '';

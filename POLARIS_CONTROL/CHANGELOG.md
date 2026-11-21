@@ -2,8 +2,9 @@
 
 ## 0.36.20 — 2026-11-21 — Identités abonné masquées sur les GET Control
 
-- `/ues`, les profils UE et les vues abonnés projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
+- `/ues`, les profils UE, les vues abonnés et Activity JSON/SSE projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
 - `subscriber_identity_exposed` reste faux et aucun MSISDN n'est projeté par ces routes GET.
+- Le helper web remasque défensivement toute identité et refuse une valeur non conforme ; les tests scannent un corps multi-UE complet pour chaque rôle.
 - Les secrets d'authentification restent protégés ; les mutations et la route POST de lookup existante sont inchangées.
 
 ## 0.36.19 — 2026-11-21 — Stop UE cohérent avec le contexte gNB (patch)
