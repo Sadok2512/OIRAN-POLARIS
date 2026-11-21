@@ -1820,6 +1820,10 @@ trait UeRuntime: Send + Sync {
         let _ = job;
         Err("UE_DEREGISTER_COMMAND_UNSUPPORTED".into())
     }
+    fn reconcile_gnb_contexts_after_stop(&self, timeout_seconds: u64) -> Result<(), String> {
+        let _ = timeout_seconds;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -3018,6 +3022,28 @@ impl UeRuntime for DockerUeRuntime {
         }
         let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
         Self::execute_ue_cli(target, "deregister switch-off".into())
+    }
+
+    fn reconcile_gnb_contexts_after_stop(&self, timeout_seconds: u64) -> Result<(), String> {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        let mut release_attempted = BTreeSet::new();
+        loop {
+            let contexts = DockerGnbNgapChecker::ue_contexts()?;
+            let orphan_ids = orphan_gnb_ue_ids(&contexts);
+            if orphan_ids.is_empty() {
+                return Ok(());
+            }
+            for ue_id in orphan_ids {
+                if release_attempted.insert(ue_id) {
+                    DockerGnbNgapChecker::release_ue_context(ue_id)?;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("GNB_UE_CONTEXT_RELEASE_INCOMPLETE".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
     }
 
     fn resolve_traffic_target(
@@ -4433,6 +4459,57 @@ mod gnb_ngap_activity_tests {
 /// `false` en test) empêche le pré-check de s'exécuter.
 struct DockerGnbNgapChecker;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GnbUeContext {
+    ue_id: u32,
+    ran_ngap_id: u32,
+    amf_ngap_id: i64,
+}
+
+fn parse_gnb_ue_contexts(output: &str) -> Result<Vec<GnbUeContext>, String> {
+    fn finish(
+        contexts: &mut Vec<GnbUeContext>,
+        ue_id: &mut Option<u32>,
+        ran_ngap_id: &mut Option<u32>,
+        amf_ngap_id: &mut Option<i64>,
+    ) -> Result<(), String> {
+        if ue_id.is_none() && ran_ngap_id.is_none() && amf_ngap_id.is_none() {
+            return Ok(());
+        }
+        contexts.push(GnbUeContext {
+            ue_id: ue_id.take().ok_or("GNB_UE_LIST_MALFORMED")?,
+            ran_ngap_id: ran_ngap_id.take().ok_or("GNB_UE_LIST_MALFORMED")?,
+            amf_ngap_id: amf_ngap_id.take().ok_or("GNB_UE_LIST_MALFORMED")?,
+        });
+        Ok(())
+    }
+
+    let mut contexts = Vec::new();
+    let mut ue_id = None;
+    let mut ran_ngap_id = None;
+    let mut amf_ngap_id = None;
+    for line in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(value) = line.strip_prefix("- ue-id:") {
+            finish(&mut contexts, &mut ue_id, &mut ran_ngap_id, &mut amf_ngap_id)?;
+            ue_id = Some(value.trim().parse().map_err(|_| "GNB_UE_LIST_MALFORMED")?);
+        } else if let Some(value) = line.strip_prefix("ran-ngap-id:") {
+            ran_ngap_id = Some(value.trim().parse().map_err(|_| "GNB_UE_LIST_MALFORMED")?);
+        } else if let Some(value) = line.strip_prefix("amf-ngap-id:") {
+            amf_ngap_id = Some(value.trim().parse().map_err(|_| "GNB_UE_LIST_MALFORMED")?);
+        }
+    }
+    finish(&mut contexts, &mut ue_id, &mut ran_ngap_id, &mut amf_ngap_id)?;
+    Ok(contexts)
+}
+
+fn orphan_gnb_ue_ids(contexts: &[GnbUeContext]) -> Vec<u32> {
+    contexts
+        .iter()
+        .filter(|context| context.amf_ngap_id < 0)
+        .map(|context| context.ue_id)
+        .collect()
+}
+
 impl DockerGnbNgapChecker {
     const GNB_CONTAINER: &'static str = "oiran-lab-ueransim-gnb-1";
     const AMF_CONTAINER: &'static str = "oiran-lab-amf-1";
@@ -4459,6 +4536,28 @@ impl DockerGnbNgapChecker {
         let name = stdout.lines().map(str::trim).find(|line| !line.is_empty());
         name.map(str::to_owned)
             .ok_or_else(|| "GNB_CLI_NODE_NOT_OBSERVED".into())
+    }
+
+    fn ue_contexts() -> Result<Vec<GnbUeContext>, String> {
+        let node = Self::nr_cli_node()?;
+        let output = Command::new("/usr/bin/timeout")
+            .args(["--signal=TERM", "--kill-after=1s", "5s", "/usr/bin/docker", "exec", Self::GNB_CONTAINER, "nr-cli", &node, "-e", "ue-list"])
+            .output()
+            .map_err(|_| "GNB_UE_LIST_UNAVAILABLE")?;
+        if !output.status.success() {
+            return Err("GNB_UE_LIST_UNAVAILABLE".into());
+        }
+        parse_gnb_ue_contexts(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    fn release_ue_context(ue_id: u32) -> Result<(), String> {
+        let node = Self::nr_cli_node()?;
+        let command = format!("ue-release {ue_id}");
+        let output = Command::new("/usr/bin/timeout")
+            .args(["--signal=TERM", "--kill-after=1s", "5s", "/usr/bin/docker", "exec", Self::GNB_CONTAINER, "nr-cli", &node, "-e", &command])
+            .output()
+            .map_err(|_| "GNB_UE_CONTEXT_RELEASE_FAILED")?;
+        if output.status.success() { Ok(()) } else { Err("GNB_UE_CONTEXT_RELEASE_FAILED".into()) }
     }
 }
 
@@ -11123,6 +11222,25 @@ fn start_one_live(state: &AppState, ue_id: &str) -> Result<simulator_controller:
     outcome
 }
 
+fn finalize_stop_after_gnb_reconciliation(
+    state: &AppState,
+    ue_id: &str,
+    operation_id: &str,
+) -> Result<simulator_controller::UeJob, String> {
+    if let Err(error) = state.ue_runtime.reconcile_gnb_contexts_after_stop(10) {
+        let response_error = error.clone();
+        let mut controller = state.multi_ue.lock().map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
+        controller.mark_stop_incomplete(ue_id, operation_id, &error)?;
+        persist_ue_registry(state, &controller)?;
+        record_activity_event(state, ue_id, "GNB_CONTEXT_RECONCILIATION_FAILED", "FAILED", json!({ "error": error }));
+        return Err(response_error);
+    }
+    let mut controller = state.multi_ue.lock().map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
+    let job = controller.stop_offline(ue_id)?.clone();
+    persist_ue_registry(state, &controller)?;
+    Ok(job)
+}
+
 fn stop_one_live_inner(
     state: &AppState,
     ue_id: &str,
@@ -11185,13 +11303,7 @@ fn stop_one_live_inner(
     // stop_offline must not strand the lock on this UE.
     let _lock_guard = OperationLockGuard::new(state, ue_id, &operation_id);
     if state.ue_runtime.discover(&approved_runtime)?.is_none() {
-        let mut controller = state
-            .multi_ue
-            .lock()
-            .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
-        let job = controller.stop_offline(ue_id)?.clone();
-        persist_ue_registry(state, &controller)?;
-        return Ok(job);
+        return finalize_stop_after_gnb_reconciliation(state, ue_id, &operation_id);
     }
     // 0.19.4 — Policy-route cleanup is best-effort on Stop: if the
     // kernel refuses the delete (stale rule, missing table, duplicate
@@ -11211,21 +11323,15 @@ fn stop_one_live_inner(
             );
         }
     }
-    // Release every PDU owned by this UE before tearing its namespace down.
-    // A failed explicit release must never strand Stop: stopping the owned
-    // container is still the terminal cleanup, while Activity keeps the
-    // precise warning for diagnosis.
-    let release_cancel = AtomicBool::new(false);
+    // Request PDU release and switch-off deregistration back-to-back before
+    // tearing down the owned namespace. UERANSIM may otherwise recreate its
+    // configured PDU between the two commands and leave a stale gNB context.
     stop_ims_client(ue_id);
-    if let Err(error) =
-        state
-            .ue_runtime
-            .release_pdu(job_approval.unwrap_or(&release_job), 30, &release_cancel)
-    {
+    if let Err(error) = request_terminal_detach(state.ue_runtime.as_ref(), job_approval.unwrap_or(&release_job)) {
         record_activity_event(
             state,
             ue_id,
-            "PDU_RELEASE_ALL_WARNING",
+            "UE_TERMINAL_DETACH_WARNING",
             "WARNING",
             json!({ "reason": error }),
         );
@@ -11242,13 +11348,7 @@ fn stop_one_live_inner(
         }
         return Err(error);
     }
-    let mut controller = state
-        .multi_ue
-        .lock()
-        .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
-    let job = controller.stop_offline(ue_id)?.clone();
-    persist_ue_registry(state, &controller)?;
-    Ok(job)
+    finalize_stop_after_gnb_reconciliation(state, ue_id, &operation_id)
 }
 
 fn is_terminal_stop_state(process_state: &str) -> bool {
@@ -16464,6 +16564,22 @@ mod p0_tests {
         }
     }
 
+    struct GnbCleanupFailureRuntime(FakeLiveUeRuntime);
+
+    impl UeRuntime for GnbCleanupFailureRuntime {
+        fn verify_provisioning(&self, profiles: &[UeProfileSpec]) -> Result<BTreeMap<String, String>, String> { self.0.verify_provisioning(profiles) }
+        fn approve_launch(&self, profile: &UeProfileSpec, profile_sha256: &str) -> Result<LiveLaunchSpec, String> { self.0.approve_launch(profile, profile_sha256) }
+        fn launch(&self, spec: &LiveLaunchSpec) -> Result<String, UeLaunchFailure> { self.0.launch(spec) }
+        fn discover(&self, spec: &LiveLaunchSpec) -> Result<Option<String>, String> { self.0.discover(spec) }
+        fn observe_owned(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<UeObservation, String> { self.0.observe_owned(spec, handle) }
+        fn observe_shared(&self) -> Result<UeObservation, String> { self.0.observe_shared() }
+        fn owns(&self, spec: &LiveLaunchSpec, handle: &str) -> bool { self.0.owns(spec, handle) }
+        fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String> { self.0.stop(spec, handle) }
+        fn request_pdu_release_for_detach(&self, job: &simulator_controller::UeJob) -> Result<(), String> { self.0.request_pdu_release_for_detach(job) }
+        fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> { self.0.deregister_switch_off(job) }
+        fn reconcile_gnb_contexts_after_stop(&self, _: u64) -> Result<(), String> { Err("GNB_UE_CONTEXT_RELEASE_INCOMPLETE".into()) }
+    }
+
     struct PostRunInspectionFailureRuntime {
         handle: String,
         stop_attempts: Arc<Mutex<usize>>,
@@ -19966,6 +20082,27 @@ mod p0_tests {
     }
 
     #[test]
+    fn stop_never_publishes_stopped_while_a_gnb_context_survives() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        let launched = Arc::new(Mutex::new(vec!["UE-02".into()]));
+        test_state.ue_runtime = Arc::new(GnbCleanupFailureRuntime(FakeLiveUeRuntime {
+            stopped: Arc::new(Mutex::new(Vec::new())), launched,
+            fail_observation: false, fail_verification: false, fail_stop: false,
+            fail_policy_route_cleanup: None,
+        }));
+        prepare_owned_traffic_target(&test_state, "UE-02", true);
+        let error = stop_one_live(&test_state, "UE-02").unwrap_err();
+        assert_eq!(error, "GNB_UE_CONTEXT_RELEASE_INCOMPLETE");
+        let job = test_state.multi_ue.lock().unwrap().snapshot().into_iter().find(|job| job.ue_id == "UE-02").unwrap();
+        assert_eq!(job.process_state, "STOP_INCOMPLETE");
+        assert_eq!(job.registration_state, "NOT_OBSERVED");
+        assert_eq!(job.pdu_session_state, "INACTIVE");
+        assert!(job.process_handle.is_some());
+        assert!(job.approved_runtime.is_some());
+    }
+
+    #[test]
     fn ue_has_live_launch_requires_both_approved_runtime_and_process_handle() {
         let state = state();
         // Default test state: no job created yet.
@@ -20738,7 +20875,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             1,
             [("UE-01".into(), "a".repeat(64))].into_iter().collect(),
         );
-        assert_eq!(&*stopped.lock().unwrap(), &["PDU_RELEASED:UE-02", "UE-02"]);
+        assert_eq!(&*stopped.lock().unwrap(), &["PDU_RELEASED:UE-02", "DEREGISTERED:UE-02", "UE-02"]);
         let job = test_state
             .multi_ue
             .lock()
@@ -22390,6 +22527,20 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert!(!is_terminal_stop_state("RUNNING"));
         assert!(!is_terminal_stop_state("STARTING"));
         assert!(!is_terminal_stop_state("UNKNOWN"));
+    }
+
+    #[test]
+    fn gnb_ue_list_parser_identifies_only_orphan_contexts() {
+        let output = "- ue-id: 51\n  ran-ngap-id: 52\n  amf-ngap-id: -1\n- ue-id: 49\n  ran-ngap-id: 50\n  amf-ngap-id: 91\n";
+        let contexts = parse_gnb_ue_contexts(output).unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(orphan_gnb_ue_ids(&contexts), vec![51]);
+    }
+
+    #[test]
+    fn gnb_ue_list_parser_rejects_incomplete_contexts() {
+        let error = parse_gnb_ue_contexts("- ue-id: 51\n  ran-ngap-id: 52\n").unwrap_err();
+        assert_eq!(error, "GNB_UE_LIST_MALFORMED");
     }
 
     #[test]

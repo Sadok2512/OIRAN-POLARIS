@@ -622,6 +622,32 @@ impl MultiUeController {
         Ok(job)
     }
 
+    /// The owned UE process has stopped, but the gNB still reports a stale
+    /// radio/NGAP context. Keep the runtime ownership envelope so a later
+    /// Stop can retry reconciliation; never publish the stronger STOPPED
+    /// state until the gNB inventory is clean.
+    pub fn mark_stop_incomplete(
+        &mut self,
+        ue_id: &str,
+        operation_id: &str,
+        error: &str,
+    ) -> Result<&UeJob, String> {
+        let job = self.jobs.get_mut(ue_id).ok_or("UE_NOT_RESERVED")?;
+        if job.operation_id.as_deref() != Some(operation_id) {
+            return Err("UE_OPERATION_MISMATCH".into());
+        }
+        job.operation_id = None;
+        job.operation_locked_at_epoch_s = None;
+        job.lifecycle = UeLifecycle::Failed;
+        job.process_state = "STOP_INCOMPLETE".into();
+        job.registration_state = "NOT_OBSERVED".into();
+        job.pdu_session_state = "INACTIVE".into();
+        job.ue_ip = None;
+        job.traffic_state = "STOPPED".into();
+        job.last_error = Some(error.into());
+        Ok(job)
+    }
+
     /// 0.19.5 — Test harness only: mutable access to the internal job
     /// table so Stop-resilience tests in the API crate can hand-stamp
     /// an expired `operation_locked_at`. Documented as "do not use in
@@ -1483,6 +1509,38 @@ mod tests {
             .reserve_live_stop("UE-02", "op-new", now, MAX_OPERATION_LOCK_SECONDS)
             .expect("expired lock must be reclaimed");
         assert_eq!(reclaimed.operation_id.as_deref(), Some("op-new"));
+    }
+
+    #[test]
+    fn incomplete_gnb_cleanup_is_visible_and_retains_the_retry_handle() {
+        let mut controller = MultiUeController::new(ready_profiles(3), 3).unwrap();
+        controller
+            .reserve_live_start("UE-02", "op-start", approved_runtime("UE-02"))
+            .unwrap();
+        controller
+            .complete_live_start(
+                "UE-02",
+                "op-start",
+                &format!("container:{}", "e".repeat(64)),
+            )
+            .unwrap();
+        controller
+            .reserve_live_stop(
+                "UE-02",
+                "op-stop",
+                now_epoch_s(),
+                MAX_OPERATION_LOCK_SECONDS,
+            )
+            .unwrap();
+
+        let job = controller
+            .mark_stop_incomplete("UE-02", "op-stop", "GNB_UE_CONTEXT_RELEASE_INCOMPLETE")
+            .unwrap();
+        assert_eq!(job.process_state, "STOP_INCOMPLETE");
+        assert_eq!(job.last_error.as_deref(), Some("GNB_UE_CONTEXT_RELEASE_INCOMPLETE"));
+        assert!(job.process_handle.is_some(), "retry ownership must be retained");
+        assert!(job.approved_runtime.is_some(), "retry approval must be retained");
+        assert!(job.operation_id.is_none(), "failed stop must release the operation lock");
     }
 
     fn now_epoch_s() -> u64 {

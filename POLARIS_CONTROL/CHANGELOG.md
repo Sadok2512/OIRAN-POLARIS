@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.19 — 2026-11-21 — Stop UE cohérent avec le contexte gNB (patch)
+
+- Le Stop envoie désormais la libération PDU puis le désenregistrement `switch-off` avant l'arrêt du conteneur UE.
+- Après l'arrêt, Control lit `ue-list`, libère uniquement les contextes orphelins (`amf-ngap-id < 0`) avec `ue-release`, puis contrôle leur disparition.
+- Tant qu'un contexte orphelin résiste, le registre publie `STOP_INCOMPLETE`, conserve l'enveloppe de propriété pour un nouvel essai et retourne `GNB_UE_CONTEXT_RELEASE_INCOMPLETE`; il ne publie jamais prématurément `STOPPED`.
+- Le parseur de `ue-list`, l'état `STOP_INCOMPLETE` et le chemin Stop incomplet ont des tests de régression dédiés.
+
 ## 0.36.18 — 2026-11-21 — Run depuis la bibliothèque de scénarios
 
 - Le bouton Run des scénarios utilisateur et des modèles ouvre un choix explicite d’UE.
