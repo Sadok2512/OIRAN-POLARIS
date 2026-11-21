@@ -6912,6 +6912,222 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// 2.21.134 (lab G9 bis, ANR1 #10 7060636299 : signalisation isolée,
+    /// débit ≈ +100 % par sens ; ordre #9 7060707210 point 2) — deux UE
+    /// rejouent le même scénario, dans l'ordre inverse : l'UPF et le gNB
+    /// redonnent à B les tunnels que A avait au premier passage, et
+    /// inversement. La trace de A est ouverte entre les deux passages :
+    /// son amorçage relit le premier. Au lab, la fin de la session de
+    /// données passe dans le NAS chiffré : seule la libération du contexte
+    /// UE est visible, qui garde le tunnel côté cœur.
+    ///
+    /// Attendu : somme des buckets de A = octets de A au second passage,
+    /// par sens. Règle d'établissement de 2.21.134 coupée : A compte aussi
+    /// le trafic de B (le double, sens par sens).
+    #[test]
+    fn rerun_in_reverse_order_does_not_double_the_throughput_2_21_134() {
+        use event_schema::{Direction, Protocol};
+        let (gnb, upf, amf) = ("10.77.11.13", "10.77.22.13", "10.77.21.20");
+        struct Session {
+            pseudonym: &'static str,
+            amf_id: &'static str,
+            ran_id: &'static str,
+            teid_ul: &'static str,
+            teid_dl: &'static str,
+        }
+        let signalling = |s: &Session, first: u64| -> Vec<event_schema::NormalizedEvent> {
+            let ngap = |packet: u64, message: &str, extra: Vec<(&str, &str)>, ies: Vec<(&str, String)>| {
+                let mut ids: Vec<(&str, &str)> = vec![("amf_ue_ngap_id", s.amf_id), ("ran_ue_ngap_id", s.ran_id)];
+                ids.extend(extra);
+                let ies: Vec<(&str, &str)> = ies.iter().map(|(n, v)| (*n, v.as_str())).collect();
+                let mut event = mk_event("N2", Protocol::Ngap, message, packet, Direction::Downlink, ids, ies);
+                event.event_id = format!("evt-n2-{packet:06}");
+                event.source_endpoint.address = amf.into();
+                event.destination_endpoint.address = gnb.into();
+                event
+            };
+            let f_teid = format!("teid={},v4=true,v6=false,ipv4={upf}", s.teid_ul);
+            let mut est = mk_event(
+                "N4",
+                Protocol::Pfcp,
+                "Session Establishment Request",
+                first + 1,
+                Direction::Unknown,
+                vec![("seid", "0x0000000000000000"), ("pfcp_sequence", s.ran_id)],
+                vec![("F-TEID", f_teid.as_str())],
+            );
+            est.event_id = format!("evt-n4-{:06}", first + 1);
+            est.destination_endpoint.address = upf.into();
+            let setup = format!(
+                "item_0_tunnel_ip_ul={upf},item_0_gtp_teid_ul={},item_0_tunnel_ip_dl={gnb},item_0_gtp_teid_dl={}",
+                s.teid_ul, s.teid_dl
+            );
+            vec![
+                ngap(first, "DownlinkNASTransport", vec![("subscriber_pseudonym", s.pseudonym)], vec![]),
+                est,
+                ngap(
+                    first + 2,
+                    "PDUSessionResourceSetupRequest",
+                    vec![("pdu_session_id", "1")],
+                    vec![("PDUSessionResourceSetupRequestTransfer", setup)],
+                ),
+            ]
+        };
+        let gpdu = |s: &Session, packet: u64, uplink: bool, bytes: u32| {
+            let (teid, endpoint) = if uplink { (s.teid_ul, upf) } else { (s.teid_dl, gnb) };
+            let mut event = mk_event(
+                "N3",
+                Protocol::Gtpu,
+                "G-PDU",
+                packet,
+                if uplink { Direction::Uplink } else { Direction::Downlink },
+                vec![("teid", teid), ("tunnel_endpoint_ip", endpoint)],
+                vec![],
+            );
+            event.event_id = format!("evt-n3-{packet:06}");
+            event.destination_endpoint.address = endpoint.into();
+            event.packet_references[0].original_length = bytes;
+            event
+        };
+        let release = |s: &Session, packet: u64| {
+            let mut event = mk_event(
+                "N2",
+                Protocol::Ngap,
+                "UEContextReleaseComplete",
+                packet,
+                Direction::Uplink,
+                vec![("amf_ue_ngap_id", s.amf_id), ("ran_ue_ngap_id", s.ran_id)],
+                vec![],
+            );
+            event.event_id = format!("evt-n2-{packet:06}");
+            event
+        };
+        // Premier passage : A puis B.
+        let a1 = Session { pseudonym: "psn-ue-a", amf_id: "11", ran_id: "21", teid_ul: "0x0000a001", teid_dl: "0x0000a002" };
+        let b1 = Session { pseudonym: "psn-ue-b", amf_id: "12", ran_id: "22", teid_ul: "0x0000b001", teid_dl: "0x0000b002" };
+        let mut history = Vec::new();
+        history.extend(signalling(&a1, 10));
+        history.extend(signalling(&b1, 20));
+        history.push(gpdu(&a1, 30, true, 1_000));
+        history.push(gpdu(&b1, 31, true, 700));
+        history.push(release(&a1, 40));
+        history.push(release(&b1, 41));
+        // Second passage, 50 min plus tard, dans l'ordre inverse : B reçoit
+        // les tunnels de A, A ceux de B.
+        let b2 = Session { pseudonym: "psn-ue-b", amf_id: "32", ran_id: "42", teid_ul: "0x0000a001", teid_dl: "0x0000a002" };
+        let a2 = Session { pseudonym: "psn-ue-a", amf_id: "31", ran_id: "41", teid_ul: "0x0000b001", teid_dl: "0x0000b002" };
+        let mut live = Vec::new();
+        live.extend(signalling(&b2, 30_000));
+        live.extend(signalling(&a2, 30_010));
+        let (mut a_ul, mut a_dl) = (0u64, 0u64);
+        let mut packet = 30_100u64;
+        for round in 0..20u64 {
+            if round < 3 {
+                live.push(gpdu(&a2, packet, true, 1_000));
+                a_ul += 1_000;
+                packet += 1;
+            }
+            if round < 5 {
+                live.push(gpdu(&a2, packet, false, 1_000));
+                a_dl += 1_000;
+                packet += 1;
+            }
+            live.push(gpdu(&b2, packet, true, 700));
+            live.push(gpdu(&b2, packet + 1, false, 700));
+            packet += 2;
+        }
+        let r = trace_on("psn-ue-a");
+        assert!(r.begin_seed());
+        learn_history(&r, history.into_iter().filter(|e| e.interface != "N3").collect());
+        r.finish_seed(&SeedReport::default());
+        for event in &live {
+            r.route_normalized(event);
+        }
+        r.flush_idle_throughput_buckets();
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        let sum = |field: &str| -> u64 {
+            t.events
+                .iter()
+                .filter(|e| e.kind == "throughput")
+                .map(|e| e.payload[field].as_u64().unwrap_or(0))
+                .sum()
+        };
+        assert_eq!(
+            (sum("ul_bytes_s"), sum("dl_bytes_s")),
+            (a_ul, a_dl),
+            "débit de A seul, par sens"
+        );
+        assert_eq!(t.trace.gpdu_attached, 8);
+        assert_eq!(t.trace.pfcp_establishment_reused_identifiers, 1);
+        let routed: Vec<String> = t
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            routed.iter().all(|id| !["evt-n2-030000", "evt-n4-030001", "evt-n2-030002"].contains(&id.as_str())),
+            "rien de la signalisation de B : {routed:?}"
+        );
+    }
+
+    /// 2.21.134 (ordre #9 7060707210 point 2, hypothèse du cœur) — deux
+    /// traces successives sur le même abonné : la seconde, ouverte après la
+    /// fin de la première, n'hérite d'aucun bucket.
+    #[test]
+    fn a_second_trace_on_the_same_subscriber_starts_with_no_throughput_2_21_134() {
+        use event_schema::{Direction, Protocol};
+        let gpdu = |packet: u64, bytes: u32| {
+            let mut event = mk_event("N3", Protocol::Gtpu, "G-PDU", packet, Direction::Uplink, vec![("teid", "0x0000a001")], vec![]);
+            event.destination_endpoint.address = "10.77.22.13".into();
+            event.packet_references[0].original_length = bytes;
+            event
+        };
+        let mut setup = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            1,
+            Direction::Downlink,
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+            vec![("PDUSessionResourceSetupRequestTransfer", "item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x0000a001")],
+        );
+        setup.event_id = "evt-setup".into();
+        let r = LiveTraceRegistry::new();
+        let open = |id: &str| {
+            let mut st = state(u64::MAX, false, vec!["psn-ue-a".into()]);
+            st.trace.trace_id = id.into();
+            r.traces.lock().unwrap().insert(id.into(), st);
+        };
+        open("first");
+        r.route_normalized(&setup);
+        for packet in 10..20 {
+            r.route_normalized(&gpdu(packet, 1_000));
+        }
+        r.flush_idle_throughput_buckets();
+        // Fin de la première trace ; la seconde s'ouvre ensuite.
+        r.traces.lock().unwrap().remove("first");
+        open("second");
+        let mut setup2 = setup.clone();
+        setup2.event_id = "evt-setup-2".into();
+        setup2.packet_references[0].packet_number = 100;
+        r.route_normalized(&setup2);
+        for packet in 110..113 {
+            r.route_normalized(&gpdu(packet, 500));
+        }
+        r.flush_idle_throughput_buckets();
+        let traces = r.traces.lock().unwrap();
+        let total: u64 = traces["second"]
+            .events
+            .iter()
+            .filter(|e| e.kind == "throughput")
+            .map(|e| e.payload["ul_bytes_s"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(total, 3 * 500, "la seconde trace ne compte que son trafic");
+        assert_eq!(traces["second"].trace.gpdu_attached, 3);
+    }
+
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
         let bytes = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
