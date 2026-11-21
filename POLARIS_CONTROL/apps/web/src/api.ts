@@ -27,6 +27,7 @@ export type ScenarioDefinitions = { items:ScenarioDefinition[]; total:number; sc
 export const secondsToDurationMs = (seconds:number) => Math.round(seconds * 1000);
 export const maskSubscriberIdentity = (value:string|undefined|null) => {
   if (!value || value === 'PROTECTED') return 'PROTECTED';
+  if (/^…\d{4}$/.test(value)) return value;
   const digits = value.replace(/^imsi-/i,'');
   return /^\d{4,}$/.test(digits) ? `…${digits.slice(-4)}` : 'PROTECTED';
 };

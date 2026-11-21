@@ -10,13 +10,13 @@
 
 - `/ues`, les profils UE, les vues abonnés et Activity JSON/SSE projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
 - `subscriber_identity_exposed` reste faux et aucun MSISDN n'est projeté par ces routes GET.
-- Le helper web remasque défensivement toute identité et refuse une valeur non conforme ; les tests scannent un corps multi-UE complet pour chaque rôle.
+- Le helper web conserve une valeur déjà masquée conforme, remasque défensivement toute identité brute et refuse une valeur non conforme ; les tests scannent un corps multi-UE complet pour chaque rôle.
 - Les secrets d'authentification restent protégés ; les mutations et la route POST de lookup existante sont inchangées.
 
 ## 0.36.19 — 2026-11-21 — Stop UE cohérent avec le contexte gNB (patch)
 
 - Le Stop envoie désormais la libération PDU puis le désenregistrement `switch-off` avant l'arrêt du conteneur UE.
-- Au Start, Control compare deux relevés `ue-list` et enregistre durablement le `ran-ngap-id` uniquement lorsqu'un seul nouveau contexte est apparu.
+- Au Start, Control compare deux relevés `ue-list`, attend de façon bornée l'état `REGISTERED` et enregistre durablement le `ran-ngap-id` uniquement lorsqu'un seul nouveau contexte est apparu. Un enregistrement ou un mapping non prouvé échoue fermé et nettoie le lancement au lieu de publier un succès sans mapping.
 - Au Stop, seul ce mapping durable peut autoriser `ue-release`. Sans mapping univoque, aucune libération gNB n'est envoyée et l'UE passe en `STOP_INCOMPLETE / GNB_STOPPED_CONTEXT_AMBIGUOUS`.
 - Le fallback temporel sur un orphelin stable est supprimé : ni l'âge ni une transition AMF ne servent de preuve de propriété.
 - L'écran indique de demander à un agent lab le redémarrage du gNB lorsque tous les UE sont inactifs ; l'enveloppe de propriété reste conservée pour la reprise.
