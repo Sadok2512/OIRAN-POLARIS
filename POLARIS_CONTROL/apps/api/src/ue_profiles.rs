@@ -230,6 +230,20 @@ impl ProfileStore {
             .ok_or_else(|| "UE_PROFILE_SECRET_INVALID".to_string())
     }
 
+    /// Reads the private profile bytes for an internal, authoritative
+    /// provisioning check. Callers must never serialize or log the result.
+    pub fn profile_bytes_for_attestation(
+        &self,
+        record: &ManagedUeProfile,
+    ) -> Result<Vec<u8>, String> {
+        let basename = &record.profile.profile_name;
+        if basename.contains('/') || basename.contains("..") {
+            return Err("UE_PROFILE_PATH_INVALID".into());
+        }
+        fs::read(self.profile_root.join(basename))
+            .map_err(|_| "PROVISIONING_PROFILE_UNREADABLE".into())
+    }
+
     pub fn load_or_bootstrap(
         &self,
         fallback: Vec<UeProfileSpec>,

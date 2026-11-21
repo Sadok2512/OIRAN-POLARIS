@@ -191,6 +191,56 @@ fn provisioning_attestation_observation(
     })
 }
 
+fn startup_attestation_profiles(
+    profiles: &[UeProfileSpec],
+    ue01_controller_owned: bool,
+) -> Vec<UeProfileSpec> {
+    profiles
+        .iter()
+        .filter(|profile| {
+            profile.configured && (profile.ue_id != "UE-01" || ue01_controller_owned)
+        })
+        .cloned()
+        .collect()
+}
+
+fn verify_startup_profiles_against_open5gs(
+    profile_store: &ProfileStore,
+    registry: &UeProfileRegistry,
+    backend: &dyn SubscriberBackend,
+    served_network: &ServedNetworkPolicy,
+    ue01_controller_owned: bool,
+) -> Result<BTreeMap<String, String>, String> {
+    let candidates = registry
+        .profiles
+        .iter()
+        .filter(|record| {
+            record.profile.configured
+                && (record.profile.ue_id != "UE-01" || ue01_controller_owned)
+        })
+        .collect::<Vec<_>>();
+    let identities = candidates
+        .iter()
+        .map(|record| profile_store.subscriber_imsi(record))
+        .collect::<Result<Vec<_>, _>>()?;
+    let subscribers = backend.lookup_many(&identities)?;
+    let mut verified = BTreeMap::new();
+    for (record, identity) in candidates.into_iter().zip(identities) {
+        let subscriber = subscribers
+            .get(&identity)
+            .ok_or_else(|| "OPEN5GS_IDENTITY_NOT_FOUND".to_string())?;
+        let profile_bytes = profile_store.profile_bytes_for_attestation(record)?;
+        let profile_sha256 = verify_mongo_subscriber_profile_bytes(
+            &record.profile,
+            &profile_bytes,
+            subscriber,
+            served_network,
+        )?;
+        verified.insert(record.profile.ue_id.clone(), profile_sha256);
+    }
+    Ok(verified)
+}
+
 fn audit_provisioning_attestation(audit_path: &Path, observation: &Value) {
     if observation["status"] == "ATTESTATION_COMPLETE" {
         return;
@@ -3388,24 +3438,23 @@ impl AppState {
             .iter()
             .map(|record| record.profile.clone())
             .collect::<Vec<_>>();
-        let provisioning_verification = ue_runtime.verify_provisioning(&profiles);
+        let attested_profiles = startup_attestation_profiles(&profiles, ue01_controller_owned);
+        let provisioning_verification = verify_startup_profiles_against_open5gs(
+            &profile_store,
+            &profile_registry,
+            subscriber_backend.as_ref(),
+            &served_network,
+            ue01_controller_owned,
+        );
         let (covered_ue_ids, provisioning_error) = match &provisioning_verification {
             Ok(verified) => (verified.keys().cloned().collect::<BTreeSet<_>>(), None),
-            Err(error) => {
-                let covered = fs::read(DockerUeRuntime::ATTESTATION_PATH)
-                    .ok()
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<Vec<ProvisioningBinding>>(&bytes).ok()
-                    })
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|binding| binding.ue_id)
-                    .collect::<BTreeSet<_>>();
-                (covered, Some(error.as_str()))
-            }
+            Err(error) => (BTreeSet::new(), Some(error.as_str())),
         };
-        let provisioning_attestation =
-            provisioning_attestation_observation(&profiles, &covered_ue_ids, provisioning_error);
+        let provisioning_attestation = provisioning_attestation_observation(
+            &attested_profiles,
+            &covered_ue_ids,
+            provisioning_error,
+        );
         audit_provisioning_attestation(&audit_path_for_startup, &provisioning_attestation);
         if let Ok(verified) = provisioning_verification {
             for profile in profiles.iter_mut().take(configuration.ue_count) {
@@ -9243,32 +9292,47 @@ fn verify_mongo_subscriber_profile_for_launch(
     subscriber: &SubscriberRecord,
     served_network: &ServedNetworkPolicy,
 ) -> Result<String, String> {
-    served_network.validate(subscriber)?;
-    let evidence = DockerUeRuntime::profile_evidence(profile)?;
     let path = DockerUeRuntime::profile_path(&profile.ue_id, &profile.profile_name)?;
     let bytes = fs::read(path).map_err(|_| "PROVISIONING_PROFILE_UNREADABLE".to_string())?;
+    verify_mongo_subscriber_profile_bytes(profile, &bytes, subscriber, served_network)
+}
+
+fn verify_mongo_subscriber_profile_bytes(
+    profile: &UeProfileSpec,
+    bytes: &[u8],
+    subscriber: &SubscriberRecord,
+    served_network: &ServedNetworkPolicy,
+) -> Result<String, String> {
+    served_network.validate(subscriber)?;
     let document =
-        std::str::from_utf8(&bytes).map_err(|_| "PROVISIONING_PROFILE_INVALID".to_string())?;
+        std::str::from_utf8(bytes).map_err(|_| "PROVISIONING_PROFILE_INVALID".to_string())?;
     let scalar = |key: &str| {
         DockerUeRuntime::top_level_scalar(document, key)
             .ok_or_else(|| "PROVISIONING_PROFILE_INVALID".to_string())
     };
     let identity = scalar("supi")?;
     let identity = identity.strip_prefix("imsi-").unwrap_or(&identity);
+    let (dnn, sst, sd) =
+        DockerUeRuntime::profile_network(document).ok_or("PROVISIONING_PROFILE_INVALID")?;
     if identity != subscriber.imsi
         || !scalar("key")?.eq_ignore_ascii_case(&subscriber.k)
         || !scalar("op")?.eq_ignore_ascii_case(&subscriber.opc)
         || !scalar("amf")?.eq_ignore_ascii_case("8000")
         || !scalar("opType")?.eq_ignore_ascii_case("OPC")
-        || evidence.plmn_mcc != subscriber.plmn_mcc
-        || evidence.plmn_mnc != subscriber.plmn_mnc
-        || evidence.sst != subscriber.sst
-        || evidence.sd != subscriber.sd
-        || !subscriber.dnns.iter().any(|dnn| dnn == &evidence.dnn)
+        || scalar("mcc")? != subscriber.plmn_mcc
+        || scalar("mnc")? != subscriber.plmn_mnc
+        || dnn != profile.dnn
+        || sst != profile.sst
+        || sd != profile.sd
+        || profile.plmn_mcc != subscriber.plmn_mcc
+        || profile.plmn_mnc != subscriber.plmn_mnc
+        || profile.sst != subscriber.sst
+        || profile.sd != subscriber.sd
+        || !subscriber.dnns.iter().any(|candidate| candidate == &dnn)
     {
         return Err("OPEN5GS_PROFILE_BINDING_MISMATCH".into());
     }
-    Ok(evidence.profile_sha256)
+    DockerUeRuntime::hash_bytes(bytes)
 }
 
 async fn delete_ue_profile(
@@ -19486,15 +19550,58 @@ mod p0_tests {
             "../../../tests/fixtures/provisioning/open5gs-records.json"
         ))
         .unwrap();
+        let source = &export["subscribers"][0];
         let binding = verify_open5gs_profile_binding(
             &ueransim_adapter::planned_profiles()[0],
             yaml,
-            &export["subscribers"][0],
+            source,
         )
         .unwrap();
         assert_eq!(binding.ue_id, "UE-01");
         assert_eq!(binding.authority, "OPEN5GS");
-        let mut wrong = export["subscribers"][0].clone();
+        let security = source["security"].as_object().unwrap();
+        let subscriber = SubscriberRecord {
+            imsi: source["imsi"].as_str().unwrap().into(),
+            msisdn: None,
+            k: security
+                .get("k")
+                .or_else(|| security.get("key"))
+                .and_then(Value::as_str)
+                .unwrap()
+                .into(),
+            opc: source["security"]["opc"].as_str().unwrap().into(),
+            slot: "test-only".into(),
+            plmn_mcc: "001".into(),
+            plmn_mnc: "01".into(),
+            sst: 1,
+            sd: Some("010203".into()),
+            dnns: vec!["internet".into()],
+            ambr: subscriber_provisioning::SubscriberAmbr {
+                uplink: 1,
+                downlink: 1,
+            },
+        };
+        let policy = ServedNetworkPolicy::parse("1/010203", "internet").unwrap();
+        assert!(verify_mongo_subscriber_profile_bytes(
+            &ueransim_adapter::planned_profiles()[0],
+            yaml,
+            &subscriber,
+            &policy,
+        )
+        .is_ok());
+        let mut wrong_subscriber = subscriber;
+        wrong_subscriber.k = "0".repeat(32);
+        assert_eq!(
+            verify_mongo_subscriber_profile_bytes(
+                &ueransim_adapter::planned_profiles()[0],
+                yaml,
+                &wrong_subscriber,
+                &policy,
+            )
+            .unwrap_err(),
+            "OPEN5GS_PROFILE_BINDING_MISMATCH"
+        );
+        let mut wrong = source.clone();
         wrong["security"]["k"] = Value::String("0".repeat(32));
         assert_eq!(
             verify_open5gs_profile_binding(&ueransim_adapter::planned_profiles()[0], yaml, &wrong,)
@@ -20437,6 +20544,28 @@ mod p0_tests {
         assert_eq!(entry["type"], "provisioning_attestation");
         assert_eq!(entry["status"], "ATTESTATION_INCOMPLETE");
         assert_eq!(entry["uncovered_ue_ids"], observation["uncovered_ue_ids"]);
+    }
+
+    #[test]
+    fn startup_attestation_excludes_shared_ue01_but_keeps_controller_profiles() {
+        let mut profiles = ueransim_adapter::planned_profiles();
+        profiles
+            .iter_mut()
+            .take(3)
+            .for_each(|profile| profile.configured = true);
+
+        let shared = startup_attestation_profiles(&profiles[..3], false);
+        assert_eq!(
+            shared
+                .iter()
+                .map(|profile| profile.ue_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["UE-02", "UE-03"]
+        );
+
+        let transferred = startup_attestation_profiles(&profiles[..3], true);
+        assert_eq!(transferred.len(), 3);
+        assert_eq!(transferred[0].ue_id, "UE-01");
     }
 
     /// 0.19.2 — Small traffic template now interleaves a 1 MiB

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.22 — 2026-11-21 — Attestation C3 autoritative au démarrage
+
+- Le démarrage vérifie en lecture seule les profils contrôlés directement contre les abonnés Open5GS marqués POLARIS, y compris l'identité, les secrets d'authentification et le réseau servi.
+- L'UE-01 partagé est exclu de cette attestation tant que son transfert de propriété à Control n'est pas actif ; son ancien profil minimal ne bloque donc plus UE-201 et UE-05.
+- Le fichier d'attestation périmé n'est plus utilisé comme repli pour déclarer une couverture actuelle. Une base indisponible ou une divergence reste visible comme attestation incomplète, sans écriture Open5GS.
+
 ## 0.36.20 — 2026-11-21 — Identités abonné masquées sur les GET Control
 
 - `/ues`, les profils UE, les vues abonnés et Activity JSON/SSE projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
