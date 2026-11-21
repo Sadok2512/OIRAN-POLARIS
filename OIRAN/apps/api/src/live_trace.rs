@@ -222,6 +222,14 @@ fn carries_rtp_flows(interface: &str) -> bool {
     matches!(interface, "N3" | "S1-U" | "S5-U" | "IMS" | "N6")
 }
 
+/// The decoder publishes SIP/RTP with their logical IMS interface.  A trace
+/// filter, however, names the physical capture plane selected by the caller.
+fn trace_interface_matches(requested: &str, decoded: &str) -> bool {
+    requested.eq_ignore_ascii_case(decoded)
+        || (requested.eq_ignore_ascii_case("N6") && decoded.eq_ignore_ascii_case("IMS"))
+        || (requested.eq_ignore_ascii_case("N3") && decoded.eq_ignore_ascii_case("N3-IMS"))
+}
+
 /// 2.21.105 — période d'émission de l'event SSE `stats`.
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -1822,7 +1830,7 @@ impl LiveTraceRegistry {
                     .trace
                     .interfaces
                     .iter()
-                    .any(|item| item.eq_ignore_ascii_case(&event.interface))
+                    .any(|item| trace_interface_matches(item, &event.interface))
             {
                 // 2.21.105 — compte pour diagnostic. Un event GTP-U sur
                 // une interface non-filtrée est un signal fort que le
@@ -4676,6 +4684,68 @@ mod tests {
             s.trace.seed.events_scanned,
             n2.len() as u64,
             "l'amorçage voit N2 malgré le filtre N3"
+        );
+    }
+
+    /// 2.21.138 — N6 and N3 are capture-plane names. Their decoded SIP/RTP
+    /// events use the logical names IMS and N3-IMS and must not be filtered.
+    #[test]
+    fn n6_and_n3_filters_accept_their_decoded_ims_events_2_21_138() {
+        use event_schema::{Direction, Protocol};
+        let r = trace_on("psn-ue-a");
+        r.traces
+            .lock()
+            .unwrap()
+            .get_mut("t")
+            .unwrap()
+            .trace
+            .interfaces = vec!["N6".into(), "N3".into()];
+        for (packet, interface) in [(1, "IMS"), (2, "N3-IMS")] {
+            let mut event = mk_event(
+                interface,
+                Protocol::Sip,
+                "REGISTER",
+                packet,
+                Direction::Unknown,
+                vec![("subscriber_pseudonym", "psn-ue-a")],
+                vec![("CSeq", "1 REGISTER")],
+            );
+            event.event_id = format!("evt-ims-{packet}");
+            r.route_normalized(&event);
+        }
+        assert_eq!(routed_ids(&r), ["evt-ims-1", "evt-ims-2"]);
+        let traces = r.traces.lock().unwrap();
+        assert_eq!(traces["t"].trace.feed["IMS"].filtered, 0);
+        assert_eq!(traces["t"].trace.feed["N3-IMS"].filtered, 0);
+        drop(traces);
+
+        let n3_only = trace_on("psn-ue-a");
+        n3_only
+            .traces
+            .lock()
+            .unwrap()
+            .get_mut("t")
+            .unwrap()
+            .trace
+            .interfaces = vec!["N3".into()];
+        let mut n6_event = mk_event(
+            "IMS",
+            Protocol::Sip,
+            "REGISTER",
+            3,
+            Direction::Unknown,
+            vec![("subscriber_pseudonym", "psn-ue-a")],
+            vec![("CSeq", "1 REGISTER")],
+        );
+        n6_event.event_id = "evt-ims-3".into();
+        n3_only.route_normalized(&n6_event);
+        assert!(
+            routed_ids(&n3_only).is_empty(),
+            "N3 seul ne sélectionne pas N6/IMS"
+        );
+        assert_eq!(
+            n3_only.traces.lock().unwrap()["t"].trace.feed["IMS"].filtered,
+            1
         );
     }
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## oiran-api 2.21.138 — 2026-11-21 — trace voix : alias des plans capturés N6/N3 vers IMS/N3-IMS
+
+Upgrade **patch** au-dessus de 2.21.137 @ `74c8b94`. Le G7 de production 2.21.136 a prouvé que N6 contenait les REGISTER, que l'établissement PFCP IMS et son IP UE étaient appris avant eux, mais que les deux traces publiaient `IMS.filtered=49`, `N3-IMS.filtered=49`, SIP=0 et RTP=0.
+
+### Cause
+
+Le lecteur décode volontairement SIP/RTP de N6 sous l'interface logique `IMS` et ceux du tunnel N3 sous `N3-IMS`. La requête de trace sélectionne les plans physiques `N6` et `N3`. Le filtre de trace exigeait une égalité littérale et rejetait donc tous ces événements avant les règles de rattachement voix.
+
+### Correctif
+
+Le filtre accepte les deux alias exacts `N6 -> IMS` et `N3 -> N3-IMS`, en plus de l'égalité existante. Aucun autre couple d'interfaces n'est élargi.
+
+### Test — échec avant, succès après
+
+`n6_and_n3_filters_accept_their_decoded_ims_events_2_21_138` route deux REGISTER associés au bon abonné, décodés respectivement sur `IMS` et `N3-IMS`, dans une trace filtrée sur `N6,N3`; les compteurs `filtered` restent à zéro. Le cas inverse vérifie qu'une trace limitée à `N3` ne reçoit pas un événement `IMS` issu de N6. Avant le correctif, aucun des deux événements attendus n'était publié.
+
 ## oiran-api 2.21.137 — 2026-11-21 — lecteur live : le débit global ne recompte pas le segment courant au redémarrage du lecteur (ordre #9 7061820250)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.136 @ `6f4fcd3`. Branche `fix/oiran-2.21.137-throughput-hooks`. Seul `apps/api/src/live_trace.rs` change. Train et branche du déploiement en cours non déplacés.
