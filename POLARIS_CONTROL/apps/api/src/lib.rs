@@ -4524,6 +4524,44 @@ fn unique_new_ran_ngap_id(
     (appeared.len() == 1).then(|| appeared[0])
 }
 
+fn wait_for_registered_gnb_mapping(
+    runtime: &dyn UeRuntime,
+    spec: &LiveLaunchSpec,
+    handle: &str,
+    before_start: &[GnbUeContext],
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<(UeObservation, u32), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut registered_seen = false;
+    let mut gnb_snapshot_seen = false;
+    loop {
+        let observation = runtime.observe_owned(spec, handle)?;
+        if observation.process_state != "RUNNING" {
+            return Err("LIVE_UE_NOT_RUNNING_AFTER_START".into());
+        }
+        if observation.registration_state == "REGISTERED" {
+            registered_seen = true;
+            if let Ok(after_start) = runtime.snapshot_gnb_contexts() {
+                gnb_snapshot_seen = true;
+                if let Some(ran_ngap_id) = unique_new_ran_ngap_id(before_start, &after_start) {
+                    return Ok((observation, ran_ngap_id));
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(if !registered_seen {
+                "LIVE_UE_REGISTRATION_NOT_OBSERVED_AFTER_START".into()
+            } else if gnb_snapshot_seen {
+                "GNB_START_CONTEXT_AMBIGUOUS".into()
+            } else {
+                "GNB_START_CONTEXT_SNAPSHOT_FAILED".into()
+            });
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
 fn mapped_release_target(
     mapped_ran_ngap_id: u32,
     contexts: &[GnbUeContext],
@@ -10989,7 +11027,10 @@ fn start_one_live_inner(
         }
     };
     let approved_runtime = state.ue_runtime.approve_launch(&profile, &profile_sha256)?;
-    let gnb_contexts_before_start = state.ue_runtime.snapshot_gnb_contexts().ok();
+    let gnb_contexts_before_start = state
+        .ue_runtime
+        .snapshot_gnb_contexts()
+        .map_err(|_| "GNB_START_CONTEXT_SNAPSHOT_FAILED".to_string())?;
     let operation_id = random_hex(16);
     {
         let mut controller = state
@@ -11070,21 +11111,15 @@ fn start_one_live_inner(
             return Err(error);
         }
     }
-    let observation = match state.ue_runtime.observe_owned(&approved_runtime, &handle) {
-        Ok(observation) if observation.process_state == "RUNNING" => observation,
-        Ok(_) => {
-            let cleanup = state.ue_runtime.stop(&approved_runtime, &handle);
-            if let Ok(mut controller) = state.multi_ue.lock() {
-                let _ = controller.fail_live_operation(
-                    ue_id,
-                    &operation_id,
-                    "LIVE_UE_NOT_RUNNING_AFTER_START",
-                    cleanup.is_err(),
-                );
-                let _ = persist_ue_registry(state, &controller);
-            }
-            return Err("LIVE_UE_NOT_RUNNING_AFTER_START".into());
-        }
+    let (observation, gnb_ran_ngap_id) = match wait_for_registered_gnb_mapping(
+        state.ue_runtime.as_ref(),
+        &approved_runtime,
+        &handle,
+        &gnb_contexts_before_start,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+    ) {
+        Ok(proof) => proof,
         Err(error) => {
             let cleanup = state.ue_runtime.stop(&approved_runtime, &handle);
             if let Ok(mut controller) = state.multi_ue.lock() {
@@ -11104,17 +11139,6 @@ fn start_one_live_inner(
             return Err(error);
         }
     };
-    let gnb_ran_ngap_id = if observation.registration_state == "REGISTERED" {
-        gnb_contexts_before_start.as_ref().and_then(|before| {
-            state
-                .ue_runtime
-                .snapshot_gnb_contexts()
-                .ok()
-                .and_then(|after| unique_new_ran_ngap_id(before, &after))
-        })
-    } else {
-        None
-    };
     let mut controller = state
         .multi_ue
         .lock()
@@ -11127,7 +11151,7 @@ fn start_one_live_inner(
         &observation.pdu_session_state,
         observation.ue_ip.as_deref(),
     )?;
-    controller.set_gnb_ran_ngap_id(ue_id, gnb_ran_ngap_id)?;
+    controller.set_gnb_ran_ngap_id(ue_id, Some(gnb_ran_ngap_id))?;
     if let Err(error) = persist_ue_registry(state, &controller) {
         drop(controller);
         let cleanup = state.ue_runtime.stop(&approved_runtime, &handle);
@@ -16515,6 +16539,25 @@ mod p0_tests {
             }
         }
 
+        fn snapshot_gnb_contexts(&self) -> Result<Vec<GnbUeContext>, String> {
+            let stopped = self.stopped.lock().unwrap();
+            Ok(self
+                .launched
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|ue_id| !stopped.contains(ue_id))
+                .filter_map(|ue_id| {
+                    let numeric_id = ue_id.trim_start_matches("UE-").parse::<u32>().ok()?;
+                    Some(GnbUeContext {
+                        ue_id: numeric_id,
+                        ran_ngap_id: 1_000 + numeric_id,
+                        amf_ngap_id: 2_000 + i64::from(numeric_id),
+                    })
+                })
+                .collect())
+        }
+
         fn establish_pdu(
             &self,
             job: &simulator_controller::UeJob,
@@ -16595,6 +16638,68 @@ mod p0_tests {
         }
     }
 
+    struct DelayedRegistrationRuntime {
+        inner: FakeLiveUeRuntime,
+        observations: AtomicU64,
+    }
+
+    impl UeRuntime for DelayedRegistrationRuntime {
+        fn verify_provisioning(
+            &self,
+            profiles: &[UeProfileSpec],
+        ) -> Result<BTreeMap<String, String>, String> {
+            self.inner.verify_provisioning(profiles)
+        }
+
+        fn approve_launch(
+            &self,
+            profile: &UeProfileSpec,
+            profile_sha256: &str,
+        ) -> Result<LiveLaunchSpec, String> {
+            self.inner.approve_launch(profile, profile_sha256)
+        }
+
+        fn launch(&self, spec: &LiveLaunchSpec) -> Result<String, UeLaunchFailure> {
+            self.inner.launch(spec)
+        }
+
+        fn discover(&self, spec: &LiveLaunchSpec) -> Result<Option<String>, String> {
+            self.inner.discover(spec)
+        }
+
+        fn observe_owned(
+            &self,
+            spec: &LiveLaunchSpec,
+            handle: &str,
+        ) -> Result<UeObservation, String> {
+            if self.observations.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(UeObservation {
+                    process_state: "RUNNING".into(),
+                    registration_state: "NOT_OBSERVED".into(),
+                    pdu_session_state: "INACTIVE".into(),
+                    ue_ip: None,
+                });
+            }
+            self.inner.observe_owned(spec, handle)
+        }
+
+        fn observe_shared(&self) -> Result<UeObservation, String> {
+            self.inner.observe_shared()
+        }
+
+        fn owns(&self, spec: &LiveLaunchSpec, handle: &str) -> bool {
+            self.inner.owns(spec, handle)
+        }
+
+        fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String> {
+            self.inner.stop(spec, handle)
+        }
+
+        fn snapshot_gnb_contexts(&self) -> Result<Vec<GnbUeContext>, String> {
+            self.inner.snapshot_gnb_contexts()
+        }
+    }
+
     struct GnbCleanupFailureRuntime(FakeLiveUeRuntime);
 
     impl UeRuntime for GnbCleanupFailureRuntime {
@@ -16606,6 +16711,7 @@ mod p0_tests {
         fn observe_shared(&self) -> Result<UeObservation, String> { self.0.observe_shared() }
         fn owns(&self, spec: &LiveLaunchSpec, handle: &str) -> bool { self.0.owns(spec, handle) }
         fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String> { self.0.stop(spec, handle) }
+        fn snapshot_gnb_contexts(&self) -> Result<Vec<GnbUeContext>, String> { self.0.snapshot_gnb_contexts() }
         fn request_pdu_release_for_detach(&self, job: &simulator_controller::UeJob) -> Result<(), String> { self.0.request_pdu_release_for_detach(job) }
         fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> { self.0.deregister_switch_off(job) }
         fn reconcile_gnb_contexts_after_stop(&self, _: Option<u32>, _: u64) -> Result<(), String> { Err("GNB_UE_CONTEXT_RELEASE_INCOMPLETE".into()) }
@@ -22623,6 +22729,69 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             },
         ];
         assert_eq!(unique_new_ran_ngap_id(&before, &after), None);
+    }
+
+    #[test]
+    fn registration_after_the_initial_start_observation_still_gets_a_durable_gnb_mapping() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .configure_count(2)
+            .unwrap();
+        test_state.ue_runtime = Arc::new(DelayedRegistrationRuntime {
+            inner: FakeLiveUeRuntime {
+                stopped: Arc::new(Mutex::new(Vec::new())),
+                launched: Arc::new(Mutex::new(Vec::new())),
+                fail_observation: false,
+                fail_verification: false,
+                fail_stop: false,
+                fail_policy_route_cleanup: None,
+            },
+            observations: AtomicU64::new(0),
+        });
+
+        let started = start_one_live_inner(&test_state, "UE-02").unwrap();
+        assert_eq!(started.registration_state, "REGISTERED");
+        assert_eq!(started.gnb_ran_ngap_id, Some(1_002));
+        let persisted = test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .find(|job| job.ue_id == "UE-02")
+            .unwrap();
+        assert_eq!(persisted.gnb_ran_ngap_id, Some(1_002));
+    }
+
+    #[test]
+    fn registered_start_without_a_unique_new_context_fails_closed() {
+        let runtime = FakeLiveUeRuntime {
+            stopped: Arc::new(Mutex::new(Vec::new())),
+            launched: Arc::new(Mutex::new(vec!["UE-02".into(), "UE-03".into()])),
+            fail_observation: false,
+            fail_verification: false,
+            fail_stop: false,
+            fail_policy_route_cleanup: None,
+        };
+        let profile = ueransim_adapter::planned_profiles()
+            .into_iter()
+            .find(|profile| profile.ue_id == "UE-02")
+            .unwrap();
+        let spec = FakeLiveUeRuntime::approval(&profile, &"a".repeat(64));
+        let error = wait_for_registered_gnb_mapping(
+            &runtime,
+            &spec,
+            &format!("container:{}", "2".repeat(64)),
+            &[],
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error, "GNB_START_CONTEXT_AMBIGUOUS");
     }
 
     #[test]
