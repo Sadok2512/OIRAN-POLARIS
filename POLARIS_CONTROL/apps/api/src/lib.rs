@@ -3291,6 +3291,17 @@ struct EffectiveIdentity {
     csrf_valid: bool,
 }
 
+/// Typed refusal context attached by certified-traffic handlers. The
+/// middleware consumes this extension directly; it never parses response
+/// bodies and it only receives server-resolved pseudonyms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ErrorTelemetry {
+    error_code: String,
+    action: &'static str,
+    target_pseudonym: Option<String>,
+    scenario_definition_id: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub username: String,
@@ -3728,6 +3739,7 @@ async fn authorize(
             request.method(),
             &path,
             "staging",
+            None,
         );
         return (
             StatusCode::LOCKED,
@@ -3805,7 +3817,15 @@ async fn authorize(
     let role = identity.role.clone();
     request.extensions_mut().insert(identity);
     let response = next.run(request).await;
-    log_http_refusal(&state, response.status(), &method, &path, &role);
+    let telemetry = response.extensions().get::<ErrorTelemetry>();
+    log_http_refusal(
+        &state,
+        response.status(),
+        &method,
+        &path,
+        &role,
+        telemetry,
+    );
     response
 }
 
@@ -3829,7 +3849,14 @@ fn staging_request_allowed(method: &Method, path: &str) -> bool {
 /// username, session id, or cookie. The entry lands in the same
 /// audit log as the `audit()` sink; a `type: "http_refusal"` key lets
 /// readers filter it out.
-fn log_http_refusal(state: &AppState, status: StatusCode, method: &Method, path: &str, role: &str) {
+fn log_http_refusal(
+    state: &AppState,
+    status: StatusCode,
+    method: &Method,
+    path: &str,
+    role: &str,
+    telemetry: Option<&ErrorTelemetry>,
+) {
     if !status.is_client_error() && !status.is_server_error() {
         return;
     }
@@ -3841,7 +3868,7 @@ fn log_http_refusal(state: &AppState, status: StatusCode, method: &Method, path:
         .append(true)
         .open(&state.audit_path)
     {
-        let entry = json!({
+        let mut entry = json!({
             "timestamp_epoch_s": epoch_seconds(),
             "type": "http_refusal",
             "method": method.as_str(),
@@ -3849,6 +3876,12 @@ fn log_http_refusal(state: &AppState, status: StatusCode, method: &Method, path:
             "status": status.as_u16(),
             "role": role,
         });
+        if let Some(telemetry) = telemetry {
+            entry["error_code"] = json!(telemetry.error_code);
+            entry["action"] = json!(telemetry.action);
+            entry["target_pseudonym"] = json!(telemetry.target_pseudonym);
+            entry["scenario_definition_id"] = json!(telemetry.scenario_definition_id);
+        }
         let _ = writeln!(file, "{}", entry);
     }
 }
@@ -7482,7 +7515,9 @@ fn normalize_terminal_record(value: &mut Value) {
         .unwrap_or("UNKNOWN")
         .to_string();
     record.entry("started_at_epoch_s").or_insert(json!(started));
-    record.entry("target_ue_id").or_insert(json!("UE-01"));
+    if !record.contains_key("error_code") {
+        record.entry("target_ue_id").or_insert(json!("UE-01"));
+    }
     record
         .entry("target_ue_pseudonym")
         .or_insert(json!("UE-PSEUDONYM-01"));
@@ -7528,6 +7563,157 @@ fn job_json(job: &OwnedScenarioJob) -> Value {
         duration_ms.saturating_add(999) / 1_000
     };
     json!({"scenario_id":job.job_id,"job_id":job.job_id,"technology":"5G SA","simulator":"UERANSIM","started_at":job.started_at.to_string(),"started_at_epoch_s":job.started_at,"started_at_epoch_ms":job.started_at_epoch_ms,"ended_at_epoch_s":job.ended_at,"ended_at_epoch_ms":job.ended_at_epoch_ms,"duration_seconds":duration_seconds,"duration_milliseconds":duration_ms,"configured_ues":1,"registered_ues":1,"active_pdu_sessions":1,"traffic_state":job.state,"packets_requested":job.packets_requested,"packets_sent":job.packets_sent,"packets_received":job.packets_received,"packet_size_bytes":TRAFFIC_PACKET_BYTES,"bytes_sent":job.bytes_sent,"bytes_received":job.bytes_received,"accounting_source":"OWNED_PROCESS_EXIT_AND_FIXED_PROFILE","receive_accounting":"NOT_OBSERVED_SEND_ONLY_PROFILE","terminal_result":job.terminal_result,"process_id":job.process_id,"cpu":"BOUNDED","memory":"BOUNDED","state":job.state,"controller_owned":true,"target_ue_id":job.target_ue_id,"target_ue_pseudonym":job.target_ue_pseudonym,"tun_interface":job.tun_interface})
+}
+
+fn certified_target_pseudonym(
+    state: &AppState,
+    scenario_type: &str,
+    target_ue_id: &str,
+) -> Option<String> {
+    if scenario_type == "bounded-existing-ue-udp-v1"
+        && target_ue_id == "UE-01"
+        && !state.ue01_controller_owned
+    {
+        return Some("UE-PSEUDONYM-01".into());
+    }
+    if scenario_type != "bounded-controller-ue-udp-v1" || !controller_owns_ue(state, target_ue_id)
+    {
+        return None;
+    }
+    state
+        .profile_registry
+        .lock()
+        .ok()?
+        .profiles
+        .iter()
+        .find(|record| record.profile.ue_id == target_ue_id)
+        .map(|record| safe_telemetry_reference("psn", &record.profile.pseudonym))
+}
+
+fn safe_telemetry_reference(prefix: &str, value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let looks_like_identity = lower.starts_with("imsi")
+        || lower.starts_with("supi")
+        || lower.starts_with("msisdn")
+        || lower.starts_with("imei")
+        || (value.len() >= 10 && value.chars().all(|character| character.is_ascii_digit()));
+    let looks_like_address = value.parse::<Ipv4Addr>().is_ok();
+    let trusted_shape = if prefix == "psn" {
+        lower.starts_with("psn-") || lower.starts_with("ue-pseudonym-")
+    } else {
+        valid_job_id(value)
+    };
+    if trusted_shape && !looks_like_identity && !looks_like_address {
+        return value.to_string();
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    let suffix = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}-{suffix}")
+}
+
+fn certified_error_response(
+    status: StatusCode,
+    error_code: &str,
+    target_pseudonym: Option<String>,
+    scenario_definition_id: Option<String>,
+    body: Value,
+) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response.extensions_mut().insert(ErrorTelemetry {
+        error_code: error_code.to_string(),
+        action: "START_CERTIFIED_TRAFFIC",
+        target_pseudonym,
+        scenario_definition_id,
+    });
+    response
+}
+
+fn certified_validation_error_response(
+    status: StatusCode,
+    error_code: &str,
+    target_pseudonym: Option<String>,
+    scenario_definition_id: Option<String>,
+    body: Value,
+) -> Response {
+    let mut response = certified_error_response(
+        status,
+        error_code,
+        target_pseudonym,
+        scenario_definition_id,
+        body,
+    );
+    if let Some(telemetry) = response.extensions_mut().get_mut::<ErrorTelemetry>() {
+        telemetry.action = "VALIDATE_CERTIFIED_TRAFFIC";
+    }
+    response
+}
+
+fn record_certified_failure(
+    state: &AppState,
+    runtime: &mut ControlRuntime,
+    error_code: &str,
+    target_pseudonym: Option<&str>,
+    scenario_definition_id: &str,
+) {
+    let now = epoch_seconds();
+    runtime.history.push(json!({
+        "job_id":format!("failure-{}", random_hex(8)),
+        "scenario_id":scenario_definition_id,
+        "scenario_definition_id":scenario_definition_id,
+        "technology":"5G SA",
+        "simulator":"UERANSIM",
+        "started_at":now.to_string(),
+        "started_at_epoch_s":now,
+        "ended_at_epoch_s":now,
+        "duration_seconds":0,
+        "configured_ues":0,
+        "registered_ues":0,
+        "active_pdu_sessions":0,
+        "traffic_state":"FAILED",
+        "packets_requested":TRAFFIC_PACKET_COUNT,
+        "packets_sent":Value::Null,
+        "terminal_result":error_code,
+        "state":"FAILED",
+        "controller_owned":true,
+        "target_ue_pseudonym":target_pseudonym,
+        "error_code":error_code,
+        "cause":error_code,
+        "action":"START_CERTIFIED_TRAFFIC"
+    }));
+    persist_runtime(state, runtime);
+}
+
+fn certified_failure_response(
+    state: &AppState,
+    runtime: &mut ControlRuntime,
+    status: StatusCode,
+    error_code: &str,
+    target_pseudonym: Option<String>,
+    scenario_definition_id: &str,
+    body: Value,
+) -> Response {
+    if matches!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY | StatusCode::LOCKED | StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        record_certified_failure(
+            state,
+            runtime,
+            error_code,
+            target_pseudonym.as_deref(),
+            scenario_definition_id,
+        );
+    }
+    certified_error_response(
+        status,
+        error_code,
+        target_pseudonym,
+        Some(scenario_definition_id.to_string()),
+        body,
+    )
 }
 
 fn refresh_runtime(runtime: &mut ControlRuntime) -> Option<(String, String)> {
@@ -9958,9 +10144,58 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
     if refresh_runtime_with_state(&state, &mut runtime) {
         persist_runtime(&state, &runtime);
     }
+    let error_summary = fs::read_to_string(&state.audit_path)
+        .map(|document| aggregate_certified_errors(&document))
+        .unwrap_or_default();
     Json(
-        json!({"items":runtime.history,"total":runtime.history.len(),"source":"controller registry"}),
+        json!({"items":runtime.history,"total":runtime.history.len(),"source":"controller registry","error_summary":error_summary}),
     )
+}
+
+fn aggregate_certified_errors(document: &str) -> Vec<Value> {
+    let mut groups: BTreeMap<(String, String, String, u64), (u64, u64)> = BTreeMap::new();
+    for entry in document
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if entry["type"] != "http_refusal"
+            || !matches!(
+                entry["action"].as_str(),
+                Some("START_CERTIFIED_TRAFFIC" | "VALIDATE_CERTIFIED_TRAFFIC")
+            )
+            || !entry["error_code"].is_string()
+        {
+            continue;
+        }
+        let key = (
+            entry["error_code"].as_str().unwrap_or_default().to_string(),
+            entry["target_pseudonym"]
+                .as_str()
+                .unwrap_or("UNRESOLVED")
+                .to_string(),
+            entry["action"].as_str().unwrap_or_default().to_string(),
+            entry["status"].as_u64().unwrap_or_default(),
+        );
+        let timestamp = entry["timestamp_epoch_s"].as_u64().unwrap_or_default();
+        let aggregate = groups.entry(key).or_insert((0, 0));
+        aggregate.0 = aggregate.0.saturating_add(1);
+        aggregate.1 = aggregate.1.max(timestamp);
+    }
+    groups
+        .into_iter()
+        .map(
+            |((error_code, target_pseudonym, action, status), (count, last_occurrence))| {
+                json!({
+                    "error_code":error_code,
+                    "count":count,
+                    "last_occurrence_epoch_s":last_occurrence,
+                    "target_pseudonym":target_pseudonym,
+                    "action":action,
+                    "status":status
+                })
+            },
+        )
+        .collect()
 }
 
 fn scenario_definition_error(error: String) -> (StatusCode, Json<Value>) {
@@ -12418,6 +12653,18 @@ fn resource_gate_preview(state: &AppState) -> Result<Value, String> {
 
 fn controller_resource_gate(state: &AppState) -> Result<Value, String> {
     resource_gate_for_budget(state, ScenarioResourceBudget::traffic(), true, false)
+}
+
+fn certified_resource_gate(state: &AppState, scenario_type: &str) -> Result<Value, String> {
+    if certified_target_requires_legacy_ue(scenario_type) {
+        resource_gate(state)
+    } else {
+        controller_resource_gate(state)
+    }
+}
+
+fn certified_target_requires_legacy_ue(scenario_type: &str) -> bool {
+    scenario_type != "bounded-controller-ue-udp-v1"
 }
 
 fn resource_gate_for_additions(state: &AppState, additions: usize) -> Result<Value, String> {
@@ -14958,7 +15205,7 @@ async fn start_scenario(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
     Json(input): Json<StartScenarioInput>,
-) -> impl IntoResponse {
+) -> Response {
     if !matches!(identity.role.as_str(), "operator" | "administrator") {
         let audit_id = input
             .scenario_definition_id
@@ -14974,13 +15221,15 @@ async fn start_scenario(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error":"OPERATOR_PERMISSION_REQUIRED"})),
-        );
+        )
+            .into_response();
     }
     if !identity.csrf_valid {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error":"CSRF_TOKEN_REQUIRED"})),
-        );
+        )
+            .into_response();
     }
     if let Some(definition_id) = input.scenario_definition_id.as_deref() {
         let definition = state
@@ -14992,7 +15241,8 @@ async fn start_scenario(
             .find(|item| item.id == definition_id)
             .cloned();
         let Some(definition) = definition else {
-            return scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into());
+            return scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into())
+                .into_response();
         };
         if let Ok(Some(reason)) =
             scenario_definition_block_reason(&definition, dl_sender_health(&state).is_ok())
@@ -15008,17 +15258,19 @@ async fn start_scenario(
                     "error":reason,
                     "message":scenario_execution_message(reason)
                 })),
-            );
+            )
+                .into_response();
         }
         let resolved = match resolve_steps(&definition) {
             Ok(value) => value,
-            Err(error) => return scenario_definition_error(error),
+            Err(error) => return scenario_definition_error(error).into_response(),
         };
         if resolved.iter().any(|step| step.step_type == "voice_call") && input.ue_ids.len() != 2 {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error":"VOICE_TWO_DISTINCT_UES_REQUIRED"})),
-            );
+            )
+                .into_response();
         }
         let has_lte_steps = resolved.iter().any(|step| {
             matches!(
@@ -15047,7 +15299,8 @@ async fn start_scenario(
                 return (
                     StatusCode::LOCKED,
                     Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})),
-                );
+                )
+                    .into_response();
             }
             if input.ue_ids != [srsran_controller::LTE_UE_ID.to_string()]
                 || active_lte_run_grant(&state).is_none()
@@ -15055,19 +15308,21 @@ async fn start_scenario(
                 return (
                     StatusCode::LOCKED,
                     Json(json!({"error":"LTE_GRANT_V2_CONSUMED_RUN_REQUIRED"})),
-                );
+                )
+                    .into_response();
             }
             if let Err(error) = state
                 .srsran_runtime
                 .verify_ownership(srsran_controller::Target::Ue)
             {
-                return (StatusCode::LOCKED, Json(json!({"error":error})));
+                return (StatusCode::LOCKED, Json(json!({"error":error}))).into_response();
             }
             if let Err(error) = lte_start_resource_gate(&state) {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({"error":error})),
-                );
+                )
+                    .into_response();
             }
         }
         if resolved.iter().any(|step| step.step_type == "traffic_dl") {
@@ -15075,7 +15330,8 @@ async fn start_scenario(
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(json!({"error":"DL_SENDER_NOT_AVAILABLE"})),
-                );
+                )
+                    .into_response();
             }
         }
         if resolved.iter().any(|step| step.step_type == "traffic_ul")
@@ -15084,7 +15340,8 @@ async fn start_scenario(
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error":"UL_RECEIVER_NOT_AVAILABLE"})),
-            );
+            )
+                .into_response();
         }
         if resolved
             .iter()
@@ -15094,7 +15351,8 @@ async fn start_scenario(
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error":"TRANSFER_PEER_NOT_AVAILABLE"})),
-            );
+            )
+                .into_response();
         }
         let outcome = if state.execution_mode == "mock" {
             run_mock_definition_scenario(&state, definition_id, &input.ue_ids)
@@ -15104,40 +15362,58 @@ async fn start_scenario(
         return match outcome {
             Ok(record) => (StatusCode::OK, Json(record)),
             Err(error) => error,
-        };
+        }
+        .into_response();
     }
     let Some(scenario_id) = input.scenario_id.as_deref() else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error":"SCENARIO_ID_REQUIRED"})),
-        );
+        )
+            .into_response();
     };
     let Some(scenario_type) = input.scenario_type.as_deref() else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error":"SCENARIO_TYPE_REQUIRED"})),
-        );
+        )
+            .into_response();
     };
     let requested_target = input.target_ue_id.clone().unwrap_or_else(|| "UE-01".into());
+    if !valid_job_id(scenario_id) {
+        return certified_error_response(
+            StatusCode::LOCKED,
+            "SCENARIO_NOT_CERTIFIED",
+            None,
+            None,
+            json!({"error":"SCENARIO_NOT_CERTIFIED"}),
+        );
+    }
+    let telemetry_scenario_id = safe_telemetry_reference("scenario", scenario_id);
+    let target_pseudonym =
+        certified_target_pseudonym(&state, scenario_type, &requested_target);
     let scenario_target_valid = match scenario_type {
         "bounded-existing-ue-udp-v1" => requested_target == "UE-01" && !state.ue01_controller_owned,
         "bounded-controller-ue-udp-v1" => controller_owns_ue(&state, &requested_target),
         _ => false,
     };
-    if !scenario_target_valid
-        || !valid_job_id(scenario_id)
-        || !state.policy_enabled.load(Ordering::SeqCst)
-    {
+    if !scenario_target_valid || !state.policy_enabled.load(Ordering::SeqCst) {
         audit(
             &state,
             &identity.role,
             "START_SCENARIO",
             "DENIED_POLICY",
-            Some(scenario_id),
+            Some(&telemetry_scenario_id),
         );
-        return (
+        let mut runtime = state.runtime.lock().unwrap();
+        return certified_failure_response(
+            &state,
+            &mut runtime,
             StatusCode::LOCKED,
-            Json(json!({"error":"SCENARIO_NOT_CERTIFIED"})),
+            "SCENARIO_NOT_CERTIFIED",
+            target_pseudonym,
+            &telemetry_scenario_id,
+            json!({"error":"SCENARIO_NOT_CERTIFIED"}),
         );
     }
     let validated = identity.session_id.as_ref().is_some_and(|session_id| {
@@ -15159,9 +15435,12 @@ async fn start_scenario(
             .unwrap_or(false)
     });
     if !validated {
-        return (
+        return certified_error_response(
             StatusCode::PRECONDITION_REQUIRED,
-            Json(json!({"error":"CERTIFIED_SCENARIO_VALIDATION_REQUIRED"})),
+            "CERTIFIED_SCENARIO_VALIDATION_REQUIRED",
+            target_pseudonym,
+            Some(telemetry_scenario_id.clone()),
+            json!({"error":"CERTIFIED_SCENARIO_VALIDATION_REQUIRED"}),
         );
     }
     let mut runtime = state.runtime.lock().unwrap();
@@ -15174,35 +15453,47 @@ async fn start_scenario(
         .find(|item| item["job_id"] == scenario_id)
     {
         if previous["target_ue_id"].as_str() != Some(requested_target.as_str()) {
-            return (
+            return certified_error_response(
                 StatusCode::CONFLICT,
-                Json(json!({"error":"OWNERSHIP_TARGET_MISMATCH"})),
+                "OWNERSHIP_TARGET_MISMATCH",
+                target_pseudonym.clone(),
+                Some(telemetry_scenario_id.clone()),
+                json!({"error":"OWNERSHIP_TARGET_MISMATCH"}),
             );
         }
         let mut response = previous.clone();
         response["idempotent"] = json!(true);
-        return (StatusCode::OK, Json(response));
+        return (StatusCode::OK, Json(response)).into_response();
     }
     if let Some(active) = runtime.active.as_ref() {
         if active.job_id == scenario_id {
-            return (StatusCode::OK, Json(job_json(active)));
+            return (StatusCode::OK, Json(job_json(active))).into_response();
         }
-        return (
+        return certified_error_response(
             StatusCode::CONFLICT,
-            Json(json!({"error":"SCENARIO_CONFLICT","active_job_id":active.job_id})),
+            "SCENARIO_CONFLICT",
+            target_pseudonym.clone(),
+            Some(telemetry_scenario_id.clone()),
+            json!({"error":"SCENARIO_CONFLICT","active_job_id":active.job_id}),
         );
     }
-    if let Err(error) = resource_gate(&state) {
+    if let Err(error) = certified_resource_gate(&state, scenario_type) {
         audit(
             &state,
             &identity.role,
             "START_SCENARIO",
             &error,
-            Some(scenario_id),
+            Some(&telemetry_scenario_id),
         );
-        return (
+        let body = cpu_error_response(&state, &error);
+        return certified_failure_response(
+            &state,
+            &mut runtime,
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(cpu_error_response(&state, &error)),
+            &error,
+            target_pseudonym.clone(),
+            &telemetry_scenario_id,
+            body,
         );
     }
     let target = if requested_target == "UE-01" && !state.ue01_controller_owned {
@@ -15210,9 +15501,14 @@ async fn start_scenario(
             match DockerUeRuntime::namespace_pid("oiran-lab-ueransim-ue-1") {
                 Ok(pid) => pid,
                 Err(error) => {
-                    return (
+                    return certified_failure_response(
+                        &state,
+                        &mut runtime,
                         StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"error":error})),
+                        &error,
+                        target_pseudonym.clone(),
+                        &telemetry_scenario_id,
+                        json!({"error":error}),
                     )
                 }
             }
@@ -15230,9 +15526,14 @@ async fn start_scenario(
         match resolve_controller_traffic_target(&state, &requested_target) {
             Ok(target) => target,
             Err(error) => {
-                return (
+                return certified_failure_response(
+                    &state,
+                    &mut runtime,
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({"error":error})),
+                    &error,
+                    target_pseudonym.clone(),
+                    &telemetry_scenario_id,
+                    json!({"error":error}),
                 )
             }
         }
@@ -15252,18 +15553,26 @@ async fn start_scenario(
         {
             Ok(child) => Some(child),
             Err(_) => {
-                return (
+                return certified_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error":"TRAFFIC_PROCESS_SPAWN_FAILED"})),
+                    "TRAFFIC_PROCESS_SPAWN_FAILED",
+                    target_pseudonym.clone(),
+                    Some(telemetry_scenario_id.clone()),
+                    json!({"error":"TRAFFIC_PROCESS_SPAWN_FAILED"}),
                 )
             }
         }
     } else if state.execution_mode == "mock" {
         None
     } else {
-        return (
+        return certified_failure_response(
+            &state,
+            &mut runtime,
             StatusCode::LOCKED,
-            Json(json!({"error":"LIVE_EXECUTION_NOT_CONFIGURED"})),
+            "LIVE_EXECUTION_NOT_CONFIGURED",
+            target_pseudonym.clone(),
+            &telemetry_scenario_id,
+            json!({"error":"LIVE_EXECUTION_NOT_CONFIGURED"}),
         );
     };
     if controller_owns_ue(&state, &target.ue_id) {
@@ -15280,9 +15589,12 @@ async fn start_scenario(
                 let _ = process.kill();
                 let _ = process.wait();
             }
-            return (
+            return certified_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error":error})),
+                &error,
+                target_pseudonym.clone(),
+                Some(telemetry_scenario_id.clone()),
+                json!({"error":error}),
             );
         }
     }
@@ -15319,6 +15631,7 @@ async fn start_scenario(
         StatusCode::OK,
         Json(job_json(runtime.active.as_ref().unwrap())),
     )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -15937,19 +16250,33 @@ async fn validate_scenario(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
     Json(input): Json<ValidateInput>,
-) -> impl IntoResponse {
+) -> Response {
     if !matches!(identity.role.as_str(), "operator" | "administrator") {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"valid":false,"error":"OPERATOR_PERMISSION_REQUIRED"})),
-        );
+        )
+            .into_response();
     }
     if !identity.csrf_valid {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"valid":false,"error":"CSRF_TOKEN_REQUIRED"})),
-        );
+        )
+            .into_response();
     }
+    let requested_target = input.target_ue_id.clone().unwrap_or_else(|| "UE-01".into());
+    let hinted_scenario_type = if requested_target == "UE-01" && !state.ue01_controller_owned {
+        "bounded-existing-ue-udp-v1"
+    } else {
+        "bounded-controller-ue-udp-v1"
+    };
+    let target_pseudonym =
+        certified_target_pseudonym(&state, hinted_scenario_type, &requested_target);
+    let telemetry_scenario_id = Some(safe_telemetry_reference(
+        "scenario",
+        &input.scenario_id,
+    ));
     let exact_certified_profile = input.ue_count == 1
         && input.start_mode == "SEQUENTIAL"
         && input.stagger_seconds == 0
@@ -15960,9 +16287,12 @@ async fn validate_scenario(
         && input.rate_per_second == 1
         && input.duration_seconds == 5;
     if !exact_certified_profile {
-        return (
+        return certified_validation_error_response(
             StatusCode::LOCKED,
-            Json(json!({"valid":false,"error":"SCENARIO_NOT_CERTIFIED"})),
+            "SCENARIO_NOT_CERTIFIED",
+            target_pseudonym,
+            telemetry_scenario_id,
+            json!({"valid":false,"error":"SCENARIO_NOT_CERTIFIED"}),
         );
     }
     use scenario_engine::{Scenario, StartMode, State as ScenarioState};
@@ -15980,9 +16310,12 @@ async fn validate_scenario(
     let destination = match input.destination.parse() {
         Ok(v) => v,
         Err(_) => {
-            return (
+            return certified_validation_error_response(
                 StatusCode::BAD_REQUEST,
-                Json(json!({"valid":false,"error":"INVALID_DESTINATION"})),
+                "INVALID_DESTINATION",
+                target_pseudonym,
+                telemetry_scenario_id,
+                json!({"valid":false,"error":"INVALID_DESTINATION"}),
             )
         }
     };
@@ -16006,14 +16339,17 @@ async fn validate_scenario(
         .and_then(|_| traffic_engine::validate(&scenario.traffic, &["10.46.0.1".parse().unwrap()]))
     {
         Ok(()) => {
-            let target_ue_id = input.target_ue_id.unwrap_or_else(|| "UE-01".into());
+            let target_ue_id = requested_target;
             let scenario_type = if target_ue_id == "UE-01" && !state.ue01_controller_owned {
                 "bounded-existing-ue-udp-v1"
             } else {
                 if let Err(error) = resolve_controller_traffic_target(&state, &target_ue_id) {
-                    return (
+                    return certified_validation_error_response(
                         StatusCode::LOCKED,
-                        Json(json!({"valid":false,"error":error})),
+                        &error,
+                        target_pseudonym,
+                        telemetry_scenario_id,
+                        json!({"valid":false,"error":error}),
                     );
                 }
                 "bounded-controller-ue-udp-v1"
@@ -16033,10 +16369,14 @@ async fn validate_scenario(
                     json!({"valid":true,"execution":"NOT_EXECUTED","next":"certified Start is authorized for five minutes","scenario_type":scenario_type,"target_ue_id":target_ue_id}),
                 ),
             )
+                .into_response()
         }
-        Err(e) => (
+        Err(e) => certified_validation_error_response(
             StatusCode::BAD_REQUEST,
-            Json(json!({"valid":false,"error":e})),
+            &e,
+            target_pseudonym,
+            telemetry_scenario_id,
+            json!({"valid":false,"error":e}),
         ),
     }
 }
@@ -20608,6 +20948,141 @@ mod p0_tests {
     /// status and role — never with a username or session id. This
     /// test fires a few deliberate refusals (missing CSRF, forbidden
     /// role) and reads the audit log back to verify the entries.
+    #[test]
+    fn c6_certified_gate_is_target_specific() {
+        assert!(certified_target_requires_legacy_ue(
+            "bounded-existing-ue-udp-v1"
+        ));
+        assert!(!certified_target_requires_legacy_ue(
+            "bounded-controller-ue-udp-v1"
+        ));
+        assert_eq!(
+            safe_telemetry_reference("psn", "psn-lab-04"),
+            "psn-lab-04"
+        );
+        assert!(safe_telemetry_reference("psn", "198.51.100.7").starts_with("psn-"));
+        assert!(safe_telemetry_reference("scenario", "001010123456789")
+            .starts_with("scenario-"));
+    }
+
+    #[test]
+    fn c6_failure_history_uses_only_the_resolved_pseudonym() {
+        let test_state = state();
+        let mut runtime = test_state.runtime.lock().unwrap();
+        record_certified_failure(
+            &test_state,
+            &mut runtime,
+            "UE_TRAFFIC_PREREQUISITES_NOT_MET",
+            Some("psn-test-target"),
+            "certified-test-job",
+        );
+        let record = runtime.history.last().unwrap();
+        assert_eq!(record["state"], "FAILED");
+        assert_eq!(record["target_ue_pseudonym"], "psn-test-target");
+        assert_eq!(record["error_code"], "UE_TRAFFIC_PREREQUISITES_NOT_MET");
+        assert_eq!(record["cause"], "UE_TRAFFIC_PREREQUISITES_NOT_MET");
+        assert!(record.get("target_ue_id").is_none());
+        let serialized = serde_json::to_string(record).unwrap();
+        assert!(!serialized.contains("imsi-"));
+        assert!(!serialized.contains("10.46."));
+    }
+
+    #[test]
+    fn c6_typed_refusal_context_reaches_the_audit_log() {
+        let test_state = state();
+        let telemetry = ErrorTelemetry {
+            error_code: "LAB_HEALTH_GATE_FAILED".into(),
+            action: "START_CERTIFIED_TRAFFIC",
+            target_pseudonym: Some("psn-test-target".into()),
+            scenario_definition_id: Some("certified-test-job".into()),
+        };
+        log_http_refusal(
+            &test_state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &Method::POST,
+            "/api/v1/scenarios/start",
+            "operator",
+            Some(&telemetry),
+        );
+        let log = fs::read_to_string(&test_state.audit_path).unwrap();
+        let entry = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["error_code"] == "LAB_HEALTH_GATE_FAILED")
+            .last()
+            .unwrap();
+        assert_eq!(entry["action"], "START_CERTIFIED_TRAFFIC");
+        assert_eq!(entry["target_pseudonym"], "psn-test-target");
+        assert_eq!(entry["scenario_definition_id"], "certified-test-job");
+        assert!(entry.get("username").is_none());
+        assert!(entry.get("target_ue_id").is_none());
+
+        for status in [
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::LOCKED,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let response = certified_error_response(
+                status,
+                "CERTIFIED_TEST_FAILURE",
+                Some("psn-test-target".into()),
+                Some("certified-test-job".into()),
+                json!({"error":"CERTIFIED_TEST_FAILURE"}),
+            );
+            let attached = response.extensions().get::<ErrorTelemetry>().unwrap();
+            assert_eq!(attached.error_code, "CERTIFIED_TEST_FAILURE");
+            assert_eq!(attached.target_pseudonym.as_deref(), Some("psn-test-target"));
+        }
+    }
+
+    #[test]
+    fn c6_error_summary_separates_targets_and_excludes_operator_stop() {
+        let document = [
+            json!({"type":"http_refusal","timestamp_epoch_s":10,"status":503,"error_code":"LAB_HEALTH_GATE_FAILED","action":"START_CERTIFIED_TRAFFIC","target_pseudonym":"psn-a"}),
+            json!({"type":"http_refusal","timestamp_epoch_s":12,"status":503,"error_code":"LAB_HEALTH_GATE_FAILED","action":"START_CERTIFIED_TRAFFIC","target_pseudonym":"psn-a"}),
+            json!({"type":"http_refusal","timestamp_epoch_s":11,"status":503,"error_code":"LAB_HEALTH_GATE_FAILED","action":"START_CERTIFIED_TRAFFIC","target_pseudonym":"psn-b"}),
+            json!({"type":"audit","timestamp_epoch_s":13,"outcome":"OPERATOR_STOP","action":"STOP_SCENARIO"}),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let summary = aggregate_certified_errors(&document);
+        assert_eq!(summary.len(), 2);
+        let first = summary
+            .iter()
+            .find(|value| value["target_pseudonym"] == "psn-a")
+            .unwrap();
+        assert_eq!(first["count"], 2);
+        assert_eq!(first["last_occurrence_epoch_s"], 12);
+        assert!(summary.iter().all(|value| value["action"] != "STOP_SCENARIO"));
+    }
+
+    #[tokio::test]
+    async fn c6_validation_refusal_is_attributed_without_identity_or_address() {
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-04", false);
+        let audit_path = test_state.audit_path.clone();
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        assert_eq!(
+            validate_targeted(&application, &cookie, &csrf, "UE-04").await,
+            StatusCode::LOCKED
+        );
+        let log = fs::read_to_string(audit_path).unwrap();
+        let entry = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["error_code"] == "UE_TRAFFIC_PREREQUISITES_NOT_MET")
+            .unwrap();
+        assert_eq!(entry["action"], "VALIDATE_CERTIFIED_TRAFFIC");
+        assert!(entry["target_pseudonym"].is_string());
+        let serialized = entry.to_string();
+        assert!(!serialized.contains("target_ue_id"));
+        assert!(!serialized.contains("subscriber_identity"));
+        assert!(!serialized.contains("10.46."));
+    }
+
     #[tokio::test]
     async fn http_refusals_land_in_the_audit_log_without_identity() {
         let test_state = state();
