@@ -1,5 +1,51 @@
 # Changelog
 
+## oiran-api 2.21.133, session-engine 0.5.27, event-schema 1.12.0, callflow-schema 1.5.1 — 2026-11-21 — ordre et clé des events d'un même paquet (ordre #9 7060289296 ; audits CLAUDE2 #9 7053820455 et 7060055216)
+
+Branche `fix/oiran-2.21.133-in-packet-order`, base train @ `5f21967` (2.21.132). Aucun déploiement.
+
+### En tête : la clé « stable » d'un event ancien n'égalait pas celle du live
+
+Pour un event stocké sans `stable_event_key` (dataset d'avant 2.21.91), la clé est dérivée à la lecture. Son ordinal était le rang de **lecture** de l'event dans son paquet. Or un stockage est trié (fichier trié par `capture_id`, paquet, `event_id` ; callflow dans l'ordre du ladder) : un NAS y précède souvent le NGAP / S1AP qui le porte. La clé dérivée différait alors de celle que le décodeur pose en live, pour le parent comme pour l'enfant.
+
+Mesuré sur la capture Open5GS réelle du dépôt `multi-imsi.pcap` (cinq abonnés, 522 events N2 + N4 + SBI), avant ce lot, à `5f21967`, stockage trié à l'ancienne : **450 clés justes sur 522** (446 sur 502 hors paquets groupés). Après : **506 sur 522**, soit 502 sur 502 hors paquets groupés et 4 sur 20 dedans (voir OUVERT). Dans l'ordre du décodeur : 522 sur 522 avant comme après. Je n'ai pas mesuré combien de données de prod sont antérieures à 2.21.91.
+
+### Audit
+
+- Ordre publié : `session_engine::canonical_sort_key` = (`capture_id`, paquet, `event_id`), et le ladder LTE (`callflow-schema`) comme `/packets` (`apps/api`) départageaient deux events d'un même paquet par `event_id`, un hachage. Mesuré à `5f21967` sur `multi-imsi.pcap` : **35 couples parent / enfant sur 58 avec l'enfant avant son parent** dans l'ordre canonique.
+- Seuls `decoder-ngap` et `decoder-s1ap` posent `parent_event_id`, toujours sur un NAS du même paquet.
+- `capture_id` d'un segment publié = SHA-256 de son contenu (`live-probe`) : l'ordre ancien était stable d'un import à l'autre mais arbitraire.
+- Aucune décision de session n'en dépend sur les captures du dépôt (comparaison avant / après ci-dessous).
+
+### Changement
+
+1. `session-engine` : `canonical_sort_key` = (`capture_id`, paquet, `in_packet_order`), avec `in_packet_order` = (enfant ?, ordinal d'émission lu en fin de `stable_event_key`, `event_id`). Dans un paquet : parent avant enfant par structure, puis ordinal, puis `event_id`. Un event sans clé prend l'ordinal `u32::MAX` (après ceux qui en ont une, puis par `event_id`). `emission_ordinal` est public.
+2. `callflow-schema` : le ladder LTE trie par (horodatage, paquet, `in_packet_order`). Le callflow 5G suit déjà l'ordre de `reconstruct`, donc la clé canonique.
+3. `apps/api` : `/packets` trie par (`capture_id`, paquet, enfant ?, ordinal, `event_id`).
+4. `event-schema` : `emission_order` reconstitue l'ordre d'émission des events d'un paquet (chaque event sans parent dans le paquet, dans l'ordre de lecture, suivi de ses descendants). `backfill_stable_event_keys_in_callflow` et `session_engine::backfill_stable_event_keys` numérotent dans cet ordre au lieu de l'ordre de lecture.
+5. Aucune réécriture de données : tri et clé sont calculés à la lecture.
+
+### OUVERT
+
+- **Paquets qui groupent plusieurs messages sans parenté** : un paquet SCTP portant deux NGAP `UplinkNASTransport`, chacun avec son NAS. Rien dans un event stocké ne dit dans quel ordre le décodeur les a émis (pas de décalage d'octets sur le NGAP ; la référence de payload est un hachage). Sur `multi-imsi.pcap` : **5 paquets, 20 events** ; depuis un stockage trié, leur clé dérivée est juste pour 4 sur 20 (même compte pour trois `capture_id`). Chaque NAS y reste numéroté après son NGAP. Depuis un stockage dans l'ordre du décodeur : 20 sur 20.
+- Dans ces mêmes paquets, l'ordre canonique sort NGAP, NGAP, NAS, NAS (parents, puis enfants) et non NGAP, NAS, NGAP, NAS. Parent avant enfant est tenu ; l'entrelacement exact ne l'est pas.
+- Ce qui a été persisté déjà trié (listes `event_ids` d'une session publiée, callflows en cache) garde l'ancien ordre jusqu'à la prochaine publication.
+- `apps/api/src/read_time_patch.rs` (frères PFCP insérés à la lecture, 2.21.112) et le tri du rejeu de `apps/api/src/live_trace.rs` ne sont pas touchés : pas de parenté NGAP / NAS en jeu pour le premier ; le second est à CLAUDE1.
+- **Aucune capture LTE réelle dans le dépôt** : le LTE n'est couvert que par les tests synthétiques (dont un nouveau pour le ladder).
+
+### Tests
+
+- `live-probe/tests/in_packet_order_2_21_133.rs`, sur captures réelles du dépôt :
+  - `read_time_key_equals_the_decoder_key_whatever_the_storage_order_2_21_133` : trois `capture_id`, trois ordres de stockage (décodeur, ancien canonique, ancien ladder) et un callflow dans l'ordre du ladder → clé dérivée = clé du décodeur pour tout event hors paquets groupés (502 / 502), 20 / 20 dans l'ordre du décodeur, NAS toujours numéroté après son NGAP.
+  - `no_child_before_its_parent_in_published_order_2_21_133` : 0 couple inversé sur 58, ordre canonique et callflow 5G (`reconstruct` + `build_callflow`), trois `capture_id`, trois ordres de stockage, clé stockée ou non.
+  - `session_discovery_does_not_depend_on_the_capture_id_2_21_133` : découverte des sessions (contextes UE, sessions PDU et PFCP, procédures, events non rattachés) identique pour trois `capture_id`, sur les dix captures 5G du dépôt.
+  - **Échec avant** : à `5f21967`, les deux premiers échouent (35 / 58 inversés ; 446 / 502).
+- Unitaires : `event-schema` `emission_order_puts_each_parent_before_its_children_2_21_133`, `callflow_backfill_numbers_the_parent_first_2_21_133` ; `session-engine` `canonical_order_puts_the_parent_first_within_a_packet_2_21_133`, `read_time_key_numbers_the_parent_first_2_21_133` ; `callflow-schema` `lte_ladder_puts_the_s1ap_before_its_nas_2_21_133`.
+
+### Découverte des sessions avant / après
+
+Empreinte SHA-256 du résumé de `discover_sessions` (events désignés par plan, paquet, protocole, message), à `5f21967` et sur cette branche : **identique pour les dix captures 5G** (`multi-imsi`, `5gc-e2e`, `5gc-registration`, `ki-mismatch`, `supi-not-provisioned`, `unknown-dnn`, `userplane`, `OIRAN_A`, `OIRAN_B`, `OIRAN_5G_PDU_SESSION_DATA_V1`). Mesure de base faite dans un répertoire de build dédié (voir le rapport #9 sur le partage du répertoire de build entre worktrees).
+
 ## oiran-api 2.21.132, decoder-rtp 0.3.1 — 2026-11-21 — journal RTP sans adresse IP (ordre #9 7059947810)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.131 @ `4477c9d`. Branches `fix/oiran-2.21.132-rtp-journal-no-ip` et `fix/oiran-2.21.121-train`. Seul `decoder-rtp/src/lib.rs` change (plus versions et locks).
