@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "callflow-schema"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "event-schema"
-version = "1.11.0"
+version = "1.12.0"
 dependencies = [
  "serde_json",
 ]
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.26"
+version = "0.5.27"
 dependencies = [
  "event-schema",
  "libc",

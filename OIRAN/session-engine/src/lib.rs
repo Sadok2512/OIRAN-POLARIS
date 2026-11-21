@@ -979,29 +979,49 @@ pub fn load_jsonl<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String> {
 /// Événement sans `packet_references` : clé laissée vide (écart
 /// déclaré OUVERT au caller).
 pub fn backfill_stable_event_keys(events: &mut [EventRecord]) {
-    let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
-    for event in events.iter_mut() {
-        if !event.stable_event_key.is_empty() {
-            continue;
+    // 0.5.27 (POLARIS 2.21.133) — l'ordinal n'est plus le rang de LECTURE.
+    // Un stockage trié (fichier trié par `event_id`, callflow dans l'ordre
+    // du ladder) mettait un enfant avant son parent une fois sur deux, et
+    // la clé dérivée n'égalait alors pas celle du décodeur (55 events sur
+    // 522 sur une capture réelle). Les events d'un même paquet sont
+    // numérotés dans l'ordre d'émission reconstitué : chaque parent, suivi
+    // de ses enfants ; à défaut de parenté, l'ordre de lecture.
+    let mut by_packet: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, event) in events.iter().enumerate() {
+        if let Some(packet) = event.packet_references.first() {
+            by_packet
+                .entry(event_schema::packet_lookup_key(
+                    &packet.source_file,
+                    packet.interface_id,
+                    packet.packet_number,
+                    packet.byte_offset,
+                ))
+                .or_default()
+                .push(index);
         }
-        let Some(packet) = event.packet_references.first() else {
-            continue;
-        };
-        let lookup = event_schema::packet_lookup_key(
-            &packet.source_file,
-            packet.interface_id,
-            packet.packet_number,
-            packet.byte_offset,
-        );
-        let ordinal = ordinals.entry(lookup).and_modify(|v| *v = v.saturating_add(1)).or_insert(0);
-        event.stable_event_key = event_schema::derive_stable_event_key(
-            &packet.source_file,
-            packet.interface_id,
-            packet.packet_number,
-            packet.byte_offset,
-            &event.protocol,
-            *ordinal,
-        );
+    }
+    for members in by_packet.values() {
+        let order = event_schema::emission_order(members.len(), |position| {
+            let event = &events[members[position]];
+            (event.event_id.as_str(), event.parent_event_id.as_deref())
+        });
+        for (ordinal, position) in order.into_iter().enumerate() {
+            let event = &mut events[members[position]];
+            if !event.stable_event_key.is_empty() {
+                continue;
+            }
+            let Some(packet) = event.packet_references.first() else {
+                continue;
+            };
+            event.stable_event_key = event_schema::derive_stable_event_key(
+                &packet.source_file,
+                packet.interface_id,
+                packet.packet_number,
+                packet.byte_offset,
+                &event.protocol,
+                ordinal as u32,
+            );
+        }
     }
 }
 
@@ -1812,8 +1832,45 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
 /// `callflow-schema::build_ladder_records_for_display` for the only
 /// place that is allowed to do so, and the explicit comment at that
 /// call site.
-pub fn canonical_sort_key<'a>(event: &'a EventRecord) -> (&'a str, u64, &'a str) {
-    (event.capture_id.as_str(), event.packet_number(), event.event_id.as_str())
+///
+/// 0.5.27 (POLARIS 2.21.133) — ordre DANS un même paquet. Jusqu'ici
+/// l'`event_id` départageait seul deux events d'un même paquet. C'est un
+/// hachage : entre un message NGAP / S1AP et le NAS qu'il porte, l'ordre
+/// était arbitraire (sur une capture réelle à cinq abonnés, 26 enfants
+/// sur 58 passaient avant leur parent). Désormais, dans un même paquet :
+///   1. parent avant enfant, par structure (`parent_event_id`) ;
+///   2. puis l'ordinal d'émission lu en fin de `stable_event_key`
+///      (`…|protocole|ordinal`) quand la clé est présente ;
+///   3. puis l'`event_id`, comme avant.
+/// La clé reste une comparaison de valeurs portées par chaque event :
+/// l'ordre est total et ne dépend pas des autres events présents.
+pub fn canonical_sort_key<'a>(event: &'a EventRecord) -> (&'a str, u64, InPacketOrder<'a>) {
+    (event.capture_id.as_str(), event.packet_number(), in_packet_order(event))
+}
+
+/// 0.5.27 — rang d'un event parmi ceux de son paquet : `(enfant ?,
+/// ordinal d'émission, event_id)`. Utilisé par `canonical_sort_key` et
+/// par l'ordre d'affichage du ladder (`callflow-schema`).
+pub type InPacketOrder<'a> = (bool, u32, &'a str);
+
+pub fn in_packet_order<'a>(event: &'a EventRecord) -> InPacketOrder<'a> {
+    (
+        event.parent_event_id.is_some(),
+        emission_ordinal(&event.stable_event_key),
+        event.event_id.as_str(),
+    )
+}
+
+/// 0.5.27 — ordinal d'émission porté par une `stable_event_key`
+/// (`{fichier}|{iid}|{paquet}|{offset}|{protocole}|{ordinal}`).
+/// `u32::MAX` si la clé est absente ou mal formée : l'event se range
+/// alors après ceux qui en portent une, puis par `event_id`.
+pub fn emission_ordinal(stable_event_key: &str) -> u32 {
+    stable_event_key
+        .rsplit('|')
+        .next()
+        .and_then(|last| last.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
 }
 
 pub fn deterministic_sort(events: &mut [EventRecord]) {
@@ -6360,5 +6417,96 @@ mod tests {
             serde_json::to_value(spilled_discovery).unwrap(),
             "certified fixture discovery differs",
         );
+    }
+}
+
+#[cfg(test)]
+mod in_packet_order_tests {
+    use super::*;
+
+    /// Event stocké complet (forme des fixtures de ce module), dans le
+    /// paquet `packet` du fichier `/ring/n2/n2_00001.pcapng`.
+    fn stored(id: &str, parent: Option<&str>, packet: u64, stable_event_key: &str) -> Value {
+        let mut value = serde_json::json!({
+            "event_id": id,
+            "capture_id": "sha256:test",
+            "capture_point_id": "N2",
+            "timestamp": {"seconds": 1, "nanoseconds": packet, "raw_ticks": packet, "display": "1Z"},
+            "interface": "N2",
+            "protocol": if parent.is_some() { "NAS-5GMM" } else { "NGAP" },
+            "message_name": id,
+            "source_endpoint": {"address": "a", "network_function": "gNB"},
+            "destination_endpoint": {"address": "b", "network_function": "AMF"},
+            "direction": "RAN_TO_CORE",
+            "session_identifiers": [],
+            "information_elements": [],
+            "decoding_status": "DECODED",
+            "decoder_name": "test",
+            "decoder_version": "1",
+            "raw_payload_reference": "sha256:test",
+            "packet_references": [{
+                "source_file": "/ring/n2/n2_00001.pcapng",
+                "packet_number": packet,
+                "byte_offset": 0,
+                "interface_id": 0,
+                "captured_length": 1,
+                "original_length": 1
+            }],
+            "errors": []
+        });
+        let object = value.as_object_mut().unwrap();
+        if let Some(parent) = parent {
+            object.insert("parent_event_id".into(), Value::String(parent.into()));
+        }
+        if !stable_event_key.is_empty() {
+            object.insert("stable_event_key".into(), Value::String(stable_event_key.into()));
+        }
+        value
+    }
+
+    fn load(values: &[Value]) -> Vec<EventRecord> {
+        let jsonl = values.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        load_jsonl(std::io::Cursor::new(jsonl.into_bytes())).unwrap()
+    }
+
+    /// 0.5.27 (POLARIS 2.21.133) — dans un même paquet, l'ordre canonique
+    /// met le parent avant son enfant même quand l'`event_id` de l'enfant
+    /// est le plus petit, puis l'ordinal d'émission, puis l'`event_id`.
+    /// D'un paquet à l'autre, rien ne change.
+    #[test]
+    fn canonical_order_puts_the_parent_first_within_a_packet_2_21_133() {
+        let mut events = load(&[
+            stored("evt-0001", Some("evt-ffff"), 7, "n2_00001.pcapng|0|7|0|NAS-5GMM|1"),
+            stored("evt-ffff", None, 7, "n2_00001.pcapng|0|7|0|NGAP|0"),
+            stored("evt-9999", None, 6, "n2_00001.pcapng|0|6|0|NGAP|0"),
+        ]);
+        deterministic_sort(&mut events);
+        let ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["evt-9999", "evt-ffff", "evt-0001"]);
+        // Frères sans parenté : l'ordinal d'émission avant l'`event_id`.
+        let mut siblings = load(&[
+            stored("evt-aaaa", None, 8, "n2_00001.pcapng|0|8|0|NGAP|1"),
+            stored("evt-zzzz", None, 8, "n2_00001.pcapng|0|8|0|NGAP|0"),
+        ]);
+        deterministic_sort(&mut siblings);
+        assert_eq!(siblings[0].event_id, "evt-zzzz");
+        assert_eq!(emission_ordinal(""), u32::MAX);
+        assert_eq!(emission_ordinal("f|0|8|0|NGAP|12"), 12);
+        assert_eq!(emission_ordinal("f|0|8|0|NGAP|x"), u32::MAX);
+    }
+
+    /// 0.5.27 — un fichier stocké sans clé, enfant avant parent : la clé
+    /// dérivée à la lecture numérote le parent 0 et l'enfant 1, comme le
+    /// décodeur. Avant : l'enfant prenait 0.
+    #[test]
+    fn read_time_key_numbers_the_parent_first_2_21_133() {
+        let events = load(&[
+            stored("evt-0001", Some("evt-ffff"), 7, ""),
+            stored("evt-ffff", None, 7, ""),
+        ]);
+        let key = |id: &str| events.iter().find(|e| e.event_id == id).unwrap().stable_event_key.clone();
+        assert_eq!(key("evt-ffff"), "n2_00001.pcapng|0|7|0|NGAP|0");
+        assert_eq!(key("evt-0001"), "n2_00001.pcapng|0|7|0|NAS-5GMM|1");
+        assert_eq!(events[0].event_id, "evt-ffff", "parent d'abord dans l'ordre canonique");
     }
 }

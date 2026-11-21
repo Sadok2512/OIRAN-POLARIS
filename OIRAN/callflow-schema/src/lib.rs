@@ -468,7 +468,17 @@ pub fn build_lte_callflow(
     // No session / correlation / dedup decision depends on this order:
     // the records have already been selected into `session.event_ids`
     // upstream.
-    records.sort_by_key(|event| (event.timestamp_ns, event.packet_number(), &event.event_id));
+    // 1.5.1 (POLARIS 2.21.133) — dans un même paquet : parent avant
+    // enfant, puis ordinal d'émission, puis `event_id`
+    // (`session_engine::in_packet_order`). L'`event_id` seul mettait un
+    // NAS avant le NGAP / S1AP qui le porte une fois sur deux.
+    records.sort_by_key(|event| {
+        (
+            event.timestamp_ns,
+            event.packet_number(),
+            session_engine::in_packet_order(event),
+        )
+    });
     let mut participants: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut interfaces = BTreeSet::new();
     let mut captures = BTreeSet::new();
@@ -840,6 +850,41 @@ mod tests {
         assert_eq!(flow.end_timestamp, "2026-10-31T12:00:00.000000030Z");
         assert_eq!(flow.accounting.session_events, 3);
         assert_eq!(flow.correlation_status["E2E"], "UNKNOWN");
+    }
+
+    /// 1.5.1 (POLARIS 2.21.133) — ladder LTE : un S1AP et le NAS qu'il
+    /// porte (même paquet, même horodatage) sortent parent puis enfant,
+    /// même quand l'`event_id` de l'enfant est le plus petit. Avant, c'est
+    /// l'`event_id` qui départageait : NAS avant S1AP.
+    #[test]
+    fn lte_ladder_puts_the_s1ap_before_its_nas_2_21_133() {
+        let parent = lte_event("evt-ffff", "S1-MME", "S1AP", "InitialUEMessage", 10);
+        let mut child = lte_event("evt-0001", "S1-MME", "NAS-EPS", "Attach Request", 10);
+        child.parent_event_id = Some("evt-ffff".into());
+        child.stable_event_key = "synthetic.json|0|10|0|NAS-EPS|1".into();
+        let session = LteSession {
+            session_id: "lte-session-b".into(),
+            technology: "LTE".into(),
+            ue_pseudonym: "subscriber-opaque-b".into(),
+            enb_ue_s1ap_id: None,
+            mme_ue_s1ap_id: None,
+            eps_bearer_ids: vec![],
+            s11_f_teids: vec![],
+            tunnels: vec![],
+            procedures: vec![],
+            interfaces: vec!["S1-MME".into()],
+            state: "ACTIVE".into(),
+            start_timestamp_ns: 10,
+            end_timestamp_ns: 10,
+            duration_ns: 0,
+            event_ids: vec!["evt-ffff".into(), "evt-0001".into()],
+            limitations: vec![],
+        };
+        let flow = build_lte_callflow(&session, &[child, parent], vec![]);
+        assert_eq!(
+            flow.events.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(),
+            vec!["evt-ffff", "evt-0001"]
+        );
     }
 
     /// 2.9.2 — ANR2 #9 comment 6712678520. `sbi-n2-tunnel-match`

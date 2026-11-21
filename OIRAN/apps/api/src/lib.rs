@@ -8635,6 +8635,10 @@ fn find_packet(state: &AppState, matches: impl Fn(&str, &Value, &Value) -> bool)
 struct PacketKey {
     capture_id: String,
     packet_number: u64,
+    /// 2.21.133 — rang dans le paquet : enfant après son parent, puis
+    /// ordinal d'émission (`session_engine::emission_ordinal`).
+    is_child: bool,
+    emission_ordinal: u32,
     event_id: Option<String>,
     packet_id: String,
     session_index: usize,
@@ -8671,6 +8675,10 @@ fn packets_page(state: &AppState, query: &ListQuery) -> Json<Value> {
         keys.push(PacketKey {
             capture_id: capture_id.to_string(),
             packet_number,
+            is_child: event["parent_event_id"].as_str().is_some_and(|id| !id.is_empty()),
+            emission_ordinal: session_engine::emission_ordinal(
+                event["stable_event_key"].as_str().unwrap_or(""),
+            ),
             event_id: event["event_id"].as_str().map(str::to_string),
             packet_id,
             session_index,
@@ -8682,6 +8690,8 @@ fn packets_page(state: &AppState, query: &ListQuery) -> Json<Value> {
         a.capture_id
             .cmp(&b.capture_id)
             .then_with(|| a.packet_number.cmp(&b.packet_number))
+            .then_with(|| a.is_child.cmp(&b.is_child))
+            .then_with(|| a.emission_ordinal.cmp(&b.emission_ordinal))
             .then_with(|| a.event_id.cmp(&b.event_id))
     });
     let total = keys.len();

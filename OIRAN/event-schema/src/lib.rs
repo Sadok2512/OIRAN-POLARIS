@@ -652,67 +652,161 @@ pub fn backfill_stable_event_keys_in_callflow(
     let Some(events) = value.get_mut("events").and_then(|v| v.as_array_mut()) else {
         return (0, 0);
     };
-    let mut ordinals = std::collections::BTreeMap::<String, u32>::new();
-    let mut patched = 0usize;
-    let mut skipped = 0usize;
-    for event in events.iter_mut() {
-        let Some(obj) = event.as_object_mut() else { continue };
-        if obj
-            .get("stable_event_key")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-        {
-            continue;
-        }
-        let protocol = obj
-            .get("protocol")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let packet_opt = obj
+    // 1.12.0 (POLARIS 2.21.133) — numérotation dans l'ordre d'émission
+    // reconstitué (parent, puis ses enfants), plus dans l'ordre de l'array :
+    // un callflow stocké est trié pour l'affichage, et un enfant y précède
+    // son parent une fois sur deux.
+    let packet_of = |event: &serde_json::Value| -> Option<(String, u32, u64, u64)> {
+        let p = event
             .get("packet_references")
             .and_then(serde_json::Value::as_array)
             .and_then(|a| a.first())
-            .and_then(|p| p.as_object())
-            .map(|p| {
-                (
-                    p.get("source_file")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                    p.get("interface_id")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0) as u32,
-                    p.get("packet_number")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                    p.get("byte_offset")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                )
-            });
-        let Some((source_file, interface_id, packet_number, byte_offset)) = packet_opt else {
-            skipped += 1;
+            .and_then(|p| p.as_object())?;
+        Some((
+            p.get("source_file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            p.get("interface_id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            p.get("packet_number")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            p.get("byte_offset")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        ))
+    };
+    let has_key = |event: &serde_json::Value| {
+        event
+            .get("stable_event_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    let mut skipped = 0usize;
+    let mut by_packet = std::collections::BTreeMap::<String, Vec<usize>>::new();
+    for (index, event) in events.iter().enumerate() {
+        if !event.is_object() {
             continue;
-        };
-        let lookup =
-            packet_lookup_key(&source_file, interface_id, packet_number, byte_offset);
-        let ordinal = *ordinals
-            .entry(lookup)
-            .and_modify(|v| *v = v.saturating_add(1))
-            .or_insert(0);
-        let key = derive_stable_event_key(
-            &source_file,
-            interface_id,
-            packet_number,
-            byte_offset,
-            &protocol,
-            ordinal,
-        );
-        obj.insert("stable_event_key".into(), serde_json::Value::String(key));
-        patched += 1;
+        }
+        match packet_of(event) {
+            Some((source_file, interface_id, packet_number, byte_offset)) => by_packet
+                .entry(packet_lookup_key(&source_file, interface_id, packet_number, byte_offset))
+                .or_default()
+                .push(index),
+            None => {
+                if !has_key(event) {
+                    skipped += 1;
+                }
+            }
+        }
+    }
+    let mut assignments: Vec<(usize, String)> = Vec::new();
+    for members in by_packet.values() {
+        let order = emission_order(members.len(), |position| {
+            let event = &events[members[position]];
+            (
+                event.get("event_id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                event.get("parent_event_id").and_then(serde_json::Value::as_str),
+            )
+        });
+        for (ordinal, position) in order.into_iter().enumerate() {
+            let index = members[position];
+            let event = &events[index];
+            if has_key(event) {
+                continue;
+            }
+            let Some((source_file, interface_id, packet_number, byte_offset)) = packet_of(event)
+            else {
+                continue;
+            };
+            let protocol = event
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            assignments.push((
+                index,
+                derive_stable_event_key(
+                    &source_file,
+                    interface_id,
+                    packet_number,
+                    byte_offset,
+                    protocol,
+                    ordinal as u32,
+                ),
+            ));
+        }
+    }
+    let patched = assignments.len();
+    for (index, key) in assignments {
+        if let Some(obj) = events[index].as_object_mut() {
+            obj.insert("stable_event_key".into(), serde_json::Value::String(key));
+        }
     }
     (patched, skipped)
+}
+
+/// 1.12.0 (POLARIS 2.21.133) — ordre d'émission reconstitué des events
+/// d'un MÊME paquet, donnés dans leur ordre de lecture. `describe(i)`
+/// rend `(event_id, parent_event_id)` de l'event de rang `i`.
+///
+/// Le décodeur émet un message, puis les messages qu'il porte (NGAP ou
+/// S1AP, puis son NAS). Un stockage trié peut avoir inversé les deux. On
+/// rend : chaque event sans parent dans le paquet, dans l'ordre de
+/// lecture, suivi de ses descendants (ordre de lecture entre frères).
+/// Deux events sans lien de parenté gardent leur ordre de lecture : il
+/// ne peut pas être reconstitué.
+///
+/// Retourne une permutation de `0..len`.
+pub fn emission_order<'a, F>(len: usize, describe: F) -> Vec<usize>
+where
+    F: Fn(usize) -> (&'a str, Option<&'a str>),
+{
+    let described: Vec<(&str, Option<&str>)> = (0..len).map(&describe).collect();
+    let position_of = |id: &str| described.iter().position(|(own, _)| !own.is_empty() && *own == id);
+    let parent_position: Vec<Option<usize>> = described
+        .iter()
+        .enumerate()
+        .map(|(index, (_, parent))| {
+            parent
+                .and_then(position_of)
+                .filter(|parent_index| *parent_index != index)
+        })
+        .collect();
+    let mut order = Vec::with_capacity(len);
+    let mut placed = vec![false; len];
+    fn place(
+        index: usize,
+        parent_position: &[Option<usize>],
+        placed: &mut [bool],
+        order: &mut Vec<usize>,
+    ) {
+        if placed[index] {
+            return;
+        }
+        placed[index] = true;
+        order.push(index);
+        for child in 0..parent_position.len() {
+            if parent_position[child] == Some(index) {
+                place(child, parent_position, placed, order);
+            }
+        }
+    }
+    for index in 0..len {
+        if parent_position[index].is_none() {
+            place(index, &parent_position, &mut placed, &mut order);
+        }
+    }
+    // Cycle de parenté (donnée corrompue) : les events restants gardent
+    // leur ordre de lecture.
+    for index in 0..len {
+        if !placed[index] {
+            placed[index] = true;
+            order.push(index);
+        }
+    }
+    order
 }
 
 pub fn stable_hash(bytes: &[u8]) -> u64 {
@@ -2272,3 +2366,67 @@ mod ue_ip_pseudonym_tests {
         assert_eq!(pseudonym_ip_octets(&key, &[0x02, 10, 45, 0, 2]), None);
     }
 }
+
+#[cfg(test)]
+mod in_packet_order_tests {
+    use super::*;
+
+    fn order(events: &[(&'static str, Option<&'static str>)]) -> Vec<&'static str> {
+        emission_order(events.len(), |i| events[i])
+            .into_iter()
+            .map(|i| events[i].0)
+            .collect()
+    }
+
+    /// 1.12.0 (POLARIS 2.21.133) — l'ordre d'émission reconstitué met le
+    /// parent avant ses enfants quel que soit l'ordre de lecture, garde
+    /// l'ordre de lecture entre events sans parenté, suit la profondeur,
+    /// et rend une permutation même sur une parenté cyclique ou un parent
+    /// hors du paquet.
+    #[test]
+    fn emission_order_puts_each_parent_before_its_children_2_21_133() {
+        assert_eq!(order(&[("nas", Some("ngap")), ("ngap", None)]), vec!["ngap", "nas"]);
+        assert_eq!(order(&[("ngap", None), ("nas", Some("ngap"))]), vec!["ngap", "nas"]);
+        // Deux messages sans parenté : ordre de lecture gardé.
+        assert_eq!(order(&[("b", None), ("a", None)]), vec!["b", "a"]);
+        // Deux NGAP groupés dans un paquet, chacun avec son NAS, lus triés
+        // par identifiant : chaque parent suivi de son enfant.
+        assert_eq!(
+            order(&[("c1", Some("p1")), ("c2", Some("p2")), ("p1", None), ("p2", None)]),
+            vec!["p1", "c1", "p2", "c2"]
+        );
+        // Petit-enfant.
+        assert_eq!(
+            order(&[("g", Some("c")), ("c", Some("p")), ("p", None)]),
+            vec!["p", "c", "g"]
+        );
+        // Parent hors du paquet : traité comme sans parent.
+        assert_eq!(order(&[("c", Some("absent")), ("p", None)]), vec!["c", "p"]);
+        // Cycle (donnée corrompue) : permutation complète, ordre de lecture.
+        assert_eq!(order(&[("x", Some("y")), ("y", Some("x"))]), vec!["x", "y"]);
+        // Auto-référence.
+        assert_eq!(order(&[("x", Some("x"))]), vec!["x"]);
+    }
+
+    /// 1.12.0 — `backfill_stable_event_keys_in_callflow` numérote un
+    /// callflow stocké dans l'ordre d'affichage (enfant avant parent) comme
+    /// le décodeur : parent 0, enfant 1. Avant : enfant 0, parent 1.
+    #[test]
+    fn callflow_backfill_numbers_the_parent_first_2_21_133() {
+        let reference = serde_json::json!([{
+            "source_file": "/ring/n2/n2_00001.pcapng",
+            "interface_id": 0,
+            "packet_number": 7,
+            "byte_offset": 0
+        }]);
+        let mut callflow = serde_json::json!({"events": [
+            {"event_id": "evt-0001", "parent_event_id": "evt-ffff", "protocol": "NAS-5GMM", "packet_references": reference},
+            {"event_id": "evt-ffff", "protocol": "NGAP", "packet_references": reference},
+        ]});
+        assert_eq!(backfill_stable_event_keys_in_callflow(&mut callflow), (2, 0));
+        let key = |i: usize| callflow["events"][i]["stable_event_key"].as_str().unwrap().to_owned();
+        assert_eq!(key(1), "n2_00001.pcapng|0|7|0|NGAP|0");
+        assert_eq!(key(0), "n2_00001.pcapng|0|7|0|NAS-5GMM|1");
+    }
+}
+
