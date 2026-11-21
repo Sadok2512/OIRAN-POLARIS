@@ -3,7 +3,8 @@
 ## 0.36.19 — 2026-11-21 — Stop UE cohérent avec le contexte gNB (patch)
 
 - Le Stop envoie désormais la libération PDU puis le désenregistrement `switch-off` avant l'arrêt du conteneur UE.
-- Après l'arrêt, Control lit `ue-list`, libère uniquement les contextes orphelins (`amf-ngap-id < 0`) avec `ue-release`, puis contrôle leur disparition.
+- Control relève `ue-list` avant l'arrêt. Après l'arrêt, il ne libère que l'unique contexte dont le même `ran-ngap-id` vient de passer d'un AMF attribué à l'état orphelin ; un autre UE en cours d'enregistrement reste intact.
+- Si ce rapprochement direct est impossible, le fallback ne cible qu'un unique orphelin présent dans deux relevés espacés de plus de 30 secondes.
 - Tant qu'un contexte orphelin résiste, le registre publie `STOP_INCOMPLETE`, conserve l'enveloppe de propriété pour un nouvel essai et retourne `GNB_UE_CONTEXT_RELEASE_INCOMPLETE`; il ne publie jamais prématurément `STOPPED`.
 - Le parseur de `ue-list`, l'état `STOP_INCOMPLETE` et le chemin Stop incomplet ont des tests de régression dédiés.
 
