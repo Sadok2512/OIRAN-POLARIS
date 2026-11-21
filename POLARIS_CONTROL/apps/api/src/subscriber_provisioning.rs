@@ -788,12 +788,14 @@ pub fn sanitize(record: &SubscriberRecord) -> SanitizedSubscriber {
     sanitize_for_role(record, SubscriberIdentityVisibility::Protected)
 }
 
-/// 0.19.7 (#48) — `operator` and `administrator` get the raw IMSI; everyone
-/// else keeps `"PROTECTED"`. K / OPc are **never** returned.
+/// Internal projection policy. Public Control GET routes select `Masked`;
+/// raw IMSI is retained only for explicit internal lookup workflows.
 #[derive(Clone, Copy)]
 pub enum SubscriberIdentityVisibility {
     /// Return `"PROTECTED"` as the subscriber identity (viewer).
     Protected,
+    /// Return only the last four digits, prefixed by an ellipsis.
+    Masked,
     /// Return the raw IMSI as the subscriber identity (operator / admin).
     Imsi,
 }
@@ -815,6 +817,7 @@ pub fn sanitize_for_role(
 ) -> SanitizedSubscriber {
     let identity = match visibility {
         SubscriberIdentityVisibility::Imsi => record.imsi.clone(),
+        SubscriberIdentityVisibility::Masked => mask_subscriber_identity(&record.imsi),
         SubscriberIdentityVisibility::Protected => "PROTECTED".into(),
     };
     SanitizedSubscriber {
@@ -831,8 +834,19 @@ pub fn sanitize_for_role(
         dnns: record.dnns.clone(),
         ambr: record.ambr.clone(),
         subscriber_identity: identity,
-        msisdn: record.msisdn.clone(),
+        msisdn: matches!(visibility, SubscriberIdentityVisibility::Imsi)
+            .then(|| record.msisdn.clone())
+            .flatten(),
         authentication_material: "PROTECTED".into(),
+    }
+}
+
+pub fn mask_subscriber_identity(identity: &str) -> String {
+    let suffix: String = identity.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    if suffix.len() == 4 && suffix.chars().all(|character| character.is_ascii_digit()) {
+        format!("…{suffix}")
+    } else {
+        "PROTECTED".into()
     }
 }
 
@@ -1754,8 +1768,12 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         };
         let viewer = sanitize_for_role(&record, SubscriberIdentityVisibility::Protected);
         assert_eq!(viewer.subscriber_identity, "PROTECTED");
-        assert_eq!(viewer.msisdn.as_deref(), Some("15550000007"));
+        assert_eq!(viewer.msisdn, None);
         assert_eq!(viewer.authentication_material, "PROTECTED");
+
+        let masked = sanitize_for_role(&record, SubscriberIdentityVisibility::Masked);
+        assert_eq!(masked.subscriber_identity, "…7890");
+        assert_eq!(masked.msisdn, None);
 
         // Operator view exposes the raw IMSI, but K / OPc stay PROTECTED.
         let operator = sanitize_for_role(&record, SubscriberIdentityVisibility::Imsi);

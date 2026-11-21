@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.20 — 2026-11-21 — Identités abonné masquées sur les GET Control
+
+- `/ues`, les profils UE et les vues abonnés projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
+- `subscriber_identity_exposed` reste faux et aucun MSISDN n'est projeté par ces routes GET.
+- Les secrets d'authentification restent protégés ; les mutations et la route POST de lookup existante sont inchangées.
+
 ## 0.36.19 — 2026-11-21 — Stop UE cohérent avec le contexte gNB (patch)
 
 - Le Stop envoie désormais la libération PDU puis le désenregistrement `switch-off` avant l'arrêt du conteneur UE.
