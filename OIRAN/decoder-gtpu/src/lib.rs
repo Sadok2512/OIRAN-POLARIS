@@ -477,6 +477,19 @@ fn be32(b: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Les plages d'adresses UE sont un réglage global du processus, et
+    /// les tests tournent en parallèle : ceux qui le modifient ou en
+    /// dépendent se suivent. Sans ce verrou, le test des plages par
+    /// défaut pouvait lire la surcharge posée par son voisin (échec vu
+    /// une fois sur le workspace complet, oiran-api 2.21.131).
+    static UE_IP_POOLS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn ue_ip_pools_guard() -> std::sync::MutexGuard<'static, ()> {
+        UE_IP_POOLS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
     #[test]
     fn valid_tunnel_packet() {
         let p = [0x30, 0xff, 0, 4, 0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4];
@@ -514,6 +527,7 @@ mod tests {
 
     #[test]
     fn infers_s1u_direction_from_enb_and_sgw_roles() {
+        let _pools = ue_ip_pools_guard();
         let packets = vec![];
         let timestamp = event_schema::ExactTimestamp {
             seconds: 1,
@@ -549,6 +563,7 @@ mod tests {
 
     #[test]
     fn gpdu_exposes_teid_receiver_endpoint_and_direction_on_s1u_and_s5u() {
+        let _pools = ue_ip_pools_guard();
         let packets = vec![];
         let timestamp = event_schema::ExactTimestamp {
             seconds: 1,
@@ -666,6 +681,7 @@ mod tests {
     /// (ajout 10.47/16 pour couvrir le DNN IMS, non reconnu avant 2.21.100).
     #[test]
     fn is_ue_address_covers_10_45_46_47_by_default_2_21_100() {
+        let _pools = ue_ip_pools_guard();
         // Reset aux défauts (test parallèle : le static peut avoir été
         // modifié par un autre test, on reset explicitement).
         set_ue_ip_pools(default_ue_ip_pools());
@@ -681,6 +697,7 @@ mod tests {
     /// préfixes par défaut (configuration lab).
     #[test]
     fn set_ue_ip_pools_overrides_defaults_2_21_100() {
+        let _pools = ue_ip_pools_guard();
         set_ue_ip_pools(vec!["172.16.".into()]);
         assert!(is_ue_address("172.16.0.1"));
         assert!(!is_ue_address("10.45.0.1"), "10.45 n'est plus dans le pool après override");
