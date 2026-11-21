@@ -93,6 +93,19 @@ pub(crate) struct LiveTrace {
     /// valeur de SEID de l'abonné, vers un autre nœud.
     #[serde(default)]
     rejected_seid_endpoint_mismatch: u64,
+    /// 2.21.129 — events reconnus par un identifiant technique de la
+    /// trace mais qui portent l'identité d'un AUTRE abonné : rejetés.
+    #[serde(default)]
+    rejected_foreign_subscriber: u64,
+    /// 2.21.129 — oublis de l'état technique : il était périmé
+    /// (identifiants réattribués à un autre abonné, ou nouveau contexte
+    /// UE sur un identifiant que la trace croyait vivant).
+    #[serde(default)]
+    stale_state_resets: u64,
+    /// 2.21.129 — nouveaux enregistrements de l'abonné avec son identité
+    /// permanente : la trace est repartie de cette procédure.
+    #[serde(default)]
+    fresh_registrations: u64,
     /// 2.21.119 — libérations d'une session nommée dont aucun tunnel
     /// n'était rangé par session : rien n'a pu être oublié.
     #[serde(default)]
@@ -293,6 +306,15 @@ impl MatchKeys {
     pub fn forget(&mut self, key: &str) -> bool {
         self.0.remove(key)
     }
+    /// 2.21.129 — une clé d'IDENTITÉ de l'abonné (pseudonyme, chiffres
+    /// amorcés) figure parmi ces jetons. Les références d'event
+    /// (`evt-…`) n'en sont pas : elles disent « enfant d'un event
+    /// rattaché », pas « de cet abonné ».
+    pub fn any_identity_in(&self, tokens: &HashSet<String>) -> bool {
+        self.0
+            .iter()
+            .any(|key| !key.starts_with("evt-") && tokens.contains(key))
+    }
     pub fn forget_event_references(&mut self) {
         self.0.retain(|key| !key.starts_with("evt-"));
     }
@@ -363,6 +385,9 @@ struct TraceState {
     /// l'adresse du paquet et le PFCP par son IE 93. Oubliés avec leur
     /// session.
     ue_ip_keys: HashMap<String, HashSet<String>>,
+    /// 2.21.129 — `event_id` des parents des events rattachés : un
+    /// InitialUEMessage qui en fait partie est celui de l'abonné.
+    parents_of_attached: HashSet<String>,
     /// 2.21.109 (ordre #9 7050201220) — identifiants UE de signalisation
     /// appris sur les events routés : `(nom, valeur, association)` avec
     /// `nom` ∈ amf_ue_ngap_id / ran_ue_ngap_id / mme_ue_s1ap_id /
@@ -677,6 +702,14 @@ fn is_ue_context_release(name: &str) -> bool {
     compact_name(name) == "uecontextreleasecomplete"
 }
 
+/// 2.21.129 — demande d'enregistrement 5G ou d'attachement 4G (le nom
+/// de l'event NAS enfant est préfixé par celui de son message NGAP /
+/// S1AP).
+fn is_fresh_registration(name: &str) -> bool {
+    let name = compact_name(name);
+    name.ends_with("registrationrequest") || name.ends_with("attachrequest")
+}
+
 /// Détachement : l'abonné quitte le réseau, tout ce qui a été appris sur
 /// ses sessions est oublié.
 fn is_detach(name: &str) -> bool {
@@ -755,6 +788,28 @@ fn parse_seid_pairs(ie_value: &str) -> Vec<(String, String)> {
 
 /// 2.21.121 (H1) — oublie des couples (adresse, TEID) : du côté cœur, des
 /// couples connus, et leur TEID s'il ne désigne plus aucun couple connu.
+/// 2.21.129 (recette lab 2.21.124, G9 : la trace de A prend tout le
+/// trafic de B ; ordre #9 7053864526) — tout l'état TECHNIQUE de la trace
+/// est oublié : identifiants UE, tunnels, SEID, références de contexte
+/// SM, IP UE, références d'event. Les identités de l'abonné sont gardées :
+/// elles rattachent sa prochaine procédure, qui réapprend le reste.
+fn forget_technical_state(state: &mut TraceState) {
+    state.ue_ids.clear();
+    state.sm_context_sessions.clear();
+    state.tunnel_teids.clear();
+    state.tunnel_endpoints.clear();
+    state.session_tunnels.clear();
+    state.core_tunnel_endpoints.clear();
+    state.seid_tunnels.clear();
+    state.seids.clear();
+    state.seid_endpoints.clear();
+    state.ue_ips.clear();
+    for (ip, _) in state.ue_ip_keys.drain() {
+        state.exposed_keys.remove(&ip);
+    }
+    state.match_keys.forget_event_references();
+}
+
 fn forget_tunnel_pairs(state: &mut TraceState, pairs: &[(String, String)]) {
     for pair in pairs {
         state.core_tunnel_endpoints.remove(pair);
@@ -1060,9 +1115,12 @@ impl LiveTraceRegistry {
             },
             "parents_attached_after_child": trace.parents_attached_after_child,
             "session_releases_without_filed_tunnels": trace.session_releases_without_filed_tunnels,
+            "fresh_registrations": trace.fresh_registrations,
             "rejects": {
                 "ue_id_mismatch": trace.rejected_ue_id_mismatch,
                 "seid_endpoint_mismatch": trace.rejected_seid_endpoint_mismatch,
+                "foreign_subscriber": trace.rejected_foreign_subscriber,
+                "stale_state_resets": trace.stale_state_resets,
                 "gpdu_endpoint_mismatch": trace.gpdu_rejected_endpoint_mismatch,
                 "gpdu_no_match": trace.gpdu_rejected_no_match,
                 "gpdu_interface_filter": trace.gpdu_rejected_interface_filter,
@@ -1440,6 +1498,15 @@ impl LiveTraceRegistry {
                 .any(|ie| ie.trim().to_ascii_uppercase().ends_with(" BYE"));
         let ev_equipment_pseudonyms = equipment_pseudonyms(event);
         let ev_ue_ip_pseudonyms = ue_ip_pseudonyms(event);
+        // 2.21.129 — identités d'abonné portées par l'event (hors
+        // pseudonymes d'équipement), et ouverture d'un nouveau contexte UE.
+        let ev_subscriber_pseudonyms: Vec<String> = session_ids_named(&value, "subscriber_pseudonym")
+            .into_iter()
+            .filter(|pseudonym| !ev_equipment_pseudonyms.contains(*pseudonym))
+            .map(str::to_owned)
+            .collect();
+        let is_initial_ue_message = matches!(event.protocol.as_str(), "NGAP" | "S1AP")
+            && compact_name(&event.message_name) == "initialuemessage";
         let mut parents_to_attach: Vec<(String, String)> = Vec::new();
         let mut rejected_by_a_trace = false;
         let ev_pdu_address: Option<String> = ev_ies
@@ -1621,6 +1688,62 @@ impl LiveTraceRegistry {
                 || match_teid
                 || match_tunnel
                 || match_ue_id;
+            // 2.21.129 (recette lab 2.21.124, G9 ; ordre #9 7053864526) —
+            // garde d'identité. Un event reconnu SANS identité de
+            // l'abonné (identifiant technique, ou parent déjà rattaché)
+            // est celui d'un autre abonné quand :
+            //   * il porte un pseudonyme d'abonné que la trace ne connaît
+            //     pas — l'identifiant technique a été réattribué ;
+            //   * ou il ouvre un NOUVEAU contexte UE sur un identifiant
+            //     que la trace croyait vivant — l'ancien contexte a fini
+            //     sans que la trace le voie.
+            // Il est rejeté, et tout l'état technique de la trace, périmé,
+            // est oublié (choix de l'isolement). Un SIP porte l'identité
+            // du pair : il n'est pas concerné.
+            let identity_match =
+                match_pseudo || match_call || state.match_keys.any_identity_in(&tokens);
+            // Un enfant hérite les identifiants de session de son parent,
+            // dont l'IMEISV masqué (libellé `subscriber_pseudonym`), qui
+            // n'est reconnu comme pseudonyme d'équipement que sur le
+            // parent : le verdict n'est rendu que si le parent est déjà
+            // rattaché à cette trace (ordre d'émission du décodeur,
+            // garanti depuis 2.21.126).
+            let parent_attached = ev_parent_ids
+                .iter()
+                .all(|parent| state.match_keys.contains(parent));
+            let carries_foreign_subscriber = !is_sip
+                && !is_rtp
+                && parent_attached
+                && !ev_subscriber_pseudonyms.is_empty()
+                && ev_subscriber_pseudonyms.iter().all(|pseudonym| {
+                    !state.match_keys.contains(pseudonym)
+                        && !state.equipment_keys.contains(pseudonym)
+                        && !state.trace.subscriber_pseudonyms.iter().any(|known| known == pseudonym)
+                });
+            // Le parent d'un event déjà rattaché (son enfant NAS, passé
+            // avant lui, porte l'identité) n'ouvre pas un contexte
+            // étranger : c'est celui de l'abonné.
+            let stale_context = is_initial_ue_message
+                && (core_known || ran_known)
+                && !state.parents_of_attached.contains(&event.event_id);
+            let matched = if matched
+                && !forced
+                && !identity_match
+                && (carries_foreign_subscriber || stale_context)
+            {
+                forget_technical_state(state);
+                if !seed_only {
+                    state.trace.stale_state_resets =
+                        state.trace.stale_state_resets.saturating_add(1);
+                    if carries_foreign_subscriber {
+                        state.trace.rejected_foreign_subscriber =
+                            state.trace.rejected_foreign_subscriber.saturating_add(1);
+                    }
+                }
+                false
+            } else {
+                matched
+            };
             if !matched {
                 // 2.21.105 — un G-PDU qui arrive APRÈS la trace mais
                 // dont le TEID / UE IP n'a pas été appris (parce que
@@ -1656,6 +1779,21 @@ impl LiveTraceRegistry {
                     }
                 }
                 continue;
+            }
+            // 2.21.129 (ordre #9 7053864526, question 2) — nouvel
+            // enregistrement de l'abonné, présenté avec son identité
+            // permanente (SUCI / IMSI : il n'a plus d'identité temporaire
+            // valide, donc plus de contexte ni de session dans le réseau) :
+            // tout ce que la trace tenait d'avant est périmé. Elle repart
+            // de cette procédure. Un enregistrement de mobilité ou
+            // périodique se présente avec l'identité temporaire : il garde
+            // les sessions, et n'est pas concerné.
+            if !forced && match_pseudo && is_fresh_registration(&event.message_name) {
+                forget_technical_state(state);
+                if !seed_only {
+                    state.trace.fresh_registrations =
+                        state.trace.fresh_registrations.saturating_add(1);
+                }
             }
             if forced {
                 state.trace.parents_attached_after_child =
@@ -1875,6 +2013,11 @@ impl LiveTraceRegistry {
             }
             if event.protocol.as_str() != "GTP-U" && event.event_id.starts_with("evt-") {
                 state.match_keys.insert(event.event_id.clone());
+                // 2.21.129 — parents des events rattachés (borné).
+                if state.parents_of_attached.len() >= 4_096 {
+                    state.parents_of_attached.clear();
+                }
+                state.parents_of_attached.extend(ev_parent_ids.iter().cloned());
             }
             for pair in &ev_tunnel_pairs {
                 state.tunnel_endpoints.insert(pair.clone());
@@ -2323,6 +2466,14 @@ impl LiveTraceRegistry {
                         Some(state) => recent
                             .iter()
                             .filter(|e| !state.match_keys.contains(&e.event_id))
+                            // 2.21.129 — seulement les PFCP du moment :
+                            // l'établissement précède de peu le message
+                            // qui apporte ses tunnels. Un PFCP plus ancien
+                            // est celui d'une autre session.
+                            .filter(|e| {
+                                (event.timestamp.seconds - e.timestamp.seconds).abs()
+                                    <= AFTER_THE_FACT_MAX_AGE_S
+                            })
                             .cloned()
                             .collect(),
                         None => Vec::new(),
@@ -2343,7 +2494,15 @@ impl LiveTraceRegistry {
         if targeted {
             return;
         }
-        if rejected_by_a_trace && event.protocol.as_str() == "PFCP" {
+        // 2.21.129 (recette lab 2.21.124, G9) — l'AMORÇAGE n'alimente pas
+        // les tampons du rattachement après coup. Avant : les PFCP de
+        // l'historique du ring, rejetés pendant la relecture, y entraient ;
+        // en live, une trace qui apprenait un SEID ou un tunnel de même
+        // valeur (les nœuds réattribuent leurs identifiants) se voyait
+        // représenter le PFCP d'une ANCIENNE session — émis comme un
+        // message du moment — et en apprenait les tunnels et l'IP UE,
+        // devenus ceux d'un autre abonné.
+        if rejected_by_a_trace && !seed_only && event.protocol.as_str() == "PFCP" {
             let mut recent = self.recent_rejected_pfcp.lock().unwrap();
             recent.push_back(event.clone());
             while recent.len() > RECENT_REJECTED_PFCP {
@@ -2361,7 +2520,7 @@ impl LiveTraceRegistry {
                     pending.push((trace_id, parent.clone()));
                 }
             }
-            if rejected_by_a_trace && event.protocol.as_str() != "GTP-U" {
+            if rejected_by_a_trace && !seed_only && event.protocol.as_str() != "GTP-U" {
                 recent.push_back(event.clone());
                 while recent.len() > RECENT_REJECTED_EVENTS {
                     recent.pop_front();
@@ -2377,6 +2536,10 @@ impl LiveTraceRegistry {
 /// 2.21.124 — nombre de messages PFCP de session rejetés gardés pour un
 /// rattachement après coup.
 const RECENT_REJECTED_PFCP: usize = 256;
+
+/// 2.21.129 — écart maximal, en secondes de capture, entre un PFCP
+/// rejeté et l'event qui le fait reconnaître après coup.
+const AFTER_THE_FACT_MAX_AGE_S: i64 = 10;
 
 /// 2.21.113 (E4) — nombre d'events de signalisation rejetés gardés pour
 /// un rattachement après coup du parent.
@@ -3078,6 +3241,9 @@ pub(crate) async fn create(
         pfcp_attached_by_ue_ip: 0,
         rejected_ue_id_mismatch: 0,
         rejected_seid_endpoint_mismatch: 0,
+        rejected_foreign_subscriber: 0,
+        stale_state_resets: 0,
+        fresh_registrations: 0,
         session_releases_without_filed_tunnels: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
@@ -3103,6 +3269,7 @@ pub(crate) async fn create(
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
             ue_ip_keys: HashMap::new(),
+            parents_of_attached: HashSet::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -3489,6 +3656,9 @@ mod tests {
                 pfcp_attached_by_ue_ip: 0,
                 rejected_ue_id_mismatch: 0,
                 rejected_seid_endpoint_mismatch: 0,
+                rejected_foreign_subscriber: 0,
+                stale_state_resets: 0,
+                fresh_registrations: 0,
                 session_releases_without_filed_tunnels: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
@@ -3510,6 +3680,7 @@ mod tests {
             seids: HashSet::new(),
             ue_ips: HashSet::new(),
             ue_ip_keys: HashMap::new(),
+            parents_of_attached: HashSet::new(),
             ue_ids: HashSet::new(),
             seid_endpoints: HashSet::new(),
             session_tunnels: HashMap::new(),
@@ -5628,6 +5799,292 @@ mod tests {
         // chemins. Seule l'égalité compte ici.
         assert_eq!(sequence(&first), sequence(&second));
         assert!(sequence(&first).windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    }
+
+    /// 2.21.129 (recette lab 2.21.124, G9 FAIL : la trace de A prend
+    /// tout le trafic de B ; ordre #9 7053864526) — capture réelle à cinq
+    /// abonnés, cinq traces ouvertes EN MÊME TEMPS dans le même registre,
+    /// comme au lab. Trois cas :
+    ///   1. les cinq dialogues entrelacés, démarrés à 10 ms d'écart ;
+    ///   2. la capture est l'historique du ring (amorçage, plans N2 et
+    ///      N4), puis elle est rejouée en live avec les abonnés décalés
+    ///      d'un rang : les identifiants techniques que l'historique
+    ///      donne à un abonné (contexte UE, tunnels, SEID) sont portés
+    ///      par le suivant. C'est l'identifiant réattribué.
+    ///   3. témoin : le même rejeu sans amorçage.
+    /// Attendu partout : aucune trace ne reçoit un event d'un autre
+    /// abonné, aucune n'expose le pseudonyme d'un autre.
+    /// À `35571a0` (2.21.124), cas 2 : chaque trace prend TOUT le dialogue
+    /// de l'abonné suivant (65 à 70 events) et expose son pseudonyme.
+    #[test]
+    fn simultaneous_traces_and_reassigned_identifiers_never_cross_subscribers_2_21_129() {
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap",
+        );
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events: Vec<event_schema::NormalizedEvent> = Vec::new();
+        for interface in ["N2", "N4", "SBI"] {
+            let config = oiran_decode::DecodeConfig {
+                input: capture.clone(),
+                capture_id: format!("sha256:{}", sha256_hex(interface.as_bytes())),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "multi-imsi.pcap".into(),
+            };
+            let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            });
+        }
+        events.sort_by_key(|e| e.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        let id_of = |event: &event_schema::NormalizedEvent, name: &str| -> Option<String> {
+            event.session_identifiers.iter().find(|id| id.name == name).map(|id| id.value.clone())
+        };
+        let mut contexts: Vec<(String, Vec<String>)> = Vec::new();
+        for event in events.iter().filter(|e| e.interface == "N2") {
+            if let (Some(pseudonym), Some(ran)) =
+                (id_of(event, "subscriber_pseudonym"), id_of(event, "ran_ue_ngap_id"))
+            {
+                match contexts.iter_mut().find(|(known, _)| known == &ran) {
+                    Some((_, pseudonyms)) if !pseudonyms.contains(&pseudonym) => pseudonyms.push(pseudonym),
+                    Some(_) => {}
+                    None => contexts.push((ran, vec![pseudonym])),
+                }
+            }
+        }
+        let shared: HashSet<String> = contexts
+            .iter()
+            .flat_map(|(_, list)| list.iter().cloned())
+            .filter(|p| contexts.iter().filter(|(_, list)| list.contains(p)).count() > 1)
+            .collect();
+        let subs: Vec<String> = contexts
+            .iter()
+            .map(|(_, list)| list.iter().find(|p| !shared.contains(*p)).unwrap().clone())
+            .collect();
+        assert_eq!(subs.len(), 5);
+        let attached_of = |registry: &LiveTraceRegistry, id: &str| -> Vec<String> {
+            registry.traces.lock().unwrap()[id]
+                .events
+                .iter()
+                .filter(|e| e.kind == "message")
+                .filter_map(|e| e.payload["event_id"].as_str().map(str::to_owned))
+                .collect()
+        };
+        // Vérité terrain : une trace seule, ordre de la capture (le gate
+        // de 2.21.124 : 70 / 68 / 67 / 69 / 65).
+        let mut owner: HashMap<String, usize> = HashMap::new();
+        for (k, sub) in subs.iter().enumerate() {
+            let r = trace_on(sub);
+            for e in &events {
+                r.route_normalized(e);
+            }
+            for id in attached_of(&r, "t") {
+                assert!(owner.insert(id, k).is_none());
+            }
+        }
+        assert_eq!(owner.len(), 339);
+        let names: Vec<String> = (0..subs.len()).map(|k| format!("t{k}")).collect();
+        // Renvoie, par trace : (rattachés, étrangers, manquants, pseudonymes
+        // tiers exposés, oublis d'état périmé).
+        let run = |sequence: &[event_schema::NormalizedEvent],
+                   history: Option<&[event_schema::NormalizedEvent]>,
+                   truth: &dyn Fn(&str) -> Option<usize>|
+         -> Vec<(usize, usize, usize, usize, u64)> {
+            let r = LiveTraceRegistry::new();
+            for (k, sub) in subs.iter().enumerate() {
+                let mut st = state(u64::MAX, false, vec![sub.clone()]);
+                st.trace.trace_id = names[k].clone();
+                r.traces.lock().unwrap().insert(names[k].clone(), st);
+            }
+            if let Some(history) = history {
+                assert!(r.begin_seed());
+                for e in history.iter().filter(|e| e.interface == "N2" || e.interface == "N4") {
+                    r.learn_from_ring(e);
+                }
+                r.finish_seed(&SeedReport::default());
+            }
+            for e in sequence {
+                r.route_normalized(e);
+            }
+            (0..subs.len())
+                .map(|k| {
+                    let got = attached_of(&r, &names[k]);
+                    let foreign = got.iter().filter(|id| truth(id).is_some_and(|o| o != k)).count();
+                    let missing = sequence
+                        .iter()
+                        .filter(|e| truth(&e.event_id) == Some(k) && !got.contains(&e.event_id))
+                        .count();
+                    let traces = r.traces.lock().unwrap();
+                    let t = &traces[&names[k]];
+                    let exposed = subs
+                        .iter()
+                        .enumerate()
+                        .filter(|(o, s)| *o != k && (t.exposed_keys.contains(*s) || t.match_keys.contains(s)))
+                        .count();
+                    (got.len(), foreign, missing, exposed, t.trace.stale_state_resets)
+                })
+                .collect()
+        };
+        let truth = |id: &str| owner.get(id).copied();
+
+        // Cas 1 — dialogues entrelacés.
+        let ns = |e: &event_schema::NormalizedEvent| {
+            e.timestamp.seconds as i128 * 1_000_000_000 + e.timestamp.nanoseconds as i128
+        };
+        let t0 = ns(&events[0]);
+        let mut start: HashMap<usize, i128> = HashMap::new();
+        for e in &events {
+            if let Some(k) = owner.get(&e.event_id) {
+                start.entry(*k).or_insert(ns(e));
+            }
+        }
+        let mut keyed: Vec<(i128, event_schema::NormalizedEvent)> = events
+            .iter()
+            .map(|e| {
+                let key = match owner.get(&e.event_id) {
+                    Some(k) => ns(e) - start[k] + (*k as i128) * 10_000_000,
+                    None => ns(e) - t0 - 3_600_000_000_000,
+                };
+                (key, e.clone())
+            })
+            .collect();
+        keyed.sort_by_key(|(key, _)| *key);
+        let interleaved: Vec<event_schema::NormalizedEvent> = keyed.into_iter().map(|(_, e)| e).collect();
+        let first_of = |k: usize| interleaved.iter().position(|e| owner.get(&e.event_id) == Some(&k)).unwrap();
+        let last_of = |k: usize| interleaved.iter().rposition(|e| owner.get(&e.event_id) == Some(&k)).unwrap();
+        assert!(first_of(4) < last_of(0), "les cinq dialogues se recouvrent");
+        let result = run(&interleaved, None, &truth);
+        assert_eq!(
+            result.iter().map(|r| (r.0, r.1, r.2, r.3)).collect::<Vec<_>>(),
+            [(70, 0, 0, 0), (68, 0, 0, 0), (67, 0, 0, 0), (69, 0, 0, 0), (65, 0, 0, 0)]
+        );
+
+        // Cas 2 et 3 — rejeu avec les abonnés décalés d'un rang.
+        let swap = |text: &str| -> String {
+            let mut out = text.to_owned();
+            for (k, sub) in subs.iter().enumerate() {
+                out = out.replace(sub.as_str(), &format!("@@{k}@@"));
+            }
+            for k in 0..subs.len() {
+                out = out.replace(&format!("@@{k}@@"), &subs[(k + 1) % subs.len()]);
+            }
+            out
+        };
+        let replay: Vec<event_schema::NormalizedEvent> = events
+            .iter()
+            .map(|e| {
+                let mut e = e.clone();
+                e.event_id = format!("{}-bis", e.event_id);
+                if let Some(parent) = e.parent_event_id.as_mut() {
+                    *parent = format!("{parent}-bis");
+                }
+                for id in e.session_identifiers.iter_mut() {
+                    id.value = swap(&id.value);
+                }
+                for ie in e.information_elements.iter_mut() {
+                    if let Some(v) = ie.value.as_mut() {
+                        *v = swap(v);
+                    }
+                }
+                e
+            })
+            .collect();
+        let truth_bis =
+            |id: &str| owner.get(id.trim_end_matches("-bis")).map(|k| (k + 1) % subs.len());
+        let witness = run(&replay, None, &truth_bis);
+        assert!(witness.iter().all(|r| r.1 == 0 && r.2 == 0 && r.3 == 0), "{witness:?}");
+        let seeded = run(&replay, Some(&events), &truth_bis);
+        for (k, (_, foreign, missing, exposed, _)) in seeded.iter().enumerate() {
+            assert_eq!(*foreign, 0, "trace {k} : events d'un autre abonné : {seeded:?}");
+            assert_eq!(*exposed, 0, "trace {k} : pseudonyme d'un autre abonné : {seeded:?}");
+            assert_eq!(*missing, 0, "trace {k} : events de l'abonné perdus : {seeded:?}");
+        }
+        // Chaque trace tient exactement le dialogue de son abonné, comme
+        // sans historique.
+        assert_eq!(
+            seeded.iter().map(|r| r.0).collect::<Vec<_>>(),
+            witness.iter().map(|r| r.0).collect::<Vec<_>>()
+        );
+        assert_eq!(witness.iter().map(|r| r.0).collect::<Vec<_>>(), [65, 70, 68, 67, 69]);
+        // L'abonné dont l'ancien contexte UE est repris avant son propre
+        // enregistrement voit son état périmé oublié.
+        assert_eq!(seeded[0].4, 1);
+    }
+
+    /// 2.21.129 (recette lab 2.21.124, G9 : `pfcp.attached_after_the_fact`
+    /// à 5 pour un abonné qui a 4 PFCP ; ordre #9 7053864526, questions 3
+    /// et 4) — le tampon des PFCP rejetés est commun aux traces et
+    /// l'amorçage y versait l'historique du ring. Ici, l'historique porte
+    /// le PFCP d'une ANCIENNE session, d'un autre abonné, dont le tunnel
+    /// a la valeur que l'UPF redonne ensuite à l'abonné tracé.
+    /// Attendu : ce PFCP n'est ni émis ni appris — ni depuis l'amorçage,
+    /// ni depuis le live quand il date de plus de quelques secondes — et
+    /// le PFCP du moment, lui, est rattaché après coup.
+    /// Avant 2.21.129 : le PFCP ancien est émis comme un message du
+    /// moment, la trace apprend l'IP UE de l'autre abonné et rattache son
+    /// SIP.
+    #[test]
+    fn a_pfcp_of_an_older_session_is_never_attached_after_the_fact_2_21_129() {
+        use event_schema::{Direction, Protocol};
+        let (ip_old, pcscf) = ("10.45.0.8", "10.46.0.2");
+        let f_teid = "teid=0x0000d4a6,v4=true,v6=false,ipv4=10.100.0.1";
+        let pfcp = |id: &str, seconds: i64, seid: &str, ue_ip: Option<&str>| {
+            let ue = ue_ip.map(|ip| format!("ue_ip={},ue_ip_flags=0x02", ip_psn(ip)));
+            let mut ies = vec![("F-TEID", f_teid)];
+            if let Some(ue) = ue.as_deref() {
+                ies.push(("UE IP Address", ue));
+            }
+            let mut event = mk_event("N4", Protocol::Pfcp, "Session Establishment Request", 1, Direction::Unknown, vec![("seid", seid)], ies);
+            for ie in event.information_elements.iter_mut() {
+                if ie.name == "UE IP Address" {
+                    ie.id = Some(93);
+                }
+            }
+            event.event_id = id.into();
+            event.timestamp.seconds = seconds;
+            event
+        };
+        let setup = |seconds: i64| {
+            let mut event = mk_event(
+                "N2",
+                Protocol::Ngap,
+                "PDUSessionResourceSetupRequest",
+                2,
+                Direction::Unknown,
+                vec![("subscriber_pseudonym", "psn-ue-a")],
+                vec![("PDUSessionResourceSetupRequestTransfer", "item_0_tunnel_ip_ul=10.100.0.1,item_0_gtp_teid_ul=0x0000d4a6")],
+            );
+            event.event_id = "evt-ngap-setup".into();
+            event.timestamp.seconds = seconds;
+            event
+        };
+        let now = 1_795_000_000i64;
+        for from_seed in [true, false] {
+            let r = trace_on("psn-ue-a");
+            // PFCP d'une ancienne session, une heure plus tôt, même tunnel.
+            let old = pfcp("evt-pfcp-old", now - 3_600, "0x0000000000002002", Some(ip_old));
+            if from_seed {
+                assert!(r.begin_seed());
+                r.learn_from_ring(&old);
+                r.finish_seed(&SeedReport::default());
+            } else {
+                r.route_normalized(&old);
+            }
+            // PFCP du moment, celui de l'abonné : même tunnel, pas d'IE 93.
+            r.route_normalized(&pfcp("evt-pfcp-now", now, "0x0000000000001001", None));
+            r.route_normalized(&setup(now));
+            r.route_normalized(&sip_from(9, "REGISTER", "1 REGISTER", "reg-b@ims", "psn-alias-b", ip_old, pcscf));
+            assert_eq!(
+                routed_ids(&r),
+                ["evt-ngap-setup", "evt-pfcp-now"],
+                "amorçage={from_seed} : seul le PFCP du moment est rattaché après coup"
+            );
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert_eq!(t.trace.pfcp_attached_after_the_fact, 1, "amorçage={from_seed}");
+            assert!(t.ue_ip_keys.is_empty(), "amorçage={from_seed} : IP UE d'une ancienne session apprise");
+            assert!(!t.seids.contains("0x0000000000002002"), "amorçage={from_seed}");
+        }
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {

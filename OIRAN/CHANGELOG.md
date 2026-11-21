@@ -1,5 +1,62 @@
 # Changelog
 
+## oiran-api 2.21.129 — 2026-11-21 — trace live : une trace ne prend plus l'abonné qui reprend ses identifiants techniques (recette lab 2.21.124, G9 FAIL ; ordre #9 7053864526)
+
+Upgrade **patch** sans déploiement, un commit au-dessus de 2.21.126 @ `653bda0`. Branches `fix/oiran-2.21.129-foreign-subscriber` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change. 2.21.127 (CLAUDE2) et 2.21.128 (coût d'une passe du lecteur) sont réservés.
+
+### Constat lab (ANR1 #10 7053755949)
+
+2.21.124, deux UE simultanés, traces ouvertes avant : la trace de B est juste ; la trace de A rattache **tout** le N3 (12 029 G-PDU), le pseudonyme de B y sort 48 fois, 59 events communs ; `pfcp.attached_after_the_fact` A=5 (un abonné a 4 PFCP), B=2. Asymétrique : ce n'est pas l'IMEISV masqué.
+
+### Reproduction — capture réelle `multi-imsi.pcap`, cinq traces ouvertes en même temps
+
+À `35571a0` (2.21.124), sonde non commitée :
+- cinq traces dans un même registre, ordre de la capture : 70 / 68 / 67 / 69 / 65, 0 étranger ;
+- cinq dialogues **entrelacés** (démarrés à 200 ms, puis 10 ms d'écart) : 0 étranger, 0 manquant. La simultanéité seule ne reproduit pas.
+- **historique amorcé puis identifiants réattribués** (la capture est l'historique du ring ; elle est rejouée en live avec les abonnés décalés d'un rang, donc le contexte UE, les tunnels et les SEID que l'historique donne à un abonné sont portés par le suivant) : **chaque trace prend tout le dialogue de l'abonné suivant — 65 à 70 events étrangers — et expose son pseudonyme**. Premier event étranger : son `InitialUEMessage`. Même forme que le lab.
+
+### Causes, par le code @ `35571a0`
+
+1. **L'état technique appris n'est jamais confronté à l'identité** (`live_trace.rs:1483-1489`, `:1497-1515`) : un event reconnu par un identifiant UE, un tunnel, un SEID ou une référence SM est rattaché même s'il porte le pseudonyme d'un **autre** abonné ; ce pseudonyme est alors appris (`:1671`) et tout suit.
+2. **L'enfant d'un event rattaché est rattaché par la référence de son parent** (`:1451`, les clés génériques contiennent les `evt-…`) : le `Registration Request` d'un autre abonné entre derrière son `InitialUEMessage`, et son pseudonyme est appris.
+3. **Aucune borne à la dernière procédure d'enregistrement** : l'amorçage relit jusqu'à 64 Mio par plan (`:144`, `:163-181`) ; ce qu'une ancienne session a laissé sans fin vue reste connu.
+4. **Rattachement après coup des PFCP sans borne d'âge** (`:2140-2165`, tampon `:871`, alimentation `:2169-2174`) : le tampon est commun à toutes les traces du registre et survit à leur fermeture. Un PFCP rejeté des minutes plus tôt (session d'une passe précédente, d'un essai abandonné) est représenté à une trace qui apprend un tunnel ou un SEID de même valeur, **émis comme un message du moment**, et la trace apprend ses autres tunnels. C'est cohérent avec `attached_after_the_fact` A=5 ; **non prouvé** que ce soit le chemin du lab.
+
+### Correctif
+
+1. **Garde d'identité** : un event reconnu sans identité de l'abonné (identifiant technique, ou parent rattaché) et qui porte un pseudonyme d'abonné inconnu de la trace est **rejeté** (`rejects.foreign_subscriber`), et tout l'état technique de la trace, périmé, est oublié (`rejects.stale_state_resets`). Les pseudonymes d'équipement ne comptent pas ; un SIP ou un flux RTP n'est pas concerné (il porte l'identité du pair) ; le verdict n'est rendu sur un event enfant que si son parent est rattaché (il hérite l'IMEISV masqué de son parent).
+2. **Nouveau contexte UE sur un identifiant connu** : un `InitialUEMessage` qui porte un identifiant UE que la trace croyait vivant, et qui n'est pas le parent d'un event rattaché, n'est pas rattaché ; l'état technique est oublié.
+3. **La trace repart du dernier enregistrement** : un `Registration Request` / `Attach Request` rattaché par le pseudonyme de l'abonné (identité permanente : il n'a plus d'identité temporaire valide, donc plus de contexte ni de session) fait oublier l'état technique antérieur avant d'apprendre (`fresh_registrations`). Un enregistrement de mobilité ou périodique, présenté avec l'identité temporaire, garde les sessions.
+4. **Rattachement après coup borné dans le temps** : seuls les PFCP à moins de 10 s (temps de capture) de l'event qui les fait reconnaître sont représentés. L'amorçage n'alimente plus les tampons du rattachement après coup (PFCP et parents).
+
+### Réponses aux quatre questions (lignes @ `35571a0`)
+
+1. **Ordre de l'amorçage** : plan par plan — `live_trace.rs:204` (`for interface in SEED_INTERFACES`, liste `:142` : N2, S1-MME, N4, S11, S5-C, Sxab), fichiers du plus ancien au plus récent, events de chaque fichier dans l'ordre de la capture (`:242`). Les fins de session sont appliquées (même code que le live), mais dans l'ordre du plan : une fin vue sur N2 n'efface pas ce que N4, relu ensuite, apprend. **Inchangé dans ce lot** : rejouer dans l'ordre du temps demande que l'amorçage rattache aussi les PFCP après coup (l'établissement PFCP précède le message N2 qui porte ses tunnels) ; l'ordre « N2 puis N4 » en tient lieu aujourd'hui. Lot à part. Le correctif 3 borne l'effet : l'état d'avant le dernier enregistrement est oublié.
+2. **Borne** : tout l'historique jusqu'à 64 Mio par plan (`:144`, `:163-181`), pas la dernière procédure. Corrigé (point 3).
+3. **Tampon des PFCP rejetés** : commun à toutes les traces du registre (`:871`), alimenté sans distinction de trace ni d'âge (`:2169-2174`), 256 entrées. Corrigé (point 4). L'amorçage l'alimentait aussi ; sur mon test, un PFCP relu à l'amorçage n'est pas représenté ensuite (mécanisme non instruit).
+4. **Tunnel descendant commun** : le déclencheur est large (`:1579-1585`, tout event rattaché portant un couple de tunnel, descendant compris), mais chaque PFCP représenté repasse le test ordinaire : il faut l'égalité du **couple** (adresse, TEID) (`:1487-1490`), ou du TEID seul quand aucun point de terminaison n'est connu pour ce TEID (`:1474-1486`). L'adresse du gNB seule ne suffit pas.
+
+### Changements de comportement à connaître
+
+- Après un nouvel enregistrement à identité permanente, la trace ne rattache plus le trafic d'une session antérieure tant que la signalisation ne l'a pas réapprise.
+- Quand l'état est jugé périmé, **tout** l'état technique est oublié, y compris celui d'une session vivante de l'abonné : son trafic usager n'est plus rattaché jusqu'à sa prochaine signalisation (choix de l'isolement).
+- Trace ouverte par MSISDN ou IMEI seulement : tant qu'aucun event rattaché par identité n'a appris le pseudonyme d'abonné, un event rattaché par identifiant technique qui le porte est rejeté.
+
+### OUVERT
+
+- **Le chemin exact du lab n'est pas identifié.** La mesure demandée à ANR1 (premier event de B dans le SSE de A, bloc `seed`) le dira. Les compteurs `rejects.foreign_subscriber`, `rejects.stale_state_resets`, `fresh_registrations` et `pfcp.attached_after_the_fact` de A et de B sont à relever au prochain G9.
+- **Events sans identité** : un event d'un autre abonné reconnu par un tunnel ou un SEID périmé et qui ne porte aucun pseudonyme (PDU Session Resource Setup, G-PDU, PFCP) est encore rattaché, jusqu'au premier event qui porte une identité. Borné par les points 3 et 4, pas fermé.
+- Pas de plan usager dans la capture du dépôt : l'effet sur les G-PDU n'est pas vérifié sur données réelles.
+- 4G : `Attach Request` traité comme l'enregistrement 5G ; aucun test sur capture réelle 4G à plusieurs UE.
+- Amorçage dans l'ordre du temps : non fait (question 1).
+- Désenregistrement « switch-off » (sans `Deregistration Accept`) : la trace ne voit qu'une libération de contexte et garde les sessions ; c'est le correctif 3 qui nettoie au prochain enregistrement.
+
+### Tests — échec avant, succès après
+
+- `simultaneous_traces_and_reassigned_identifiers_never_cross_subscribers_2_21_129` (capture réelle, cinq traces dans un registre) : dialogues entrelacés à 10 ms → 70 / 68 / 67 / 69 / 65, 0 étranger, 0 manquant ; historique amorcé puis identifiants réattribués → 0 étranger, 0 pseudonyme tiers, 0 manquant, mêmes comptes que sans historique. Garde et point 3 coupés : 65 à 70 étrangers par trace, pseudonyme tiers exposé.
+- `a_pfcp_of_an_older_session_is_never_attached_after_the_fact_2_21_129` : le PFCP d'une ancienne session portant le même tunnel n'est ni émis ni appris ; celui du moment l'est. Sans la borne : le PFCP ancien est émis, l'IP UE de l'autre abonné apprise, son SIP rattaché.
+- `multi-imsi.pcap` : toujours 70 / 68 / 67 / 69 / 65, 339 + 183 = 522.
+
 ## oiran-api 2.21.126 — 2026-11-21 — trace live : SIP rattaché par l'adresse IP de l'UE, IP apprise aussi sur le PFCP et oubliée avec sa session ; ordre des events d'un même paquet indépendant du nom du segment (ordres #9 7053030106, 7053229737, 7053683830)
 
 Upgrade **patch** sans déploiement, un commit au-dessus de la fusion de 2.21.125 dans le train (`6606d91`). Branches `fix/oiran-2.21.126-sip-by-ue-ip` et `fix/oiran-2.21.121-train`. Seul `apps/api/src/live_trace.rs` change.
