@@ -5345,7 +5345,12 @@ impl CaptureManager {
         if next.exists() {
             fs::remove_dir_all(&next).map_err(display_error)?;
         }
-        refuse_fragmented_dataset(&current, "RESTORE_REFUSED_FRAGMENTED_DATASET")?;
+        // 2.21.147 — jeu en fragments : l'archive est ajoutée comme un
+        // fragment de plus, par le chemin de publication des cycles. Le
+        // jeu n'est ni refondu en fichier plat ni remplacé.
+        if refuse_fragmented_dataset(&current, "RESTORE_REFUSED_FRAGMENTED_DATASET").is_err() {
+            return self.restore_archive_as_fragment(&base, &current, &next, archive_segment_dir);
+        }
         let current_events = current.join("oiran_events.jsonl");
         if !current_events.is_file() {
             return Err(format!(
@@ -5450,6 +5455,153 @@ impl CaptureManager {
             session_ids: dataset.session_ids.clone(),
             events_sha256,
         })
+    }
+
+    /// 2.21.147 (essai hors lab d'archivage, #9 7085580313 ; ordre cœur
+    /// #9 7085626859) — restauration d'un segment d'archive dans un jeu
+    /// EN FRAGMENTS. Avant 2.21.146 la restauration ne lisait que le
+    /// fichier plat et supprimait les fragments ; 2.21.146 la faisait
+    /// refuser. Elle fait maintenant ce qu'un cycle fait d'un segment
+    /// nouveau :
+    ///
+    /// * les fragments du manifeste restent où ils sont, immuables ;
+    /// * les events de l'archive deviennent un fragment
+    ///   `event-shards/shard-restored-<sha16>.jsonl`, placé EN TÊTE de
+    ///   la liste : ce sont les events les plus anciens, et la passe des
+    ///   représentants donne raison au dernier observé ;
+    /// * sessions, corrélation et call flows sont republiés par le
+    ///   chemin normal, puis commités comme un cycle incrémental.
+    ///
+    /// Rien n'est remplacé ni supprimé : il n'y a pas de
+    /// `.dataset-previous`. Idempotente : si un fragment du manifeste a
+    /// déjà l'empreinte de l'archive, elle ne fait rien.
+    fn restore_archive_as_fragment(
+        &self,
+        base: &Path,
+        current: &Path,
+        next: &Path,
+        archive_segment_dir: &Path,
+    ) -> Result<DatasetRestoreReport, String> {
+        let archive_events = archive_segment_dir.join("events.jsonl");
+        if !archive_events.is_file() {
+            return Err(format!(
+                "RESTORE_MISSING_ARCHIVE_EVENTS: {}",
+                archive_events.display()
+            ));
+        }
+        let archive_sha = sha256_hex_file(&archive_events)?;
+        let archive_manifest_path = archive_segment_dir.join("manifest.json");
+        if archive_manifest_path.is_file() {
+            let manifest: Value =
+                serde_json::from_slice(&fs::read(&archive_manifest_path).map_err(display_error)?)
+                    .map_err(|error| error.to_string())?;
+            if let Some(expected) = manifest.get("events_sha256").and_then(Value::as_str) {
+                if archive_sha != expected {
+                    return Err(format!(
+                        "RESTORE_ARCHIVE_TAMPERED: manifest sha {expected} != actual {archive_sha}"
+                    ));
+                }
+            }
+        }
+        // Le manifeste courant doit être lisible et cohérent avec ses
+        // fichiers : la restauration s'appuie dessus, elle ne devine rien.
+        let prior: LiveDataset = serde_json::from_slice(
+            &fs::read(current.join("dataset_manifest.json")).map_err(display_error)?,
+        )
+        .map_err(|error| format!("RESTORE_FRAGMENTED_MANIFEST_INVALID: {error}"))?;
+        validate_dataset_artifacts(&prior, current)
+            .map_err(|error| format!("RESTORE_FRAGMENTED_MANIFEST_INVALID: {error}"))?;
+        for shard in &prior.event_shards {
+            if !current.join(&shard.path).is_file() {
+                return Err(format!(
+                    "RESTORE_FRAGMENT_MISSING: {} est référencé par le manifeste et absent du disque ; rien n'a été modifié",
+                    shard.path
+                ));
+            }
+        }
+        let archive_event_count = count_valid_event_records(&archive_events)?;
+        let event_count_before = prior.event_count;
+        let report = |dataset: &LiveDataset, overlap_event_count: usize| DatasetRestoreReport {
+            schema_version: "2.21.147",
+            archive_segment_dir: archive_segment_dir.display().to_string(),
+            dataset_dir: current.display().to_string(),
+            event_count_before,
+            archive_event_count,
+            overlap_event_count,
+            // En mode fragments le recouvrement est compté, pas listé.
+            overlap_event_ids: Vec::new(),
+            event_count_after: dataset.event_count,
+            session_ids: dataset.session_ids.clone(),
+            events_sha256: archive_sha.clone(),
+        };
+        // Idempotence : cette archive est déjà un fragment du jeu.
+        if prior.event_shards.iter().any(|shard| shard.sha256 == archive_sha) {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "DATASET_RESTORE_ALREADY_PRESENT",
+                    "archive_sha256_prefix": &archive_sha[..16],
+                })
+            );
+            return Ok(report(&prior, archive_event_count));
+        }
+        prepare_dataset_directory(next)?;
+        let restored_name = format!("event-shards/shard-restored-{}.jsonl", &archive_sha[..16]);
+        let restored_path = next.join(&restored_name);
+        fs::create_dir_all(next.join("event-shards")).map_err(display_error)?;
+        fs::copy(&archive_events, &restored_path).map_err(display_error)?;
+        let restored = EventShard {
+            path: restored_name,
+            sha256: archive_sha.clone(),
+            bytes: fs::metadata(&restored_path).map_err(display_error)?.len(),
+            event_count: archive_event_count,
+        };
+        // Les fragments en place sont référencés par des liens, comme
+        // dans un cycle : aucun n'est ouvert en écriture ni déplacé.
+        for shard in &prior.event_shards {
+            let source = current.join(&shard.path);
+            let target = next.join(&shard.path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(display_error)?;
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&source, &target).map_err(|error| {
+                format!("CONTINUOUS_SHARD_REFERENCE {}: {error}", source.display())
+            })?;
+            #[cfg(not(unix))]
+            fs::copy(&source, &target).map_err(display_error)?;
+        }
+        let mut event_shards = vec![restored.clone()];
+        event_shards.extend(prior.event_shards.iter().cloned());
+        let event_paths: Vec<PathBuf> = event_shards.iter().map(|shard| next.join(&shard.path)).collect();
+        let published = self.publish_events_to_dataset_dir(
+            CONTINUOUS_CAPTURE_ID,
+            CONTINUOUS_DATASET_ID.into(),
+            next,
+            format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
+            Some((current.to_path_buf(), prior.clone())),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            Some(&event_paths),
+            event_shards,
+            restored.bytes,
+            None,
+        );
+        let dataset = match published {
+            Ok(dataset) => dataset,
+            Err(error) => {
+                let _ = fs::remove_dir_all(next);
+                return Err(error);
+            }
+        };
+        let dataset = commit_incremental_publication(current, next, dataset)?;
+        self.upsert_dataset(dataset.clone(), current)?;
+        let _ = base;
+        let overlap = event_count_before
+            .saturating_add(archive_event_count)
+            .saturating_sub(dataset.event_count);
+        Ok(report(&dataset, overlap))
     }
 
     /// 2.8.4 (#9 comment 6705466743): historical repair driven by the
@@ -22874,22 +23026,41 @@ Content-Length: 0\r\n\
     }
     // ===== 2.21.146 — restauration et réparation : refus d'un jeu en fragments, jeu précédent gardé =====
 
-    /// 2.21.146 (essai hors lab d'archivage, #9 7085572347 et 7085580313 ;
-    /// ordre cœur #9 7085626859) — l'« aller » de l'archivage, sur la
-    /// forme du lab : un fichier plat hérité hors de `event-shards/`,
-    /// puis des fragments. La rétention archive les captures anciennes
-    /// sans rien détruire ; les sessions restantes gardent leur id ; le
-    /// cycle suivant est sain et la reprise de 2.21.143 est active.
-    /// Puis le garde : la restauration et la réparation REFUSENT ce jeu
-    /// en fragments et ne modifient rien. Avant : la restauration
-    /// republiait le seul fichier plat et supprimait les fragments.
-    #[test]
-    fn archiving_keeps_the_remaining_sessions_and_restore_refuses_a_fragmented_dataset_2_21_146() {
+    /// Jeu de la forme du lab, archivé : un fichier plat hérité (cinq
+    /// abonnés, capture d'août) hors de `event-shards/`, un fragment
+    /// (un autre UE, octobre), puis la rétention un cycle, puis un cycle
+    /// de plus sans rétention.
+    struct ArchivedLabShapedDataset {
+        manager: CaptureManager,
+        base: PathBuf,
+        segment: PathBuf,
+        /// Sessions des cinq abonnés archivés.
+        old_sessions: BTreeSet<String>,
+        /// Session restée dans le jeu après l'archivage.
+        remaining: BTreeSet<String>,
+        /// Avant l'archivage : SHA du call flow de chaque session, et events.
+        flows_before: BTreeMap<String, String>,
+        events_before: usize,
+        old_events: usize,
+    }
+
+    fn flow_shas_2_21_146(dataset_dir: &Path) -> BTreeMap<String, String> {
+        let manifest: LiveDataset =
+            serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap()).unwrap();
+        let callflows = dataset_callflows_dir(dataset_dir, &manifest);
+        manifest
+            .session_ids
+            .iter()
+            .map(|id| (id.clone(), sha256_hex(&fs::read(callflows.join(format!("{id}.json"))).unwrap())))
+            .collect()
+    }
+
+    fn archived_lab_shaped_dataset_2_21_146(label: &str) -> ArchivedLabShapedDataset {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let five = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
         let registration = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-registration.pcap");
         let one = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
-        let root = temporary_root("archive-then-restore-refused");
+        let root = temporary_root(label);
         let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
         // Chemin de production : relecture des fragments.
         manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
@@ -22910,13 +23081,7 @@ Content-Length: 0\r\n\
         let manifest = || -> LiveDataset {
             serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap()).unwrap()
         };
-        let fragment_files = || -> BTreeSet<String> {
-            fs::read_dir(dataset_dir.join("event-shards"))
-                .map(|dir| dir.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect())
-                .unwrap_or_default()
-        };
-        // Cycle 0 : cinq abonnés (capture d'août), mis en forme héritée :
-        // un fichier plat, manifeste sans fragments.
+        // Cycle 0 : cinq abonnés, mis en forme héritée (fichier plat, manifeste sans fragments).
         cycle(&[("N2.pcap-five.pcapng", five.clone()), ("N4.pcap-five.pcapng", five.clone())]);
         {
             let manifest_path = dataset_dir.join("dataset_manifest.json");
@@ -22933,13 +23098,14 @@ Content-Length: 0\r\n\
         let old_sessions: BTreeSet<String> = manifest().session_ids.into_iter().collect();
         assert_eq!(old_sessions.len(), 5);
         let old_events = manifest().event_count;
-        // Cycle 1 : un autre UE (capture d'octobre) — fichier plat + fragment, comme au lab.
+        // Cycle 1 : un autre UE — fichier plat + fragment, comme au lab.
         cycle(&[("N2.pcap-one.pcapng", one.join("N2.pcapng")), ("N4.pcap-one.pcapng", one.join("N4.pcapng"))]);
         let before = manifest();
         assert_eq!(before.event_shards[0].path, "oiran_events.jsonl", "le fichier plat est le premier fragment");
         assert!(before.event_shards[1].path.starts_with("event-shards/"));
         let remaining: BTreeSet<String> = before.session_ids.iter().filter(|id| !old_sessions.contains(*id)).cloned().collect();
         assert_eq!(remaining.len(), 1);
+        let flows_before = flow_shas_2_21_146(&dataset_dir);
         // Rétention posée (coupure entre août et octobre), un cycle.
         TEST_RETENTION_DAYS.with(|value| value.set(Some(60)));
         cycle(&[("N3.pcap-one.pcapng", one.join("N3.pcapng"))]);
@@ -22964,25 +23130,166 @@ Content-Length: 0\r\n\
         let (reused, rebuilt, _) = *manager.last_callflow_reuse.lock().unwrap();
         assert_eq!((reused, rebuilt), (1, 1), "la session restante est reprise, la nouvelle construite");
         assert!(manifest().session_ids.iter().any(|id| remaining.contains(id)));
-        // Le garde : restauration et réparation refusent, sans rien modifier.
+        ArchivedLabShapedDataset {
+            manager,
+            segment: segments[0].clone(),
+            base,
+            old_sessions,
+            remaining,
+            flows_before,
+            events_before: before.event_count,
+            old_events,
+        }
+    }
+
+    /// 2.21.146 (essai hors lab d'archivage, #9 7085572347 et 7085580313 ;
+    /// ordre cœur #9 7085626859) — l'« aller » de l'archivage, sur la
+    /// forme du lab (vérifié par `archived_lab_shaped_dataset_2_21_146`) :
+    /// la rétention archive les captures anciennes sans rien détruire,
+    /// les sessions restantes gardent leur id, le cycle suivant est sain
+    /// et la reprise de 2.21.143 est active. Puis le garde : la
+    /// RÉPARATION, qui ne lit toujours que le fichier plat, refuse ce
+    /// jeu en fragments et ne modifie rien. (La restauration, elle,
+    /// reprend les fragments depuis 2.21.147.)
+    #[test]
+    fn archiving_keeps_the_remaining_sessions_and_repair_refuses_a_fragmented_dataset_2_21_146() {
+        let lab = archived_lab_shaped_dataset_2_21_146("archive-then-repair-refused");
+        let dataset_dir = lab.base.join("dataset");
+        let fragment_files = || -> BTreeSet<String> {
+            fs::read_dir(dataset_dir.join("event-shards"))
+                .map(|dir| dir.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default()
+        };
         let manifest_bytes = fs::read(dataset_dir.join("dataset_manifest.json")).unwrap();
         let fragments = fragment_files();
         assert!(fragments.len() >= 2);
-        let restore = manager.restore_from_archive_segment(&segments[0]).unwrap_err();
-        assert!(restore.starts_with("RESTORE_REFUSED_FRAGMENTED_DATASET"), "{restore}");
         for dry_run in [true, false] {
-            let repair = manager.repair_partial_imports(dry_run, None).unwrap_err();
+            let repair = lab.manager.repair_partial_imports(dry_run, None).unwrap_err();
             assert!(repair.starts_with("REPAIR_REFUSED_FRAGMENTED_DATASET"), "{repair}");
         }
         assert_eq!(fs::read(dataset_dir.join("dataset_manifest.json")).unwrap(), manifest_bytes, "manifeste intact");
         assert_eq!(fragment_files(), fragments, "aucun fragment perdu");
-        let leftovers: Vec<String> = fs::read_dir(&base)
+        let leftovers: Vec<String> = fs::read_dir(&lab.base)
             .unwrap()
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".dataset-previous") || name == ".dataset-next")
             .collect();
         assert!(leftovers.is_empty(), "le refus ne laisse rien derrière lui : {leftovers:?}");
+    }
+
+    /// 2.21.147 (ordre cœur #9 7085626859, point 3) — aller-retour
+    /// complet sur la forme du lab : après archivage puis un cycle de
+    /// plus, la restauration du segment d'archive remet les sessions
+    /// archivées SANS rien perdre de ce qui a été publié depuis. Les
+    /// fragments en place ne sont ni déplacés ni supprimés, les ids
+    /// d'avant l'archivage reviennent à l'identique, leurs call flows
+    /// aussi, et une seconde restauration ne change rien. Avant
+    /// 2.21.146 : seuls les events de l'archive restaient, les
+    /// fragments étaient supprimés ; en 2.21.146 : refus.
+    #[test]
+    fn restoring_an_archive_into_a_fragmented_dataset_loses_nothing_2_21_147() {
+        let lab = archived_lab_shaped_dataset_2_21_146("archive-then-restore-round-trip");
+        let dataset_dir = lab.base.join("dataset");
+        let manifest = || -> LiveDataset {
+            serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap()).unwrap()
+        };
+        let fragment_shas = || -> BTreeMap<String, String> {
+            fs::read_dir(dataset_dir.join("event-shards"))
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .map(|entry| (entry.file_name().to_string_lossy().into_owned(), sha256_hex(&fs::read(entry.path()).unwrap())))
+                .collect()
+        };
+        let archived = manifest();
+        let archived_sessions: BTreeSet<String> = archived.session_ids.iter().cloned().collect();
+        let since: BTreeSet<String> = archived_sessions.difference(&lab.remaining).cloned().collect();
+        assert_eq!(since.len(), 1, "une session publiée depuis l'archivage");
+        let fragments_before = fragment_shas();
+        let events_since_archive = archived.event_count;
+        // La restauration.
+        let report = lab.manager.restore_from_archive_segment(&lab.segment).unwrap();
+        assert_eq!(report.schema_version, "2.21.147");
+        assert_eq!(report.event_count_before, events_since_archive);
+        assert_eq!(report.archive_event_count, lab.old_events);
+        let restored = manifest();
+        let restored_sessions: BTreeSet<String> = restored.session_ids.iter().cloned().collect();
+        // Rien de perdu : les sessions archivées reviennent, celles d'après restent.
+        assert!(lab.old_sessions.is_subset(&restored_sessions), "les cinq sessions archivées reviennent avec leur id");
+        assert!(lab.remaining.is_subset(&restored_sessions), "la session restante garde son id");
+        assert!(since.is_subset(&restored_sessions), "la session publiée depuis l'archivage est toujours là");
+        assert_eq!(restored_sessions.len(), 7, "5 archivées + 1 restante + 1 publiée depuis");
+        assert_eq!(restored.event_count, lab.old_events + events_since_archive, "tous les events : archive + jeu courant");
+        assert!(restored.event_count > lab.events_before, "plus que l'état d'avant l'archivage : ce qui a été publié depuis");
+        // Les fragments en place : inchangés, octet pour octet ; l'archive en est un de plus, en tête.
+        let fragments_after = fragment_shas();
+        for (name, sha) in &fragments_before {
+            assert_eq!(fragments_after.get(name), Some(sha), "fragment {name} intact");
+        }
+        assert_eq!(fragments_after.len(), fragments_before.len() + 1);
+        assert!(restored.event_shards[0].path.starts_with("event-shards/shard-restored-"), "l'archive, plus ancienne, est en tête");
+        assert_eq!(restored.event_shards.len(), archived.event_shards.len() + 1);
+        // Les call flows des sessions archivées reviennent tels qu'avant l'archivage.
+        let flows_after = flow_shas_2_21_146(&dataset_dir);
+        for id in &lab.old_sessions {
+            assert_eq!(flows_after.get(id), lab.flows_before.get(id), "call flow de {id} identique à celui d'avant l'archivage");
+        }
+        // Rien n'a été remplacé : pas de jeu précédent, pas de préparation oubliée.
+        let leftovers: Vec<String> = fs::read_dir(&lab.base)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".dataset-previous") || name == ".dataset-next")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // Idempotence : une seconde restauration ne change rien.
+        let manifest_bytes = fs::read(dataset_dir.join("dataset_manifest.json")).unwrap();
+        let again = lab.manager.restore_from_archive_segment(&lab.segment).unwrap();
+        assert_eq!(again.event_count_after, restored.event_count);
+        assert_eq!(again.session_ids, restored.session_ids);
+        assert_eq!(fs::read(dataset_dir.join("dataset_manifest.json")).unwrap(), manifest_bytes, "manifeste inchangé");
+        assert_eq!(fragment_shas(), fragments_after, "aucun fragment ajouté ni retiré");
+        // Le cycle suivant reste sain.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = lab.base.join("pcap").join("N2.pcap-e2e.pcapng");
+        fs::copy(workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-e2e.pcap"), &path).unwrap();
+        lab.manager
+            .process_continuous_capture_selected(&lab.base, &interface_specs(), 1024 * 1024 * 1024, &BTreeSet::from([path]))
+            .unwrap();
+        let next: BTreeSet<String> = manifest().session_ids.into_iter().collect();
+        assert!(restored_sessions.is_subset(&next), "le cycle suivant garde tout");
+    }
+
+    /// 2.21.147 — refus explicites de la restauration en mode fragments :
+    /// archive altérée, fragment référencé absent du disque. Rien n'est
+    /// modifié.
+    #[test]
+    fn restore_into_fragments_fails_closed_2_21_147() {
+        let lab = archived_lab_shaped_dataset_2_21_146("archive-then-restore-fails-closed");
+        let dataset_dir = lab.base.join("dataset");
+        let manifest_bytes = fs::read(dataset_dir.join("dataset_manifest.json")).unwrap();
+        // Archive altérée.
+        let tampered = lab.base.join("archive-tampered");
+        fs::create_dir_all(&tampered).unwrap();
+        fs::copy(lab.segment.join("manifest.json"), tampered.join("manifest.json")).unwrap();
+        let mut events = fs::read(lab.segment.join("events.jsonl")).unwrap();
+        events.extend_from_slice(b"\n");
+        fs::write(tampered.join("events.jsonl"), &events).unwrap();
+        let error = lab.manager.restore_from_archive_segment(&tampered).unwrap_err();
+        assert!(error.starts_with("RESTORE_ARCHIVE_TAMPERED"), "{error}");
+        // Fragment référencé absent : déplacé hors du jeu, puis remis.
+        let manifest: LiveDataset = serde_json::from_slice(&manifest_bytes).unwrap();
+        let shard = dataset_dir.join(&manifest.event_shards[0].path);
+        let aside = lab.base.join("fragment-mis-de-cote.jsonl");
+        fs::rename(&shard, &aside).unwrap();
+        let error = lab.manager.restore_from_archive_segment(&lab.segment).unwrap_err();
+        assert!(error.starts_with("RESTORE_FRAGMENT") , "{error}");
+        fs::rename(&aside, &shard).unwrap();
+        assert_eq!(fs::read(dataset_dir.join("dataset_manifest.json")).unwrap(), manifest_bytes, "manifeste intact");
+        assert!(!lab.base.join(".dataset-next").exists());
+        // Remis en état, la restauration fonctionne.
+        lab.manager.restore_from_archive_segment(&lab.segment).unwrap();
     }
 
     /// 2.21.146 — sur un jeu SANS fragments (fichier plat seul), la

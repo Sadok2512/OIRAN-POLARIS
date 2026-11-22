@@ -1,5 +1,37 @@
 # Changelog
 
+## oiran-api 2.21.147, live-probe 0.6.34 — 2026-11-22 — restauration d'une archive dans un jeu en fragments : rien n'est perdu
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.146 @ `3f9abd3` (branche `fix/oiran-2.21.147-restore-fragments`). Ordre du cœur #9 7085626859, point 3 ; défaut décrit en #9 7085580313.
+
+### Ce qui change
+
+Sur un jeu en fragments, `restore_from_archive_segment` (outil `dataset-restore`) ne refuse plus (2.21.146) : elle fait d'un segment d'archive ce qu'un cycle fait d'un segment nouveau.
+
+- Les fragments du manifeste restent où ils sont, immuables ; ils sont référencés par des liens pendant la préparation, comme dans un cycle.
+- Les events de l'archive deviennent un fragment `event-shards/shard-restored-<sha16>.jsonl`, placé **en tête** de la liste des fragments : ce sont les events les plus anciens, et la passe des représentants donne raison au dernier observé.
+- Sessions, corrélation et call flows sont republiés par le chemin normal, puis commités comme un cycle incrémental. La reprise de 2.21.143 s'applique : seules les sessions touchées par l'archive sont reconstruites.
+- **Rien n'est remplacé ni supprimé** : pas de fichier plat refondu, pas de `.dataset-previous`.
+- **Idempotente** : si un fragment du manifeste a déjà l'empreinte de l'archive, elle ne fait rien (événement `DATASET_RESTORE_ALREADY_PRESENT`).
+- **Échec fermé**, avant toute écriture : archive altérée (`RESTORE_ARCHIVE_TAMPERED`), manifeste courant illisible ou incohérent avec ses fichiers (`RESTORE_FRAGMENTED_MANIFEST_INVALID`), fragment référencé absent du disque (`RESTORE_FRAGMENT_MISSING`).
+- Sur un jeu sans fragments (fichier plat seul), le chemin d'origine est inchangé, avec la garde du jeu remplacé de 2.21.146.
+- `repair_partial_imports` refuse toujours un jeu en fragments (2.21.146) : il n'est pas repris dans ce lot.
+
+Le rapport de restauration garde sa forme. En mode fragments, `schema_version` vaut `2.21.147`, `overlap_event_ids` est vide (le recouvrement est compté dans `overlap_event_count`, pas listé) et `events_sha256` est l'empreinte de l'archive.
+
+### Tests
+
+- `restoring_an_archive_into_a_fragmented_dataset_loses_nothing_2_21_147` — aller-retour complet sur la forme du lab (fichier plat hérité + fragments → rétention un cycle → un cycle de plus → restauration) : les cinq sessions archivées reviennent **avec leur id et leur call flow d'avant l'archivage** (SHA identiques), la session restante garde son id, la session publiée depuis l'archivage est toujours là ; le nombre d'events est celui de l'archive plus celui du jeu courant ; chaque fragment en place est inchangé octet pour octet ; aucun `.dataset-previous` ni `.dataset-next` ; une seconde restauration ne change ni le manifeste ni les fragments ; le cycle suivant garde tout. Échec quand la restauration reprend l'ancien chemin (mutation).
+- `restore_into_fragments_fails_closed_2_21_147` — archive altérée, fragment référencé absent : refus, rien de modifié.
+- `archiving_keeps_the_remaining_sessions_and_repair_refuses_a_fragmented_dataset_2_21_146` — le test de 2.21.146, recentré sur la réparation, qui refuse toujours.
+
+### OUVERT
+
+- **Non essayé à l'échelle du lab** : une restauration du monolithe (1,55 million d'events, 3,4 Go) relancerait une publication sur tout le jeu, au coût d'avant l'archivage (de l'ordre de dix minutes et du plafond mémoire).
+- L'id des sessions restantes n'a pas changé dans l'essai ; il peut changer au lab si un triplet d'identifiants NGAP a servi avant et après la coupure (voir #9 7085802896).
+- `dataset-repair-partial-imports` reste sans équivalent en mode fragments.
+- Le test d'intégration du binaire `dataset-restore` ne construit qu'un jeu à fichier plat ; le mode fragments est couvert par les tests de la bibliothèque.
+
 ## oiran-api 2.21.146, live-probe 0.6.33 — 2026-11-22 — restauration et réparation : refus d'un jeu en fragments, plus aucune suppression du jeu remplacé
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.144 @ `1bda06d` (branche `fix/oiran-2.21.146-restore-refuses-fragments`). Essai hors lab d'archivage (#9 7085572347, corrigé par #9 7085580313) : **FAIL sur la restauration**. Ordre du cœur #9 7085626859 : désarmer d'abord. La restauration correcte en mode fragments est le lot suivant (2.21.147).
