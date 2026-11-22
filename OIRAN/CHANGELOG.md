@@ -1,5 +1,25 @@
 # Changelog
 
+## oiran-api 2.21.141 — 2026-11-22 — trace live : le débit n'évince plus les messages du tampon de rejeu
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.140 @ `7b2bf0a` (branche `fix/oiran-2.21.141-replay-buffer-quotas`). GO cœur #9 7083987761 : « je ne veux pas que le débit évince les messages ». Aucun crate partagé modifié.
+
+### Cause
+
+Le tampon de rejeu d'une trace avait un seul plafond de 2 000 events, toutes classes confondues. Un point de débit par seconde en remplit 1 800 en 30 minutes : les messages du début de la trace sortaient, et la réouverture (2.21.139) ne rejouait presque plus que du débit.
+
+### Correctif
+
+Un quota par classe (`TraceState::buffer`) : signalisation — messages, procédures, `ue_info`, marqueurs — 2 000 ; débit 1 800 (30 minutes à un point par seconde) ; instantanés `stats` 8. Au dépassement, c'est le plus ancien event **de la même classe** qui sort. Les sept points de remplissage passent par cette fonction ; les quatre boucles de troncature globale sont retirées. Mémoire bornée à 3 808 events par trace (2 000 avant), 10 traces au plus.
+
+### Test
+
+`throughput_points_never_evict_signalling_from_the_replay_buffer_2_21_141` : 100 messages et leurs procédures, puis 3 000 points de débit et 600 `stats` → les 100 messages sont toujours là, 1 800 points de débit (les plus récents), 8 `stats` ; puis 2 000 messages de plus → le plus ancien message sort, le débit n'est pas touché ; total = somme des quotas. Avant (une seule classe, par mutation) : échec.
+
+### OUVERT
+
+- Une trace qui émet plus de 2 000 events de signalisation perd toujours les plus anciens au rejeu ; le compteur `messages` de la trace, lui, reste exact.
+
 ## oiran-api 2.21.140 — 2026-11-22 — `/sessions/filter` : la recherche d'un pseudonyme est servie par l'index, sans relire les call flows
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.139 @ `d9de83f` (branche `fix/oiran-2.21.140-filter-pseudonym-index`). Recette de référence ANR2 (#10 7083623180) : « un filtre historique large sur la même cible dépasse 30 s ». Audit #9 7083792263. Aucun crate partagé modifié.

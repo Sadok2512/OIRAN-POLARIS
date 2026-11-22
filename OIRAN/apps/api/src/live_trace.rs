@@ -20,6 +20,12 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 const MAX_TRACES: usize = 10;
 const MAX_EVENTS: usize = 2_000;
+/// 2.21.141 — quota du tampon de rejeu réservé aux points de débit :
+/// 30 minutes à un point par seconde. Les messages, procédures,
+/// `ue_info` et marqueurs gardent `MAX_EVENTS` pour eux seuls.
+const MAX_THROUGHPUT_EVENTS: usize = 1_800;
+/// 2.21.141 — quota des instantanés `stats` : seuls les derniers servent.
+const MAX_STATS_EVENTS: usize = 8;
 
 #[derive(Clone, Serialize)]
 pub(crate) struct LiveTrace {
@@ -426,6 +432,57 @@ impl MatchKeys {
 impl FromIterator<String> for MatchKeys {
     fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
+    }
+}
+
+/// 2.21.141 — classe d'un event du tampon de rejeu : chaque classe a
+/// son quota, pour qu'un flot régulier (un point de débit par seconde)
+/// n'évince jamais la signalisation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BufferClass {
+    Signalling,
+    Throughput,
+    Stats,
+}
+
+impl BufferClass {
+    fn of(kind: &str) -> Self {
+        match kind {
+            "throughput" => Self::Throughput,
+            "stats" => Self::Stats,
+            _ => Self::Signalling,
+        }
+    }
+    fn quota(self) -> usize {
+        match self {
+            Self::Signalling => MAX_EVENTS,
+            Self::Throughput => MAX_THROUGHPUT_EVENTS,
+            Self::Stats => MAX_STATS_EVENTS,
+        }
+    }
+}
+
+impl TraceState {
+    /// 2.21.141 (GO cœur #9 7083987761) — ajoute un event au tampon de
+    /// rejeu. Avant : un seul plafond de `MAX_EVENTS` pour tout ; sur
+    /// une trace de 30 minutes, les 1 800 points de débit évinçaient
+    /// les messages les plus anciens, et la réouverture (2.21.139) ne
+    /// rejouait presque plus que du débit. Désormais chaque classe a
+    /// son quota : au dépassement, c'est le plus ancien event DE LA
+    /// MÊME CLASSE qui sort. Mémoire bornée à la somme des quotas.
+    fn buffer(&mut self, item: BufferedEvent) {
+        let class = BufferClass::of(&item.kind);
+        self.events.push_back(item);
+        let mut held = self.events.iter().filter(|e| BufferClass::of(&e.kind) == class).count();
+        while held > class.quota() {
+            match self.events.iter().position(|e| BufferClass::of(&e.kind) == class) {
+                Some(oldest) => {
+                    self.events.remove(oldest);
+                    held -= 1;
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -1454,15 +1511,12 @@ impl LiveTraceRegistry {
                     "flush": "idle",
                 }),
             };
-            state.events.push_back(rate.clone());
+            state.buffer(rate.clone());
             let _ = state.tx.send(rate);
             state.ul_bytes = 0;
             state.dl_bytes = 0;
             state.unknown_bytes = 0;
             state.throughput_second = 0;
-            while state.events.len() > MAX_EVENTS {
-                state.events.pop_front();
-            }
         }
     }
     #[cfg(test)]
@@ -1477,10 +1531,7 @@ impl LiveTraceRegistry {
             kind: kind.into(),
             payload,
         };
-        state.events.push_back(item.clone());
-        while state.events.len() > MAX_EVENTS {
-            state.events.pop_front();
-        }
+        state.buffer(item.clone());
         if kind == "message" {
             state.trace.messages += 1;
         }
@@ -2771,10 +2822,7 @@ impl LiveTraceRegistry {
                     kind: "message".into(),
                     payload,
                 };
-                state.events.push_back(item.clone());
-                while state.events.len() > MAX_EVENTS {
-                    state.events.pop_front();
-                }
+                state.buffer(item.clone());
                 let _ = state.tx.send(item);
             }
             let second = event.timestamp.seconds.max(0) as u64;
@@ -2796,7 +2844,7 @@ impl LiveTraceRegistry {
                             "packet_number": packet,
                         }),
                     };
-                    state.events.push_back(rate.clone());
+                    state.buffer(rate.clone());
                     let _ = state.tx.send(rate);
                     state.ul_bytes = 0;
                     state.dl_bytes = 0;
@@ -2823,7 +2871,7 @@ impl LiveTraceRegistry {
                     kind: "procedure".into(),
                     payload: json!({"procedure":procedure,"phase":"update","event_id":event.event_id,"capture_id":event.capture_id,"packet_number":packet}),
                 };
-                state.events.push_back(update.clone());
+                state.buffer(update.clone());
                 let _ = state.tx.send(update);
             }
             // 2.21.103 (ordre #9 7046282778) — `ue_info` émis UNIQUEMENT
@@ -2849,11 +2897,8 @@ impl LiveTraceRegistry {
                     // non-Serialize, `MatchKeys`), donc ne peuvent fuiter.
                     payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.exposed_keys,"capture_id":event.capture_id,"packet_number":packet}),
                 };
-                state.events.push_back(info.clone());
+                state.buffer(info.clone());
                 let _ = state.tx.send(info);
-                while state.events.len() > MAX_EVENTS {
-                    state.events.pop_front();
-                }
             }
         }
         drop(traces);
@@ -4106,7 +4151,7 @@ pub(crate) async fn marker(
         kind: "marker".into(),
         payload: json!({"label":marker.label,"created_at":epoch_seconds()}),
     };
-    s.events.push_back(item.clone());
+    s.buffer(item.clone());
     let _ = s.tx.send(item.clone());
     live_ok(json!({"event_id":item.id}))
 }
@@ -10621,5 +10666,56 @@ mod tests {
             }
         }
         assert_eq!(total_late, 5, "cinq sessions, cinq requêtes rattachées après coup");
+    }
+    /// 2.21.141 (GO cœur #9 7083987761) — le débit n'évince plus la
+    /// signalisation du tampon de rejeu : chaque classe a son quota et
+    /// perd son plus ancien event, jamais celui d'une autre classe.
+    /// Avant : un plafond commun de 2 000 ; après 30 minutes de débit,
+    /// les messages du début de la trace avaient disparu du rejeu.
+    #[test]
+    fn throughput_points_never_evict_signalling_from_the_replay_buffer_2_21_141() {
+        let mut trace = state(u64::MAX, false, vec!["psn-buffer".into()]);
+        let push = |trace: &mut TraceState, kind: &str| {
+            trace.next_id += 1;
+            let id = trace.next_id;
+            trace.buffer(BufferedEvent { id, kind: kind.into(), payload: json!({"n": id}) });
+        };
+        let count = |trace: &TraceState, kind: &str| trace.events.iter().filter(|e| e.kind == kind).count();
+        // Le début d'un run : 100 messages, leurs procédures, un ue_info, un marqueur.
+        for _ in 0..100 {
+            push(&mut trace, "message");
+            push(&mut trace, "procedure");
+        }
+        push(&mut trace, "ue_info");
+        push(&mut trace, "marker");
+        let first_message = trace.events.front().unwrap().id;
+        // Puis 50 minutes de débit, et des instantanés de stats.
+        for second in 0..3_000 {
+            push(&mut trace, "throughput");
+            if second % 5 == 0 {
+                push(&mut trace, "stats");
+            }
+        }
+        assert_eq!(count(&trace, "message"), 100, "aucun message évincé par le débit");
+        assert_eq!(count(&trace, "procedure"), 100);
+        assert_eq!(count(&trace, "ue_info"), 1);
+        assert_eq!(count(&trace, "marker"), 1);
+        assert_eq!(trace.events.front().unwrap().id, first_message, "le premier message est toujours là");
+        assert_eq!(count(&trace, "throughput"), MAX_THROUGHPUT_EVENTS, "30 minutes de débit gardées");
+        assert_eq!(count(&trace, "stats"), MAX_STATS_EVENTS);
+        // Ce sont les points de débit les plus récents qui restent.
+        let throughput_ids: Vec<u64> = trace.events.iter().filter(|e| e.kind == "throughput").map(|e| e.id).collect();
+        assert!(throughput_ids.windows(2).all(|pair| pair[0] < pair[1]), "ordre d'arrivée gardé");
+        assert_eq!(*throughput_ids.last().unwrap(), trace.next_id, "le dernier point de débit reçu est gardé");
+        // La signalisation a son propre plafond : au-delà, c'est son plus ancien event qui sort.
+        for _ in 0..MAX_EVENTS {
+            push(&mut trace, "message");
+        }
+        let signalling = trace.events.iter().filter(|e| BufferClass::of(&e.kind) == BufferClass::Signalling).count();
+        assert_eq!(signalling, MAX_EVENTS);
+        assert!(trace.events.iter().all(|e| e.id != first_message), "le plus ancien message est sorti");
+        assert_eq!(count(&trace, "throughput"), MAX_THROUGHPUT_EVENTS, "le débit n'est pas touché par la signalisation");
+        // Mémoire bornée : jamais plus que la somme des quotas.
+        assert_eq!(trace.events.len(), MAX_EVENTS + MAX_THROUGHPUT_EVENTS + MAX_STATS_EVENTS);
     }
 }
