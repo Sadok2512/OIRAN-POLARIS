@@ -2,7 +2,7 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { api, eligibleTrafficTargets, eventFailureDetail, filterAndSortHistory, filterScenarioDefinitions, humanActionReason, maskSubscriberIdentity, reportedState, secondsToDurationMs, targetedTrafficStartRequest, type ScenarioDefinition, type ScenarioState, type UeState } from './api';
+import { actionReasonMessages, api, eligibleTrafficTargets, eventFailureDetail, filterAndSortHistory, filterScenarioDefinitions, humanActionReason, maskSubscriberIdentity, reportedState, secondsToDurationMs, targetedTrafficStartRequest, type ScenarioDefinition, type ScenarioState, type UeState } from './api';
 import { Scenarios } from './main';
 
 describe('POLARIS Control shell', () => {
@@ -91,6 +91,35 @@ describe('POLARIS Control shell', () => {
     expect(humanActionReason('UE_CONTROL_VALIDATION_REQUIRED')).toContain('ouvrir UE Manager');
   });
 
+  it('C5 explains every emitted provisioning refusal with an actionable next step', () => {
+    const emittedRefusals = [
+      'SUBSCRIBER_PROVISIONING_REVIEW_REQUIRED',
+      'SHARED_UE_PROTECTED',
+      'PROTECTED_OR_UNAPPROVED_UE',
+      'LIVE_EXECUTION_NOT_CONFIGURED',
+      'UE_ALREADY_RUNNING',
+      'UE_CONTROL_VALIDATION_REQUIRED',
+      'UE_NOT_RUNNING',
+      'NOT_CONFIGURED',
+      'UE_NOT_REGISTERED',
+      'PDU_SESSION_NOT_ACTIVE',
+      'UE_RUNTIME_OWNERSHIP_NOT_VERIFIED',
+      'LTE_E2E_CERTIFICATION_REQUIRED',
+      'SRSRAN_LIVE_DISABLED',
+      'LTE_LIVE_GRANT_REQUIRED',
+      'LIVE_GRANT_REQUIRED',
+      'SRSRAN_CONTROLLER_OWNERSHIP_REQUIRED',
+      'LTE_ATTACH_OR_IP_NOT_OBSERVED',
+    ];
+    expect(Object.keys(actionReasonMessages)).toEqual(expect.arrayContaining(emittedRefusals));
+    for (const code of emittedRefusals) {
+      const message = humanActionReason(code);
+      expect(message).not.toBe(code.replaceAll('_', ' '));
+      expect(message).toMatch(/ouvrir|demander|vérifier/i);
+      expect(message).toMatch(/Action :/);
+    }
+  });
+
   it('C5 sorts History newest first and filters target or cause', () => {
     const row = (overrides:Partial<ScenarioState>):ScenarioState => ({ scenario_id:'scn', technology:'5G SA', simulator:'UERANSIM', started_at:'', started_at_epoch_s:1, ended_at_epoch_s:2, duration_seconds:1, configured_ues:1, registered_ues:1, active_pdu_sessions:1, traffic_state:'IDLE', packets_requested:0, packets_sent:0, terminal_result:null, cpu:'BOUNDED', memory:'BOUNDED', state:'COMPLETED', controller_owned:true, ...overrides });
     const rows=[row({job_id:'old',started_at_epoch_s:1}),row({job_id:'new',started_at_epoch_s:2,target_ue_pseudonym:'UE-LAB',terminal_result:'CAUSE_LISIBLE'})];
@@ -131,7 +160,7 @@ describe('POLARIS Control shell', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Mes scénarios' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Run My blocked scenario' }));
-    expect((await screen.findAllByText(/UE_CONTROL_VALIDATION_REQUIRED/)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/Validation Control requise/)).length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: 'Ouvrir la gestion des UE' })).toBeTruthy();
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/scenarios/start'))).toBe(false);
   });
