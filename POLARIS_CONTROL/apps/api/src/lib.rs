@@ -38,7 +38,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -3877,10 +3877,19 @@ fn log_http_refusal(
             "role": role,
         });
         if let Some(telemetry) = telemetry {
-            entry["error_code"] = json!(telemetry.error_code);
+            let error_code = safe_telemetry_code(&telemetry.error_code);
+            let target_pseudonym = telemetry
+                .target_pseudonym
+                .as_deref()
+                .map(|value| safe_telemetry_reference("psn", value));
+            let scenario_definition_id = telemetry
+                .scenario_definition_id
+                .as_deref()
+                .map(|value| safe_telemetry_reference("scenario", value));
+            entry["error_code"] = json!(error_code);
             entry["action"] = json!(telemetry.action);
-            entry["target_pseudonym"] = json!(telemetry.target_pseudonym);
-            entry["scenario_definition_id"] = json!(telemetry.scenario_definition_id);
+            entry["target_pseudonym"] = json!(target_pseudonym);
+            entry["scenario_definition_id"] = json!(scenario_definition_id);
         }
         let _ = writeln!(file, "{}", entry);
     }
@@ -7590,20 +7599,35 @@ fn certified_target_pseudonym(
         .map(|record| safe_telemetry_reference("psn", &record.profile.pseudonym))
 }
 
+fn telemetry_reference_is_sensitive(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let looks_like_identity = ["imsi", "supi", "msisdn", "imei"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || value
+            .chars()
+            .filter(|character| character.is_ascii_digit())
+            .count()
+            >= 10;
+    let looks_like_ipv4 = value
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .any(|candidate| candidate.contains('.') && candidate.parse::<Ipv4Addr>().is_ok());
+    let looks_like_ipv6 = value
+        .split(|character: char| {
+            !(character.is_ascii_hexdigit() || character == ':')
+        })
+        .any(|candidate| candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok());
+    looks_like_identity || looks_like_ipv4 || looks_like_ipv6
+}
+
 fn safe_telemetry_reference(prefix: &str, value: &str) -> String {
     let lower = value.to_ascii_lowercase();
-    let looks_like_identity = lower.starts_with("imsi")
-        || lower.starts_with("supi")
-        || lower.starts_with("msisdn")
-        || lower.starts_with("imei")
-        || (value.len() >= 10 && value.chars().all(|character| character.is_ascii_digit()));
-    let looks_like_address = value.parse::<Ipv4Addr>().is_ok();
     let trusted_shape = if prefix == "psn" {
         lower.starts_with("psn-") || lower.starts_with("ue-pseudonym-")
     } else {
         valid_job_id(value)
     };
-    if trusted_shape && !looks_like_identity && !looks_like_address {
+    if trusted_shape && !telemetry_reference_is_sensitive(value) {
         return value.to_string();
     }
     let digest = Sha256::digest(value.as_bytes());
@@ -7614,6 +7638,14 @@ fn safe_telemetry_reference(prefix: &str, value: &str) -> String {
     format!("{prefix}-{suffix}")
 }
 
+fn safe_telemetry_code(value: &str) -> String {
+    if telemetry_reference_is_sensitive(value) {
+        safe_telemetry_reference("error", value)
+    } else {
+        value.to_string()
+    }
+}
+
 fn certified_error_response(
     status: StatusCode,
     error_code: &str,
@@ -7621,9 +7653,15 @@ fn certified_error_response(
     scenario_definition_id: Option<String>,
     body: Value,
 ) -> Response {
+    let target_pseudonym = target_pseudonym
+        .as_deref()
+        .map(|value| safe_telemetry_reference("psn", value));
+    let scenario_definition_id = scenario_definition_id
+        .as_deref()
+        .map(|value| safe_telemetry_reference("scenario", value));
     let mut response = (status, Json(body)).into_response();
     response.extensions_mut().insert(ErrorTelemetry {
-        error_code: error_code.to_string(),
+        error_code: safe_telemetry_code(error_code),
         action: "START_CERTIFIED_TRAFFIC",
         target_pseudonym,
         scenario_definition_id,
@@ -7659,6 +7697,11 @@ fn record_certified_failure(
     scenario_definition_id: &str,
 ) {
     let now = epoch_seconds();
+    let target_pseudonym = target_pseudonym
+        .map(|value| safe_telemetry_reference("psn", value));
+    let scenario_definition_id =
+        safe_telemetry_reference("scenario", scenario_definition_id);
+    let error_code = safe_telemetry_code(error_code);
     runtime.history.push(json!({
         "job_id":format!("failure-{}", random_hex(8)),
         "scenario_id":scenario_definition_id,
@@ -10167,12 +10210,15 @@ fn aggregate_certified_errors(document: &str) -> Vec<Value> {
         {
             continue;
         }
+        let raw_error_code = entry["error_code"].as_str().unwrap_or_default();
+        let error_code = safe_telemetry_code(raw_error_code);
+        let target_pseudonym = entry["target_pseudonym"]
+            .as_str()
+            .map(|value| safe_telemetry_reference("psn", value))
+            .unwrap_or_else(|| "UNRESOLVED".to_string());
         let key = (
-            entry["error_code"].as_str().unwrap_or_default().to_string(),
-            entry["target_pseudonym"]
-                .as_str()
-                .unwrap_or("UNRESOLVED")
-                .to_string(),
+            error_code,
+            target_pseudonym,
             entry["action"].as_str().unwrap_or_default().to_string(),
             entry["status"].as_u64().unwrap_or_default(),
         );
@@ -15380,18 +15426,21 @@ async fn start_scenario(
             .into_response();
     };
     let requested_target = input.target_ue_id.clone().unwrap_or_else(|| "UE-01".into());
-    if !valid_job_id(scenario_id) {
-        return certified_error_response(
-            StatusCode::LOCKED,
-            "SCENARIO_NOT_CERTIFIED",
-            None,
-            None,
-            json!({"error":"SCENARIO_NOT_CERTIFIED"}),
-        );
-    }
     let telemetry_scenario_id = safe_telemetry_reference("scenario", scenario_id);
     let target_pseudonym =
         certified_target_pseudonym(&state, scenario_type, &requested_target);
+    if !valid_job_id(scenario_id) {
+        let mut runtime = state.runtime.lock().unwrap();
+        return certified_failure_response(
+            &state,
+            &mut runtime,
+            StatusCode::LOCKED,
+            "SCENARIO_NOT_CERTIFIED",
+            target_pseudonym,
+            &telemetry_scenario_id,
+            json!({"error":"SCENARIO_NOT_CERTIFIED"}),
+        );
+    }
     let scenario_target_valid = match scenario_type {
         "bounded-existing-ue-udp-v1" => requested_target == "UE-01" && !state.ue01_controller_owned,
         "bounded-controller-ue-udp-v1" => controller_owns_ue(&state, &requested_target),
@@ -20985,6 +21034,89 @@ mod p0_tests {
         let serialized = serde_json::to_string(record).unwrap();
         assert!(!serialized.contains("imsi-"));
         assert!(!serialized.contains("10.46."));
+    }
+
+    #[tokio::test]
+    async fn c6_adversarial_locked_invalid_job_is_recorded_failed() {
+        let test_state = state();
+        let application = app(test_state.clone());
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/scenarios/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from(
+                        json!({
+                            "scenario_id":"invalid job reference",
+                            "scenario_type":"bounded-existing-ue-udp-v1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        let runtime = test_state.runtime.lock().unwrap();
+        let failure = runtime
+            .history
+            .iter()
+            .find(|entry| entry["error_code"] == "SCENARIO_NOT_CERTIFIED")
+            .expect("every HTTP 423 Start refusal must enter History");
+        assert_eq!(failure["state"], "FAILED");
+        assert_eq!(failure["traffic_state"], "FAILED");
+        assert!(failure["scenario_definition_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("scenario-")));
+    }
+
+    #[test]
+    fn c6_adversarial_prefixed_sensitive_references_are_rehashed_everywhere() {
+        let identity = format!("psn-imsi-{}", "0".repeat(15));
+        let address = "psn-198.51.100.7";
+        let safe_identity = safe_telemetry_reference("psn", &identity);
+        let safe_address = safe_telemetry_reference("psn", address);
+        assert_ne!(safe_identity, identity);
+        assert_ne!(safe_address, address);
+        assert!(safe_identity.starts_with("psn-"));
+        assert!(safe_address.starts_with("psn-"));
+
+        let test_state = state();
+        {
+            let mut runtime = test_state.runtime.lock().unwrap();
+            record_certified_failure(
+                &test_state,
+                &mut runtime,
+                "CERTIFIED_TEST_FAILURE",
+                Some(&identity),
+                "certified-test-job",
+            );
+        }
+        let telemetry = ErrorTelemetry {
+            error_code: "CERTIFIED_TEST_FAILURE".into(),
+            action: "START_CERTIFIED_TRAFFIC",
+            target_pseudonym: Some(address.to_string()),
+            scenario_definition_id: Some("certified-test-job".into()),
+        };
+        log_http_refusal(
+            &test_state,
+            StatusCode::LOCKED,
+            &Method::POST,
+            "/api/v1/scenarios/start",
+            "operator",
+            Some(&telemetry),
+        );
+        let audit_document = fs::read_to_string(&test_state.audit_path).unwrap();
+        let aggregate = aggregate_certified_errors(&audit_document);
+        let history = serde_json::to_string(&test_state.runtime.lock().unwrap().history).unwrap();
+        let observed = format!("{audit_document}\n{history}\n{}", json!(aggregate));
+        assert!(!observed.contains(&identity));
+        assert!(!observed.contains(address));
     }
 
     #[test]
