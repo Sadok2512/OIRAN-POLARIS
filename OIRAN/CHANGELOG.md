@@ -1,5 +1,42 @@
 # Changelog
 
+## oiran-api 2.21.143, live-probe 0.6.32 — 2026-11-22 — publication continue : une session que le delta n'a pas touchée garde son call flow
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.142 @ `33c02c3` (branche `fix/oiran-2.21.143-callflow-reuse`). Premier lot de la publication proportionnelle au delta (design #9 7084281004, ventilation ANR1 #9 7084780948, ordre révisé #9 7084796963, audit #9 7084815615).
+
+### Pourquoi
+
+Ventilation d'un cycle au lab : 561 s pour **2 events** nouveaux, dont **262 s** dans les lots de call flows. Au-delà de 262 144 events indexés (699 929 au lab), chaque lot de 32 sessions relit tous les fragments (594 Mo, environ 27 s) puis réécrit ses call flows — les 425, à chaque cycle.
+
+### Ce qui change (`live-probe`)
+
+- **Clé de reprise par session PDU**, rangée au manifeste (`callflow_reuse_keys`) : empreinte des versions (`live-probe`, `session-engine`, `callflow-schema`, `callflow-renderer`, `correlation-engine`), de l'id de session, du pseudonyme du contexte, de l'ensemble des ids d'events et des arêtes de corrélation internes à cet ensemble.
+- **Une session est reprise** — ses deux fichiers recopiés du cycle précédent — si le manifeste précédent porte la même clé, si aucun de ses ids n'est dans le fragment ajouté par ce cycle, et si ses fichiers existent. Sinon elle est reconstruite comme avant.
+- Sur le chemin « relecture des fragments », la reprise est décidée **avant** toute relecture : les lots ne portent que les sessions à reconstruire ; s'il n'y en a aucune, les fragments ne sont pas relus.
+- Sur le chemin en mémoire, la clé se calcule sur les events réellement choisis (ils comprennent les membres PFCP ajoutés depuis tout le jeu).
+- **Jamais faux, au pire aussi lent qu'avant** : clé différente, event du delta, fichier manquant, rétention active, delta inconnu (pas de manifeste précédent, pas de fragments) → reconstruction.
+- **Interrupteur** : `OIRAN_CALLFLOW_REUSE=0` désactive la reprise (comparaison A/B au lab, retour arrière sans rebuild). Lu une fois au démarrage, par instance.
+- **Journal**, une ligne par cycle : `CALLFLOW_REUSE` avec `reused`, `rebuilt`, `rebuilt_reasons` (`no_prior_key`, `key_changed`, `touched_by_delta`, `missing_file`, `reuse_unavailable`), `fragment_scans`, `delta_events`.
+
+### Données déjà stockées
+
+Un manifeste d'avant ce lot n'a pas de clés (le champ a une valeur par défaut, il se relit sans erreur) : **le premier cycle après mise à jour reconstruit tout**, au coût actuel, et écrit les clés. Le gain commence au cycle suivant. Aucune migration, aucun fragment réécrit.
+
+### Tests
+
+- `untouched_sessions_keep_their_callflow_byte_for_byte_2_21_143` : trois cycles (capture réelle à cinq abonnés, puis un autre UE, puis son plan de données), sur les deux chemins — en mémoire et par relecture des fragments. Les cinq abonnés sont repris aux cycles 1 et 2, la session touchée est reconstruite, au plus une relecture ; **chaque fichier est identique octet pour octet** à celui d'une publication sans reprise. Échec quand la reprise est désactivée dans le code (mutation).
+- `a_manifest_without_reuse_keys_rebuilds_once_then_reuses_2_21_143`.
+- `replaying_an_identical_segment_changes_nothing_2_21_143` : un segment identique est écarté en amont ; tout est repris, résultat identique.
+- `delta_event_ids_are_those_of_the_new_fragments_only_2_21_143`.
+- `callflow_reuse_key_tracks_every_component_2_21_143`.
+
+### OUVERT
+
+- **Le gain au lab n'est pas mesuré.** Il dépend de la part des sessions dont la clé survit à un nouveau segment : l'id d'une session dérive d'un compteur sur la liste entière (`session-engine`), qu'un segment inséré peut décaler. Le journal `rebuilt_reasons` le dira ; c'est le lot « id de session intrinsèque » qui lève cette limite.
+- La garde `touched_by_delta` n'est exercée que par son test direct : un segment au contenu identique est écarté en amont, et un segment différent produit d'autres ids.
+- Restent entiers : les représentants (193 s), la découverte (51 s), le préchauffage de l'API (23 s) — un cycle à petit delta resterait autour de 300 s (inféré). Les call flows LTE et « runtime » ne sont pas concernés.
+- Mesure à faire à cycle de vie égal : publication complète, première incrémentale, deuxième incrémentale, avec et sans `OIRAN_CALLFLOW_REUSE=0`.
+
 ## oiran-api 2.21.142 — 2026-11-22 — trace live : le call flow de la trace, servi sans attendre la publication
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.141 @ `4979d58` (branche `fix/oiran-2.21.142-trace-callflow`). GO cœur #9 7084290861 ; contrat de la route annoncé à ANR1 en #10 7084316531. Aucun crate partagé modifié.

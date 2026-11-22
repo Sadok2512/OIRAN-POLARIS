@@ -1185,6 +1185,15 @@ pub struct LiveDataset {
     /// this manifest. Legacy manifests use `callflows`.
     #[serde(default)]
     pub callflows_path: Option<String>,
+    /// 2.21.143 — clé de reprise du call flow de chaque session PDU :
+    /// empreinte du logiciel, de l'id de session, du pseudonyme du
+    /// contexte, de l'ensemble des ids d'events et des arêtes de
+    /// corrélation internes. Au cycle suivant, une session dont la clé
+    /// est inchangée et qu'aucun event du nouveau fragment ne touche
+    /// garde ses fichiers de call flow, sans relecture des fragments.
+    /// Absent d'un manifeste antérieur : tout est alors reconstruit.
+    #[serde(default)]
+    pub callflow_reuse_keys: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1796,6 +1805,18 @@ pub struct CaptureManager {
     /// pendant qu'un cycle tourne.
     sbi_hpack_carry_metrics_snapshot:
         Arc<Mutex<BTreeMap<String, SbiCarryMetricsSnapshot>>>,
+    /// 2.21.143 — reprise des call flows inchangés d'un cycle à l'autre.
+    /// Lue une fois dans `OIRAN_CALLFLOW_REUSE` (`0` la désactive : A/B
+    /// au lab et retour arrière sans rebuild). Par instance, pas globale.
+    callflow_reuse_enabled: Arc<AtomicBool>,
+    /// 2.21.143 — seuil d'events au-delà duquel les call flows sont
+    /// construits par relecture des fragments, lot par lot
+    /// (`IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS`). Par instance, pour
+    /// que les tests couvrent ce chemin sans jeu de 262 144 events.
+    in_memory_session_events_limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// 2.21.143 — (repris, reconstruits, relectures des fragments) du
+    /// dernier cycle de publication.
+    last_callflow_reuse: Arc<Mutex<(usize, usize, usize)>>,
     /// 2.21.58 (ordre #9 6989701705) — compteur cumulatif par
     /// interface des segments SBI **hors ring** décodés. Comme
     /// le carry du ring n'est plus touché par les hors-ring, ce
@@ -2215,6 +2236,13 @@ impl CaptureManager {
             sbi_hpack_carry_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             sbi_hpack_last_ring_pos_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             sbi_hpack_carry_metrics_snapshot: Arc::new(Mutex::new(BTreeMap::new())),
+            callflow_reuse_enabled: Arc::new(AtomicBool::new(
+                std::env::var("OIRAN_CALLFLOW_REUSE").map_or(true, |value| value.trim() != "0"),
+            )),
+            in_memory_session_events_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
+                IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS,
+            )),
+            last_callflow_reuse: Arc::new(Mutex::new((0, 0, 0))),
             sbi_off_ring_segments_decoded_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             recovery_warnings: Arc::new(Mutex::new(Vec::new())),
             // 2.14.11 (ANR1 #10 6860508699) — override test-only par
@@ -3050,6 +3078,7 @@ impl CaptureManager {
             publication_bytes_written: 0,
             publication_files_created: 0,
             callflows_path: None,
+            callflow_reuse_keys: BTreeMap::new(),
         };
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
@@ -7533,7 +7562,7 @@ impl CaptureManager {
         );
         let indexed_events_count = events.len();
         let retained_publication_events = if indexed_events_count
-            <= IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS
+            <= self.in_memory_session_events_limit.load(Ordering::SeqCst)
         {
             trace_publication_rss(
                 publication_started_epoch_ms,
@@ -7581,9 +7610,112 @@ impl CaptureManager {
             .join("session-scratch");
         let mut session_ids = Vec::new();
         let batch_size = session_publication_batch_size();
-        let pdu_sessions_len = discovery.pdu_sessions.len();
-        for (batch_idx, chunk) in discovery
-            .pdu_sessions
+        // 2.21.143 (ventilation ANR1 #9 7084780948 : 262 s sur 561 dans
+        // ces lots, pour 2 events nouveaux) — une session que le delta
+        // n'a pas touchée garde son call flow du cycle précédent. Voir
+        // `LiveDataset::callflow_reuse_keys`. Toute différence (clé,
+        // event du nouveau fragment, fichier manquant, rétention
+        // active, delta inconnu) fait retomber sur la reconstruction :
+        // jamais faux, au pire aussi lent qu'avant.
+        let prior_callflow_keys: BTreeMap<String, String> = prior_continuous
+            .as_ref()
+            .map(|(_, prior)| prior.callflow_reuse_keys.clone())
+            .unwrap_or_default();
+        let prior_callflows_dir: Option<PathBuf> = prior_continuous
+            .as_ref()
+            .map(|(prior_dir, prior)| dataset_callflows_dir(prior_dir, prior));
+        let reuse_delta: Option<HashSet<String>> = if self.callflow_reuse_enabled.load(Ordering::SeqCst)
+            && !retention_active
+        {
+            delta_event_ids(
+                prior_continuous.as_ref().map(|(_, prior)| prior),
+                &event_shards,
+                &event_paths,
+            )
+        } else {
+            None
+        };
+        let mut callflow_reuse_keys: BTreeMap<String, String> = BTreeMap::new();
+        let mut reuse_reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut callflows_reused = 0usize;
+        let mut callflows_rebuilt = 0usize;
+        let mut fragment_scans = 0usize;
+        // Décide de la reprise d'une session à partir de sa clé et de
+        // ses ids (`touches` dit si un id du delta est dans la session).
+        let reuse_decision = |session_id: &str, key: &str, touched: &dyn Fn(&HashSet<String>) -> Result<bool, String>| -> Result<Option<&'static str>, String> {
+            let Some(delta) = reuse_delta.as_ref() else {
+                return Ok(Some("reuse_unavailable"));
+            };
+            match prior_callflow_keys.get(session_id) {
+                None => return Ok(Some("no_prior_key")),
+                Some(prior_key) if prior_key != key => return Ok(Some("key_changed")),
+                Some(_) => {}
+            }
+            if touched(delta)? {
+                return Ok(Some("touched_by_delta"));
+            }
+            Ok(None)
+        };
+        // Sessions à construire : (indice d'origine, session, clé déjà
+        // calculée). Sur le chemin « relecture des fragments », la
+        // reprise est décidée AVANT toute relecture ; sur le chemin en
+        // mémoire, elle l'est plus bas, une fois les events choisis.
+        let mut sessions_to_build: Vec<(usize, &session_engine::DiscoveredPduSession, Option<String>)> = Vec::new();
+        for (global_idx, session) in discovery.pdu_sessions.iter().enumerate() {
+            if retained_publication_events.is_some() {
+                sessions_to_build.push((global_idx, session, None));
+                continue;
+            }
+            let context = discovery
+                .ue_contexts
+                .iter()
+                .find(|context| context.context_id == session.ue_context_id);
+            let plan_tmp = dataset_dir
+                .join(".publish-staging")
+                .join("session-plan")
+                .join(format!("{global_idx:06}"));
+            let (ids, ids_digest, edges_digest) =
+                session_event_id_set(&plan_tmp, session, context, &global_edges).map_err(display_error)?;
+            let key = callflow_reuse_key(
+                &session.session_id,
+                context.map(|context| context.pseudonym.as_str()),
+                &ids_digest,
+                &edges_digest,
+            );
+            let reason = reuse_decision(&session.session_id, &key, &|delta| {
+                for event_id in delta {
+                    if ids.contains(event_id).map_err(display_error)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?;
+            drop(ids);
+            let reason = match (reason, prior_callflows_dir.as_deref()) {
+                (None, Some(prior_callflows)) if safe_identifier(&session.session_id) => {
+                    if copy_prior_callflow(prior_callflows, dataset_dir, &session.session_id)? {
+                        None
+                    } else {
+                        Some("missing_file")
+                    }
+                }
+                (None, _) => Some("missing_file"),
+                (reason, _) => reason,
+            };
+            match reason {
+                None => {
+                    callflows_reused += 1;
+                    callflow_reuse_keys.insert(session.session_id.clone(), key);
+                    session_ids.push(session.session_id.clone());
+                }
+                Some(reason) => {
+                    *reuse_reasons.entry(reason).or_default() += 1;
+                    sessions_to_build.push((global_idx, session, Some(key)));
+                }
+            }
+        }
+        let pdu_sessions_len = sessions_to_build.len();
+        for (batch_idx, chunk) in sessions_to_build
             .chunks(batch_size)
             .enumerate()
         {
@@ -7593,30 +7725,17 @@ impl CaptureManager {
                 ue_pseudonym: Option<String>,
                 ids: SpillingEventIdSet,
                 scratch_path: PathBuf,
+                reuse_key: Option<String>,
             }
             let mut entries: Vec<BatchEntry> = Vec::with_capacity(chunk.len());
-            for (within_batch_idx, session) in chunk.iter().enumerate() {
+            for (global_idx, session, planned_key) in chunk.iter() {
                 let context = discovery
                     .ue_contexts
                     .iter()
                     .find(|context| context.context_id == session.ue_context_id);
-                let global_idx = batch_idx * batch_size + within_batch_idx;
                 let session_ids_tmp =
                     session_ids_staging_root.join(format!("{global_idx:06}"));
-                let mut ids = SpillingEventIdSet::new(
-                    &session_ids_tmp,
-                    event_id_set_mem_cap(),
-                )
-                .map_err(display_error)?;
-                for event_id in &session.event_ids {
-                    ids.insert(event_id).map_err(display_error)?;
-                }
-                if let Some(context) = context {
-                    for event_id in &context.event_ids {
-                        ids.insert(event_id).map_err(display_error)?;
-                    }
-                }
-                expand_session_evidence_ids_disk(&mut ids, &global_edges)
+                let (ids, _, _) = session_event_id_set(&session_ids_tmp, session, context, &global_edges)
                     .map_err(display_error)?;
                 let scratch_path =
                     session_scratch_staging_root.join(format!("{global_idx:06}.jsonl"));
@@ -7626,6 +7745,7 @@ impl CaptureManager {
                     ue_pseudonym: context.map(|context| context.pseudonym.clone()),
                     ids,
                     scratch_path,
+                    reuse_key: planned_key.clone(),
                 });
             }
 
@@ -7634,6 +7754,7 @@ impl CaptureManager {
             // La passe ne parse pas tout l'event, juste `event_id`
             // (clone du cheap-peek 2.9.17 depuis `load_events_by_ids`).
             if retained_publication_events.is_none() {
+                fragment_scans += 1;
                 let mut scratch_writers: Vec<BufWriter<fs::File>> = entries
                     .iter()
                     .map(|entry| {
@@ -7699,6 +7820,7 @@ impl CaptureManager {
                     ue_pseudonym: plan_ue_pseudonym,
                     ids,
                     scratch_path,
+                    reuse_key: planned_key,
                 } = entry;
                 let selected = phase_ten_session_events(
                     retained_publication_events.as_deref(),
@@ -7721,6 +7843,55 @@ impl CaptureManager {
                     })
                     .cloned()
                     .collect();
+                // 2.21.143 — chemin en mémoire : la clé se calcule sur
+                // les events réellement choisis (ils comprennent les
+                // membres PFCP ajoutés par `expand_pfcp_session_members`,
+                // qui dépendent de tout le jeu) ; la reprise se décide ici.
+                let reuse_key = match planned_key {
+                    Some(key) => key,
+                    None => {
+                        let mut ids_digest = SetDigest::default();
+                        for event_id in &selected_ids {
+                            ids_digest.add(event_id);
+                        }
+                        let mut edges_digest = SetDigest::default();
+                        for edge in &plan_edges {
+                            edges_digest.add(&serde_json::to_string(edge).unwrap_or_default());
+                        }
+                        let key = callflow_reuse_key(
+                            &plan_session_id,
+                            plan_ue_pseudonym.as_deref(),
+                            &ids_digest,
+                            &edges_digest,
+                        );
+                        let reason = reuse_decision(&plan_session_id, &key, &|delta| {
+                            Ok(selected_ids.iter().any(|event_id| delta.contains(event_id)))
+                        })?;
+                        let reason = match (reason, prior_callflows_dir.as_deref()) {
+                            (None, Some(prior_callflows)) if safe_identifier(&plan_session_id) => {
+                                if copy_prior_callflow(prior_callflows, dataset_dir, &plan_session_id)? {
+                                    None
+                                } else {
+                                    Some("missing_file")
+                                }
+                            }
+                            (None, _) => Some("missing_file"),
+                            (reason, _) => reason,
+                        };
+                        match reason {
+                            None => {
+                                callflows_reused += 1;
+                                callflow_reuse_keys.insert(plan_session_id.clone(), key);
+                                session_ids.push(plan_session_id);
+                                continue;
+                            }
+                            Some(reason) => *reuse_reasons.entry(reason).or_default() += 1,
+                        }
+                        key
+                    }
+                };
+                callflows_rebuilt += 1;
+                callflow_reuse_keys.insert(plan_session_id.clone(), reuse_key);
                 let mut reconstruction = reconstruct(
                     selected,
                     ReconstructionHints {
@@ -7761,6 +7932,22 @@ impl CaptureManager {
             );
         }
         drop(retained_publication_events);
+        // 2.21.143 — une ligne par cycle : sans elle, le gain de la
+        // reprise ne se mesure pas.
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CALLFLOW_REUSE",
+                "enabled": self.callflow_reuse_enabled.load(Ordering::SeqCst),
+                "delta_known": reuse_delta.is_some(),
+                "delta_events": reuse_delta.as_ref().map(HashSet::len),
+                "reused": callflows_reused,
+                "rebuilt": callflows_rebuilt,
+                "rebuilt_reasons": reuse_reasons,
+                "fragment_scans": fragment_scans,
+            })
+        );
+        *self.last_callflow_reuse.lock().unwrap() = (callflows_reused, callflows_rebuilt, fragment_scans);
         release_unused_heap_pages();
         trace_publication_rss(
             publication_started_epoch_ms,
@@ -7920,6 +8107,7 @@ impl CaptureManager {
             publication_bytes_written,
             publication_files_created: 0,
             callflows_path: None,
+            callflow_reuse_keys,
         };
         trace_publication_rss(
             publication_started_epoch_ms,
@@ -10754,20 +10942,157 @@ fn canonical_dedup_merge(
 /// — convergence garantie car `edges.len()` est fini. Chaque
 /// itération est O(|edges| × contains_cost) ; `SpillingEventIdSet`
 /// borne la RAM (voir `event_id_set.rs`).
+/// 2.21.143 — empreinte d'un ENSEMBLE de textes, indépendante de
+/// l'ordre d'insertion : somme (modulo 2^128) des 128 premiers bits du
+/// SHA-256 de chaque élément, plus leur nombre. Permet de résumer un
+/// ensemble d'ids gardé sur disque sans le relire trié.
+#[derive(Default, Clone, Debug)]
+struct SetDigest {
+    sum: u128,
+    count: u64,
+}
+
+impl SetDigest {
+    fn add(&mut self, item: &str) {
+        let hex = sha256_hex(item.as_bytes());
+        self.sum = self.sum.wrapping_add(u128::from_str_radix(&hex[..32], 16).unwrap_or(0));
+        self.count = self.count.saturating_add(1);
+    }
+    fn text(&self) -> String {
+        format!("{:032x}/{}", self.sum, self.count)
+    }
+}
+
+/// 2.21.143 — versions de tout ce qui façonne un call flow publié. Un
+/// changement de l'une d'elles invalide toutes les clés de reprise.
+fn callflow_software_fingerprint() -> String {
+    format!(
+        "live-probe={VERSION};session-engine={};callflow-schema={};callflow-renderer={};correlation-engine={}",
+        session_engine::VERSION,
+        callflow_schema::VERSION,
+        callflow_renderer::VERSION,
+        correlation_engine::VERSION,
+    )
+}
+
+/// 2.21.143 — clé de reprise du call flow d'une session (voir
+/// `LiveDataset::callflow_reuse_keys`).
+fn callflow_reuse_key(
+    session_id: &str,
+    ue_pseudonym: Option<&str>,
+    event_ids: &SetDigest,
+    edges: &SetDigest,
+) -> String {
+    sha256_hex(
+        format!(
+            "{}\n{session_id}\n{}\n{}\n{}",
+            callflow_software_fingerprint(),
+            ue_pseudonym.unwrap_or("-"),
+            event_ids.text(),
+            edges.text(),
+        )
+        .as_bytes(),
+    )
+}
+
+/// 2.21.143 — ids des events du fragment (ou des fragments) que ce
+/// cycle ajoute par rapport au manifeste précédent. `None` quand le
+/// delta ne peut pas être établi (pas de manifeste précédent, pas de
+/// fragments, fragment introuvable) : aucune reprise n'est alors faite.
+fn delta_event_ids(
+    prior: Option<&LiveDataset>,
+    event_shards: &[EventShard],
+    event_paths: &[PathBuf],
+) -> Option<HashSet<String>> {
+    let prior = prior?;
+    if event_shards.is_empty() || prior.event_shards.is_empty() {
+        return None;
+    }
+    let known: HashSet<&str> = prior.event_shards.iter().map(|shard| shard.sha256.as_str()).collect();
+    let mut ids = HashSet::new();
+    for shard in event_shards.iter().filter(|shard| !known.contains(shard.sha256.as_str())) {
+        let name = Path::new(&shard.path).file_name()?;
+        let path = event_paths.iter().find(|path| path.file_name() == Some(name))?;
+        let reader = BufReader::new(fs::File::open(path).ok()?);
+        for line in reader.lines() {
+            let line = line.ok()?;
+            if let Some(event_id) = event_id_from_json_line(&line) {
+                ids.insert(event_id.into_owned());
+            }
+        }
+    }
+    Some(ids)
+}
+
+/// 2.21.143 — recopie le call flow (`.json` et `.html`) d'une session
+/// depuis le cycle précédent. `false` si l'un des deux fichiers manque.
+fn copy_prior_callflow(prior_callflows: &Path, dataset_dir: &Path, session_id: &str) -> Result<bool, String> {
+    let prior_json = prior_callflows.join(format!("{session_id}.json"));
+    let prior_html = prior_callflows.join(format!("{session_id}.html"));
+    if !prior_json.is_file() || !prior_html.is_file() {
+        return Ok(false);
+    }
+    atomic_write(
+        &dataset_dir.join("callflows").join(format!("{session_id}.json")),
+        &fs::read(prior_json).map_err(display_error)?,
+    )?;
+    atomic_write(
+        &dataset_dir.join("callflows").join(format!("{session_id}.html")),
+        &fs::read(prior_html).map_err(display_error)?,
+    )?;
+    Ok(true)
+}
+
+/// 2.21.143 — l'ensemble des ids d'events d'une session (session,
+/// contexte UE, extension par les arêtes), avec son empreinte et celle
+/// des arêtes internes à l'ensemble.
+fn session_event_id_set(
+    staging: &Path,
+    session: &session_engine::DiscoveredPduSession,
+    context: Option<&session_engine::DiscoveredUeContext>,
+    global_edges: &[CorrelationEdge],
+) -> std::io::Result<(SpillingEventIdSet, SetDigest, SetDigest)> {
+    let mut ids = SpillingEventIdSet::new(staging, event_id_set_mem_cap())?;
+    let mut digest = SetDigest::default();
+    for event_id in &session.event_ids {
+        if ids.insert(event_id)? {
+            digest.add(event_id);
+        }
+    }
+    if let Some(context) = context {
+        for event_id in &context.event_ids {
+            if ids.insert(event_id)? {
+                digest.add(event_id);
+            }
+        }
+    }
+    expand_session_evidence_ids_disk(&mut ids, global_edges, &mut |event_id| digest.add(event_id))?;
+    let mut edges = SetDigest::default();
+    for edge in global_edges {
+        if ids.contains(&edge.source_event_id)? && ids.contains(&edge.target_event_id)? {
+            edges.add(&serde_json::to_string(edge).unwrap_or_default());
+        }
+    }
+    Ok((ids, digest, edges))
+}
+
 fn expand_session_evidence_ids_disk(
     ids: &mut SpillingEventIdSet,
     edges: &[CorrelationEdge],
+    on_new: &mut dyn FnMut(&str),
 ) -> std::io::Result<()> {
     loop {
         let mut changed = false;
         for edge in edges {
             if ids.contains(&edge.source_event_id)? {
                 if ids.insert(&edge.target_event_id)? {
+                    on_new(&edge.target_event_id);
                     changed = true;
                 }
             }
             if ids.contains(&edge.target_event_id)? {
                 if ids.insert(&edge.source_event_id)? {
+                    on_new(&edge.source_event_id);
                     changed = true;
                 }
             }
@@ -13229,7 +13554,7 @@ mod tests {
             .join("ids");
         let mut ids = SpillingEventIdSet::new(&tmp_dir, 1024).unwrap();
         ids.insert("n2-event").unwrap();
-        expand_session_evidence_ids_disk(&mut ids, &edges).unwrap();
+        expand_session_evidence_ids_disk(&mut ids, &edges, &mut |_| {}).unwrap();
         assert!(ids.contains("n2-event").unwrap());
         assert!(ids.contains("n4-event").unwrap());
         assert!(ids.contains("n3-event").unwrap());
@@ -15790,6 +16115,7 @@ mod tests {
                 publication_bytes_written: 0,
                 publication_files_created: 0,
                 callflows_path: None,
+                callflow_reuse_keys: BTreeMap::new(),
             },
         );
         manager.jobs.lock().unwrap().insert(
@@ -17919,6 +18245,7 @@ Content-Length: 0\r\n\
             publication_bytes_written: 0,
             publication_files_created: 0,
             callflows_path: None,
+            callflow_reuse_keys: BTreeMap::new(),
         };
         fs::write(source.join("dataset/oiran_events.jsonl"), b"").unwrap();
         fs::write(
@@ -22214,6 +22541,248 @@ Content-Length: 0\r\n\
             capture_group_id: None,
             scenario_id: None,
             planes: Vec::new(),
+        }
+    }
+    // ===== 2.21.143 — reprise des call flows inchangés =====
+
+    /// Joue les cycles `cycles` (liste de segments par cycle) sur un
+    /// gestionnaire neuf et rend, par cycle, (repris, reconstruits,
+    /// relectures) et l'état final : sessions et contenu de chaque
+    /// fichier de call flow (racine temporaire neutralisée).
+    fn run_reuse_cycles_2_21_143(
+        label: &str,
+        reuse: bool,
+        events_in_memory_limit: usize,
+        cycles: &[Vec<(&str, PathBuf)>],
+        drop_keys_before_cycle: Option<usize>,
+        pseudonym_key: &Path,
+    ) -> (Vec<(usize, usize, usize)>, Vec<String>, BTreeMap<String, Vec<u8>>, LiveDataset) {
+        let root = temporary_root(label);
+        // Même clé de pseudonymisation pour tous les gestionnaires comparés.
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(), false, pseudonym_key.to_path_buf(),
+        ).unwrap();
+        manager.callflow_reuse_enabled.store(reuse, Ordering::SeqCst);
+        manager.in_memory_session_events_limit.store(events_in_memory_limit, Ordering::SeqCst);
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let mut counters = Vec::new();
+        let mut last = None;
+        for (cycle, segments) in cycles.iter().enumerate() {
+            if drop_keys_before_cycle == Some(cycle) {
+                // Manifeste d'avant 2.21.143 : pas de clés de reprise.
+                let manifest_path = base.join("dataset/dataset_manifest.json");
+                let mut manifest: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+                manifest.as_object_mut().unwrap().remove("callflow_reuse_keys");
+                fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+            }
+            let mut selected = BTreeSet::new();
+            for (name, source) in segments {
+                let path = base.join("pcap").join(name);
+                fs::copy(source, &path).unwrap();
+                selected.insert(path);
+            }
+            last = Some(manager.process_continuous_capture_selected(
+                &base, &interface_specs(), 512 * 1024 * 1024, &selected,
+            ).unwrap());
+            counters.push(*manager.last_callflow_reuse.lock().unwrap());
+        }
+        let dataset = last.unwrap();
+        let manifest: LiveDataset = serde_json::from_slice(
+            &fs::read(base.join("dataset/dataset_manifest.json")).unwrap(),
+        ).unwrap();
+        let callflows = dataset_callflows_dir(&base.join("dataset"), &manifest);
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(&callflows).unwrap() {
+            let entry = entry.unwrap();
+            // Les call flows citent le chemin du segment source : la
+            // racine temporaire, propre à chaque gestionnaire de test,
+            // est neutralisée pour comparer le reste octet pour octet.
+            let text = String::from_utf8(fs::read(entry.path()).unwrap()).unwrap();
+            let neutral = text.replace(root.to_string_lossy().as_ref(), "<racine>");
+            files.insert(entry.file_name().to_string_lossy().into_owned(), neutral.into_bytes());
+        }
+        (counters, dataset.session_ids, files, manifest)
+    }
+
+    /// 2.21.143 (ventilation ANR1 #9 7084780948 : 262 s sur 561 passées
+    /// à refaire les call flows pour 2 events nouveaux) — une session
+    /// que le delta n'a pas touchée garde son call flow, sans relecture
+    /// des fragments, et le résultat est IDENTIQUE OCTET POUR OCTET à
+    /// celui d'une publication qui reconstruit tout. Vérifié sur les
+    /// deux chemins : en mémoire, et par relecture des fragments (seuil
+    /// abaissé à 0, celui de la production au-delà de 262 144 events).
+    #[test]
+    fn untouched_sessions_keep_their_callflow_byte_for_byte_2_21_143() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let five = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
+        let one = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let cycles: Vec<Vec<(&str, PathBuf)>> = vec![
+            // Cycle 0 : la capture à cinq abonnés (signalisation N2 et N4).
+            vec![("N2.pcap-five.pcapng", five.clone()), ("N4.pcap-five.pcapng", five.clone())],
+            // Cycle 1 : un autre UE, une autre capture — ne touche pas les cinq premiers.
+            vec![("N2.pcap-one.pcapng", one.join("N2.pcapng")), ("N4.pcap-one.pcapng", one.join("N4.pcapng"))],
+            // Cycle 2 : le plan de données du même autre UE.
+            vec![("N3.pcap-one.pcapng", one.join("N3.pcapng"))],
+        ];
+        let key = temporary_root("reuse-shared-key").join(".oiran-pseudonym.key");
+        for (path_label, limit) in [("memoire", usize::MAX), ("relecture", 0usize)] {
+            let (with, sessions_with, files_with, manifest_with) =
+                run_reuse_cycles_2_21_143(&format!("reuse-on-{path_label}"), true, limit, &cycles, None, &key);
+            let (without, sessions_without, files_without, _) =
+                run_reuse_cycles_2_21_143(&format!("reuse-off-{path_label}"), false, limit, &cycles, None, &key);
+            // Même résultat, octet pour octet.
+            assert_eq!(sessions_with, sessions_without, "{path_label} : mêmes sessions");
+            assert!(sessions_with.len() >= 6, "{path_label} : cinq abonnés + un : {}", sessions_with.len());
+            assert_eq!(
+                files_with.keys().collect::<Vec<_>>(),
+                files_without.keys().collect::<Vec<_>>(),
+                "{path_label} : mêmes fichiers"
+            );
+            for (name, bytes) in &files_with {
+                assert!(bytes == &files_without[name], "{path_label} : {name} identique octet pour octet");
+            }
+            // Sans reprise : tout est reconstruit à chaque cycle.
+            assert!(without.iter().all(|(reused, _, _)| *reused == 0), "{path_label} : {without:?}");
+            // Avec reprise : rien au premier cycle ; ensuite les sessions
+            // des cinq abonnés sont reprises.
+            assert_eq!(with[0].0, 0, "{path_label} : premier cycle, rien à reprendre");
+            assert!(with[1].0 >= 5, "{path_label} : cycle 1, les cinq abonnés repris : {with:?}");
+            assert!(with[2].0 >= 5, "{path_label} : cycle 2, les cinq abonnés repris : {with:?}");
+            assert!(with[1].1 >= 1 && with[2].1 >= 1, "{path_label} : la session touchée est reconstruite : {with:?}");
+            assert!(with[1].1 < without[1].1 && with[2].1 < without[2].1, "{path_label} : moins de reconstructions");
+            if limit == 0 {
+                assert!(with[1].2 <= 1 && with[2].2 <= 1, "relecture : un seul passage pour les sessions touchées : {with:?}");
+                assert!(without[2].2 >= with[2].2);
+            }
+            // Chaque session PDU a sa clé au manifeste.
+            assert!(manifest_with.callflow_reuse_keys.len() >= 6, "{path_label} : clés écrites");
+        }
+    }
+
+    /// 2.21.143 — un segment au contenu identique à un segment déjà
+    /// publié est écarté en amont (même empreinte) : aucun event
+    /// nouveau, donc toutes les sessions sont reprises, et le résultat
+    /// reste identique à celui d'une publication sans reprise.
+    #[test]
+    fn replaying_an_identical_segment_changes_nothing_2_21_143() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let five = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
+        let cycles: Vec<Vec<(&str, PathBuf)>> = vec![
+            vec![("N2.pcap-five.pcapng", five.clone()), ("N4.pcap-five.pcapng", five.clone())],
+            vec![("N4.pcap-five-replay.pcapng", five.clone())],
+        ];
+        let key = temporary_root("reuse-replay-key").join(".oiran-pseudonym.key");
+        for limit in [usize::MAX, 0usize] {
+            let (with, sessions_with, files_with, _) =
+                run_reuse_cycles_2_21_143(&format!("reuse-replay-on-{limit}"), true, limit, &cycles, None, &key);
+            let (_, sessions_without, files_without, _) =
+                run_reuse_cycles_2_21_143(&format!("reuse-replay-off-{limit}"), false, limit, &cycles, None, &key);
+            assert_eq!((with[1].0, with[1].1, with[1].2), (5, 0, 0), "tout est repris, aucune relecture : {with:?}");
+            assert_eq!(sessions_with, sessions_without);
+            assert!(files_with == files_without, "résultat identique à la publication sans reprise");
+        }
+    }
+
+    /// 2.21.143 — le delta d'un cycle : les ids des events des seuls
+    /// fragments absents du manifeste précédent. Inconnu (`None`, donc
+    /// aucune reprise) sans manifeste précédent, sans fragments, ou si
+    /// un fragment nouveau est introuvable.
+    #[test]
+    fn delta_event_ids_are_those_of_the_new_fragments_only_2_21_143() {
+        let root = temporary_root("reuse-delta");
+        fs::create_dir_all(&root).unwrap();
+        let write = |name: &str, ids: &[&str]| -> (EventShard, PathBuf) {
+            let path = root.join(name);
+            let body: String = ids.iter().map(|id| format!("{{\"event_id\":\"{id}\",\"x\":1}}\n")).collect();
+            fs::write(&path, &body).unwrap();
+            (
+                EventShard { path: format!("event-shards/{name}"), sha256: sha256_hex(body.as_bytes()), bytes: body.len() as u64, event_count: ids.len() },
+                path,
+            )
+        };
+        let (old_shard, old_path) = write("shard-0.jsonl", &["evt-a", "evt-b"]);
+        let (new_shard, new_path) = write("shard-1.jsonl", &["evt-c", "evt-a"]);
+        let manifest = |shards: Vec<EventShard>| -> LiveDataset {
+            let mut value = serde_json::json!({
+                "dataset_id": "d", "capture_id": "c", "path": "p", "event_count": 0,
+                "session_ids": [], "decode_reports": {}, "checksums": {}, "state": "COMPLETE",
+            });
+            value["event_shards"] = serde_json::to_value(shards).unwrap();
+            serde_json::from_value(value).unwrap()
+        };
+        let prior = manifest(vec![old_shard.clone()]);
+        assert!(prior.callflow_reuse_keys.is_empty(), "un manifeste ancien se relit sans clés");
+        let shards = vec![old_shard.clone(), new_shard.clone()];
+        let paths = vec![old_path.clone(), new_path.clone()];
+        assert_eq!(
+            delta_event_ids(Some(&prior), &shards, &paths),
+            Some(HashSet::from(["evt-c".to_owned(), "evt-a".to_owned()])),
+            "les ids du fragment nouveau, y compris un id déjà connu (event rejoué)"
+        );
+        assert_eq!(delta_event_ids(Some(&prior), &[old_shard.clone()], &[old_path.clone()]), Some(HashSet::new()), "aucun fragment nouveau");
+        assert_eq!(delta_event_ids(None, &shards, &paths), None, "pas de manifeste précédent");
+        assert_eq!(delta_event_ids(Some(&manifest(vec![])), &shards, &paths), None, "manifeste précédent sans fragments");
+        assert_eq!(delta_event_ids(Some(&prior), &[], &paths), None, "pas de fragments");
+        assert_eq!(delta_event_ids(Some(&prior), &shards, &[old_path]), None, "fragment nouveau introuvable");
+    }
+
+    /// 2.21.143 — données déjà stockées : un manifeste sans clés (celui
+    /// d'avant ce lot) fait tout reconstruire une fois, puis les clés
+    /// sont écrites et la reprise fonctionne au cycle suivant.
+    #[test]
+    fn a_manifest_without_reuse_keys_rebuilds_once_then_reuses_2_21_143() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let five = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
+        let one = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let cycles: Vec<Vec<(&str, PathBuf)>> = vec![
+            vec![("N2.pcap-five.pcapng", five.clone()), ("N4.pcap-five.pcapng", five.clone())],
+            vec![("N2.pcap-one.pcapng", one.join("N2.pcapng"))],
+            vec![("N4.pcap-one.pcapng", one.join("N4.pcapng"))],
+        ];
+        let (counters, _, _, manifest) =
+            run_reuse_cycles_2_21_143(
+                "reuse-legacy-manifest",
+                true,
+                0,
+                &cycles,
+                Some(1),
+                &temporary_root("reuse-legacy-key").join(".oiran-pseudonym.key"),
+            );
+        assert_eq!(counters[1].0, 0, "manifeste sans clés : rien n'est repris : {counters:?}");
+        assert!(counters[1].1 >= 5, "tout est reconstruit une fois : {counters:?}");
+        assert!(counters[2].0 >= 5, "au cycle suivant, les clés existent et la reprise fonctionne : {counters:?}");
+        assert!(!manifest.callflow_reuse_keys.is_empty());
+    }
+
+    /// 2.21.143 — la clé de reprise change avec chacun de ses
+    /// composants, et ne dépend pas de l'ordre d'insertion des ids.
+    #[test]
+    fn callflow_reuse_key_tracks_every_component_2_21_143() {
+        let digest = |items: &[&str]| {
+            let mut digest = SetDigest::default();
+            for item in items {
+                digest.add(item);
+            }
+            digest
+        };
+        let base = callflow_reuse_key("s1", Some("psn-a"), &digest(&["e1", "e2"]), &digest(&["x"]));
+        assert_eq!(base, callflow_reuse_key("s1", Some("psn-a"), &digest(&["e2", "e1"]), &digest(&["x"])), "ordre indifférent");
+        for other in [
+            callflow_reuse_key("s2", Some("psn-a"), &digest(&["e1", "e2"]), &digest(&["x"])),
+            callflow_reuse_key("s1", Some("psn-b"), &digest(&["e1", "e2"]), &digest(&["x"])),
+            callflow_reuse_key("s1", None, &digest(&["e1", "e2"]), &digest(&["x"])),
+            callflow_reuse_key("s1", Some("psn-a"), &digest(&["e1", "e2", "e3"]), &digest(&["x"])),
+            callflow_reuse_key("s1", Some("psn-a"), &digest(&["e1", "e3"]), &digest(&["x"])),
+            callflow_reuse_key("s1", Some("psn-a"), &digest(&["e1", "e2"]), &digest(&["y"])),
+            callflow_reuse_key("s1", Some("psn-a"), &digest(&["e1", "e2"]), &digest(&[])),
+        ] {
+            assert_ne!(base, other);
+        }
+        let fingerprint = callflow_software_fingerprint();
+        for part in [VERSION, session_engine::VERSION, callflow_schema::VERSION, callflow_renderer::VERSION, correlation_engine::VERSION] {
+            assert!(fingerprint.contains(part), "l'empreinte porte la version {part}");
         }
     }
 }
