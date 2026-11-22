@@ -597,6 +597,9 @@ struct ControlRuntime {
 struct DefinitionJobControl {
     cancel: Arc<AtomicBool>,
     started_ues: Arc<Mutex<BTreeSet<String>>>,
+    /// PDU sessions established by this run, keyed by UE. Sessions which were
+    /// already active when `pdu_establish` ran are deliberately absent.
+    established_pdus: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
     /// IMS clients launched by this exact scenario run. This is deliberately
     /// independent from `started_ues`: a run may register an already-running
     /// UE and must still clean up only the Baresip process it owns.
@@ -1477,6 +1480,18 @@ trait UeRuntime: Send + Sync {
         let _ = (job, profile, timeout_seconds, cancel);
         Err("PDU_RUNTIME_COMMAND_UNSUPPORTED".into())
     }
+    /// Returns whether this exact DNN existed before the scenario step, even
+    /// when it was still pending and had no address yet.
+    /// The conservative default is `true`: a runtime which cannot prove
+    /// absence must never claim ownership and later release a pre-existing PDU.
+    fn pdu_dnn_existed(
+        &self,
+        job: &simulator_controller::UeJob,
+        dnn: &str,
+    ) -> Result<bool, String> {
+        let _ = (job, dnn);
+        Ok(true)
+    }
     fn release_pdu(
         &self,
         job: &simulator_controller::UeJob,
@@ -1484,6 +1499,16 @@ trait UeRuntime: Send + Sync {
         cancel: &AtomicBool,
     ) -> Result<(), String> {
         let _ = (job, timeout_seconds, cancel);
+        Err("PDU_RUNTIME_COMMAND_UNSUPPORTED".into())
+    }
+    fn release_pdu_dnn(
+        &self,
+        job: &simulator_controller::UeJob,
+        dnn: &str,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let _ = (job, dnn, timeout_seconds, cancel);
         Err("PDU_RUNTIME_COMMAND_UNSUPPORTED".into())
     }
     /// Requests release for a terminal detach sequence. Unlike a standalone
@@ -3053,6 +3078,23 @@ impl UeRuntime for DockerUeRuntime {
             .map(|_| ())
     }
 
+    fn pdu_dnn_existed(
+        &self,
+        job: &simulator_controller::UeJob,
+        dnn: &str,
+    ) -> Result<bool, String> {
+        let handle = job.process_handle.as_deref().ok_or("UE_NOT_STARTED")?;
+        let spec = job
+            .approved_runtime
+            .as_ref()
+            .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+        if !self.owns(spec, handle) {
+            return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+        }
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        Ok(Self::observe_pdu_dnn(target, dnn)?.is_some())
+    }
+
     fn release_pdu(
         &self,
         job: &simulator_controller::UeJob,
@@ -3073,6 +3115,51 @@ impl UeRuntime for DockerUeRuntime {
         let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
         Self::execute_ue_cli(target, "ps-release-all".into())?;
         self.wait_for_owned_pdu(spec, handle, "INACTIVE", timeout_seconds, cancel)
+    }
+
+    fn release_pdu_dnn(
+        &self,
+        job: &simulator_controller::UeJob,
+        dnn: &str,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let handle = job.process_handle.as_deref().ok_or("UE_NOT_STARTED")?;
+        let spec = job
+            .approved_runtime
+            .as_ref()
+            .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+        if !self.owns(spec, handle) {
+            return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+        }
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        let Some(psi) = pdu_snapshots_for_job(job)
+            .into_iter()
+            .find(|pdu| pdu.dnn.as_deref() == Some(dnn) && pdu.address.is_some())
+            .and_then(|pdu| pdu.psi)
+        else {
+            return Ok(());
+        };
+        Self::execute_ue_cli(target, format!("ps-release {psi}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("SCENARIO_STOP_REQUESTED".into());
+            }
+            if !self.owns(spec, handle) {
+                return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+            }
+            if Self::observe_pdu_dnn(target, dnn)?
+                .and_then(|observation| observation.ready_address().map(str::to_owned))
+                .is_none()
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("PDU_DNN_RELEASE_TIMEOUT".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
     }
 
     fn request_pdu_release_for_detach(
@@ -7889,7 +7976,15 @@ fn refresh_runtime_with_state(state: &AppState, runtime: &mut ControlRuntime) ->
 
 fn persist_runtime(state: &AppState, runtime: &ControlRuntime) {
     let active = runtime.active.as_ref().map(job_json);
-    let document = json!({"active":active,"history":runtime.history});
+    // Defence in depth: never persist a History value before recursively
+    // removing address and identity material. Existing files are not rewritten
+    // merely by being read; the API applies the same guard on response.
+    let history = runtime
+        .history
+        .iter()
+        .map(sanitize_history_record)
+        .collect::<Vec<_>>();
+    let document = json!({"active":active,"history":history});
     if let Some(parent) = state.job_state_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -10300,20 +10395,86 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 fn sanitize_history_record(record: &Value) -> Value {
     let mut sanitized = record.clone();
-    let Some(fields) = sanitized.as_object_mut() else {
-        return sanitized;
-    };
-    for field in ["error_code", "cause", "terminal_result"] {
-        let Some(value) = fields
-            .get(field)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        fields.insert(field.to_string(), json!(safe_telemetry_code(&value)));
-    }
+    sanitize_history_value(&mut sanitized);
     sanitized
+}
+
+fn sanitize_history_value(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (field, value) in fields {
+                if matches!(field.as_str(), "error_code" | "cause" | "terminal_result") {
+                    if let Some(text) = value.as_str() {
+                        let sanitized_text = sanitize_history_text(text);
+                        *value = json!(if sanitized_text.contains("addr-") {
+                            sanitized_text
+                        } else {
+                            safe_telemetry_code(text)
+                        });
+                        continue;
+                    }
+                }
+                sanitize_history_value(value);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(sanitize_history_value),
+        Value::String(text) => *text = sanitize_history_text(text),
+        _ => {}
+    }
+}
+
+fn sanitize_history_text(value: &str) -> String {
+    let without_v4 = replace_address_tokens(value, |candidate| {
+        candidate.contains('.') && candidate.parse::<Ipv4Addr>().is_ok()
+    });
+    let without_addresses = replace_address_tokens(&without_v4, |candidate| {
+        candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok()
+    });
+    let lower = without_addresses.to_ascii_lowercase();
+    let identity_marker = ["imsi", "supi", "msisdn", "imei"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let long_digit_run = without_addresses
+        .bytes()
+        .fold((false, 0_usize), |(found, run), byte| {
+            let run = if byte.is_ascii_digit() { run + 1 } else { 0 };
+            (found || run >= 10, run)
+        })
+        .0;
+    if identity_marker || long_digit_run {
+        safe_telemetry_reference("history", &without_addresses)
+    } else {
+        without_addresses
+    }
+}
+
+fn replace_address_tokens(value: &str, is_address: impl Fn(&str) -> bool) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let character = value[index..].chars().next().expect("valid UTF-8 boundary");
+        if character.is_ascii_hexdigit() {
+            let start = index;
+            let mut end = index + character.len_utf8();
+            for (offset, next) in value[end..].char_indices() {
+                if next.is_ascii_hexdigit() || matches!(next, '.' | ':') {
+                    end += next.len_utf8();
+                } else {
+                    let _ = offset;
+                    break;
+                }
+            }
+            let candidate = &value[start..end];
+            if is_address(candidate) {
+                output.push_str(&safe_telemetry_reference("addr", candidate));
+                index = end;
+                continue;
+            }
+        }
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
 }
 
 fn aggregate_certified_errors(document: &str) -> Vec<Value> {
@@ -13163,9 +13324,22 @@ fn update_definition_record(
         .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?;
     let index = definition_record_index(&runtime, job_id).ok_or("SCENARIO_JOB_NOT_FOUND")?;
     update(&mut runtime.history[index]);
+    sanitize_history_value(&mut runtime.history[index]);
     let value = runtime.history[index].clone();
     persist_runtime(state, &runtime);
     Ok(value)
+}
+
+fn record_started_ues(record: &mut Value, started_ues: &[String]) {
+    let mut persisted = record["started_ues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    persisted.extend(started_ues.iter().cloned());
+    record["started_ues"] = json!(persisted.into_iter().collect::<Vec<_>>());
 }
 
 fn resolved_parameter_u64(
@@ -13538,10 +13712,11 @@ fn execute_live_definition_step(
                 let pdu_profile_dnn = profile.dnn.clone();
                 // 0.36.0 — observe the 5QI really granted on N2 for this PDU.
                 // 0.36.2 — not when this DNN is already up (captured at ue_start).
-                let already_active = pdu_snapshots_for_job(&job)
-                    .iter()
-                    .any(|pdu| pdu.dnn.as_deref() == Some(pdu_profile_dnn.as_str()) && pdu.address.is_some());
-                let n2_capture = if already_active
+                let already_present = state
+                    .ue_runtime
+                    .pdu_dnn_existed(&job, &pdu_profile_dnn)
+                    .unwrap_or(true);
+                let n2_capture = if already_present
                     || !state.n2_qos_capture
                     || inspect_container_state("oiran-lab-ueransim-gnb-1").is_none()
                 {
@@ -13558,6 +13733,15 @@ fn execute_live_definition_step(
                         .ue_runtime
                         .establish_pdu(&job, &profile, timeout, &control.cancel),
                 )?;
+                if !already_present {
+                    control
+                        .established_pdus
+                        .lock()
+                        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                        .entry(ue_id.clone())
+                        .or_default()
+                        .insert(pdu_profile_dnn.clone());
+                }
                 match n2_capture.and_then(N2QosCapture::stop) {
                     // 0.36.1 — decode later (after the call / at detach) so tshark
                     // never runs in the API cgroup during radio steps.
@@ -13853,7 +14037,6 @@ fn execute_live_definition_step(
         "detach" => {
             for ue_id in ue_ids {
                 stop_definition_ims_client(control, ue_id);
-                let target = resolve_controller_traffic_target(state, ue_id)?;
                 let job = if let Some(approval) = definition_job_approval(control, ue_id)? {
                     approval
                 } else {
@@ -13866,6 +14049,19 @@ fn execute_live_definition_step(
                         .find(|job| job.ue_id == *ue_id)
                         .ok_or("UE_NOT_STARTED")?
                 };
+                let scenario_started_ue = control
+                    .started_ues
+                    .lock()
+                    .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                    .contains(ue_id);
+                let established_dnns = control
+                    .established_pdus
+                    .lock()
+                    .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                    .get(ue_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let target = resolve_controller_traffic_target(state, ue_id)?;
                 // 0.19.4 — Best-effort cleanup; detach must land
                 // STOPPED even if the stale route rule can't be
                 // deleted (missing table, duplicate from a prior
@@ -13879,6 +14075,55 @@ fn execute_live_definition_step(
                         "WARNING",
                         json!({ "reason": error, "ue_ip": target.ue_ip }),
                     );
+                }
+                if !scenario_started_ue {
+                    for dnn in established_dnns {
+                        trace_step_result(
+                            state,
+                            ue_id,
+                            "detach",
+                            |_: &()| json!({ "phase": "owned_pdu_released", "dnn": &dnn }),
+                            state.ue_runtime.release_pdu_dnn(
+                                &job,
+                                &dnn,
+                                30,
+                                &control.cancel,
+                            ),
+                        )?;
+                    }
+                    let spec = job
+                        .approved_runtime
+                        .as_ref()
+                        .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+                    let handle = job.process_handle.as_deref().ok_or("UE_NOT_STARTED")?;
+                    let observation = state.ue_runtime.observe_owned(spec, handle)?;
+                    if observation.process_state != "RUNNING"
+                        || observation.registration_state != "REGISTERED"
+                    {
+                        return Err("DETACH_PREEXISTING_UE_NOT_PRESERVED".into());
+                    }
+                    record_activity_event(
+                        state,
+                        ue_id,
+                        "detach",
+                        "OK",
+                        json!({
+                            "process_state": observation.process_state,
+                            "registration_state": observation.registration_state,
+                            "preexisting_ue_preserved": true,
+                        }),
+                    );
+                    control
+                        .started_jobs
+                        .lock()
+                        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                        .remove(ue_id);
+                    control
+                        .established_pdus
+                        .lock()
+                        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                        .remove(ue_id);
+                    continue;
                 }
                 trace_step_result(
                     state,
@@ -13920,6 +14165,11 @@ fn execute_live_definition_step(
                     .remove(ue_id);
                 control
                     .started_jobs
+                    .lock()
+                    .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                    .remove(ue_id);
+                control
+                    .established_pdus
                     .lock()
                     .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                     .remove(ue_id);
@@ -14838,6 +15088,39 @@ fn cleanup_definition_started_ues(state: &AppState, control: &DefinitionJobContr
         .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     let mut errors = Vec::new();
+    let started_set = started.iter().cloned().collect::<BTreeSet<_>>();
+    let established = control
+        .established_pdus
+        .lock()
+        .map(|sessions| sessions.clone())
+        .unwrap_or_default();
+    for (ue_id, dnns) in established {
+        if started_set.contains(&ue_id) {
+            continue;
+        }
+        let Some(approval) = definition_job_approval(control, &ue_id).ok().flatten() else {
+            errors.push(format!("{ue_id}:PDU_CLEANUP_APPROVAL_MISSING"));
+            continue;
+        };
+        let mut released = true;
+        let cleanup_cancel = AtomicBool::new(false);
+        for dnn in dnns {
+            if let Err(error) = state.ue_runtime.release_pdu_dnn(
+                &approval,
+                &dnn,
+                30,
+                &cleanup_cancel,
+            ) {
+                errors.push(format!("{ue_id}:{error}"));
+                released = false;
+            }
+        }
+        if released {
+            if let Ok(mut sessions) = control.established_pdus.lock() {
+                sessions.remove(&ue_id);
+            }
+        }
+    }
     for ue_id in started {
         stop_ims_client(&ue_id);
         if ue_id == srsran_controller::LTE_UE_ID {
@@ -14877,6 +15160,7 @@ fn execute_live_definition_job(
     ue_ids: Vec<String>,
     control: DefinitionJobControl,
 ) {
+    eprintln!("POLARIS_CONTROL_JOB job_id={job_id} event=START");
     let mut terminal_state = "COMPLETED";
     let mut terminal_result = "LIVE_COMPLETED".to_string();
     for (position, step) in resolved.iter().enumerate() {
@@ -14891,15 +15175,25 @@ fn execute_live_definition_job(
         });
         match execute_live_definition_step(&state, step, &ue_ids, &control) {
             Ok(measurements) => {
+                let started_ues = control
+                    .started_ues
+                    .lock()
+                    .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
                 let _ = update_definition_record(&state, &job_id, |record| {
                     record["steps"][position]["state"] = json!("COMPLETED");
                     record["steps"][position]["ended_at"] = json!(epoch_seconds());
                     record["steps"][position]["measurements"] = measurements;
+                    record_started_ues(record, &started_ues);
                 });
             }
             Err(error) if error == "SCENARIO_STOP_REQUESTED" => {
                 terminal_state = "STOPPED";
                 terminal_result = "OPERATOR_STOP".into();
+                eprintln!(
+                    "POLARIS_CONTROL_JOB job_id={job_id} event=STEP_FAILED step_index={} step_type={} error=SCENARIO_STOP_REQUESTED",
+                    step.index, step.step_type
+                );
                 let _ = update_definition_record(&state, &job_id, |record| {
                     record["steps"][position]["state"] = json!("FAILED");
                     record["steps"][position]["ended_at"] = json!(epoch_seconds());
@@ -14910,6 +15204,12 @@ fn execute_live_definition_job(
             Err(error) => {
                 terminal_state = "FAILED";
                 terminal_result = "STEP_FAILED".into();
+                eprintln!(
+                    "POLARIS_CONTROL_JOB job_id={job_id} event=STEP_FAILED step_index={} step_type={} error={}",
+                    step.index,
+                    step.step_type,
+                    safe_telemetry_code(&error)
+                );
                 let _ = update_definition_record(&state, &job_id, |record| {
                     let evidence = serde_json::from_str::<Value>(&error).ok();
                     let code = evidence
@@ -14942,7 +15242,15 @@ fn execute_live_definition_job(
         record["ended_at_epoch_s"] = json!(epoch_seconds());
         record["terminal_result"] = json!(terminal_result);
         record["cleanup_errors"] = json!(cleanup_errors);
+        record_started_ues(record, &control
+            .started_ues
+            .lock()
+            .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default());
     });
+    eprintln!(
+        "POLARIS_CONTROL_JOB job_id={job_id} event=END state={terminal_state} terminal_result={terminal_result}"
+    );
     if let Ok(mut jobs) = state.definition_jobs.lock() {
         jobs.remove(&job_id);
     }
@@ -15058,6 +15366,24 @@ fn start_live_definition_scenario(
         ));
     }
     let job_id = format!("{}-{}", definition.id, random_hex(6));
+    let initial_jobs = state
+        .multi_ue
+        .lock()
+        .map(|controller| controller.snapshot())
+        .unwrap_or_default();
+    let initial_ue_states = ue_ids
+        .iter()
+        .map(|ue_id| {
+            let state = initial_jobs.iter().find(|job| job.ue_id == *ue_id);
+            let configured_but_not_started = profiles.iter().any(|profile| profile.ue_id == *ue_id);
+            json!({
+                "ue_id":ue_id,
+                "process_state":state.map(|job| job.process_state.as_str()).unwrap_or(if configured_but_not_started { "STOPPED" } else { "UNKNOWN" }),
+                "registration_state":state.map(|job| job.registration_state.as_str()).unwrap_or(if configured_but_not_started { "DEREGISTERED" } else { "UNKNOWN" }),
+                "pdu_session_state":state.map(|job| job.pdu_session_state.as_str()).unwrap_or(if configured_but_not_started { "INACTIVE" } else { "UNKNOWN" })
+            })
+        })
+        .collect::<Vec<_>>();
     let steps = resolved
         .iter()
         .map(|step| {
@@ -15075,11 +15401,13 @@ fn start_live_definition_scenario(
         "job_id":job_id,"scenario_id":definition.id,"scenario_definition_id":definition.id,
         "scenario_definition_version":definition.version,"ue_ids":ue_ids,"state":"RUNNING",
         "traffic_state":"PENDING","started_at_epoch_s":epoch_seconds(),
-        "ended_at_epoch_s":Value::Null,"terminal_result":Value::Null,"steps":steps
+        "ended_at_epoch_s":Value::Null,"terminal_result":Value::Null,"steps":steps,
+        "initial_ue_states":initial_ue_states,"started_ues":[]
     });
     let control = DefinitionJobControl {
         cancel: Arc::new(AtomicBool::new(false)),
         started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+        established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
         ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
         started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         authorised_at_start: Arc::new(authorisation),
@@ -17185,6 +17513,20 @@ mod p0_tests {
             Ok(())
         }
 
+        fn release_pdu_dnn(
+            &self,
+            job: &simulator_controller::UeJob,
+            dnn: &str,
+            _: u64,
+            _: &AtomicBool,
+        ) -> Result<(), String> {
+            self.stopped
+                .lock()
+                .unwrap()
+                .push(format!("PDU_DNN_RELEASED:{}:{dnn}", job.ue_id));
+            Ok(())
+        }
+
         fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
             self.stopped
                 .lock()
@@ -17468,6 +17810,7 @@ mod p0_tests {
         let job = |ues: &[&str]| DefinitionJobControl {
             cancel: Arc::new(AtomicBool::new(false)),
             started_ues: Arc::new(Mutex::new(ues.iter().map(|u| (*u).to_string()).collect())),
+            established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
             ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
             started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
             authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(
@@ -21432,6 +21775,89 @@ mod p0_tests {
     }
 
     #[tokio::test]
+    async fn control_03629_history_recursively_masks_addresses_without_rewriting_legacy_records() {
+        fn contains_address(value: &Value) -> bool {
+            match value {
+                Value::Object(fields) => fields.values().any(contains_address),
+                Value::Array(items) => items.iter().any(contains_address),
+                Value::String(text) => text
+                    .split(|character: char| {
+                        !(character.is_ascii_hexdigit()
+                            || matches!(character, '.' | ':'))
+                    })
+                    .any(|candidate| {
+                        candidate.parse::<Ipv4Addr>().is_ok()
+                            || candidate.parse::<Ipv6Addr>().is_ok()
+                    }),
+                _ => false,
+            }
+        }
+        let legacy = json!({
+            "job_id":"legacy-history-addresses",
+            "steps":[{"measurements":{
+                "destination":"198.51.100.7",
+                "raw":"src 198.51.100.7 via 2001:db8::7",
+                "nested":[{"route":"[2001:db8::7]:5060"}]
+            }}]
+        });
+        let test_state = Arc::new(state());
+        let legacy_document = json!({"active":null,"history":[legacy.clone()]}).to_string();
+        fs::write(&test_state.job_state_path, &legacy_document).unwrap();
+        test_state.runtime.lock().unwrap().history.push(legacy);
+
+        let payload = history(State(test_state.clone())).await.0;
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("198.51.100.7"));
+        assert!(!serialized.contains("2001:db8::7"));
+        assert!(!contains_address(&payload));
+        let v4_reference = payload["items"][0]["steps"][0]["measurements"]["destination"]
+            .as_str()
+            .unwrap();
+        assert!(v4_reference.starts_with("addr-"));
+        assert!(payload["items"][0]["steps"][0]["measurements"]["raw"]
+            .as_str()
+            .unwrap()
+            .contains(v4_reference));
+        assert_eq!(
+            fs::read_to_string(&test_state.job_state_path).unwrap(),
+            legacy_document,
+            "read-time compatibility must not rewrite stored legacy History"
+        );
+    }
+
+    #[test]
+    fn control_03629_history_write_guard_is_recursive_and_stable() {
+        let test_state = state();
+        test_state.runtime.lock().unwrap().history.push(json!({
+            "job_id":"new-history-addresses",
+            "steps":[]
+        }));
+        let first = "198.51.100.7";
+        let second = "2001:db8::7";
+        update_definition_record(&test_state, "new-history-addresses", |record| {
+            record["steps"] = json!([{"measurements":{
+                "destination":first,
+                "raw":format!("src {first} via {second}"),
+                "route":second
+            }}]);
+        })
+        .unwrap();
+        let persisted = fs::read_to_string(&test_state.job_state_path).unwrap();
+        assert!(!persisted.contains(first));
+        assert!(!persisted.contains(second));
+        let record = &test_state.runtime.lock().unwrap().history[0];
+        let first_reference = record["steps"][0]["measurements"]["destination"]
+            .as_str()
+            .unwrap();
+        assert!(first_reference.starts_with("addr-"));
+        assert!(record["steps"][0]["measurements"]["raw"]
+            .as_str()
+            .unwrap()
+            .contains(first_reference));
+        assert_ne!(first_reference, record["steps"][0]["measurements"]["route"]);
+    }
+
+    #[tokio::test]
     async fn c6_adversarial_locked_invalid_job_is_recorded_failed() {
         let test_state = state();
         let application = app(test_state.clone());
@@ -23892,6 +24318,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         let control = DefinitionJobControl {
             cancel: Arc::new(AtomicBool::new(false)),
             started_ues: Arc::new(Mutex::new(BTreeSet::from(["UE-02".into()]))),
+            established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
             ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
             started_jobs: Arc::new(Mutex::new(BTreeMap::from([(
                 "UE-02".into(),
@@ -23928,6 +24355,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         let control = DefinitionJobControl {
             cancel: Arc::new(AtomicBool::new(false)),
             started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+            established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
             ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
             started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
             authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(
@@ -23965,6 +24393,175 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
                 .is_some(),
             "the newly-started voice pair must retain its runtime approval"
         );
+    }
+
+    #[test]
+    fn control_03629_final_detach_preserves_preexisting_voice_ue_and_stops_job_started_peer() {
+        let mut test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .configure_count(6)
+            .unwrap();
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        test_state.ue_runtime = Arc::new(FakeLiveUeRuntime {
+            stopped: stopped.clone(),
+            launched: Arc::new(Mutex::new(vec!["UE-05".into()])),
+            fail_observation: false,
+            fail_verification: false,
+            fail_stop: false,
+            fail_policy_route_cleanup: None,
+        });
+        let control = DefinitionJobControl {
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+            established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
+            ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
+            started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(
+                &["UE-05".into(), "UE-06".into()],
+                "test-fixture",
+            )),
+        };
+        let step = |index: usize, step_type: &str| ResolvedStep {
+            index,
+            step_type: step_type.into(),
+            scenario_loop_iteration: 1,
+            scenario_loop_count: 1,
+            step_loop_iteration: 1,
+            step_loop_count: 1,
+            parameters: BTreeMap::new(),
+        };
+        let ue_ids = ["UE-05".into(), "UE-06".into()];
+
+        execute_live_definition_step(&test_state, &step(0, "ue_start"), &ue_ids, &control)
+            .unwrap();
+        control
+            .established_pdus
+            .lock()
+            .unwrap()
+            .insert("UE-05".into(), BTreeSet::from(["ims".into()]));
+        execute_live_definition_step(&test_state, &step(4, "detach"), &ue_ids, &control)
+            .unwrap();
+
+        let actions = stopped.lock().unwrap();
+        assert!(actions.contains(&"PDU_DNN_RELEASED:UE-05:ims".into()));
+        assert!(!actions.contains(&"DEREGISTERED:UE-05".into()));
+        assert!(!actions.contains(&"UE-05".into()));
+        assert!(actions.contains(&"DEREGISTERED:UE-06".into()));
+        assert!(actions.contains(&"UE-06".into()));
+    }
+
+    #[test]
+    fn control_03629_unknown_pre_step_pdu_ownership_never_becomes_job_owned() {
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        let control = DefinitionJobControl {
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+            established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
+            ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
+            started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(
+                &["UE-05".into()],
+                "test-fixture",
+            )),
+        };
+        let step = ResolvedStep {
+            index: 1,
+            step_type: "pdu_establish".into(),
+            scenario_loop_iteration: 1,
+            scenario_loop_count: 1,
+            step_loop_iteration: 1,
+            step_loop_count: 1,
+            parameters: BTreeMap::from([("dnn".into(), json!("ims"))]),
+        };
+
+        execute_live_definition_step(
+            &test_state,
+            &step,
+            &["UE-05".into()],
+            &control,
+        )
+        .unwrap();
+        assert!(control.established_pdus.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn control_03629_persists_initial_states_and_cumulative_started_ues() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.definition_live_enabled = true;
+        test_state.additional_ue_live_enabled = true;
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .configure_count(6)
+            .unwrap();
+        test_state.ue_runtime = Arc::new(FakeLiveUeRuntime {
+            stopped: Arc::new(Mutex::new(Vec::new())),
+            launched: Arc::new(Mutex::new(vec!["UE-05".into()])),
+            fail_observation: false,
+            fail_verification: false,
+            fail_stop: false,
+            fail_policy_route_cleanup: None,
+        });
+        install_definition(
+            &mut test_state,
+            "ownership-persistence",
+            vec![
+                scenario_definitions::ScenarioStep {
+                    step_type: "ue_start".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::new(),
+                    steps: Vec::new(),
+                },
+                scenario_definitions::ScenarioStep {
+                    step_type: "detach".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::new(),
+                    steps: Vec::new(),
+                },
+            ],
+        );
+        let state = Arc::new(test_state);
+        let record = start_live_definition_scenario(
+            state.clone(),
+            "ownership-persistence",
+            &["UE-05".into(), "UE-06".into()],
+        )
+        .unwrap();
+        let job_id = record["job_id"].as_str().unwrap().to_owned();
+        for _ in 0..200 {
+            let complete = state
+                .runtime
+                .lock()
+                .unwrap()
+                .history
+                .iter()
+                .find(|record| record["job_id"] == job_id)
+                .is_some_and(|record| record["state"] != "RUNNING");
+            if complete {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let runtime = state.runtime.lock().unwrap();
+        let record = runtime
+            .history
+            .iter()
+            .find(|record| record["job_id"] == job_id)
+            .unwrap();
+        assert_eq!(record["state"], "COMPLETED");
+        assert_eq!(record["started_ues"], json!(["UE-06"]));
+        assert_eq!(record["initial_ue_states"][0]["ue_id"], "UE-05");
+        assert_eq!(record["initial_ue_states"][0]["process_state"], "RUNNING");
+        assert_eq!(record["initial_ue_states"][1]["ue_id"], "UE-06");
+        assert_eq!(record["initial_ue_states"][1]["process_state"], "STOPPED");
     }
 
     #[test]

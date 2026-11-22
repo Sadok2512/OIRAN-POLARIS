@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.29 — 2026-11-22 — Nettoyage voix et History sans adresse sensible
+
+- Préserve un UE déjà actif à l'étape finale d'un scénario voix : seuls les clients IMS et les PDU créés par le scénario sont libérés ; un UE lancé par le scénario reste arrêté normalement.
+- Nettoie récursivement les adresses IPv4/IPv6 et les références d'identité dans History, à l'écriture comme à la lecture, avec un pseudonyme d'adresse stable et sans réécrire les anciens enregistrements lors d'une simple lecture.
+- Ajoute les tests adverses de modèle final voix à deux UE et de garde récursif History ; aligne les versions API et web sur 0.36.29.
+
 ## 0.36.28 — 2026-11-22 — Masquage uniforme des références numériques
 
 - Aligne l'API Rust sur la règle du web : toute suite d'au moins cinq chiffres consécutifs rend une référence sensible et déclenche son masquage avant l'audit, History ou l'agrégation.
