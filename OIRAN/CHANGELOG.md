@@ -1,5 +1,47 @@
 # Changelog
 
+## oiran-api 2.21.144 — 2026-11-22 — trace live : le pseudonyme d'un autre abonné n'est jamais appris, et il est masqué dans tout ce que la trace sert
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.143 @ `b475aa8` (branche `fix/oiran-2.21.144-mixed-subscriber-event`). Relecture indépendante d'ANR1 (#10 7085078423) : **FAIL bloquant sur 2.21.142**. Décisions du cœur : #9 7085198470 (masquer, ne pas jeter) et #9 7085354184 (exception bornée, côté SIP inféré). Audit #9 7085241182. Aucun crate partagé modifié.
+
+### Le défaut, plus large que le call flow
+
+Contre-exemple d'ANR1 : un event non-SIP qui porte le pseudonyme de l'abonné tracé et celui d'un autre abonné. Le flux SSE passe par le même chemin que le call flow (`route_event_for`) : la trace rattachait l'event, puis **apprenait tous ses pseudonymes**. Celui de l'autre abonné devenait une clé de la trace, sortait dans `ue_info`, et toute la signalisation de cet abonné entrait ensuite dans la trace. Le défaut existe donc en production (2.21.138) par le SSE et le rejeu ; 2.21.142 l'a rendu visible par le call flow.
+
+### Correctif
+
+- **Jamais appris** : un pseudonyme tenu pour celui d'un autre abonné n'entre ni dans les clés de la trace ni dans `ue_info`.
+- **Masqué partout** : il est remplacé par `psn-autre-abonne` dans le message servi — arbre d'IE, URI SBI, toute autre valeur où il réapparaît — pour le flux SSE, le rejeu et le call flow de la trace. Le message porte `masked_pseudonyms` ; le call flow aussi ; `stats.masked_pseudonyms` cumule, et dira si le cas existe en trafic réel.
+- **L'event reste dans la trace** : il appartient aussi à la cible, le call flow reste complet.
+- Un event qui ne porte **que** des pseudonymes étrangers reste rejeté (garde de 2.21.129, inchangée).
+
+Quand un pseudonyme d'abonné inconnu est-il « celui d'un autre abonné » ?
+- **Hors contexte UE** (SBI, PFCP…) : quand **un même champ** porte un pseudonyme connu de la trace et un pseudonyme inconnu.
+- **Sur le contexte UE de la trace** (identifiant NGAP connu, ou enfant d'un parent rattaché) : l'event peut révéler **une** autre forme d'identité du même abonné, apprise comme avant ; s'il porte **plusieurs** pseudonymes d'abonné inconnus, aucun n'est appris et tous sont masqués.
+- **SIP** : il porte par construction l'identité du pair ; tout pseudonyme d'abonné inconnu de la trace y est étranger — sauf celui du **côté de l'abonné tracé**, quand l'adresse de son UE le désigne sans ambiguïté : From d'une requête qu'il émet ou d'une réponse qu'il reçoit, To d'une requête qu'il reçoit ou d'une réponse qu'il émet. Ce pseudonyme reste lisible, l'event porte `subscriber_side_inferred: "ue-address"`, et il n'est **jamais appris** (2.21.122 intacte). Si aucune des deux adresses, ou les deux, sont celles de l'UE, les deux côtés sont masqués.
+
+### Données déjà servies
+
+L'état d'une trace n'existe qu'en mémoire : `live_trace.rs` n'écrit aucun fichier (ni tampon, ni clés, ni journal d'audit). Au démarrage de 2.21.144 les traces repartent vides ; un pseudonyme étranger appris par une trace de 2.21.138 disparaît avec le redémarrage. Rien à purger sur disque.
+
+### OUVERT
+
+- **La règle « hors contexte UE » est plus étroite que la décision initiale** (« tout pseudonyme d'abonné différent de la cible »). Appliquée telle quelle, celle-ci masque des données réelles et casse deux comportements existants — mesuré sur la capture à cinq abonnés (`GenerateAuthData` : URI en SUCI, réponse en SUPI ; `User ID` du PFCP) et par deux tests antérieurs (`imsi_and_msisdn_traces_route_the_same_event_set_2_21_90`, `ue_info_emitted_only_on_exposed_keys_change_2_21_103`). Un message parle d'un abonné mais porte souvent plusieurs formes de son identité, dans des champs différents ; c'est par eux que la trace les apprend, et une trace ouverte par MSISDN en dépend.
+- En conséquence : **un pseudonyme d'abonné inconnu, seul dans son champ, sur un event hors contexte UE qui porte la cible ailleurs, n'est ni masqué ni refusé à l'apprentissage.** Rien, dans l'event, ne le distingue d'une autre forme d'identité du même abonné. Figé par `an_unknown_pseudonym_alone_in_its_field_is_another_form_of_the_subscriber_2_21_144`. Le fermer demande une source de vérité extérieure à l'event (le coffre d'identités, par exemple) : à décider.
+- La règle du cœur pour le côté SIP disait « From si la source est l'adresse de l'UE, To si c'est la destination » ; c'est vrai d'une **requête**. Une réponse garde les en-têtes de sa requête : le code inverse donc le côté pour les réponses. À confirmer.
+- Aucune capture réelle ne porte d'event mixte ni de SIP : la preuve repose sur des events construits.
+
+### Tests (échec avant, succès après)
+
+- `a_foreign_pseudonym_on_a_mixed_event_is_masked_and_never_learned_2_21_144` (contre-exemple d'ANR1, dans les deux sens).
+- `foreign_pseudonyms_are_masked_wherever_they_appear_2_21_144` (URI SBI mixte, liste de trois, réapparition hors du champ d'origine, pseudonyme d'adresse IP intact).
+- `a_purely_foreign_event_is_still_rejected_2_21_144`.
+- `the_peer_is_masked_and_the_subscriber_side_is_inferred_from_the_ue_address_2_21_144` (INVITE dans les deux sens avec alias, réponses, adresse ambiguë).
+- `several_unknown_pseudonyms_on_the_ue_context_are_all_masked_2_21_144` (borne de l'exception).
+- `a_second_identity_form_on_the_ue_context_is_learned_not_masked_2_21_144`.
+- `an_unknown_pseudonym_alone_in_its_field_is_another_form_of_the_subscriber_2_21_144` (fige l'OUVERT).
+- Capture réelle à cinq abonnés : 70 / 68 / 67 / 69 / 65 inchangés, **0 masquage**.
+
 ## oiran-api 2.21.143, live-probe 0.6.32 — 2026-11-22 — publication continue : une session que le delta n'a pas touchée garde son call flow
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.142 @ `33c02c3` (branche `fix/oiran-2.21.143-callflow-reuse`). Premier lot de la publication proportionnelle au delta (design #9 7084281004, ventilation ANR1 #9 7084780948, ordre révisé #9 7084796963, audit #9 7084815615).

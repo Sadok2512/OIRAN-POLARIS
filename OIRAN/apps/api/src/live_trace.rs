@@ -105,6 +105,10 @@ pub(crate) struct LiveTrace {
     /// trace mais qui portent l'identité d'un AUTRE abonné : rejetés.
     #[serde(default)]
     rejected_foreign_subscriber: u64,
+    /// 2.21.144 — nombre de pseudonymes d'un autre abonné masqués
+    /// (`psn-autre-abonne`) dans ce que la trace a servi.
+    #[serde(default)]
+    masked_foreign_pseudonyms: u64,
     /// 2.21.129 — oublis de l'état technique : il était périmé
     /// (identifiants réattribués à un autre abonné, ou nouveau contexte
     /// UE sur un identifiant que la trace croyait vivant).
@@ -437,6 +441,157 @@ impl FromIterator<String> for MatchKeys {
     }
 }
 
+/// 2.21.142 / 2.21.144 — un event de signalisation gardé par la trace
+/// pour son call flow, avec les pseudonymes d'un autre abonné qu'il
+/// porte (à masquer dans le call flow comme ils l'ont été dans le flux).
+struct KeptSignalling {
+    event: event_schema::NormalizedEvent,
+    foreign: BTreeSet<String>,
+}
+
+/// 2.21.144 — jeton qui remplace le pseudonyme d'un autre abonné dans
+/// tout ce qu'une trace sert.
+const FOREIGN_PSEUDONYM_MASK: &str = "psn-autre-abonne";
+
+/// 2.21.144 — ce nom de champ porte-t-il une identité d'ABONNÉ ? Les
+/// pseudonymes d'adresse IP, d'équipement ou de contenu ne le sont pas.
+fn is_subscriber_identity_name(name: &str) -> bool {
+    const NAMES: [&str; 10] = [
+        "subscriber_pseudonym",
+        "imsi_pseudonym",
+        "msisdn_pseudonym",
+        "tmsi_pseudonym",
+        "temporary_identity_pseudonym",
+        "identity_pseudonym",
+        "ue_identity_pseudonym",
+        "from_uri_pseudonym",
+        "to_uri_pseudonym",
+        "request_uri_pseudonym",
+    ];
+    // `peer_subscriber_pseudonym`, `request_subscriber_pseudonym`,
+    // `response subscriber_pseudonym`… : variantes préfixées.
+    NAMES.contains(&name) || name.ends_with("subscriber_pseudonym")
+}
+
+/// 2.21.144 — parcourt les pseudonymes (`psn-` suivi de lettres,
+/// chiffres, `-` ou `_`) de `text` : (début, fin) de chacun.
+fn pseudonym_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(found) = text[at..].find("psn-") {
+        let start = at + found;
+        let mut end = start + 4;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-' || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end > start + 4 {
+            spans.push((start, end));
+        }
+        at = end.max(start + 4);
+    }
+    spans
+}
+
+/// 2.21.144 — pseudonymes d'abonné d'un event (forme JSON), rangés par
+/// CHAMP : le nom de l'identifiant ou de l'IE qui les porte. Un
+/// pseudonyme est « d'abonné » quand il est la valeur d'un champ
+/// d'identité d'abonné, ou inclus dans un texte sous la forme
+/// `subscriber-psn-…` (URI SBI) ou `subscriber_pseudonym=psn-…`.
+fn subscriber_pseudonyms_by_field(event: &Value) -> BTreeMap<String, BTreeSet<String>> {
+    fn walk(value: &Value, field: &str, out: &mut BTreeMap<String, BTreeSet<String>>) {
+        match value {
+            Value::String(text) => {
+                for (start, end) in pseudonym_spans(text) {
+                    let before = &text[..start];
+                    if is_subscriber_identity_name(field)
+                        || before.ends_with("subscriber-")
+                        || before.ends_with("subscriber_pseudonym=")
+                    {
+                        out.entry(field.to_owned()).or_default().insert(text[start..end].to_owned());
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, field, out)),
+            Value::Object(map) => {
+                let name = map.get("name").and_then(Value::as_str);
+                for (key, item) in map {
+                    // La valeur d'un champ nommé appartient à ce champ ;
+                    // le reste garde le champ courant.
+                    let field = match name {
+                        Some(name) if key == "value" => name,
+                        _ => field,
+                    };
+                    walk(item, field, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(event, "", &mut out);
+    out
+}
+
+/// 2.21.144 — pseudonymes d'un AUTRE abonné portés par un event.
+///
+/// * SIP : il porte, par construction, l'identité du pair. Tout
+///   pseudonyme d'abonné qui n'est pas connu de la trace est étranger.
+/// * Autres protocoles : un message parle d'UN abonné, dont il peut
+///   porter plusieurs formes d'identité dans des champs différents
+///   (URI en SUCI et réponse en SUPI, `User ID` du PFCP, MSISDN) —
+///   c'est ainsi que la trace apprend ces formes. Deux abonnés ne sont
+///   prouvés que lorsqu'UN MÊME champ porte un pseudonyme connu de la
+///   trace et un pseudonyme inconnu : l'inconnu est alors étranger.
+fn foreign_subscriber_pseudonyms(
+    event: &Value,
+    is_sip: bool,
+    own: &dyn Fn(&str) -> bool,
+) -> BTreeSet<String> {
+    let mut foreign = BTreeSet::new();
+    for tokens in subscriber_pseudonyms_by_field(event).into_values() {
+        let unknown = tokens.iter().filter(|token| token.as_str() != FOREIGN_PSEUDONYM_MASK && !own(token));
+        if is_sip || tokens.iter().any(|token| own(token)) {
+            foreign.extend(unknown.cloned());
+        }
+    }
+    foreign
+}
+
+/// 2.21.144 — remplace, dans tous les textes de `value`, chaque
+/// pseudonyme de `foreign` par le jeton de masquage. Rend le nombre de
+/// remplacements. Le pseudonyme est remplacé en entier, jamais un
+/// préfixe d'un pseudonyme plus long.
+fn mask_pseudonyms(value: &mut Value, foreign: &BTreeSet<String>) -> usize {
+    if foreign.is_empty() {
+        return 0;
+    }
+    match value {
+        Value::String(text) => {
+            let spans: Vec<(usize, usize)> = pseudonym_spans(text)
+                .into_iter()
+                .filter(|(start, end)| foreign.contains(&text[*start..*end]))
+                .collect();
+            if spans.is_empty() {
+                return 0;
+            }
+            let mut masked = String::with_capacity(text.len());
+            let mut at = 0;
+            for (start, end) in &spans {
+                masked.push_str(&text[at..*start]);
+                masked.push_str(FOREIGN_PSEUDONYM_MASK);
+                at = *end;
+            }
+            masked.push_str(&text[at..]);
+            *text = masked;
+            spans.len()
+        }
+        Value::Array(items) => items.iter_mut().map(|item| mask_pseudonyms(item, foreign)).sum(),
+        Value::Object(map) => map.values_mut().map(|item| mask_pseudonyms(item, foreign)).sum(),
+        _ => 0,
+    }
+}
+
 /// 2.21.141 — classe d'un event du tampon de rejeu : chaque classe a
 /// son quota, pour qu'un flot régulier (un point de débit par seconde)
 /// n'évince jamais la signalisation.
@@ -476,12 +631,17 @@ impl TraceState {
     /// en `message`. Une révision d'un flux RTP (même
     /// `stable_event_key`) REMPLACE la précédente, comme dans le tampon
     /// de rejeu : un flux n'apparaît qu'une fois dans le call flow.
-    fn keep_signalling(&mut self, event: &event_schema::NormalizedEvent, replaces_flow: bool) {
+    fn keep_signalling(
+        &mut self,
+        event: &event_schema::NormalizedEvent,
+        replaces_flow: bool,
+        foreign: BTreeSet<String>,
+    ) {
         if replaces_flow && !event.stable_event_key.is_empty() {
             self.signalling
-                .retain(|kept| kept.stable_event_key != event.stable_event_key);
+                .retain(|kept| kept.event.stable_event_key != event.stable_event_key);
         }
-        self.signalling.push_back(event.clone());
+        self.signalling.push_back(KeptSignalling { event: event.clone(), foreign });
         while self.signalling.len() > MAX_EVENTS {
             self.signalling.pop_front();
             self.signalling_dropped = self.signalling_dropped.saturating_add(1);
@@ -518,7 +678,7 @@ struct TraceState {
     /// (`GET /live/traces/:id/callflow`). Même quota que le tampon de
     /// rejeu (`MAX_EVENTS`) ; au-delà, le plus ancien sort et
     /// `signalling_dropped` le compte. Jamais sérialisé tel quel.
-    signalling: VecDeque<event_schema::NormalizedEvent>,
+    signalling: VecDeque<KeptSignalling>,
     /// 2.21.142 — events sortis de `signalling` par le quota.
     signalling_dropped: u64,
     next_id: u64,
@@ -1447,10 +1607,14 @@ impl LiveTraceRegistry {
             "rtp": {
                 "flow_updates": trace.rtp_flow_updates,
             },
+            // 2.21.144 — pseudonymes d'un autre abonné masqués dans ce que
+            // la trace a servi : dit si le cas existe en trafic réel.
+            "masked_pseudonyms": trace.masked_foreign_pseudonyms,
             "rejects": {
                 "ue_id_mismatch": trace.rejected_ue_id_mismatch,
                 "seid_endpoint_mismatch": trace.rejected_seid_endpoint_mismatch,
                 "foreign_subscriber": trace.rejected_foreign_subscriber,
+
                 "stale_state_resets": trace.stale_state_resets,
                 "gpdu_endpoint_mismatch": trace.gpdu_rejected_endpoint_mismatch,
                 "gpdu_no_match": trace.gpdu_rejected_no_match,
@@ -2196,6 +2360,96 @@ impl LiveTraceRegistry {
             } else {
                 matched
             };
+            // 2.21.144 (relecture ANR1 #10 7085078423, FAIL bloquant ;
+            // décision cœur #9 7085198470) — event MIXTE : il porte un
+            // pseudonyme de l'abonné tracé ET un pseudonyme d'abonné que
+            // la trace ne connaît pas. Avant : TOUS ses pseudonymes
+            // étaient appris — celui de l'autre abonné devenait une clé
+            // de la trace, sortait dans `ue_info`, puis toute la
+            // signalisation de cet abonné suivait. L'event reste
+            // rattaché (il appartient aussi à la cible), mais le
+            // pseudonyme étranger n'est plus appris, et il est masqué
+            // dans tout ce que la trace sert (plus bas).
+            // Exception : un event lié au contexte UE de la trace
+            // (identifiant NGAP connu, ou enfant d'un parent rattaché) ne
+            // porte que les identités de CET UE ; il peut en révéler une
+            // autre forme (SUCI puis GUTI…), apprise comme avant.
+            let tied_to_ue_context =
+                core_known || ran_known || (!ev_parent_ids.is_empty() && parent_attached);
+            let carries_known_subscriber = ev_subscriber_pseudonyms.iter().any(|pseudonym| {
+                state.match_keys.contains(pseudonym)
+                    || state.trace.subscriber_pseudonyms.iter().any(|known| known == pseudonym)
+            });
+            // Pseudonymes étrangers de cet event, établis AVANT
+            // l'apprentissage.
+            let own_pseudonym = |token: &str| {
+                state.match_keys.contains(token)
+                    || state.exposed_keys.contains(token)
+                    || state.equipment_keys.contains(token)
+                    || state.trace.subscriber_pseudonyms.iter().any(|known| known == token)
+            };
+            let mut sip_side_inferred = false;
+            let foreign_on_event: BTreeSet<String> = if is_rtp {
+                BTreeSet::new()
+            } else if is_sip {
+                // Un SIP porte l'identité du pair : tout pseudonyme
+                // d'abonné inconnu de la trace est étranger… sauf celui
+                // du côté de l'abonné tracé, quand l'adresse de l'UE le
+                // désigne sans ambiguïté (décision cœur #9 7085354184).
+                // Une requête va de son From vers son To ; une réponse
+                // fait le chemin inverse avec les mêmes en-têtes. Ce
+                // pseudonyme n'est pas masqué, et n'est JAMAIS appris
+                // (2.21.122 intacte : un SIP n'apprend rien).
+                let mut foreign = foreign_subscriber_pseudonyms(&value, true, &own_pseudonym);
+                let address_is_ue = |name: &str| {
+                    event
+                        .information_elements
+                        .iter()
+                        .find(|ie| ie.name == name)
+                        .and_then(|ie| ie.value.as_deref())
+                        .is_some_and(|address| state.ue_ip_keys.contains_key(address))
+                };
+                let source_is_ue = address_is_ue("packet_source_ip_pseudonym");
+                let destination_is_ue = address_is_ue("packet_destination_ip_pseudonym");
+                if source_is_ue != destination_is_ue {
+                    let is_response = event.message_name.as_bytes().first().is_some_and(u8::is_ascii_digit);
+                    let subscriber_is_from = source_is_ue != is_response;
+                    let side: [&str; 2] = if subscriber_is_from {
+                        ["subscriber_pseudonym", "from_uri_pseudonym"]
+                    } else {
+                        ["peer_subscriber_pseudonym", "to_uri_pseudonym"]
+                    };
+                    let by_field = subscriber_pseudonyms_by_field(&value);
+                    for field in side {
+                        for token in by_field.get(field).into_iter().flatten() {
+                            if foreign.remove(token) {
+                                sip_side_inferred = true;
+                            }
+                        }
+                    }
+                }
+                foreign
+            } else if tied_to_ue_context {
+                // Exception « contexte UE », bornée (décision cœur #9
+                // 7085354184) : l'event peut révéler UNE autre forme
+                // d'identité du même abonné, apprise comme avant. S'il
+                // porte plusieurs pseudonymes d'abonné inconnus, aucun
+                // n'est appris et tous sont masqués.
+                let unknown: BTreeSet<String> = subscriber_pseudonyms_by_field(&value)
+                    .into_values()
+                    .flatten()
+                    .filter(|token| token != FOREIGN_PSEUDONYM_MASK && !own_pseudonym(token))
+                    .collect();
+                if unknown.len() > 1 {
+                    unknown
+                } else {
+                    BTreeSet::new()
+                }
+            } else if carries_known_subscriber {
+                foreign_subscriber_pseudonyms(&value, false, &own_pseudonym)
+            } else {
+                BTreeSet::new()
+            };
             if !matched {
                 // 2.21.105 — un G-PDU qui arrive APRÈS la trace mais
                 // dont le TEID / UE IP n'a pas été appris (parce que
@@ -2388,6 +2642,12 @@ impl LiveTraceRegistry {
                     let already_known = state.match_keys.contains(v)
                         || state.trace.subscriber_pseudonyms.iter().any(|known| known == v);
                     if is_sip && is_pseudonym && !already_known {
+                        continue;
+                    }
+                    // 2.21.144 — sur un event mixte, un pseudonyme
+                    // d'abonné inconnu est celui d'un autre abonné :
+                    // ni appris ni exposé.
+                    if foreign_on_event.contains(v) {
                         continue;
                     }
                     // 2.21.126 — l'IP UE pseudonymisée a sa règle et son
@@ -2882,13 +3142,28 @@ impl LiveTraceRegistry {
                 if let Some(revision) = flow_revision {
                     payload["revision"] = json!(revision);
                 }
+                // 2.21.144 — masquage : tout pseudonyme d'abonné qui
+                // n'est pas celui de la trace est remplacé par un jeton
+                // fixe, partout dans le message (identifiants, arbre
+                // d'IE, URI). Même liste gardée avec l'event, pour le
+                // call flow de la trace.
+                let foreign = foreign_on_event.clone();
+                let masked = mask_pseudonyms(&mut payload, &foreign);
+                if sip_side_inferred {
+                    payload["subscriber_side_inferred"] = json!("ue-address");
+                }
+                if masked > 0 {
+                    payload["masked_pseudonyms"] = json!(masked);
+                    state.trace.masked_foreign_pseudonyms =
+                        state.trace.masked_foreign_pseudonyms.saturating_add(masked as u64);
+                }
                 let item = BufferedEvent {
                     id: state.next_id,
                     kind: "message".into(),
                     payload,
                 };
                 state.buffer(item.clone());
-                state.keep_signalling(event, is_flow_update);
+                state.keep_signalling(event, is_flow_update, foreign);
                 let _ = state.tx.send(item);
             }
             let second = event.timestamp.seconds.max(0) as u64;
@@ -4046,6 +4321,7 @@ pub(crate) async fn create(
         rejected_ue_id_mismatch: 0,
         rejected_seid_endpoint_mismatch: 0,
         rejected_foreign_subscriber: 0,
+        masked_foreign_pseudonyms: 0,
         stale_state_resets: 0,
         fresh_registrations: 0,
         rtp_flow_updates: 0,
@@ -4360,7 +4636,8 @@ fn build_trace_callflow(
     trace_id: &str,
     subscriber_pseudonym: Option<String>,
     events: Vec<event_schema::NormalizedEvent>,
-) -> Result<Value, String> {
+    foreign: &BTreeSet<String>,
+) -> Result<(Value, usize), String> {
     // Même chemin que la publication : la ligne JSONL de l'event,
     // relue par le chargeur du moteur de sessions.
     let mut jsonl = String::new();
@@ -4385,7 +4662,10 @@ fn build_trace_callflow(
     let mut flow = callflow_schema::build_callflow(&reconstruction, Vec::new());
     flow.correlation_status
         .insert("E2E".into(), "LIVE_TRACE_NOT_CORRELATED".into());
-    serde_json::to_value(flow).map_err(|error| error.to_string())
+    let mut value = serde_json::to_value(flow).map_err(|error| error.to_string())?;
+    // 2.21.144 — même masquage que dans le flux de la trace.
+    let masked = mask_pseudonyms(&mut value, foreign);
+    Ok((value, masked))
 }
 
 /// 2.21.142 (GO cœur #9 7084290861 ; contrat #10 7084316531) — le call
@@ -4413,7 +4693,7 @@ pub(crate) async fn callflow(
             "trace expired; its call flow is no longer available",
         )
     };
-    let (pseudonym, events, dropped) = {
+    let (pseudonym, events, foreign, dropped) = {
         let traces = state.inner.live_traces.traces.lock().unwrap();
         let Some(s) = traces.get(&id) else {
             drop(traces);
@@ -4438,17 +4718,23 @@ pub(crate) async fn callflow(
         }
         (
             s.trace.subscriber_pseudonyms.first().cloned(),
-            s.signalling.iter().cloned().collect::<Vec<_>>(),
+            s.signalling.iter().map(|kept| kept.event.clone()).collect::<Vec<_>>(),
+            s.signalling
+                .iter()
+                .flat_map(|kept| kept.foreign.iter().cloned())
+                .collect::<BTreeSet<String>>(),
             s.signalling_dropped,
         )
     };
     let cursor = query.cursor.clone();
     let trace_id = id.clone();
     tokio::task::spawn_blocking(move || {
-        let page = build_trace_callflow(&trace_id, pseudonym, events)
-            .and_then(|flow| crate::callflow_page_from_value(&flow, cursor.as_deref(), limit));
+        let page = build_trace_callflow(&trace_id, pseudonym, events, &foreign).and_then(|(flow, masked)| {
+            crate::callflow_page_from_value(&flow, cursor.as_deref(), limit).map(|page| (page, masked))
+        });
         match page {
-            Ok(mut value) => {
+            Ok((mut value, masked)) => {
+                value["masked_pseudonyms"] = json!(masked);
                 if let Some(events) = value.get_mut("events").and_then(Value::as_array_mut) {
                     crate::read_time_patch::fill_unknown_participants_by_interface(events);
                 }
@@ -4615,6 +4901,7 @@ mod tests {
                 rejected_ue_id_mismatch: 0,
                 rejected_seid_endpoint_mismatch: 0,
                 rejected_foreign_subscriber: 0,
+                masked_foreign_pseudonyms: 0,
                 stale_state_resets: 0,
                 fresh_registrations: 0,
                 rtp_flow_updates: 0,
@@ -10934,12 +11221,18 @@ mod tests {
 
     /// Le call flow de la trace `t`, comme le sert la route.
     fn trace_flow_2_21_142(registry: &LiveTraceRegistry) -> Value {
-        let (pseudonym, events) = {
+        let (pseudonym, events, foreign) = {
             let traces = registry.traces.lock().unwrap();
             let t = &traces["t"];
-            (t.trace.subscriber_pseudonyms.first().cloned(), t.signalling.iter().cloned().collect::<Vec<_>>())
+            (
+                t.trace.subscriber_pseudonyms.first().cloned(),
+                t.signalling.iter().map(|kept| kept.event.clone()).collect::<Vec<_>>(),
+                t.signalling.iter().flat_map(|kept| kept.foreign.iter().cloned()).collect::<BTreeSet<String>>(),
+            )
         };
-        build_trace_callflow("t", pseudonym, events).unwrap()
+        let (mut flow, masked) = build_trace_callflow("t", pseudonym, events, &foreign).unwrap();
+        flow["masked_pseudonyms"] = json!(masked);
+        flow
     }
 
     /// 2.21.142 (GO cœur #9 7084290861) — data seule, capture réelle à
@@ -11012,6 +11305,9 @@ mod tests {
             };
             let flow = trace_flow_2_21_142(&registry);
             let flow_events = flow["events"].as_array().unwrap();
+            // 2.21.144 — sur la capture réelle, aucun event n'est mixte.
+            assert_eq!(flow["masked_pseudonyms"], 0, "aucun masquage sur la capture réelle");
+            assert_eq!(registry.traces.lock().unwrap()["t"].trace.masked_foreign_pseudonyms, 0);
             // Exactement les messages de la trace.
             assert_eq!(flow_events.len() as u64, messages, "autant d'events que de messages émis");
             let flow_ids: BTreeSet<&str> = flow_events.iter().map(|e| e["event_id"].as_str().unwrap()).collect();
@@ -11148,20 +11444,328 @@ mod tests {
             event
         };
         for n in 0..MAX_EVENTS {
-            trace.keep_signalling(&event(n), false);
+            trace.keep_signalling(&event(n), false, BTreeSet::new());
         }
         assert_eq!((trace.signalling.len(), trace.signalling_dropped), (MAX_EVENTS, 0));
         for n in MAX_EVENTS..MAX_EVENTS + 5 {
-            trace.keep_signalling(&event(n), false);
+            trace.keep_signalling(&event(n), false, BTreeSet::new());
         }
         assert_eq!((trace.signalling.len(), trace.signalling_dropped), (MAX_EVENTS, 5));
-        assert_eq!(trace.signalling.front().unwrap().event_id, "evt-00005", "les plus anciens sortent");
+        assert_eq!(trace.signalling.front().unwrap().event.event_id, "evt-00005", "les plus anciens sortent");
         // Révision d'un flux : même clé stable, autre event_id → remplacement.
         let mut revision = event(MAX_EVENTS + 4);
         revision.event_id = "evt-revision".into();
-        trace.keep_signalling(&revision, true);
+        trace.keep_signalling(&revision, true, BTreeSet::new());
         assert_eq!((trace.signalling.len(), trace.signalling_dropped), (MAX_EVENTS, 5), "ni ajout ni perte");
-        assert_eq!(trace.signalling.back().unwrap().event_id, "evt-revision");
-        assert!(trace.signalling.iter().all(|kept| kept.event_id != format!("evt-{:05}", MAX_EVENTS + 4)));
+        assert_eq!(trace.signalling.back().unwrap().event.event_id, "evt-revision");
+        assert!(trace.signalling.iter().all(|kept| kept.event.event_id != format!("evt-{:05}", MAX_EVENTS + 4)));
+    }
+    // ===== 2.21.144 — pseudonyme d'un autre abonné : jamais appris, toujours masqué =====
+
+    fn id_event_2_21_144(packet: u64, interface: &str, name: &str, ids: Vec<(&str, &str)>, ies: Vec<(&str, &str)>) -> event_schema::NormalizedEvent {
+        use event_schema::{Direction, Protocol};
+        let mut event = mk_event(interface, Protocol::Ngap, name, packet, Direction::Unknown, ids, ies);
+        event.event_id = format!("evt-{packet:04}");
+        event
+    }
+
+    /// Tout ce que la trace `t` sert : messages du flux et du rejeu,
+    /// `ue_info`, et son call flow.
+    fn served_text_2_21_144(registry: &LiveTraceRegistry) -> String {
+        let mut text = String::new();
+        {
+            let traces = registry.traces.lock().unwrap();
+            for event in traces["t"].events.iter() {
+                text.push_str(&event.payload.to_string());
+            }
+        }
+        text.push_str(&trace_flow_2_21_142(registry).to_string());
+        text
+    }
+
+    /// 2.21.144 (relecture ANR1 #10 7085078423, FAIL bloquant ; décision
+    /// cœur #9 7085198470) — le contre-exemple d'ANR1 : un event non-SIP
+    /// qui porte le pseudonyme de l'abonné tracé ET celui d'un autre
+    /// abonné. Il reste dans la trace (il appartient aussi à la cible),
+    /// mais le pseudonyme étranger n'est NI APPRIS NI SERVI : il est
+    /// masqué dans le flux, le rejeu et le call flow, et les events de
+    /// l'autre abonné restent dehors. Avant : pseudonyme étranger appris
+    /// et exposé, puis toute la signalisation de l'autre abonné rattachée.
+    #[test]
+    fn a_foreign_pseudonym_on_a_mixed_event_is_masked_and_never_learned_2_21_144() {
+        let events = vec![
+            id_event_2_21_144(1, "N2", "InitialUEMessage", vec![("subscriber_pseudonym", "psn-ue-a"), ("ran_ue_ngap_id", "1")], vec![]),
+            // Mixte, sans contexte UE : la cible et un autre abonné.
+            id_event_2_21_144(2, "SBI", "Liste", vec![("subscriber_pseudonym", "psn-ue-a"), ("subscriber_pseudonym", "psn-ue-b")], vec![("subscriber_pseudonym", "psn-ue-b")]),
+            // L'autre abonné, seul : avec, puis sans contexte UE.
+            id_event_2_21_144(3, "N2", "InitialUEMessage", vec![("subscriber_pseudonym", "psn-ue-b"), ("ran_ue_ngap_id", "9")], vec![]),
+            id_event_2_21_144(4, "SBI", "Operation", vec![("subscriber_pseudonym", "psn-ue-b")], vec![]),
+            // La cible continue.
+            id_event_2_21_144(5, "SBI", "Operation", vec![("subscriber_pseudonym", "psn-ue-a")], vec![]),
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&a), ["evt-0001", "evt-0002", "evt-0005"], "l'event mixte reste ; ceux de l'autre abonné non");
+        {
+            let traces = a.traces.lock().unwrap();
+            let t = &traces["t"];
+            assert!(!t.match_keys.contains("psn-ue-b"), "le pseudonyme étranger n'est pas appris");
+            assert!(!t.exposed_keys.contains("psn-ue-b"), "ni exposé dans ue_info");
+            assert_eq!(t.trace.masked_foreign_pseudonyms, 1, "une occurrence masquée dans le message servi");
+            assert_eq!(a.stats_payload(&t.trace)["masked_pseudonyms"], 1);
+            let mixed = t.events.iter().find(|e| e.payload["event_id"] == "evt-0002").unwrap();
+            assert_eq!(mixed.payload["masked_pseudonyms"], 1, "le message dit combien il a masqué");
+            assert!(mixed.payload.to_string().contains("psn-autre-abonne"));
+        }
+        let served = served_text_2_21_144(&a);
+        assert!(!served.contains("psn-ue-b"), "aucun pseudonyme d'un autre abonné dans ce que la trace sert");
+        assert!(served.contains("psn-ue-a"), "le pseudonyme de la cible reste lisible");
+        let flow = trace_flow_2_21_142(&a);
+        assert_eq!(flow["events"].as_array().unwrap().len(), 3, "le call flow reste complet");
+        assert!(flow["masked_pseudonyms"].as_u64().unwrap() >= 1, "le call flow dit qu'il a masqué");
+        // Symétrique : la trace de l'autre abonné masque la cible.
+        let b = trace_on("psn-ue-b");
+        for event in &events {
+            b.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&b), ["evt-0002", "evt-0003", "evt-0004"]);
+        assert!(!served_text_2_21_144(&b).contains("psn-ue-a"));
+    }
+
+    /// 2.21.144 — URI SBI mixte, et liste de trois pseudonymes : quand
+    /// un même champ porte la cible et d'autres abonnés, chacun des
+    /// autres est masqué, où qu'il réapparaisse dans l'event — valeur
+    /// d'IE, jeton dans une URI, forme `subscriber_pseudonym=…` — et
+    /// seulement eux : le pseudonyme de la cible et les pseudonymes qui
+    /// ne sont pas des abonnés (adresse IP) restent.
+    #[test]
+    fn foreign_pseudonyms_are_masked_wherever_they_appear_2_21_144() {
+        let events = vec![
+            id_event_2_21_144(1, "N2", "InitialUEMessage", vec![("subscriber_pseudonym", "psn-ue-a"), ("ran_ue_ngap_id", "1")], vec![]),
+            // URI mixte : la cible et un autre abonné dans la même URI.
+            id_event_2_21_144(
+                2,
+                "SBI",
+                "Transfert",
+                vec![("subscriber_pseudonym", "psn-ue-a")],
+                vec![
+                    ("Request URI (sanitized)", "/nudm-sdm/v2/subscriber-psn-ue-b/sm-data?peer=subscriber-psn-ue-a"),
+                    ("identity_pseudonym", "subscriber_pseudonym=psn-ue-a,subscriber_pseudonym=psn-ue-c"),
+                    ("copie", "vu aussi : psn-ue-b"),
+                    ("packet_source_ip_pseudonym", "psn-adresse-ip"),
+                ],
+            ),
+            // Liste de trois pseudonymes dans le même champ.
+            id_event_2_21_144(
+                3,
+                "SBI",
+                "Liste",
+                vec![("subscriber_pseudonym", "psn-ue-a"), ("subscriber_pseudonym", "psn-ue-d"), ("subscriber_pseudonym", "psn-ue-e")],
+                vec![("response subscriber_pseudonym", "psn-ue-d"), ("autre", "psn-ue-e")],
+            ),
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&a), ["evt-0001", "evt-0002", "evt-0003"]);
+        let served = served_text_2_21_144(&a);
+        for foreign in ["psn-ue-b", "psn-ue-c", "psn-ue-d", "psn-ue-e"] {
+            assert!(!served.contains(foreign), "{foreign} masqué partout");
+        }
+        assert!(served.contains("/nudm-sdm/v2/subscriber-psn-autre-abonne/sm-data?peer=subscriber-psn-ue-a"), "URI : l'étranger masqué, la cible gardée");
+        assert!(served.contains("subscriber_pseudonym=psn-ue-a,subscriber_pseudonym=psn-autre-abonne"));
+        assert!(served.contains("vu aussi : psn-autre-abonne"), "masqué aussi hors de son champ d'origine");
+        assert!(served.contains("psn-adresse-ip"), "un pseudonyme qui n'est pas un abonné n'est pas touché");
+        let traces = a.traces.lock().unwrap();
+        let t = &traces["t"];
+        for foreign in ["psn-ue-b", "psn-ue-c", "psn-ue-d", "psn-ue-e"] {
+            assert!(!t.match_keys.contains(foreign) && !t.exposed_keys.contains(foreign), "{foreign} jamais appris");
+        }
+        // Event 2 : URI, IE d'identité, copie = 3 ; event 3 : deux IE = 2.
+        assert_eq!(t.trace.masked_foreign_pseudonyms, 5);
+    }
+
+    /// 2.21.144 — OUVERT, figé ici : un pseudonyme d'abonné inconnu qui
+    /// est SEUL dans son champ, sur un event qui porte la cible dans un
+    /// autre champ, n'est pas tenu pour étranger. C'est la forme des
+    /// events réels qui relient deux formes d'identité du même abonné
+    /// (URI en SUCI et réponse en SUPI, `User ID` du PFCP, MSISDN), et
+    /// c'est par eux que la trace les apprend. Un event construit qui
+    /// placerait là un autre abonné ne serait pas masqué.
+    #[test]
+    fn an_unknown_pseudonym_alone_in_its_field_is_another_form_of_the_subscriber_2_21_144() {
+        let events = vec![
+            id_event_2_21_144(1, "N2", "InitialUEMessage", vec![("subscriber_pseudonym", "psn-ue-a"), ("ran_ue_ngap_id", "1")], vec![]),
+            // Comme GenerateAuthData : URI sous une forme, réponse sous l'autre.
+            id_event_2_21_144(
+                2,
+                "SBI",
+                "GenerateAuthData",
+                vec![("subscriber_pseudonym", "psn-ue-a"), ("msisdn_pseudonym", "psn-ue-a-msisdn")],
+                vec![("Request URI (sanitized)", "/nudm-ueau/v1/subscriber-psn-ue-a-suci/security-information")],
+            ),
+            // La forme MSISDN seule : la trace l'a apprise.
+            id_event_2_21_144(3, "SBI", "Operation", vec![("msisdn_pseudonym", "psn-ue-a-msisdn")], vec![]),
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&a), ["evt-0001", "evt-0002", "evt-0003"], "la forme apprise rattache la suite");
+        let served = served_text_2_21_144(&a);
+        assert!(served.contains("psn-ue-a-suci") && served.contains("psn-ue-a-msisdn"), "les autres formes restent lisibles");
+        assert_eq!(a.traces.lock().unwrap()["t"].trace.masked_foreign_pseudonyms, 0);
+    }
+
+    /// 2.21.144 — un event qui ne porte QUE des pseudonymes étrangers
+    /// reste rejeté, comme avant : la garde de 2.21.129 n'est pas
+    /// affaiblie par le masquage.
+    #[test]
+    fn a_purely_foreign_event_is_still_rejected_2_21_144() {
+        let events = vec![
+            id_event_2_21_144(1, "N2", "InitialUEMessage", vec![("subscriber_pseudonym", "psn-ue-a"), ("ran_ue_ngap_id", "1"), ("amf_ue_ngap_id", "7")], vec![]),
+            // Même identifiant technique, un autre abonné seulement : réattribution.
+            id_event_2_21_144(2, "N2", "DownlinkNASTransport", vec![("subscriber_pseudonym", "psn-ue-b"), ("ran_ue_ngap_id", "1"), ("amf_ue_ngap_id", "7")], vec![]),
+            id_event_2_21_144(3, "SBI", "Operation", vec![("subscriber_pseudonym", "psn-ue-b")], vec![]),
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&a), ["evt-0001"], "rien de l'autre abonné");
+        let traces = a.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.rejected_foreign_subscriber, 1);
+        assert_eq!(t.trace.masked_foreign_pseudonyms, 0, "rejeté, donc rien à masquer");
+    }
+
+    /// 2.21.144 — l'exception : un event lié au contexte UE de la trace
+    /// peut révéler une autre forme d'identité du MÊME abonné ; elle est
+    /// apprise, donc lisible et jamais masquée.
+    #[test]
+    fn a_second_identity_form_on_the_ue_context_is_learned_not_masked_2_21_144() {
+        let events = vec![
+            id_event_2_21_144(1, "N2", "InitialUEMessage", vec![("subscriber_pseudonym", "psn-ue-a"), ("ran_ue_ngap_id", "1")], vec![]),
+            id_event_2_21_144(2, "N2", "DownlinkNASTransport", vec![("subscriber_pseudonym", "psn-ue-a"), ("subscriber_pseudonym", "psn-ue-a-guti"), ("ran_ue_ngap_id", "1"), ("amf_ue_ngap_id", "7")], vec![]),
+            id_event_2_21_144(3, "SBI", "Operation", vec![("subscriber_pseudonym", "psn-ue-a-guti")], vec![]),
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&a), ["evt-0001", "evt-0002", "evt-0003"]);
+        assert!(served_text_2_21_144(&a).contains("psn-ue-a-guti"), "la seconde forme reste lisible");
+        let traces = a.traces.lock().unwrap();
+        assert!(traces["t"].match_keys.contains("psn-ue-a-guti"));
+        assert_eq!(traces["t"].trace.masked_foreign_pseudonyms, 0);
+    }
+
+    /// Un SIP du test : (From, To) en alias, entre `source` et `destination`.
+    fn sip_between_2_21_144(packet: u64, message: &str, call: &str, from: &str, to: &str, source: &str, destination: &str) -> event_schema::NormalizedEvent {
+        let mut event = sip_from(packet, message, "1 INVITE", call, from, source, destination);
+        let template = event.information_elements[0].clone();
+        for (name, value) in [("from_uri_pseudonym", format!("sip:{from}@ims")), ("peer_subscriber_pseudonym", to.to_owned()), ("to_uri_pseudonym", format!("sip:{to}@ims"))] {
+            event.information_elements.push(event_schema::InformationElement { name: name.into(), value: Some(value), ..template.clone() });
+        }
+        event
+    }
+
+    /// 2.21.144 (décision cœur #9 7085354184) — appel voix avec des URI
+    /// en alias, dans les deux sens. Le correspondant est masqué. Le
+    /// côté de l'abonné tracé — celui que l'adresse de son UE désigne :
+    /// From d'une requête qu'il émet ou d'une réponse qu'il reçoit, To
+    /// d'une requête qu'il reçoit ou d'une réponse qu'il émet — reste
+    /// lisible, porte le marqueur `subscriber_side_inferred`, et n'est
+    /// jamais appris. Adresse ambiguë : les deux côtés sont masqués.
+    #[test]
+    fn the_peer_is_masked_and_the_subscriber_side_is_inferred_from_the_ue_address_2_21_144() {
+        use event_schema::{Direction, Protocol};
+        let (ip_a, pcscf, elsewhere) = ("10.45.0.7", "10.46.0.2", "10.46.0.9");
+        let value = format!("type=IPv4,address={ip_a}");
+        let mut accept = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDU Session Establishment Accept",
+            1,
+            Direction::Unknown,
+            vec![("subscriber_pseudonym", "psn-ue-a"), ("pdu_session_id", "2")],
+            vec![("PDU address", value.as_str())],
+        );
+        accept.event_id = "evt-nas-0001".into();
+        let events = vec![
+            accept,
+            // A appelle : requête émise par l'UE, From = A.
+            sip_between_2_21_144(2, "INVITE", "call-1@ims", "psn-alias-a", "psn-alias-pair", ip_a, pcscf),
+            // Réponse reçue par l'UE : mêmes en-têtes, From = A.
+            sip_between_2_21_144(3, "200 OK", "call-1@ims", "psn-alias-a", "psn-alias-pair", pcscf, ip_a),
+            // A est appelé : requête reçue par l'UE, To = A.
+            sip_between_2_21_144(4, "INVITE", "call-2@ims", "psn-alias-pair", "psn-alias-a", pcscf, ip_a),
+            // Réponse émise par l'UE : mêmes en-têtes, To = A.
+            sip_between_2_21_144(5, "180 Ringing", "call-2@ims", "psn-alias-pair", "psn-alias-a", ip_a, pcscf),
+            // Même appel vu ailleurs (aucune adresse n'est celle de l'UE) : ambigu.
+            sip_between_2_21_144(6, "ACK", "call-2@ims", "psn-alias-pair", "psn-alias-a", pcscf, elsewhere),
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&a), ["evt-nas-0001", "evt-sip-0002", "evt-sip-0003", "evt-sip-0004", "evt-sip-0005", "evt-sip-0006"]);
+        let traces = a.traces.lock().unwrap();
+        let t = &traces["t"];
+        let message = |id: &str| t.events.iter().find(|e| e.payload["event_id"] == id).unwrap().payload.clone();
+        for id in ["evt-sip-0002", "evt-sip-0003", "evt-sip-0004", "evt-sip-0005"] {
+            let payload = message(id);
+            let text = payload.to_string();
+            assert!(!text.contains("psn-alias-pair"), "{id} : le correspondant est masqué");
+            assert!(text.contains("psn-alias-a"), "{id} : le côté de l'abonné tracé reste lisible");
+            assert_eq!(payload["subscriber_side_inferred"], "ue-address", "{id} : inférence marquée");
+            assert!(payload["masked_pseudonyms"].as_u64().unwrap() >= 1, "{id}");
+        }
+        let ambiguous = message("evt-sip-0006");
+        assert!(!ambiguous.to_string().contains("psn-alias-pair") && !ambiguous.to_string().contains("psn-alias-a"), "adresse ambiguë : les deux côtés masqués");
+        assert!(ambiguous["subscriber_side_inferred"].is_null());
+        // Jamais appris, ni l'un ni l'autre (2.21.122 intacte).
+        for alias in ["psn-alias-a", "psn-alias-pair"] {
+            assert!(!t.match_keys.contains(alias) && !t.exposed_keys.contains(alias), "{alias} jamais appris");
+        }
+        drop(traces);
+        let flow = trace_flow_2_21_142(&a).to_string();
+        assert!(!flow.contains("psn-alias-pair"), "le call flow masque aussi le correspondant");
+    }
+
+    /// 2.21.144 (décision cœur #9 7085354184) — borne de l'exception
+    /// « contexte UE » : un event lié au contexte UE qui porte PLUSIEURS
+    /// pseudonymes d'abonné inconnus n'en apprend aucun et les masque
+    /// tous.
+    #[test]
+    fn several_unknown_pseudonyms_on_the_ue_context_are_all_masked_2_21_144() {
+        let events = vec![
+            id_event_2_21_144(1, "N2", "InitialUEMessage", vec![("subscriber_pseudonym", "psn-ue-a"), ("ran_ue_ngap_id", "1")], vec![]),
+            id_event_2_21_144(
+                2,
+                "N2",
+                "DownlinkNASTransport",
+                vec![("subscriber_pseudonym", "psn-ue-a"), ("subscriber_pseudonym", "psn-ue-x"), ("msisdn_pseudonym", "psn-ue-y"), ("ran_ue_ngap_id", "1")],
+                vec![("identity_pseudonym", "psn-ue-x"), ("msisdn_pseudonym", "psn-ue-y")],
+            ),
+            id_event_2_21_144(3, "SBI", "Operation", vec![("subscriber_pseudonym", "psn-ue-x")], vec![]),
+            id_event_2_21_144(4, "SBI", "Operation", vec![("msisdn_pseudonym", "psn-ue-y")], vec![]),
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        assert_eq!(routed_ids(&a), ["evt-0001", "evt-0002"], "aucun des deux n'est appris : leurs events restent dehors");
+        let served = served_text_2_21_144(&a);
+        assert!(!served.contains("psn-ue-x") && !served.contains("psn-ue-y"), "tous deux masqués");
+        let traces = a.traces.lock().unwrap();
+        let t = &traces["t"];
+        for unknown in ["psn-ue-x", "psn-ue-y"] {
+            assert!(!t.match_keys.contains(unknown) && !t.exposed_keys.contains(unknown));
+        }
+        assert_eq!(t.trace.masked_foreign_pseudonyms, 2);
     }
 }
