@@ -1,5 +1,57 @@
 # Changelog
 
+## oiran-api 2.21.149, live-probe 0.6.35 — 2026-11-22 — restauration et réparation : les refus précèdent toute modification ; l'empreinte d'un fragment se vérifie sur ses octets ; générations de call flows orphelines ramassées
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.148 @ `80b8db1` (branche `fix/oiran-2.21.149-restore-validates-first`). Relecture indépendante d'ANR1 (#10 7086184564) : **FAIL sur 2.21.146 et sur 2.21.147**. Ordre du cœur #9 7086221183. Les deux défauts sont réels ; les deux contre-exemples d'ANR1 sont repris en tests.
+
+### Défaut de 2.21.146 — le refus ne précédait pas toute modification
+
+`restore_from_archive_segment` et `repair_partial_imports` commençaient par reprendre un échange interrompu (`.dataset-previous` → `dataset`) et par effacer `.dataset-next`, **puis** contrôlaient et refusaient. Un refus qui disait « rien n'a été modifié » avait donc déjà modifié le disque — ce que le CHANGELOG de 2.21.146 affirmait à tort.
+
+**Correctif** : toutes les validations sont faites en lecture seule, sur le jeu qui serait le jeu courant après reprise, avant la moindre écriture. Ordre des opérations, tel qu'il est dans le code :
+
+| Fonction | Refus, en lecture seule | Première écriture | Ensuite |
+|---|---|---|---|
+| Restauration, jeu en fragments | archive présente et conforme à son manifeste ; manifeste du jeu lisible et cohérent ; chaque fragment présent et d'empreinte conforme | reprise d'un échange interrompu, puis effacement de `.dataset-next` | préparation, copie de l'archive en fragment, liens, publication, commit |
+| Restauration, fichier plat | jeu sans fragments ; fichier plat présent ; archive présente et conforme | idem | préparation, fusion, publication, jeu remplacé gardé daté, échange |
+| Réparation | jeu sans fragments ; fichier plat présent | idem | analyse, préparation, publication, jeu remplacé gardé daté, échange |
+
+Les trois refus qui subsistaient **après** ces écritures dans le chemin « fichier plat » (doublons des contrôles désormais faits avant) sont retirés. Au-delà de la première écriture il ne reste que des erreurs d'exécution (entrée/sortie, publication), pas des validations.
+
+### Défaut de 2.21.147 — idempotence fondée sur l'empreinte déclarée
+
+La restauration en mode fragments répondait « déjà présent » dès qu'un fragment du manifeste **déclarait** l'empreinte de l'archive. `validate_dataset_artifacts` contrôle le chemin, la taille et les compteurs d'un fragment, jamais son empreinte : un fragment altéré à taille égale passait, et restait en place.
+
+**Correctif** : l'empreinte SHA-256 de **chaque** fragment référencé est recalculée sur ses octets et comparée à celle du manifeste, avant la branche idempotente comme avant toute publication. Divergence → `RESTORE_FRAGMENT_SHA_MISMATCH`, rien n'est modifié.
+
+**Coût** : une lecture complète de tous les fragments, **par restauration seulement**. Ce contrôle est dans le pré-contrôle de l'outil ; il n'est sur le chemin d'aucun cycle de publication, dont la durée ne change pas. À l'échelle du lab : 4,0 Go à hacher aujourd'hui (0,6 Go une fois le monolithe archivé) — de l'ordre de dix à trente secondes, non mesuré.
+
+### Générations de call flows orphelines — ramassées
+
+Relevé par ANR1, non destructif. `commit_incremental_publication` installe le fragment nouveau, puis la génération de call flows, puis écrit le manifeste, puis retire la génération du manifeste précédent. Une interruption laissait :
+
+| Interruption après… | Reste sur le disque | Avant ce lot | Désormais |
+|---|---|---|---|
+| l'installation du fragment | un fragment non référencé | reste ; repris tel quel si le cycle suivant reproduit le même fragment | **inchangé** : un fragment n'est jamais ramassé |
+| l'installation de la génération | une génération orpheline (181 Mo au lab) | restait pour toujours | **ramassée** au commit suivant |
+| l'écriture du manifeste | la génération précédente (181 Mo) | restait pour toujours | **ramassée** au commit suivant |
+
+Après l'écriture du manifeste, toute génération autre que la sienne est retirée (`CALLFLOW_GENERATION_ORPHANS_REMOVED`). Ce sont des données dérivées ; le jeu publié reste, dans tous les cas, celui du dernier manifeste écrit. Ce chemin est celui de **tous** les cycles, pas seulement de la restauration.
+
+### Tests (échec avant, succès après)
+
+- `a_refused_restore_or_repair_has_modified_nothing_2_21_149` — le contre-exemple d'ANR1 (manifeste illisible, fragment sur le disque, sentinelle dans `.dataset-next`), étendu : archive altérée, et échange interrompu qu'un refus ne reprend pas ; une restauration valide, elle, le reprend puis s'exécute.
+- `restore_refuses_a_fragment_whose_bytes_differ_from_its_declared_hash_2_21_149` — le contre-exemple d'ANR1 (archive déjà fragment, fragment altéré à taille égale → refus au lieu de « déjà présent »), plus un fragment ordinaire altéré avant restauration.
+- `orphan_callflow_generations_are_collected_at_the_next_commit_2_21_149` — deux générations orphelines et un fragment non référencé posés comme après une interruption ; au cycle suivant il ne reste que la génération du manifeste, aucune session n'est perdue, le fragment reste.
+- Les tests existants de restauration et de réparation passent sans changement.
+
+### OUVERT
+
+- **Un fragment installé puis non référencé** (interruption avant l'écriture du manifeste) reste sur le disque. Il n'est repris que si le cycle suivant reproduit exactement le même fragment ; sinon il occupe la place d'un fragment de cycle (quelques kilo-octets à quelques mégaoctets au lab) jusqu'à un geste d'opérateur. Aucun ramassage : c'est le choix « on ne supprime jamais un fragment d'events ».
+- **La réparation « à blanc » (`dry_run`) n'est pas une lecture seule** : elle reprend un échange interrompu et efface `.dataset-next` comme la réparation réelle. Comportement antérieur à ces lots, non modifié ; sur un jeu en fragments elle refuse avant.
+- Le coût du recalcul d'empreinte à l'échelle du lab n'est pas mesuré.
+- `dataset-restore` reste interdit au lab tant que ce lot n'y est pas relu et déployé.
+
 ## oiran-api 2.21.148, session-engine 0.5.28 — 2026-11-22 — publication : passe des représentants allégée, résultat identique
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.147 @ `ed34119` (branche `fix/oiran-2.21.148-representatives-pass`). Lot « 2a » de la publication proportionnelle au delta (audit #9 7085113630, GO #9 7085198470). La version 2.21.145, d'abord réservée à ce lot, n'a jamais été publiée.

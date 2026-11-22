@@ -5339,46 +5339,48 @@ impl CaptureManager {
         let current = base.join("dataset");
         let next = base.join(".dataset-next");
         let previous = base.join(".dataset-previous");
+        // 2.21.149 (relecture ANR1 #10 7086184564) — TOUTE validation
+        // précède la moindre modification. Avant : la reprise d'un
+        // échange interrompu (`.dataset-previous` → `dataset`) et
+        // l'effacement de `.dataset-next` avaient lieu avant les refus ;
+        // un refus « rien n'a été modifié » avait donc déjà modifié le
+        // disque. Les contrôles portent sur le jeu qui SERAIT le jeu
+        // courant après reprise.
+        let effective: &Path = if !current.is_dir() && previous.is_dir() {
+            &previous
+        } else {
+            &current
+        };
+        // 2.21.147 — jeu en fragments : l'archive est ajoutée comme un
+        // fragment de plus, par le chemin de publication des cycles. Le
+        // jeu n'est ni refondu en fichier plat ni remplacé.
+        if refuse_fragmented_dataset(effective, "RESTORE_REFUSED_FRAGMENTED_DATASET").is_err() {
+            let preflight = fragment_restore_preflight(effective, archive_segment_dir)?;
+            if previous.is_dir() && !current.is_dir() {
+                fs::rename(&previous, &current).map_err(display_error)?;
+            }
+            if next.exists() {
+                fs::remove_dir_all(&next).map_err(display_error)?;
+            }
+            return self.restore_archive_as_fragment(&current, &next, archive_segment_dir, preflight);
+        }
+        if !effective.join("oiran_events.jsonl").is_file() {
+            return Err(format!(
+                "RESTORE_MISSING_HOT_VIEW: {}",
+                current.join("oiran_events.jsonl").display()
+            ));
+        }
+        verified_archive_segment(archive_segment_dir)?;
         if previous.is_dir() && !current.is_dir() {
             fs::rename(&previous, &current).map_err(display_error)?;
         }
         if next.exists() {
             fs::remove_dir_all(&next).map_err(display_error)?;
         }
-        // 2.21.147 — jeu en fragments : l'archive est ajoutée comme un
-        // fragment de plus, par le chemin de publication des cycles. Le
-        // jeu n'est ni refondu en fichier plat ni remplacé.
-        if refuse_fragmented_dataset(&current, "RESTORE_REFUSED_FRAGMENTED_DATASET").is_err() {
-            return self.restore_archive_as_fragment(&base, &current, &next, archive_segment_dir);
-        }
+        // Tous les refus ont été rendus plus haut, avant ces deux
+        // modifications : il n'en reste aucun au-delà.
         let current_events = current.join("oiran_events.jsonl");
-        if !current_events.is_file() {
-            return Err(format!(
-                "RESTORE_MISSING_HOT_VIEW: {}",
-                current_events.display()
-            ));
-        }
         let archive_events = archive_segment_dir.join("events.jsonl");
-        if !archive_events.is_file() {
-            return Err(format!(
-                "RESTORE_MISSING_ARCHIVE_EVENTS: {}",
-                archive_events.display()
-            ));
-        }
-        let archive_manifest_path = archive_segment_dir.join("manifest.json");
-        if archive_manifest_path.is_file() {
-            let manifest: Value =
-                serde_json::from_slice(&fs::read(&archive_manifest_path).map_err(display_error)?)
-                    .map_err(|error| error.to_string())?;
-            if let Some(expected) = manifest.get("events_sha256").and_then(Value::as_str) {
-                let actual = sha256_hex_file(&archive_events)?;
-                if actual != expected {
-                    return Err(format!(
-                        "RESTORE_ARCHIVE_TAMPERED: manifest sha {expected} != actual {actual}"
-                    ));
-                }
-            }
-        }
         // Prior continuous checkpoint: the restore carries over
         // operator-written `decode_reports` + `checksums` from the
         // current manifest if it exists AND validates against its
@@ -5477,49 +5479,18 @@ impl CaptureManager {
     /// déjà l'empreinte de l'archive, elle ne fait rien.
     fn restore_archive_as_fragment(
         &self,
-        base: &Path,
         current: &Path,
         next: &Path,
         archive_segment_dir: &Path,
+        preflight: FragmentRestorePreflight,
     ) -> Result<DatasetRestoreReport, String> {
+        let FragmentRestorePreflight {
+            prior,
+            archive_sha,
+            archive_event_count,
+            already_present,
+        } = preflight;
         let archive_events = archive_segment_dir.join("events.jsonl");
-        if !archive_events.is_file() {
-            return Err(format!(
-                "RESTORE_MISSING_ARCHIVE_EVENTS: {}",
-                archive_events.display()
-            ));
-        }
-        let archive_sha = sha256_hex_file(&archive_events)?;
-        let archive_manifest_path = archive_segment_dir.join("manifest.json");
-        if archive_manifest_path.is_file() {
-            let manifest: Value =
-                serde_json::from_slice(&fs::read(&archive_manifest_path).map_err(display_error)?)
-                    .map_err(|error| error.to_string())?;
-            if let Some(expected) = manifest.get("events_sha256").and_then(Value::as_str) {
-                if archive_sha != expected {
-                    return Err(format!(
-                        "RESTORE_ARCHIVE_TAMPERED: manifest sha {expected} != actual {archive_sha}"
-                    ));
-                }
-            }
-        }
-        // Le manifeste courant doit être lisible et cohérent avec ses
-        // fichiers : la restauration s'appuie dessus, elle ne devine rien.
-        let prior: LiveDataset = serde_json::from_slice(
-            &fs::read(current.join("dataset_manifest.json")).map_err(display_error)?,
-        )
-        .map_err(|error| format!("RESTORE_FRAGMENTED_MANIFEST_INVALID: {error}"))?;
-        validate_dataset_artifacts(&prior, current)
-            .map_err(|error| format!("RESTORE_FRAGMENTED_MANIFEST_INVALID: {error}"))?;
-        for shard in &prior.event_shards {
-            if !current.join(&shard.path).is_file() {
-                return Err(format!(
-                    "RESTORE_FRAGMENT_MISSING: {} est référencé par le manifeste et absent du disque ; rien n'a été modifié",
-                    shard.path
-                ));
-            }
-        }
-        let archive_event_count = count_valid_event_records(&archive_events)?;
         let event_count_before = prior.event_count;
         let report = |dataset: &LiveDataset, overlap_event_count: usize| DatasetRestoreReport {
             schema_version: "2.21.147",
@@ -5534,8 +5505,10 @@ impl CaptureManager {
             session_ids: dataset.session_ids.clone(),
             events_sha256: archive_sha.clone(),
         };
-        // Idempotence : cette archive est déjà un fragment du jeu.
-        if prior.event_shards.iter().any(|shard| shard.sha256 == archive_sha) {
+        // Idempotence : cette archive est déjà un fragment du jeu — un
+        // fragment dont les OCTETS ont cette empreinte (2.21.149), pas
+        // seulement le manifeste qui le déclare.
+        if already_present {
             eprintln!(
                 "{}",
                 serde_json::json!({
@@ -5597,7 +5570,6 @@ impl CaptureManager {
         };
         let dataset = commit_incremental_publication(current, next, dataset)?;
         self.upsert_dataset(dataset.clone(), current)?;
-        let _ = base;
         let overlap = event_count_before
             .saturating_add(archive_event_count)
             .saturating_sub(dataset.event_count);
@@ -5661,20 +5633,28 @@ impl CaptureManager {
         let current = base.join("dataset");
         let next = base.join(".dataset-next");
         let previous = base.join(".dataset-previous");
+        // 2.21.149 (relecture ANR1 #10 7086184564) — les refus
+        // précèdent toute modification (reprise d'un échange interrompu,
+        // effacement de `.dataset-next`).
+        let effective: &Path = if !current.is_dir() && previous.is_dir() {
+            &previous
+        } else {
+            &current
+        };
+        refuse_fragmented_dataset(effective, "REPAIR_REFUSED_FRAGMENTED_DATASET")?;
+        if !effective.join("oiran_events.jsonl").is_file() {
+            return Err(format!(
+                "REPAIR_MISSING_HOT_VIEW: {}",
+                current.join("oiran_events.jsonl").display()
+            ));
+        }
         if previous.is_dir() && !current.is_dir() {
             fs::rename(&previous, &current).map_err(display_error)?;
         }
         if next.exists() {
             fs::remove_dir_all(&next).map_err(display_error)?;
         }
-        refuse_fragmented_dataset(&current, "REPAIR_REFUSED_FRAGMENTED_DATASET")?;
         let current_events = current.join("oiran_events.jsonl");
-        if !current_events.is_file() {
-            return Err(format!(
-                "REPAIR_MISSING_HOT_VIEW: {}",
-                current_events.display()
-            ));
-        }
         // 2.8.4: `state.segments` is consulted ONLY as a fallback
         // when `source_root` is absent. Missing or invalid state.json
         // is not fatal — the content-based grouping still works.
@@ -9067,8 +9047,49 @@ fn commit_incremental_publication(
             }
         }
     }
+    // 2.21.149 (relecture ANR1 #10 7086184564) — ramassage des générations
+    // ORPHELINES. Une interruption entre l'installation d'une génération
+    // et le renommage du manifeste, ou entre ce renommage et le retrait de
+    // la génération précédente, laissait une génération que plus aucun
+    // manifeste ne référence ; le retrait ci-dessus ne connaît que celle du
+    // manifeste précédent, elle restait donc pour toujours. Le manifeste
+    // vient d'être écrit : toute génération autre que la sienne est
+    // retirée. Ce sont des données dérivées ; les fragments d'events ne
+    // passent jamais par ce ramassage.
+    let orphans = remove_unreferenced_callflow_generations(&generations, &generation_name);
+    if orphans > 0 {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CALLFLOW_GENERATION_ORPHANS_REMOVED",
+                "count": orphans,
+            })
+        );
+    }
     fs::remove_dir_all(staging).map_err(display_error)?;
     Ok(dataset)
+}
+
+/// 2.21.149 — retire de `generations` tout dossier `generation-*` autre
+/// que `referenced`. Rend le nombre de dossiers retirés. Un échec de
+/// suppression n'interrompt pas la publication, déjà visible : le
+/// dossier sera ramassé au cycle suivant.
+fn remove_unreferenced_callflow_generations(generations: &Path, referenced: &str) -> usize {
+    let Ok(entries) = fs::read_dir(generations) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == referenced || !name.starts_with("generation-") || !entry.path().is_dir() {
+            continue;
+        }
+        if fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn count_regular_files(path: &Path) -> u64 {
@@ -9200,6 +9221,98 @@ fn refuse_fragmented_dataset(current: &Path, code: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 2.21.149 — résultat des contrôles d'une restauration en mode
+/// fragments, tous faits AVANT la moindre modification du disque.
+struct FragmentRestorePreflight {
+    prior: LiveDataset,
+    archive_sha: String,
+    archive_event_count: usize,
+    /// Un fragment du jeu a déjà les octets de l'archive.
+    already_present: bool,
+}
+
+/// 2.21.149 — contrôle un segment d'archive : `events.jsonl` présent,
+/// et conforme à l'empreinte de son manifeste s'il en a un. Rend
+/// l'empreinte réelle des events. Lecture seule.
+fn verified_archive_segment(archive_segment_dir: &Path) -> Result<String, String> {
+    let archive_events = archive_segment_dir.join("events.jsonl");
+    if !archive_events.is_file() {
+        return Err(format!(
+            "RESTORE_MISSING_ARCHIVE_EVENTS: {}",
+            archive_events.display()
+        ));
+    }
+    let archive_sha = sha256_hex_file(&archive_events)?;
+    let archive_manifest_path = archive_segment_dir.join("manifest.json");
+    if archive_manifest_path.is_file() {
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(&archive_manifest_path).map_err(display_error)?)
+                .map_err(|error| error.to_string())?;
+        if let Some(expected) = manifest.get("events_sha256").and_then(Value::as_str) {
+            if archive_sha != expected {
+                return Err(format!(
+                    "RESTORE_ARCHIVE_TAMPERED: manifest sha {expected} != actual {archive_sha}"
+                ));
+            }
+        }
+    }
+    Ok(archive_sha)
+}
+
+/// 2.21.149 (relecture ANR1 #10 7086184564) — tous les contrôles d'une
+/// restauration en mode fragments, en LECTURE SEULE, sur le jeu
+/// `dataset_dir` :
+///
+/// * l'archive est présente et conforme à son manifeste ;
+/// * le manifeste du jeu est lisible et cohérent avec ses fichiers ;
+/// * chaque fragment référencé est présent, et ses OCTETS ont
+///   l'empreinte que le manifeste déclare. Avant : l'empreinte déclarée
+///   était crue sur parole ; un fragment altéré à taille égale passait,
+///   et l'idempotence répondait « déjà présent » pour une archive dont
+///   le fragment homonyme n'avait plus le contenu.
+///
+/// Toute divergence est un refus explicite ; rien n'est modifié.
+fn fragment_restore_preflight(
+    dataset_dir: &Path,
+    archive_segment_dir: &Path,
+) -> Result<FragmentRestorePreflight, String> {
+    let archive_sha = verified_archive_segment(archive_segment_dir)?;
+    let prior: LiveDataset = serde_json::from_slice(
+        &fs::read(dataset_dir.join("dataset_manifest.json"))
+            .map_err(|error| format!("RESTORE_FRAGMENTED_MANIFEST_INVALID: {error}"))?,
+    )
+    .map_err(|error| format!("RESTORE_FRAGMENTED_MANIFEST_INVALID: {error}"))?;
+    validate_dataset_artifacts(&prior, dataset_dir)
+        .map_err(|error| format!("RESTORE_FRAGMENTED_MANIFEST_INVALID: {error}"))?;
+    for shard in &prior.event_shards {
+        let path = dataset_dir.join(&shard.path);
+        if !path.is_file() {
+            return Err(format!(
+                "RESTORE_FRAGMENT_MISSING: {} est référencé par le manifeste et absent du disque ; rien n'a été modifié",
+                shard.path
+            ));
+        }
+        let actual = sha256_hex_file(&path)?;
+        if actual != shard.sha256 {
+            return Err(format!(
+                "RESTORE_FRAGMENT_SHA_MISMATCH: {} a l'empreinte {}… sur le disque et {}… au manifeste ; rien n'a été modifié",
+                shard.path,
+                &actual[..16.min(actual.len())],
+                &shard.sha256[..16.min(shard.sha256.len())]
+            ));
+        }
+    }
+    let archive_event_count = count_valid_event_records(&archive_segment_dir.join("events.jsonl"))?;
+    // Les empreintes déclarées viennent d'être vérifiées sur les octets.
+    let already_present = prior.event_shards.iter().any(|shard| shard.sha256 == archive_sha);
+    Ok(FragmentRestorePreflight {
+        prior,
+        archive_sha,
+        archive_event_count,
+        already_present,
+    })
 }
 
 /// 2.21.146 — garde le jeu précédent sous un nom daté
@@ -23362,5 +23475,170 @@ Content-Length: 0\r\n\
         assert!(!refused(&make("residu", Some(serde_json::json!({"event_shards":[{"path":"oiran_events.jsonl"}]})), &["vieux.jsonl"])));
         let message = refuse_fragmented_dataset(&root.join("ordinaire"), "RESTORE_REFUSED_FRAGMENTED_DATASET").unwrap_err();
         assert!(message.starts_with("RESTORE_REFUSED_FRAGMENTED_DATASET: ") && message.contains("Rien n'a été modifié"));
+    }
+    // ===== 2.21.149 — les refus précèdent toute modification ; l'empreinte d'un fragment se vérifie sur ses octets =====
+
+    /// 2.21.149 (relecture ANR1 #10 7086184564, FAIL de 2.21.146) — un
+    /// refus ne modifie RIEN : ni le dossier de préparation
+    /// `.dataset-next`, ni un échange interrompu en attente de reprise.
+    /// Contre-exemple d'ANR1 : manifeste illisible, un fragment sur le
+    /// disque, une sentinelle dans `.dataset-next`. Avant : le refus
+    /// était rendu, mais `.dataset-next` avait déjà été effacé.
+    #[test]
+    fn a_refused_restore_or_repair_has_modified_nothing_2_21_149() {
+        let lab = archived_lab_shaped_dataset_2_21_146("refusal-modifies-nothing");
+        let dataset_dir = lab.base.join("dataset");
+        let next = lab.base.join(".dataset-next");
+        let previous = lab.base.join(".dataset-previous");
+        let manifest_path = dataset_dir.join("dataset_manifest.json");
+        let good_manifest = fs::read(&manifest_path).unwrap();
+        let sentinel = next.join("sentinelle");
+        fs::create_dir_all(&next).unwrap();
+        fs::write(&sentinel, b"ne pas effacer").unwrap();
+        // Manifeste illisible, fragments présents : refus des deux outils.
+        fs::write(&manifest_path, b"pas du json").unwrap();
+        let restore = lab.manager.restore_from_archive_segment(&lab.segment).unwrap_err();
+        assert!(restore.starts_with("RESTORE_FRAGMENTED_MANIFEST_INVALID"), "{restore}");
+        assert!(sentinel.is_file(), "la restauration refusée n'a pas touché à .dataset-next");
+        let repair = lab.manager.repair_partial_imports(false, None).unwrap_err();
+        assert!(repair.starts_with("REPAIR_REFUSED_FRAGMENTED_DATASET"), "{repair}");
+        assert!(sentinel.is_file(), "la réparation refusée n'a pas touché à .dataset-next");
+        assert_eq!(fs::read(&manifest_path).unwrap(), b"pas du json", "manifeste laissé tel quel");
+        // Archive altérée : refus, sentinelle intacte.
+        fs::write(&manifest_path, &good_manifest).unwrap();
+        let tampered = lab.base.join("archive-alteree");
+        fs::create_dir_all(&tampered).unwrap();
+        fs::copy(lab.segment.join("manifest.json"), tampered.join("manifest.json")).unwrap();
+        let mut events = fs::read(lab.segment.join("events.jsonl")).unwrap();
+        events.extend_from_slice(b"\n");
+        fs::write(tampered.join("events.jsonl"), &events).unwrap();
+        let restore = lab.manager.restore_from_archive_segment(&tampered).unwrap_err();
+        assert!(restore.starts_with("RESTORE_ARCHIVE_TAMPERED"), "{restore}");
+        assert!(sentinel.is_file());
+        // Échange interrompu (le jeu est sous `.dataset-previous`) : un
+        // refus ne le reprend pas non plus.
+        fs::rename(&dataset_dir, &previous).unwrap();
+        let repair = lab.manager.repair_partial_imports(false, None).unwrap_err();
+        assert!(repair.starts_with("REPAIR_REFUSED_FRAGMENTED_DATASET"), "{repair}");
+        assert!(previous.is_dir() && !dataset_dir.exists(), "l'échange interrompu n'est pas repris par un refus");
+        let restore = lab.manager.restore_from_archive_segment(&tampered).unwrap_err();
+        assert!(restore.starts_with("RESTORE_ARCHIVE_TAMPERED"), "{restore}");
+        assert!(previous.is_dir() && !dataset_dir.exists());
+        assert!(sentinel.is_file());
+        // Une restauration valide, elle, reprend l'échange puis s'exécute.
+        lab.manager.restore_from_archive_segment(&lab.segment).unwrap();
+        assert!(dataset_dir.is_dir() && !previous.exists());
+    }
+
+    /// 2.21.149 (relecture ANR1 #10 7086184564, FAIL de 2.21.147) —
+    /// l'empreinte d'un fragment se vérifie sur ses OCTETS. Contre-
+    /// exemple d'ANR1 : l'archive est déjà un fragment du jeu, puis ce
+    /// fragment est altéré à taille égale. Avant : la restauration
+    /// rendait « déjà présent », sur la foi de l'empreinte déclarée, et
+    /// laissait le fragment altéré. Désormais : refus explicite.
+    #[test]
+    fn restore_refuses_a_fragment_whose_bytes_differ_from_its_declared_hash_2_21_149() {
+        let lab = archived_lab_shaped_dataset_2_21_146("fragment-hash-is-verified");
+        let dataset_dir = lab.base.join("dataset");
+        let manifest = || -> LiveDataset {
+            serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap()).unwrap()
+        };
+        // Altère un fragment en gardant sa taille et un JSON valide :
+        // une lettre d'une valeur textuelle.
+        let alter = |path: &Path| {
+            let mut bytes = fs::read(path).unwrap();
+            let at = bytes.windows(5).position(|window| window == b"\"evt-").unwrap() + 5;
+            bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+            fs::write(path, &bytes).unwrap();
+        };
+        // 1. Un fragment ordinaire altéré : la restauration refuse avant d'ajouter l'archive.
+        let ordinary = dataset_dir.join(&manifest().event_shards[0].path);
+        let ordinary_bytes = fs::read(&ordinary).unwrap();
+        alter(&ordinary);
+        assert_eq!(fs::read(&ordinary).unwrap().len(), ordinary_bytes.len(), "même taille");
+        let manifest_bytes = fs::read(dataset_dir.join("dataset_manifest.json")).unwrap();
+        let error = lab.manager.restore_from_archive_segment(&lab.segment).unwrap_err();
+        assert!(error.starts_with("RESTORE_FRAGMENT_SHA_MISMATCH"), "{error}");
+        assert_eq!(fs::read(dataset_dir.join("dataset_manifest.json")).unwrap(), manifest_bytes, "rien de modifié");
+        assert!(!lab.base.join(".dataset-next").exists());
+        fs::write(&ordinary, &ordinary_bytes).unwrap();
+        // 2. Restauration valide : l'archive devient un fragment.
+        lab.manager.restore_from_archive_segment(&lab.segment).unwrap();
+        let restored = manifest();
+        let restored_fragment = dataset_dir.join(&restored.event_shards[0].path);
+        assert!(restored.event_shards[0].path.starts_with("event-shards/shard-restored-"));
+        // 3. Le contre-exemple d'ANR1 : ce fragment est altéré à taille égale.
+        let good = fs::read(&restored_fragment).unwrap();
+        alter(&restored_fragment);
+        assert_ne!(sha256_hex(&fs::read(&restored_fragment).unwrap()), restored.event_shards[0].sha256);
+        let error = lab.manager.restore_from_archive_segment(&lab.segment).unwrap_err();
+        assert!(error.starts_with("RESTORE_FRAGMENT_SHA_MISMATCH"), "plus de « déjà présent » sur parole : {error}");
+        // Remis en état, l'idempotence fonctionne.
+        fs::write(&restored_fragment, &good).unwrap();
+        let again = lab.manager.restore_from_archive_segment(&lab.segment).unwrap();
+        assert_eq!(again.event_count_after, restored.event_count);
+    }
+    /// 2.21.149 (relecture ANR1 #10 7086184564, point « interruption
+    /// préparation → commit ») — ce que laisse une interruption à chaque
+    /// point du commit, et ce qu'en fait le cycle suivant :
+    ///
+    /// * fragment installé, manifeste pas encore écrit : le fragment
+    ///   n'est référencé par rien ; il RESTE sur le disque (les
+    ///   fragments ne passent jamais par un ramassage) ;
+    /// * génération de call flows installée, manifeste pas encore
+    ///   écrit — ou manifeste écrit, génération précédente pas encore
+    ///   retirée : la génération orpheline est RAMASSÉE au commit
+    ///   suivant. Avant : elle restait pour toujours.
+    ///
+    /// Dans tous les cas le jeu publié reste celui du dernier manifeste.
+    #[test]
+    fn orphan_callflow_generations_are_collected_at_the_next_commit_2_21_149() {
+        let lab = archived_lab_shaped_dataset_2_21_146("orphan-generations");
+        let dataset_dir = lab.base.join("dataset");
+        let manifest = || -> LiveDataset {
+            serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap()).unwrap()
+        };
+        let generations = dataset_dir.join("callflow-generations");
+        let names = || -> BTreeSet<String> {
+            fs::read_dir(&generations).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+        };
+        let before = manifest();
+        let referenced = before.callflows_path.clone().unwrap();
+        assert_eq!(names().len(), 1, "une seule génération après un commit normal");
+        // Ce que laisse une interruption : deux générations orphelines et
+        // un fragment installé que le manifeste ne référence pas.
+        for orphan in ["generation-1-interrompue-avant-manifeste", "generation-2-precedente-non-retiree"] {
+            fs::create_dir_all(generations.join(orphan)).unwrap();
+            fs::write(generations.join(orphan).join("5g-session-orpheline.json"), b"{}").unwrap();
+        }
+        let stray_fragment = dataset_dir.join("event-shards/shard-00000000000000000099-interrompu.jsonl");
+        fs::write(&stray_fragment, b"").unwrap();
+        assert_eq!(names().len(), 3);
+        // Le jeu publié est inchangé : les sessions et leurs call flows se lisent.
+        let flows_before = flow_shas_2_21_146(&dataset_dir);
+        assert_eq!(flows_before.len(), before.session_ids.len());
+        // Cycle suivant.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = lab.base.join("pcap").join("N2.pcap-e2e.pcapng");
+        fs::copy(workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-e2e.pcap"), &path).unwrap();
+        lab.manager
+            .process_continuous_capture_selected(&lab.base, &interface_specs(), 1024 * 1024 * 1024, &BTreeSet::from([path]))
+            .unwrap();
+        let after = manifest();
+        let now_referenced = after.callflows_path.clone().unwrap();
+        assert_ne!(now_referenced, referenced);
+        assert_eq!(
+            names(),
+            BTreeSet::from([now_referenced.trim_start_matches("callflow-generations/").to_owned()]),
+            "il ne reste que la génération du manifeste : les orphelines et la précédente sont ramassées"
+        );
+        // Tous les call flows du manifeste se lisent dans cette génération.
+        assert_eq!(flow_shas_2_21_146(&dataset_dir).len(), after.session_ids.len());
+        for id in before.session_ids.iter() {
+            assert!(after.session_ids.contains(id), "aucune session perdue");
+        }
+        // Le fragment non référencé n'est ni ramassé ni référencé.
+        assert!(stray_fragment.is_file(), "un fragment n'est jamais ramassé");
+        assert!(after.event_shards.iter().all(|shard| !shard.path.ends_with("interrompu.jsonl")));
     }
 }
