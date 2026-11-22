@@ -56,8 +56,14 @@ export const actionReasonMessages:Readonly<Record<string,string>> = {
   UE_NON_ELIGIBLE: 'UE non éligible. Action : ouvrir UE Manager et vérifier son provisioning, son autorisation et son état.',
 };
 export const humanActionReason = (code:string|undefined|null) => {
-  if (!code) return 'Action indisponible';
+  if (!code) return 'Motif indisponible. Action : actualiser la page, puis demander une vérification si le blocage persiste.';
   return actionReasonMessages[code] ?? `Blocage non documenté (${code}). Action : ouvrir UE Manager et demander une vérification.`;
+};
+export const humanApiRefusal = (error:unknown) => {
+  const raw=error instanceof Error?error.message:String(error??'');
+  const code=raw.split(':',1)[0]?.trim();
+  if (code&&actionReasonMessages[code]) return humanActionReason(code);
+  return `L’API a refusé l’opération${code?` (${code})`:''}. Action : réessayer, puis demander une vérification si le refus persiste.`;
 };
 export const filterScenarioDefinitions = (items:ScenarioDefinition[], scope:'SYSTEM'|'USER', query:string) => {
   const needle=query.trim().toLocaleLowerCase();

@@ -2,7 +2,7 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { actionReasonMessages, api, eligibleTrafficTargets, eventFailureDetail, filterAndSortHistory, filterScenarioDefinitions, humanActionReason, maskSubscriberIdentity, reportedState, secondsToDurationMs, targetedTrafficStartRequest, type ScenarioDefinition, type ScenarioState, type UeState } from './api';
+import { actionReasonMessages, api, eligibleTrafficTargets, eventFailureDetail, filterAndSortHistory, filterScenarioDefinitions, humanActionReason, humanApiRefusal, maskSubscriberIdentity, reportedState, secondsToDurationMs, targetedTrafficStartRequest, type ScenarioDefinition, type ScenarioState, type UeState } from './api';
 import { Scenarios } from './main';
 
 describe('POLARIS Control shell', () => {
@@ -118,6 +118,25 @@ describe('POLARIS Control shell', () => {
       expect(message).toMatch(/ouvrir|demander|vérifier/i);
       expect(message).toMatch(/Action :/);
     }
+  });
+
+  it('C5 translates a known API refusal and discards its raw suggestion', () => {
+    const message = humanApiRefusal(new Error('SHARED_UE_PROTECTED: retry the unsafe operation'));
+    expect(message).toContain('UE partagée protégée');
+    expect(message).toContain('Action :');
+    expect(message).not.toContain('retry the unsafe operation');
+  });
+
+  it('C5 fail-closes an unknown API refusal with a French corrective action', () => {
+    const message = humanApiRefusal(new Error('UNEXPECTED_BACKEND_REFUSAL'));
+    expect(message).toContain('L’API a refusé l’opération');
+    expect(message).toContain('Action : réessayer');
+    expect(message).toContain('UNEXPECTED_BACKEND_REFUSAL');
+  });
+
+  it('C5 fail-closes an empty API refusal with a French corrective action', () => {
+    const message = humanApiRefusal(null);
+    expect(message).toBe('L’API a refusé l’opération. Action : réessayer, puis demander une vérification si le refus persiste.');
   });
 
   it('C5 sorts History newest first and filters target or cause', () => {
