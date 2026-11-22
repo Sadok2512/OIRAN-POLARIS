@@ -7669,10 +7669,20 @@ fn certified_target_pseudonym(
 }
 
 fn telemetry_reference_is_sensitive(value: &str) -> bool {
+    const MAX_SAFE_CONSECUTIVE_DIGITS: usize = 4;
+
+    let has_sensitive_digit_run = value
+        .bytes()
+        .fold((false, 0_usize), |(found, run), byte| {
+            let run = if byte.is_ascii_digit() { run + 1 } else { 0 };
+            (found || run > MAX_SAFE_CONSECUTIVE_DIGITS, run)
+        })
+        .0;
     let lower = value.to_ascii_lowercase();
     let looks_like_identity = ["imsi", "supi", "msisdn", "imei"]
         .iter()
         .any(|marker| lower.contains(marker))
+        || has_sensitive_digit_run
         || value
             .chars()
             .filter(|character| character.is_ascii_digit())
@@ -10263,7 +10273,7 @@ async fn scenario_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     }
     Json(json!({
         "active_job":runtime.active.as_ref().map(job_json),
-        "latest_terminal_job":runtime.history.last(),
+        "latest_terminal_job":runtime.history.last().map(sanitize_history_record),
         "active_count":usize::from(runtime.active.is_some()),
         "history_count":runtime.history.len(),
         "observed_at_epoch_s":epoch_seconds(),
@@ -10278,9 +10288,32 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
     let error_summary = fs::read_to_string(&state.audit_path)
         .map(|document| aggregate_certified_errors(&document))
         .unwrap_or_default();
+    let items = runtime
+        .history
+        .iter()
+        .map(sanitize_history_record)
+        .collect::<Vec<_>>();
     Json(
-        json!({"items":runtime.history,"total":runtime.history.len(),"source":"controller registry","error_summary":error_summary}),
+        json!({"items":items,"total":runtime.history.len(),"source":"controller registry","error_summary":error_summary}),
     )
+}
+
+fn sanitize_history_record(record: &Value) -> Value {
+    let mut sanitized = record.clone();
+    let Some(fields) = sanitized.as_object_mut() else {
+        return sanitized;
+    };
+    for field in ["error_code", "cause", "terminal_result"] {
+        let Some(value) = fields
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        fields.insert(field.to_string(), json!(safe_telemetry_code(&value)));
+    }
+    sanitized
 }
 
 fn aggregate_certified_errors(document: &str) -> Vec<Value> {
@@ -21359,6 +21392,43 @@ mod p0_tests {
         let serialized = serde_json::to_string(record).unwrap();
         assert!(!serialized.contains("imsi-"));
         assert!(!serialized.contains("10.46."));
+    }
+
+    #[test]
+    fn control_03628_telemetry_digit_run_boundary_is_fail_closed() {
+        assert_eq!(safe_telemetry_code("REFUS_1234_SYNTHETIQUE"), "REFUS_1234_SYNTHETIQUE");
+        assert!(safe_telemetry_code("REFUS_12345_SYNTHETIQUE").starts_with("error-"));
+        assert_eq!(
+            safe_telemetry_code("REFUS_1_2_3_4_5_SYNTHETIQUE"),
+            "REFUS_1_2_3_4_5_SYNTHETIQUE"
+        );
+        assert_eq!(
+            safe_telemetry_code("OPEN5GS_MME_DOCKER_LOG_RFC3339"),
+            "OPEN5GS_MME_DOCKER_LOG_RFC3339"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_03628_masks_preexisting_sensitive_codes_when_history_is_read() {
+        let sensitive = "REFUS_12345_SYNTHETIQUE";
+        let test_state = Arc::new(state());
+        test_state.runtime.lock().unwrap().history.push(json!({
+            "job_id":"failure-stored-before-03628",
+            "state":"FAILED",
+            "traffic_state":"FAILED",
+            "error_code":sensitive,
+            "cause":sensitive,
+            "terminal_result":sensitive
+        }));
+
+        let payload = history(State(test_state)).await.0;
+        let serialized = payload.to_string();
+        assert!(!serialized.contains(sensitive));
+        for field in ["error_code", "cause", "terminal_result"] {
+            assert!(payload["items"][0][field]
+                .as_str()
+                .is_some_and(|value| value.starts_with("error-")));
+        }
     }
 
     #[tokio::test]

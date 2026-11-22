@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.28 — 2026-11-22 — Masquage uniforme des références numériques
+
+- Aligne l'API Rust sur la règle du web : toute suite d'au moins cinq chiffres consécutifs rend une référence sensible et déclenche son masquage avant l'audit, History ou l'agrégation.
+- Masque également à la lecture les codes sensibles déjà présents dans History, sans réécrire les données persistées.
+- Conserve les codes légitimes dont la plus longue suite numérique ne dépasse pas quatre chiffres ; les chiffres séparés ne forment pas une suite et restent admis sous les autres gardes existants.
+- Aligne l'API, le web, `apps/simulator-control` et le verrou Cargo sur 0.36.28.
+
 ## 0.36.27 — 2026-11-22 — Intégration Control C5, voix, C6 et C7
 
 - Intègre C5 : refus et motifs de boutons en français, sans restitution de texte libre ; les codes contenant au moins cinq chiffres consécutifs sont aussi masqués dans les refus et l’audit.
