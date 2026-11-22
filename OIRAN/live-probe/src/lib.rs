@@ -9035,61 +9035,134 @@ fn commit_incremental_publication(
         })
     );
 
-    // Only unreferenced derived generations are collected. Event shards are
-    // append-only and are never passed to this GC.
-    if let Some(previous) = previous_callflows {
-        if previous.starts_with("callflow-generations/")
-            && previous != dataset.callflows_path.as_deref().unwrap_or_default()
-        {
-            let obsolete = current.join(previous);
-            if obsolete.is_dir() {
-                fs::remove_dir_all(obsolete).map_err(display_error)?;
-            }
-        }
+    // 2.21.150 (relecture ANR1 #10 7086494861, FAIL de 2.21.149) — la
+    // génération PRÉCÉDENTE n'est plus retirée ici. À cet instant le
+    // manifeste sur disque désigne la nouvelle génération, mais le
+    // registre en mémoire de l'API sert encore l'ancien jeu et son
+    // ancien `callflows_path` jusqu'à `upsert_dataset` ; et un lecteur
+    // qui a résolu ce chemin sans avoir encore ouvert le fichier peut
+    // le faire après. Retirer la génération précédente maintenant —
+    // ce que le code faisait déjà avant 2.21.149, et que le ramassage de
+    // 2.21.149 étendait — lui retirait le fichier sous les pieds.
+    //
+    // Règle : la génération du manifeste qui vient d'être écrit et celle
+    // du manifeste précédent sont TOUJOURS gardées. Toute autre
+    // génération (orpheline d'une interruption, ou précédente d'il y a
+    // deux commits) n'est retirée que si elle a au moins
+    // `CALLFLOW_GENERATION_GRACE_MS`. Une génération vit donc au moins
+    // jusqu'au deuxième commit qui la suit, et au moins ce délai.
+    // Seules des données dérivées passent par ce ramassage ; jamais un
+    // fragment d'events.
+    let previous_generation = previous_callflows
+        .as_deref()
+        .and_then(|path| path.strip_prefix("callflow-generations/"))
+        .map(str::to_owned);
+    let mut kept: Vec<&str> = vec![generation_name.as_str()];
+    if let Some(previous) = previous_generation.as_deref() {
+        kept.push(previous);
     }
-    // 2.21.149 (relecture ANR1 #10 7086184564) — ramassage des générations
-    // ORPHELINES. Une interruption entre l'installation d'une génération
-    // et le renommage du manifeste, ou entre ce renommage et le retrait de
-    // la génération précédente, laissait une génération que plus aucun
-    // manifeste ne référence ; le retrait ci-dessus ne connaît que celle du
-    // manifeste précédent, elle restait donc pour toujours. Le manifeste
-    // vient d'être écrit : toute génération autre que la sienne est
-    // retirée. Ce sont des données dérivées ; les fragments d'events ne
-    // passent jamais par ce ramassage.
-    let orphans = remove_unreferenced_callflow_generations(&generations, &generation_name);
-    if orphans > 0 {
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "event": "CALLFLOW_GENERATION_ORPHANS_REMOVED",
-                "count": orphans,
-            })
-        );
-    }
+    // Ce qui est ramassé est journalisé à CHAQUE commit, nombre et
+    // octets, y compris zéro (ordre cœur #9 7086439869).
+    let (orphans, orphan_bytes) =
+        remove_unreferenced_callflow_generations(&generations, &kept, CALLFLOW_GENERATION_GRACE_MS);
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "CALLFLOW_GENERATION_ORPHANS_REMOVED",
+            "count": orphans,
+            "bytes": orphan_bytes,
+            "kept": kept.len(),
+        })
+    );
     fs::remove_dir_all(staging).map_err(display_error)?;
     Ok(dataset)
 }
 
-/// 2.21.149 — retire de `generations` tout dossier `generation-*` autre
-/// que `referenced`. Rend le nombre de dossiers retirés. Un échec de
-/// suppression n'interrompt pas la publication, déjà visible : le
-/// dossier sera ramassé au cycle suivant.
-fn remove_unreferenced_callflow_generations(generations: &Path, referenced: &str) -> usize {
-    let Ok(entries) = fs::read_dir(generations) else {
-        return 0;
+/// 2.21.150 — nombre et taille des générations de call flows présentes
+/// sous `dataset_dir/callflow-generations/` que le manifeste du jeu ne
+/// référence pas. Lecture seule. Un manifeste absent ou illisible ne
+/// référence rien : toutes les générations sont alors comptées.
+fn unreferenced_callflow_generations(dataset_dir: &Path) -> (usize, u64) {
+    let referenced = fs::read(dataset_dir.join("dataset_manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("callflows_path")
+                .and_then(Value::as_str)
+                .and_then(|path| path.strip_prefix("callflow-generations/"))
+                .map(str::to_owned)
+        });
+    let Ok(entries) = fs::read_dir(dataset_dir.join("callflow-generations")) else {
+        return (0, 0);
     };
-    let mut removed = 0;
+    let mut count = 0usize;
+    let mut bytes = 0u64;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == referenced || !name.starts_with("generation-") || !entry.path().is_dir() {
+        if !entry.path().is_dir() || !name.starts_with("generation-") || referenced.as_deref() == Some(name.as_ref()) {
             continue;
         }
+        count += 1;
+        bytes = bytes.saturating_add(directory_size(&entry.path()));
+    }
+    (count, bytes)
+}
+
+/// 2.21.150 — âge minimal d'une génération de call flows, ni courante ni
+/// précédente, avant qu'elle puisse être retirée : quinze minutes. Bien
+/// au-delà du temps entre la résolution d'un chemin de call flow par un
+/// lecteur de l'API et l'ouverture du fichier.
+const CALLFLOW_GENERATION_GRACE_MS: u64 = 15 * 60 * 1000;
+
+/// 2.21.150 — instant de création d'une génération, en millisecondes
+/// d'époque : lu dans son nom (`generation-<epoch_ms>-<seq>`), à défaut
+/// la date de modification du dossier. `None` si aucun des deux n'est
+/// lisible : la génération est alors gardée.
+fn callflow_generation_created_ms(path: &Path, name: &str) -> Option<u64> {
+    name.strip_prefix("generation-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|age| age.as_millis() as u64)
+        })
+}
+
+/// 2.21.149, revu en 2.21.150 — retire de `generations` les dossiers
+/// `generation-*` qui ne sont pas dans `kept` ET dont l'âge atteint
+/// `grace_ms`. Rend le nombre de dossiers retirés et leurs octets. Un
+/// échec de suppression n'interrompt pas la publication, déjà visible :
+/// le dossier sera ramassé à un commit suivant.
+fn remove_unreferenced_callflow_generations(generations: &Path, kept: &[&str], grace_ms: u64) -> (usize, u64) {
+    let Ok(entries) = fs::read_dir(generations) else {
+        return (0, 0);
+    };
+    let now = epoch_ms();
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if kept.contains(&name.as_ref()) || !name.starts_with("generation-") || !entry.path().is_dir() {
+            continue;
+        }
+        let old_enough = callflow_generation_created_ms(&entry.path(), &name)
+            .is_some_and(|created| now.saturating_sub(created) >= grace_ms);
+        if !old_enough {
+            continue;
+        }
+        let size = directory_size(&entry.path());
         if fs::remove_dir_all(entry.path()).is_ok() {
             removed += 1;
+            bytes = bytes.saturating_add(size);
         }
     }
-    removed
+    (removed, bytes)
 }
 
 fn count_regular_files(path: &Path) -> u64 {
@@ -11494,6 +11567,19 @@ fn expand_session_evidence_ids_disk(
 /// log line emitted by `run_continuous_import_inner`.
 fn clean_continuous_import_root(base: &Path) -> Result<CompactionReport, String> {
     let mut report = CompactionReport::default();
+    // 2.21.150 (ordre cœur #9 7086361017) — au démarrage, compte les
+    // générations de call flows que le manifeste ne référence pas, et
+    // leur taille. Lecture seule : dit si une interruption de commit
+    // s'est produite. La ligne est émise même à zéro.
+    let (unreferenced, unreferenced_bytes) = unreferenced_callflow_generations(&base.join("dataset"));
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "CALLFLOW_GENERATIONS_UNREFERENCED",
+            "count": unreferenced,
+            "bytes": unreferenced_bytes,
+        })
+    );
     // 2.11.15: `.dataset-previous` may be a multi-gigabyte lowerdir tree
     // left by 2.11.14. Renaming or unlinking it on overlayfs creates a
     // copy-up/whiteout storm. It is operator rollback state and is never
@@ -23578,21 +23664,21 @@ Content-Length: 0\r\n\
         let again = lab.manager.restore_from_archive_segment(&lab.segment).unwrap();
         assert_eq!(again.event_count_after, restored.event_count);
     }
-    /// 2.21.149 (relecture ANR1 #10 7086184564, point « interruption
-    /// préparation → commit ») — ce que laisse une interruption à chaque
-    /// point du commit, et ce qu'en fait le cycle suivant :
+    /// 2.21.149, revu en 2.21.150 (relectures ANR1 #10 7086184564 et
+    /// 7086494861) — ce que laisse une interruption du commit, et ce
+    /// qu'en fait le cycle suivant :
     ///
     /// * fragment installé, manifeste pas encore écrit : le fragment
-    ///   n'est référencé par rien ; il RESTE sur le disque (les
-    ///   fragments ne passent jamais par un ramassage) ;
-    /// * génération de call flows installée, manifeste pas encore
-    ///   écrit — ou manifeste écrit, génération précédente pas encore
-    ///   retirée : la génération orpheline est RAMASSÉE au commit
-    ///   suivant. Avant : elle restait pour toujours.
+    ///   n'est référencé par rien ; il RESTE (un fragment n'est jamais
+    ///   ramassé) ;
+    /// * générations de call flows orphelines, anciennes : RAMASSÉES ;
+    /// * génération orpheline récente (plus jeune que le délai de
+    ///   grâce) : GARDÉE, un lecteur peut encore s'en servir ;
+    /// * la génération du manifeste précédent : GARDÉE.
     ///
     /// Dans tous les cas le jeu publié reste celui du dernier manifeste.
     #[test]
-    fn orphan_callflow_generations_are_collected_at_the_next_commit_2_21_149() {
+    fn old_orphan_callflow_generations_are_collected_and_recent_ones_kept_2_21_149() {
         let lab = archived_lab_shaped_dataset_2_21_146("orphan-generations");
         let dataset_dir = lab.base.join("dataset");
         let manifest = || -> LiveDataset {
@@ -23603,20 +23689,17 @@ Content-Length: 0\r\n\
             fs::read_dir(&generations).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
         };
         let before = manifest();
-        let referenced = before.callflows_path.clone().unwrap();
-        assert_eq!(names().len(), 1, "une seule génération après un commit normal");
-        // Ce que laisse une interruption : deux générations orphelines et
-        // un fragment installé que le manifeste ne référence pas.
-        for orphan in ["generation-1-interrompue-avant-manifeste", "generation-2-precedente-non-retiree"] {
+        let referenced = before.callflows_path.clone().unwrap().trim_start_matches("callflow-generations/").to_owned();
+        // Ce que laisse une interruption : deux générations orphelines
+        // anciennes (leur nom porte une époque de 1 et 2 ms), une
+        // récente, et un fragment installé que le manifeste ne référence pas.
+        let recent = format!("generation-{}-recente", epoch_ms());
+        for orphan in ["generation-1-interrompue-avant-manifeste", "generation-2-precedente-non-retiree", recent.as_str()] {
             fs::create_dir_all(generations.join(orphan)).unwrap();
             fs::write(generations.join(orphan).join("5g-session-orpheline.json"), b"{}").unwrap();
         }
         let stray_fragment = dataset_dir.join("event-shards/shard-00000000000000000099-interrompu.jsonl");
         fs::write(&stray_fragment, b"").unwrap();
-        assert_eq!(names().len(), 3);
-        // Le jeu publié est inchangé : les sessions et leurs call flows se lisent.
-        let flows_before = flow_shas_2_21_146(&dataset_dir);
-        assert_eq!(flows_before.len(), before.session_ids.len());
         // Cycle suivant.
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let path = lab.base.join("pcap").join("N2.pcap-e2e.pcapng");
@@ -23625,14 +23708,15 @@ Content-Length: 0\r\n\
             .process_continuous_capture_selected(&lab.base, &interface_specs(), 1024 * 1024 * 1024, &BTreeSet::from([path]))
             .unwrap();
         let after = manifest();
-        let now_referenced = after.callflows_path.clone().unwrap();
+        let now_referenced = after.callflows_path.clone().unwrap().trim_start_matches("callflow-generations/").to_owned();
         assert_ne!(now_referenced, referenced);
-        assert_eq!(
-            names(),
-            BTreeSet::from([now_referenced.trim_start_matches("callflow-generations/").to_owned()]),
-            "il ne reste que la génération du manifeste : les orphelines et la précédente sont ramassées"
-        );
-        // Tous les call flows du manifeste se lisent dans cette génération.
+        let remaining = names();
+        assert!(remaining.contains(&now_referenced), "la génération du manifeste");
+        assert!(remaining.contains(&referenced), "la génération du manifeste précédent est gardée");
+        assert!(remaining.contains(&recent), "une orpheline récente est gardée (délai de grâce)");
+        assert!(!remaining.contains("generation-1-interrompue-avant-manifeste"), "orpheline ancienne ramassée");
+        assert!(!remaining.contains("generation-2-precedente-non-retiree"), "orpheline ancienne ramassée");
+        // Tous les call flows du manifeste se lisent ; aucune session perdue.
         assert_eq!(flow_shas_2_21_146(&dataset_dir).len(), after.session_ids.len());
         for id in before.session_ids.iter() {
             assert!(after.session_ids.contains(id), "aucune session perdue");
@@ -23640,5 +23724,112 @@ Content-Length: 0\r\n\
         // Le fragment non référencé n'est ni ramassé ni référencé.
         assert!(stray_fragment.is_file(), "un fragment n'est jamais ramassé");
         assert!(after.event_shards.iter().all(|shard| !shard.path.ends_with("interrompu.jsonl")));
+    }
+
+    /// 2.21.150 (relecture ANR1 #10 7086494861, FAIL de 2.21.149) — un
+    /// lecteur qui a résolu le chemin d'un call flow AVANT un commit
+    /// peut encore l'ouvrir et le lire APRÈS : la génération qu'il
+    /// tenait n'est pas retirée par ce commit. Avant (2.21.149, et le
+    /// code antérieur pour la génération précédente) : la génération en
+    /// service était supprimée dès l'écriture du manifeste, avant même
+    /// que le registre en mémoire de l'API ne bascule ; le lecteur
+    /// trouvait un fichier absent.
+    #[test]
+    fn a_reader_holding_the_previous_callflow_path_still_reads_it_after_a_commit_2_21_150() {
+        let lab = archived_lab_shaped_dataset_2_21_146("reader-survives-commit");
+        let dataset_dir = lab.base.join("dataset");
+        let manifest = || -> LiveDataset {
+            serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap()).unwrap()
+        };
+        // Le lecteur : il a le jeu d'avant le commit, et a résolu le
+        // chemin du call flow de chaque session — sans l'ouvrir.
+        let held = manifest();
+        let held_callflows = dataset_callflows_dir(&dataset_dir, &held);
+        let held_paths: Vec<PathBuf> = held.session_ids.iter().map(|id| held_callflows.join(format!("{id}.json"))).collect();
+        let expected: Vec<String> = held_paths.iter().map(|path| sha256_hex(&fs::read(path).unwrap())).collect();
+        // Le commit bascule.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = lab.base.join("pcap").join("N2.pcap-e2e.pcapng");
+        fs::copy(workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-e2e.pcap"), &path).unwrap();
+        lab.manager
+            .process_continuous_capture_selected(&lab.base, &interface_specs(), 1024 * 1024 * 1024, &BTreeSet::from([path]))
+            .unwrap();
+        assert_ne!(manifest().callflows_path, held.callflows_path, "le manifeste désigne une nouvelle génération");
+        // Le lecteur ouvre et lit maintenant : chaque call flow est là, intact.
+        for (path, sha) in held_paths.iter().zip(&expected) {
+            let bytes = fs::read(path).unwrap_or_else(|error| panic!("{} : {error}", path.display()));
+            assert_eq!(&sha256_hex(&bytes), sha, "call flow lu après le commit, identique");
+            let _flow: CallFlow = serde_json::from_slice(&bytes).unwrap();
+        }
+    }
+
+    /// 2.21.150 — la règle du ramassage, cas par cas : la génération
+    /// courante et la précédente sont toujours gardées ; une autre n'est
+    /// retirée qu'une fois le délai de grâce écoulé ; les octets retirés
+    /// sont comptés.
+    #[test]
+    fn callflow_generation_collection_keeps_current_previous_and_recent_2_21_150() {
+        let root = temporary_root("generation-collection-rule");
+        let generations = root.join("callflow-generations");
+        let now = epoch_ms();
+        let grace = CALLFLOW_GENERATION_GRACE_MS;
+        let make = |name: &str, bytes: usize| {
+            fs::create_dir_all(generations.join(name)).unwrap();
+            fs::write(generations.join(name).join("x.json"), vec![b'x'; bytes]).unwrap();
+        };
+        let current = format!("generation-{now}-9");
+        let previous = format!("generation-{}-8", now - 2 * grace);
+        let old_orphan = format!("generation-{}-7", now - 2 * grace);
+        let young_orphan = format!("generation-{}-6", now - grace / 2);
+        for (name, bytes) in [(&current, 5usize), (&previous, 7), (&old_orphan, 11), (&young_orphan, 13)] {
+            make(name, bytes);
+        }
+        fs::write(generations.join("generation-pas-un-dossier"), b"x").unwrap();
+        make("autre-dossier", 3);
+        let (removed, bytes) =
+            remove_unreferenced_callflow_generations(&generations, &[current.as_str(), previous.as_str()], grace);
+        assert_eq!(removed, 1, "seule l'orpheline ancienne");
+        assert!(bytes >= 11, "ses octets sont comptés : {bytes}");
+        let left: BTreeSet<String> = fs::read_dir(&generations).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        for kept in [&current, &previous, &young_orphan] {
+            assert!(left.contains(kept.as_str()), "{kept} gardée");
+        }
+        assert!(!left.contains(old_orphan.as_str()));
+        assert!(left.contains("generation-pas-un-dossier") && left.contains("autre-dossier"), "rien d'autre n'est touché");
+        // Délai écoulé pour l'orpheline jeune : elle part à son tour ; courante et précédente restent.
+        let (removed, _) = remove_unreferenced_callflow_generations(&generations, &[current.as_str(), previous.as_str()], 0);
+        assert_eq!(removed, 1);
+        assert!(generations.join(&current).is_dir() && generations.join(&previous).is_dir());
+    }
+
+    /// 2.21.150 (ordre cœur #9 7086361017) — le compteur de démarrage :
+    /// générations de call flows non référencées par le manifeste, et
+    /// leur taille. Lecture seule.
+    #[test]
+    fn unreferenced_callflow_generations_are_counted_2_21_150() {
+        let root = temporary_root("unreferenced-generations");
+        let dataset = root.join("dataset");
+        let generations = dataset.join("callflow-generations");
+        assert_eq!(unreferenced_callflow_generations(&dataset), (0, 0), "pas de jeu : rien");
+        for (name, bytes) in [("generation-1-a", 10usize), ("generation-2-b", 25), ("generation-3-c", 7)] {
+            fs::create_dir_all(generations.join(name)).unwrap();
+            fs::write(generations.join(name).join("x.json"), vec![b'x'; bytes]).unwrap();
+        }
+        fs::write(generations.join("pas-une-generation.txt"), b"ignore").unwrap();
+        // Manifeste absent : rien n'est référencé.
+        let (count, bytes) = unreferenced_callflow_generations(&dataset);
+        assert_eq!(count, 3);
+        assert!(bytes >= 42);
+        // Le manifeste référence la seconde : les deux autres sont comptées.
+        fs::write(
+            dataset.join("dataset_manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"callflows_path": "callflow-generations/generation-2-b"})).unwrap(),
+        )
+        .unwrap();
+        let (count, bytes) = unreferenced_callflow_generations(&dataset);
+        assert_eq!(count, 2);
+        assert!((17..42).contains(&bytes), "les octets des deux générations non référencées : {bytes}");
+        // Rien n'a été modifié.
+        assert_eq!(fs::read_dir(&generations).unwrap().count(), 4);
     }
 }

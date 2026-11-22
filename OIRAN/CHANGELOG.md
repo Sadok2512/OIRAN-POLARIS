@@ -1,5 +1,58 @@
 # Changelog
 
+## oiran-api 2.21.150, session-engine 0.5.29, live-probe 0.6.36 — 2026-11-22 — passe des représentants : le plafond mémoire redevient une borne ; le ramassage ne retire plus une génération en service
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.149 @ `26d4d16` (branche `fix/oiran-2.21.149-restore-validates-first`). Relectures indépendantes d'ANR1 : **FAIL sur 2.21.148** (#10 7086356084) et **FAIL sur 2.21.149** (#10 7086494861). Ordres du cœur #9 7086361017 et #9 7086439869.
+
+### Ce qui était faux dans 2.21.148
+
+Le CHANGELOG de 2.21.148 disait de l'estimation de taille « un enregistrement sur seize » : « seule la mémoire tenue avant écriture varie, de quelques pour cent autour du plafond ». **C'était faux.** Quinze enregistrements sur seize étaient comptés à la moyenne de l'échantillon, mais gardés en entier : une série de gros events aux positions non échantillonnées dépassait le plafond **sans borne**. Mesuré par le test de ce lot : 1 009 864 octets retenus pour un plafond de 65 536, soit **quinze fois** le plafond. Ce plafond existe pour qu'un service déjà à sa limite mémoire ne soit pas tué ; l'optimisation l'avait vidé de son sens.
+
+### Correctif (`session-engine`)
+
+- La taille de **chaque** enregistrement est de nouveau mesurée exactement : la mémoire retenue avant l'écriture d'un passage ne dépasse jamais le plafond de plus d'un enregistrement.
+- L'optimisation de copie dans `parse_event` (2.21.148) est gardée : c'est elle qui porte le gain.
+
+### Mesure, refaite
+
+Même banc, même jeu (450 000 events, 1,15 Go), binaires `--release`, trois passes alternées :
+
+| | Passe 1 | Passe 2 | Passe 3 | Moyenne |
+|---|---|---|---|---|
+| Avant (code de 2.21.147) | 44,5 s | 44,7 s | 45,2 s | 44,8 s |
+| 2.21.150 | 41,3 s | 40,6 s | 39,3 s | 40,4 s |
+
+**−10 %**, et non les −15 % annoncés pour 2.21.148 : l'estimation retirée en portait une part. Même empreinte de la liste des représentants sur les six passes ; pic de mémoire résidente inchangé (1,15 Go).
+
+### Ramassage des générations de call flows — ce qui était faux dans 2.21.149 (`live-probe`)
+
+Relecture d'ANR1 (#10 7086494861) : **FAIL sur 2.21.149**. Le ramassage ajouté en 2.21.149 retirait, juste après l'écriture du manifeste, toute génération autre que la nouvelle — y compris celle que l'API servait encore. À cet instant le registre en mémoire de l'API n'a pas encore basculé (`upsert_dataset` vient après), et un lecteur qui a résolu le chemin d'un call flow sans avoir ouvert le fichier peut l'ouvrir plus tard : il trouvait un fichier absent. Le test de 2.21.149 prouvait le résultat du ramassage, pas sa sûreté. Le code antérieur avait déjà ce défaut pour la seule génération précédente ; 2.21.149 l'étendait.
+
+**Correctif** : la génération du manifeste qui vient d'être écrit **et celle du manifeste précédent sont toujours gardées**. Toute autre génération n'est retirée que si elle a au moins quinze minutes (`CALLFLOW_GENERATION_GRACE_MS`), son âge étant lu dans son nom (`generation-<epoch_ms>-…`), à défaut dans la date du dossier. Une génération vit donc au moins jusqu'au deuxième commit qui la suit, et au moins ce délai.
+
+**Coût** : une génération de plus sur le disque en permanence — 181 Mo au lab.
+
+### Journal (`live-probe`)
+
+- `CALLFLOW_GENERATION_ORPHANS_REMOVED` est émis à **chaque** commit de publication, avec `count`, `bytes` et `kept`, y compris à zéro : on saura au lab si des générations orphelines apparaissent.
+- Au démarrage du worker, `CALLFLOW_GENERATIONS_UNREFERENCED` compte, en lecture seule, les générations présentes que le manifeste ne référence pas (`count`, `bytes`), y compris à zéro. La génération précédente, gardée, y est comptée : la valeur normale est 1.
+
+### Tests
+
+- `the_run_memory_cap_bounds_what_is_retained_whatever_the_record_sizes_2_21_150` — le contre-exemple d'ANR1 : enregistrements petits aux positions que l'échantillonnage mesurait, gros (8 Kio) ailleurs ; plafond de 64 Kio. Le test mesure les octets **réellement** retenus, indépendamment du compteur de production, et affirme la borne `plafond + deux fois le plus gros event`. Avant (échantillonnage de 2.21.148, par mutation) : **échec**, 1 009 864 octets pour une borne de 84 044. Après : ok.
+- `a_reader_holding_the_previous_callflow_path_still_reads_it_after_a_commit_2_21_150` — le test demandé par ANR1 : un lecteur tient le jeu d'avant le commit et le chemin de chaque call flow ; le commit bascule ; le lecteur ouvre et lit alors chaque call flow, intact. Avant (retrait immédiat, par mutation) : **échec**, fichier absent.
+- `callflow_generation_collection_keeps_current_previous_and_recent_2_21_150` — la règle, cas par cas.
+- `old_orphan_callflow_generations_are_collected_and_recent_ones_kept_2_21_149` — le test de 2.21.149, revu : orphelines anciennes ramassées, orpheline récente et génération précédente gardées.
+- `unreferenced_callflow_generations_are_counted_2_21_150`.
+- `representatives_do_not_depend_on_the_run_memory_cap_2_21_148` et les équivalences existantes passent sans changement.
+
+### OUVERT
+
+- Le gain de la passe (−10 %) reste mesuré sur un jeu quatre fois plus petit que celui du lab.
+- Un fragment installé puis non référencé n'est toujours pas ramassé (2.21.149).
+- **Le délai de grâce est une durée, pas un bail** : un lecteur qui garderait plus de quinze minutes un chemin de call flow vieux de deux commits, sans l'ouvrir, trouverait encore un fichier absent. La fermeture complète demande un référencement des lecteurs ; non fait.
+- Le test du lecteur est séquentiel (chemin résolu, commit, lecture) : il ne lance pas de lecteurs concurrents pendant le commit.
+
 ## oiran-api 2.21.149, live-probe 0.6.35 — 2026-11-22 — restauration et réparation : les refus précèdent toute modification ; l'empreinte d'un fragment se vérifie sur ses octets ; générations de call flows orphelines ramassées
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.148 @ `80b8db1` (branche `fix/oiran-2.21.149-restore-validates-first`). Relecture indépendante d'ANR1 (#10 7086184564) : **FAIL sur 2.21.146 et sur 2.21.147**. Ordre du cœur #9 7086221183. Les deux défauts sont réels ; les deux contre-exemples d'ANR1 sont repris en tests.

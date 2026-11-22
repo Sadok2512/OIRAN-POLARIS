@@ -1101,9 +1101,14 @@ struct SpilledRepresentative {
 
 static REPRESENTATIVE_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// 2.21.148 — un enregistrement sur N est sérialisé pour mesurer sa
-/// taille exacte ; les autres prennent la moyenne courante.
-const REPRESENTATIVE_SIZE_SAMPLE_EVERY: usize = 16;
+#[cfg(test)]
+thread_local! {
+    /// 2.21.150 — plus grande taille (octets sérialisés, mesurés) retenue
+    /// en mémoire avant l'écriture d'un passage, pour le test du plafond.
+    static TEST_MAX_RETAINED_RUN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 2.21.150 — octets réellement retenus dans le passage en cours.
+    static TEST_RETAINED_RUN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn flush_representative_run(
     staging_dir: &Path,
@@ -1197,9 +1202,6 @@ where
     let mut run_paths = Vec::<PathBuf>::new();
     let mut source_event_count = 0usize;
     let mut ordinal = 0u64;
-    let mut sampled_records = 0usize;
-    let mut sampled_bytes = 0usize;
-    let mut sampled_count = 0usize;
     for path in paths {
         let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
         let mut reader = BufReader::new(&file);
@@ -1233,32 +1235,40 @@ where
                 ordinal,
                 event,
             };
-            // 2.21.148 / session-engine 0.5.28 — la taille d'un
-            // enregistrement ne sert qu'à décider QUAND écrire un passage
-            // sur disque. Avant : chaque enregistrement était sérialisé en
-            // entier, uniquement pour être mesuré (une sérialisation JSON
-            // de plus par event lu, à chaque cycle de publication). La
-            // taille est maintenant mesurée exactement sur un
-            // enregistrement sur `REPRESENTATIVE_SIZE_SAMPLE_EVERY`, et
-            // estimée par la moyenne courante pour les autres. Le
-            // résultat de la passe ne dépend pas du découpage en
-            // passages (le dernier observé l'emporte, dans un passage
-            // comme entre passages) : seule la mémoire tenue avant
-            // écriture varie, de quelques pour cent autour du plafond.
-            if sampled_records % REPRESENTATIVE_SIZE_SAMPLE_EVERY == 0 {
-                let exact = serde_json::to_vec(&record)
+            // 2.21.150 / session-engine 0.5.29 (relecture ANR1 #10
+            // 7086356084, FAIL de 2.21.148) — la taille de CHAQUE
+            // enregistrement est mesurée exactement. 2.21.148 n'en
+            // mesurait qu'un sur seize et comptait les autres à la
+            // moyenne de l'échantillon, tout en les gardant en entier :
+            // une série de gros events aux positions non échantillonnées
+            // dépassait le plafond sans borne — or ce plafond existe pour
+            // qu'un service déjà à sa limite mémoire ne soit pas tué. La
+            // mesure exacte ne coûte rien de mesurable (banc du lot).
+            // Garantie : la mémoire retenue avant écriture d'un passage
+            // ne dépasse jamais le plafond de plus d'un enregistrement.
+            retained_bytes = retained_bytes.saturating_add(
+                serde_json::to_vec(&record)
                     .map_err(|error| error.to_string())?
-                    .len();
-                sampled_bytes = sampled_bytes.saturating_add(exact);
-                sampled_count = sampled_count.saturating_add(1);
+                    .len(),
+            );
+            // Pour le test du plafond : les octets RÉELLEMENT retenus,
+            // mesurés indépendamment du compteur ci-dessus.
+            #[cfg(test)]
+            {
+                let exact = serde_json::to_vec(&record).map(|bytes| bytes.len()).unwrap_or(0);
+                let held = TEST_RETAINED_RUN_BYTES.with(|held| {
+                    held.set(held.get().saturating_add(exact));
+                    held.get()
+                });
+                TEST_MAX_RETAINED_RUN_BYTES.with(|max| max.set(max.get().max(held)));
             }
-            sampled_records = sampled_records.wrapping_add(1);
-            retained_bytes = retained_bytes.saturating_add(sampled_bytes / sampled_count.max(1));
             records.push(record);
             if retained_bytes >= memory_cap_bytes {
                 let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
                 run_paths.push(path);
                 retained_bytes = 0;
+                #[cfg(test)]
+                TEST_RETAINED_RUN_BYTES.with(|held| held.set(0));
             }
             if source_event_count % 100_000 == 0 {
                 progress(source_event_count, 0);
@@ -6540,9 +6550,7 @@ mod in_packet_order_tests {
     /// 2.21.148 / session-engine 0.5.28 — la liste des représentants ne
     /// dépend pas du découpage en passages : avec un plafond mémoire
     /// minuscule (un passage tous les quelques events) ou énorme (un seul
-    /// passage), elle est identique event par event. C'est ce qui permet
-    /// d'ESTIMER la taille d'un enregistrement au lieu de le sérialiser
-    /// pour le mesurer.
+    /// passage), elle est identique event par event.
     #[test]
     fn representatives_do_not_depend_on_the_run_memory_cap_2_21_148() {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6571,5 +6579,77 @@ mod in_packet_order_tests {
             let (_, many_runs) = run(cap);
             assert_eq!(many_runs, single_run, "plafond {cap} : liste identique, event par event");
         }
+    }
+    /// 2.21.150 (relecture ANR1 #10 7086356084, FAIL de 2.21.148) — le
+    /// plafond mémoire des passages est une BORNE : la mémoire retenue
+    /// avant écriture ne le dépasse jamais de plus d'un enregistrement.
+    /// Contre-exemple d'ANR1 : des enregistrements petits aux positions
+    /// que l'échantillonnage de 2.21.148 mesurait (une sur seize), gros
+    /// partout ailleurs. Avant : la moyenne de l'échantillon restait
+    /// petite, et quinze gros enregistrements sur seize s'accumulaient
+    /// sans compter — plus de dix fois le plafond.
+    #[test]
+    fn the_run_memory_cap_bounds_what_is_retained_whatever_the_record_sizes_2_21_150() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
+        let template: Value = std::fs::read_to_string(&fixture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["protocol"] == "NGAP")
+            .expect("un event NGAP dans le jeu");
+        // 480 events : petits aux positions multiples de 16, gros ailleurs.
+        // Le remplissage est un IE que la compaction garde (son nom porte « teid »).
+        const BIG_PADDING: usize = 8 * 1024;
+        let directory = std::env::temp_dir().join(format!("oiran-run-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("events.jsonl");
+        let mut lines = String::new();
+        for index in 0..480usize {
+            let mut event = template.clone();
+            event["event_id"] = Value::from(format!("evt-cap-{index:04}"));
+            event["packet_references"][0]["packet_number"] = Value::from(index as u64 + 1);
+            if index % 16 != 0 {
+                let mut padding = event["information_elements"][0].clone();
+                padding["name"] = Value::from("teid_padding");
+                padding["value"] = Value::from(format!("teid={}", "x".repeat(BIG_PADDING)));
+                event["information_elements"].as_array_mut().unwrap().push(padding);
+            }
+            lines.push_str(&serde_json::to_string(&event).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(&path, lines).unwrap();
+        const CAP: usize = 64 * 1024;
+        TEST_MAX_RETAINED_RUN_BYTES.with(|max| max.set(0));
+        TEST_RETAINED_RUN_BYTES.with(|held| held.set(0));
+        let index = load_paths_spilling_representatives_with_progress(
+            &[path],
+            &directory.join("staging"),
+            CAP,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(index.source_event_count, 480);
+        // Le test est significatif : les gros enregistrements le restent après compaction.
+        let largest = index
+            .events
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .max()
+            .unwrap();
+        assert!(largest > BIG_PADDING, "un gros enregistrement garde son remplissage : {largest}");
+        let retained = TEST_MAX_RETAINED_RUN_BYTES.with(|max| max.get());
+        // Borne chiffrée : le plafond, plus au plus un enregistrement
+        // (celui dont l'arrivée déclenche l'écriture du passage), avec sa
+        // clé et son ordinal — moins du double du plus gros event.
+        let bound = CAP + 2 * largest;
+        assert!(
+            retained <= bound,
+            "mémoire retenue {retained} octets > borne {bound} (plafond {CAP} + un enregistrement)"
+        );
+        assert!(retained >= CAP, "le plafond est bien atteint avant écriture : {retained}");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
