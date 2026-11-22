@@ -714,7 +714,7 @@ struct TransferVerification {
 const UE_POLICY_TABLE: &str = "100";
 const UE_POLICY_PRIORITY: &str = "10000";
 const IPERF_TCP_WINDOW: &str = "64K";
-const IPERF_DEFAULT_RATE: &str = "5M";
+const IPERF_DEFAULT_RATE: &str = "1M";
 const TRANSFER_VERIFY_BYTES: u64 = 1024 * 1024;
 
 fn iperf3_rate() -> Result<String, String> {
@@ -12991,13 +12991,14 @@ fn execute_live_definition_step(
                 if control.cancel.load(Ordering::SeqCst) {
                     return Err("SCENARIO_STOP_REQUESTED".into());
                 }
-                let already_running = state
+                let existing_job = state
                     .multi_ue
                     .lock()
                     .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
                     .snapshot()
-                    .iter()
-                    .any(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
+                    .into_iter()
+                    .find(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
+                let already_running = existing_job.is_some();
                 if !already_running {
                     // 0.36.2 — UERANSIM opens its configured PDU (internet) right
                     // after registration: capture N2 across the start (ANR2 #10
@@ -13041,6 +13042,17 @@ fn execute_live_definition_step(
                         .lock()
                         .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                         .insert(ue_id.clone(), started_job);
+                } else if let Some(existing_job) = existing_job {
+                    // 0.36.26 — `ue_start=COMPLETED` is also an immutable
+                    // runtime approval for a UE which was already running.
+                    // Keep it available to IMS and terminal steps, but do not
+                    // add the UE to `started_ues`: cleanup must not stop a
+                    // process that this scenario did not launch.
+                    control
+                        .started_jobs
+                        .lock()
+                        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                        .insert(ue_id.clone(), existing_job);
                 }
                 // 0.19.1 (#37) — `ue_start` completing implies the UE
                 // was registered on the AMF (UERANSIM runs register
@@ -23063,6 +23075,58 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
     }
 
     #[test]
+    fn voice_ue_start_retains_runtime_approval_for_target_and_pair() {
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .configure_count(6)
+            .unwrap();
+        let control = DefinitionJobControl {
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+            ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
+            started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(
+                &["UE-05".into(), "UE-06".into()],
+                "test-fixture",
+            )),
+        };
+        let step = ResolvedStep {
+            index: 0,
+            step_type: "ue_start".into(),
+            scenario_loop_iteration: 1,
+            scenario_loop_count: 1,
+            step_loop_iteration: 1,
+            step_loop_count: 1,
+            parameters: BTreeMap::new(),
+        };
+
+        execute_live_definition_step(
+            &test_state,
+            &step,
+            &["UE-05".into(), "UE-06".into()],
+            &control,
+        )
+        .unwrap();
+
+        assert!(
+            definition_job_approval(&control, "UE-05")
+                .unwrap()
+                .is_some(),
+            "the already-running voice target must retain its runtime approval"
+        );
+        assert!(
+            definition_job_approval(&control, "UE-06")
+                .unwrap()
+                .is_some(),
+            "the newly-started voice pair must retain its runtime approval"
+        );
+    }
+
+    #[test]
     fn operator_stop_cancels_definition_and_cleans_only_job_started_ues() {
         let mut test_state = state();
         test_state.execution_mode = "live".into();
@@ -23364,7 +23428,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
     #[test]
     fn iperf_rate_is_bounded_to_an_explicit_numeric_unit() {
         std::env::remove_var("POLARIS_IPERF3_RATE");
-        assert_eq!(iperf3_rate().unwrap(), "5M");
+        assert_eq!(iperf3_rate().unwrap(), "1M");
         std::env::set_var("POLARIS_IPERF3_RATE", "750K");
         assert_eq!(iperf3_rate().unwrap(), "750K");
         std::env::set_var("POLARIS_IPERF3_RATE", "5M;touch /tmp/x");
