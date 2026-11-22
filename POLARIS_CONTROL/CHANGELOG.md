@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.26 — 2026-11-22 — Appel voix avec UE déjà actif
+
+- `ue_start` conserve désormais l'autorisation d'exécution d'un UE déjà actif pour les étapes IMS suivantes, sans revendiquer la propriété de son arrêt lors du nettoyage.
+- Le test voix couvre séparément la cible déjà active et le pair lancé par le scénario ; l'ancien code échouait sur la cible avec `UE_NOT_STARTED`.
+- Le débit iperf interne par défaut est aligné sur le paramètre résolu des modèles, soit 1 Mbit/s au lieu de 5 Mbit/s.
+
 ## 0.36.23 — 2026-11-21 — Ergonomie Control C5
 
 - Les modèles sont visibles par défaut, recherchables par nom ou identifiant, avec l'état réel du backend et un bouton Run direct.
