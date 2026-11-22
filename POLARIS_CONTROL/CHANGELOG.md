@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.36.27 — 2026-11-22 — Intégration Control C5, voix, C6 et C7
+
+- Intègre C5 : refus et motifs de boutons en français, sans restitution de texte libre ; les codes contenant au moins cinq chiffres consécutifs sont aussi masqués dans les refus et l’audit.
+- Intègre la correction voix 0.36.26 : l’autorisation d’un UE déjà actif reste disponible sans transférer la propriété de son nettoyage.
+- Intègre C6 : gate du trafic certifié selon la cible et télémétrie pseudonymisée des refus dans History et l’agrégation.
+- Intègre C7 : archivage et restauration réversibles des scénarios utilisateur, sans suppression ni application automatique d’une liste d’archivage.
+- Aligne l’API, le web, `apps/simulator-control` et le verrou Cargo sur 0.36.27.
+
 ## 0.36.25 — 2026-11-22 — Refus C5 sans fuite et actions explicites
 
 - Reprise de la base C5 `c46360d` : un refus API ne restitue jamais un texte brut ; seul un code strictement conforme peut être affiché, et les préfixes `psn-` ne contournent pas l’inspection.
@@ -34,6 +42,14 @@
 - Les refus certifiés attachent une extension interne typée ; le middleware journalise code, action, scénario et cible pseudonymisée sans relire le corps HTTP.
 - Les erreurs de Start 422, 423 et 503 alimentent History avec leur cause et leur cible pseudonymisée. La même réponse expose une agrégation en lecture seule des refus de validation et de Start par code, cible, action et statut ; les arrêts opérateur en sont exclus.
 - Les tests couvrent la sélection des gates, deux cibles distinctes, la projection History sans identité ni adresse et le passage de l'extension typée vers l'audit.
+
+## 0.36.24 — 2026-11-21 — Archivage réversible du catalogue
+
+- Les définitions utilisateur portent un état `archived`, rétrocompatible avec les catalogues existants (`false` par défaut) et persisté atomiquement.
+- La liste masque les archives par défaut ; `include_archived=true` les rend visibles avec leur état et leur motif de non-exécution.
+- Les mutations opérateur `archive` et `restore` sont protégées par rôle et CSRF, refusent les modèles système et écrivent l'audit.
+- Un scénario archivé ne peut pas être exécuté ; sa restauration le rend à nouveau visible sans changer son identifiant, et les références historiques ne sont pas réécrites.
+- Aucun identifiant n'est archivé automatiquement et aucune donnée du catalogue n'est supprimée.
 
 ## 0.36.20 — 2026-11-21 — Identités abonné masquées sur les GET Control
 

@@ -9347,6 +9347,9 @@ fn scenario_definition_block_reason(
     definition: &ScenarioDefinition,
     dl_sender_available: bool,
 ) -> Result<Option<&'static str>, String> {
+    if definition.archived {
+        return Ok(Some("SCENARIO_ARCHIVED"));
+    }
     if definition_support_status(definition) == SUPPORT_BACKEND_REQUIRED {
         return Ok(Some("SCENARIO_BACKEND_REQUIRED"));
     }
@@ -9366,6 +9369,7 @@ fn scenario_execution_message(reason: &str) -> &'static str {
         "DL_SENDER_NOT_AVAILABLE" => "Brouillon non exécutable : émetteur DN indisponible.",
         "UL_RECEIVER_NOT_AVAILABLE" => "Brouillon non exécutable : récepteur DN indisponible.",
         "SCENARIO_BACKEND_REQUIRED" => "Brouillon non exécutable : prérequis backend manquant.",
+        "SCENARIO_ARCHIVED" => "Scénario archivé : restaurez-le avant de l’exécuter.",
         _ => "Brouillon non exécutable.",
     }
 }
@@ -10478,17 +10482,34 @@ async fn import_scenario_definition(
     }
 }
 
-async fn list_scenario_definitions(State(state): State<Arc<AppState>>) -> Json<Value> {
+#[derive(Default, Deserialize)]
+struct ListScenarioDefinitionsQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+async fn list_scenario_definitions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListScenarioDefinitionsQuery>,
+) -> Json<Value> {
     let catalog = state.scenario_catalog.lock().unwrap();
     let dl_available = dl_sender_health(&state).is_ok();
     let items = catalog
         .definitions
         .iter()
+        .filter(|definition| query.include_archived || !definition.archived)
         .map(|definition| scenario_definition_view(&state, definition, dl_available))
         .collect::<Vec<_>>();
+    let archived_total = catalog
+        .definitions
+        .iter()
+        .filter(|definition| definition.archived)
+        .count();
     Json(json!({
         "items":items,
         "total":items.len(),
+        "archived_total":archived_total,
+        "include_archived":query.include_archived,
         "schema_version":catalog.schema_version
     }))
 }
@@ -10632,6 +10653,59 @@ async fn delete_scenario_definition(
         Ok(definition) => (StatusCode::OK, Json(json!({"deleted":definition.id}))),
         Err(error) => scenario_definition_error(error),
     }
+}
+
+async fn set_scenario_definition_archived(
+    state: &Arc<AppState>,
+    identity: &EffectiveIdentity,
+    id: &str,
+    archived: bool,
+) -> (StatusCode, Json<Value>) {
+    if let Err(error) = require_operator(identity) {
+        return error;
+    }
+    let result = {
+        let mut catalog = state.scenario_catalog.lock().unwrap();
+        state
+            .scenario_definition_store
+            .set_archived(&mut catalog, id, archived)
+    };
+    match result {
+        Ok(definition) => {
+            audit(
+                state,
+                &identity.role,
+                if archived {
+                    "SCENARIO_DEFINITION_ARCHIVE"
+                } else {
+                    "SCENARIO_DEFINITION_RESTORE"
+                },
+                "SUCCESS",
+                Some(id),
+            );
+            (
+                StatusCode::OK,
+                Json(json!({"id":definition.id,"archived":definition.archived})),
+            )
+        }
+        Err(error) => scenario_definition_error(error),
+    }
+}
+
+async fn archive_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    set_scenario_definition_archived(&state, &identity, &id, true).await
+}
+
+async fn restore_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    set_scenario_definition_archived(&state, &identity, &id, false).await
 }
 
 #[derive(Deserialize)]
@@ -16674,6 +16748,14 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(clone_scenario_definition),
         )
         .route(
+            "/scenario-definitions/:id/archive",
+            post(archive_scenario_definition),
+        )
+        .route(
+            "/scenario-definitions/:id/restore",
+            post(restore_scenario_definition),
+        )
+        .route(
             "/scenario-definitions/:id/estimate",
             get(estimate_scenario_definition),
         )
@@ -20995,6 +21077,7 @@ mod p0_tests {
             simulator: "UERANSIM".into(),
             description: "Small traffic".into(),
             source_definition_id: None,
+            archived: false,
         };
         let report = BuiltinMigrationReport {
             added_ids: vec!["tpl-high-runner".into()],
@@ -22938,6 +23021,86 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
     }
 
     #[tokio::test]
+    async fn scenario_archive_http_is_hidden_reversible_csrf_protected_and_non_executable() {
+        let test_state = state();
+        let audit_path = test_state.audit_path.clone();
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let definition = json!({
+            "id":"operator-archive-test","name":"Archive test",
+            "loop_count":1,
+            "steps":[{"type":"wait","loop_count":1,"parameters":{"duration_ms":{"fixed":10}}}]
+        });
+        let created = application
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenario-definitions").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(definition.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let without_csrf = application
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenario-definitions/operator-archive-test/archive").header(header::COOKIE,&cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(without_csrf.status(), StatusCode::FORBIDDEN);
+
+        let archived = application
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenario-definitions/operator-archive-test/archive").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(archived.status(), StatusCode::OK);
+
+        let visible = application
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/scenario-definitions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let visible: Value = serde_json::from_slice(&to_bytes(visible.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(visible["total"], 0);
+        assert_eq!(visible["archived_total"], 1);
+
+        let with_archived = application
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/scenario-definitions?include_archived=true").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let with_archived: Value = serde_json::from_slice(&to_bytes(with_archived.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(with_archived["total"], 1);
+        assert_eq!(with_archived["items"][0]["archived"], true);
+        assert_eq!(with_archived["items"][0]["executable"], false);
+        assert_eq!(with_archived["items"][0]["execution_block_reason"], "SCENARIO_ARCHIVED");
+
+        let start = application
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenarios/start").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(json!({"scenario_definition_id":"operator-archive-test","ue_ids":["UE-02"]}).to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let start: Value = serde_json::from_slice(&to_bytes(start.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(start["error"], "SCENARIO_ARCHIVED");
+
+        let restored = application
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenario-definitions/operator-archive-test/restore").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        let visible_again = application
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/scenario-definitions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let visible_again: Value = serde_json::from_slice(&to_bytes(visible_again.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(visible_again["total"], 1);
+        assert_eq!(visible_again["items"][0]["archived"], false);
+        let audit_log = fs::read_to_string(audit_path).unwrap();
+        assert!(audit_log.contains("SCENARIO_DEFINITION_ARCHIVE"));
+        assert!(audit_log.contains("SCENARIO_DEFINITION_RESTORE"));
+    }
+
+    #[tokio::test]
     async fn scenario_definition_http_contract_is_versioned_strict_and_step_observable() {
         let application = app(state());
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
@@ -23352,6 +23515,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
                 simulator: "UERANSIM".into(),
                 description: id.into(),
                 source_definition_id: None,
+                archived: false,
             });
     }
 

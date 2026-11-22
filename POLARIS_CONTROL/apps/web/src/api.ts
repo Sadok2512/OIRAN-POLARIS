@@ -21,8 +21,8 @@ export type ScenarioState = { scenario_id: string; job_id?: string; target_ue_id
 export type ScenarioRuntime = { active_job: ScenarioState | null; latest_terminal_job: ScenarioState | null; active_count: number; history_count: number; observed_at_epoch_s: number; source: string };
 export type TrafficState = { state: string; packets_requested: number; packets_sent: number | null; packets_received: number | null; bytes: number | null; current_rate_pps?: number | null; accounting_source: string; target_ue_id?: string | null; target_ue_pseudonym?: string | null; tun_interface?: string | null; last_result: ScenarioState | null; approved_destinations: string[] };
 export type ValidationResult = { valid: boolean; execution?: string; next?: string; scenario_type?: string; error?: string };
-export type ScenarioDefinition = { id:string; name:string; version:number; loop_count:number; steps:{type:string;parameters?:Record<string,unknown>}[]; created_at_epoch_s:number; updated_at_epoch_s:number; catalog_scope:'SYSTEM'|'USER'; mutable:boolean; cloneable:boolean; assigned_ues:number; backend_support:string; executable:boolean; execution_block_reason:string|null; execution_message:string|null };
-export type ScenarioDefinitions = { items:ScenarioDefinition[]; total:number; schema_version:number };
+export type ScenarioDefinition = { id:string; name:string; version:number; loop_count:number; steps:{type:string;parameters?:Record<string,unknown>}[]; created_at_epoch_s:number; updated_at_epoch_s:number; catalog_scope:'SYSTEM'|'USER'; mutable:boolean; cloneable:boolean; assigned_ues:number; backend_support:string; executable:boolean; execution_block_reason:string|null; execution_message:string|null; archived:boolean };
+export type ScenarioDefinitions = { items:ScenarioDefinition[]; total:number; archived_total:number; include_archived:boolean; schema_version:number };
 
 export const secondsToDurationMs = (seconds:number) => Math.round(seconds * 1000);
 export const maskSubscriberIdentity = (value:string|undefined|null) => {
@@ -33,7 +33,9 @@ export const maskSubscriberIdentity = (value:string|undefined|null) => {
 };
 export const reportedState = (value:string|undefined|null) => value && value !== 'UNKNOWN' ? value : '-- (non rapporté par UERANSIM)';
 const safeRefusalCode=/^[A-Z][A-Z0-9_]{2,63}$/;
-export const safeAuditReference = (value:string|undefined|null) => value&&safeRefusalCode.test(value.trim()) ? value.trim() : 'REFUS_MASQUE';
+const sensitiveDigitRun=/\d{5,}/;
+const isSafeRefusalCode=(value:string)=>safeRefusalCode.test(value)&&!sensitiveDigitRun.test(value);
+export const safeAuditReference = (value:string|undefined|null) => value&&isSafeRefusalCode(value.trim()) ? value.trim() : 'REFUS_MASQUE';
 export const eventFailureDetail = (event:{detail?:{error?:string};error?:string}) => {
   const raw=event.detail?.error ?? event.error;
   return raw ? humanActionReason(safeAuditReference(raw)) : '';
@@ -73,6 +75,7 @@ export const actionReasonMessages:Readonly<Record<string,string>> = {
   SCENARIO_JOB_NOT_FOUND: 'Job de scénario introuvable. Action : actualiser History avant de relancer une action.',
   SCENARIO_NAME_VERSION_CONFLICT: 'Nom ou version de scénario en conflit. Action : choisir un nom ou une version distincte.',
   SCENARIO_NOT_CERTIFIED: 'Scénario non certifié. Action : sélectionner un scénario marqué exécutable et certifié.',
+  SCENARIO_ARCHIVED: 'Scénario archivé. Action : le restaurer avant de demander son exécution.',
   SCENARIO_TYPE_REQUIRED: 'Type de scénario manquant. Action : relancer depuis le scénario certifié de la bibliothèque.',
   SCENARIO_UE_NOT_CONTROLLER_OWNED: 'UE non géré par Control. Action : sélectionner un UE dont la propriété Control est vérifiée.',
   SCENARIO_UE_SELECTION_DUPLICATE: 'UE sélectionné plusieurs fois. Action : conserver une seule occurrence de chaque UE.',
@@ -151,14 +154,14 @@ export const actionReasonMessages:Readonly<Record<string,string>> = {
 };
 export const humanActionReason = (code:string|undefined|null) => {
   if (!code) return 'Motif indisponible. Action : actualiser la page, puis demander une vérification si le blocage persiste.';
-  if (!safeRefusalCode.test(code)) return 'Blocage non documenté. Action : actualiser la page, puis demander une vérification.';
+  if (!isSafeRefusalCode(code)) return 'Blocage non documenté. Action : actualiser la page, puis demander une vérification.';
   return actionReasonMessages[code] ?? `Blocage non documenté (${code}). Action : ouvrir UE Manager et demander une vérification.`;
 };
 export const humanDisabledReason = (reason:string|undefined|null) => humanActionReason(reason ?? 'OPERATION_IN_PROGRESS');
 export const humanApiRefusal = (error:unknown) => {
   const raw=error instanceof Error?error.message:String(error??'');
   const code=raw.split(':',1)[0]?.trim();
-  if (code&&safeRefusalCode.test(code)) {
+  if (code&&isSafeRefusalCode(code)) {
     if (actionReasonMessages[code]) return humanActionReason(code);
     return `L’API a refusé l’opération (${code}). Action : réessayer, puis demander une vérification si le refus persiste.`;
   }
