@@ -33,14 +33,31 @@ export const maskSubscriberIdentity = (value:string|undefined|null) => {
 };
 export const reportedState = (value:string|undefined|null) => value && value !== 'UNKNOWN' ? value : '-- (non rapporté par UERANSIM)';
 export const eventFailureDetail = (event:{detail?:{error?:string};error?:string}) => event.detail?.error ?? event.error ?? '';
+export const actionReasonMessages:Readonly<Record<string,string>> = {
+  UE_CONTROL_VALIDATION_REQUIRED: 'Validation Control requise. Action : ouvrir UE Manager, puis autoriser cet UE avant de relancer.',
+  ATTESTATION_INCOMPLETE: 'Attestation incomplète. Action : demander à un agent lab de vérifier le profil en lecture seule.',
+  PROVISIONING_PROFILE_INVALID: 'Profil de provisioning invalide. Action : demander à un agent lab de comparer le profil avec la base autoritative.',
+  SUBSCRIBER_PROVISIONING_REVIEW_REQUIRED: 'Abonnement non attesté. Action : ouvrir Paramètres, puis lancer la vérification du provisioning.',
+  SHARED_UE_PROTECTED: 'UE partagée protégée. Action : choisir un UE géré par Control ou demander son transfert explicite.',
+  PROTECTED_OR_UNAPPROVED_UE: 'UE hors du périmètre autorisé. Action : demander la validation de sa prise en charge par Control.',
+  LIVE_EXECUTION_NOT_CONFIGURED: 'Exécution live désactivée. Action : demander à un administrateur de vérifier la configuration d’exécution.',
+  UE_ALREADY_RUNNING: 'UE déjà démarré. Action : ouvrir UE Manager et l’arrêter avant une nouvelle exécution.',
+  UE_NOT_RUNNING: 'UE arrêté. Action : ouvrir UE Manager et le démarrer avant de poursuivre.',
+  NOT_CONFIGURED: 'UE non configuré. Action : ouvrir UE Manager et terminer sa configuration.',
+  UE_NOT_REGISTERED: 'UE non enregistré sur le réseau. Action : ouvrir son activité et vérifier l’attachement.',
+  PDU_SESSION_NOT_ACTIVE: 'Session PDU inactive. Action : ouvrir son activité et vérifier l’établissement de la session.',
+  UE_RUNTIME_OWNERSHIP_NOT_VERIFIED: 'Propriété du processus UE non vérifiée. Action : demander à un agent lab de vérifier le processus en lecture seule.',
+  LTE_E2E_CERTIFICATION_REQUIRED: 'Certification LTE de bout en bout requise. Action : demander l’exécution de la recette LTE autorisée.',
+  SRSRAN_LIVE_DISABLED: 'Exécution srsRAN live désactivée. Action : demander à un administrateur de vérifier la configuration srsRAN.',
+  LTE_LIVE_GRANT_REQUIRED: 'Autorisation live LTE requise. Action : demander une autorisation bornée pour cet UE.',
+  LIVE_GRANT_REQUIRED: 'Autorisation live requise. Action : demander une autorisation bornée avant de poursuivre.',
+  SRSRAN_CONTROLLER_OWNERSHIP_REQUIRED: 'Propriété srsRAN non vérifiée. Action : demander à un agent lab de vérifier le processus en lecture seule.',
+  LTE_ATTACH_OR_IP_NOT_OBSERVED: 'Attachement LTE ou adresse de session non observé. Action : ouvrir l’activité LTE et vérifier l’attachement.',
+  UE_NON_ELIGIBLE: 'UE non éligible. Action : ouvrir UE Manager et vérifier son provisioning, son autorisation et son état.',
+};
 export const humanActionReason = (code:string|undefined|null) => {
   if (!code) return 'Action indisponible';
-  const messages:Record<string,string> = {
-    UE_CONTROL_VALIDATION_REQUIRED: 'Validation Control requise (UE_CONTROL_VALIDATION_REQUIRED) : ouvrir UE Manager et vérifier le profil abonné.',
-    ATTESTATION_INCOMPLETE: 'Attestation incomplète : demander à un agent lab de vérifier le profil en lecture seule.',
-    PROVISIONING_PROFILE_INVALID: 'Profil de provisioning invalide : demander à un agent lab de comparer le profil et la base.',
-  };
-  return messages[code] ?? code.replaceAll('_',' ');
+  return actionReasonMessages[code] ?? `Blocage non documenté (${code}). Action : ouvrir UE Manager et demander une vérification.`;
 };
 export const filterScenarioDefinitions = (items:ScenarioDefinition[], scope:'SYSTEM'|'USER', query:string) => {
   const needle=query.trim().toLocaleLowerCase();
