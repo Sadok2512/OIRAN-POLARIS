@@ -1,0 +1,134 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root,
+  [data-theme='light'] {
+    --c-background: #F5F7FA;
+    --c-surface: #FFFFFF;
+    --c-sidebar: #F0F4F9;
+    --c-text-primary: #17283F;
+    --c-text-secondary: #66758B;
+    --c-border: #DEE5ED;
+    --c-primary: #2563EB;
+    --c-success: #059669;
+    --c-warning: #D97706;
+    --c-error: #DC2626;
+    --shadow-elev-1: 0 1px 2px rgba(23, 40, 63, 0.06);
+    --shadow-elev-2: 0 2px 6px rgba(23, 40, 63, 0.08);
+  }
+
+  [data-theme='dark'] {
+    --c-background: #0B1220;
+    --c-surface: #152238;
+    --c-sidebar: #101B2C;
+    --c-text-primary: #E7F0FF;
+    --c-text-secondary: #94A3B8;
+    --c-border: #30415C;
+    --c-primary: #3B82F6;
+    --c-success: #10B981;
+    --c-warning: #F59E0B;
+    --c-error: #EF4444;
+    --shadow-elev-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-elev-2: 0 2px 6px rgba(0, 0, 0, 0.45);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas text-text-primary font-sans text-ep-base antialiased;
+    font-feature-settings: 'ss01', 'cv11';
+    background-color: var(--c-background);
+    color: var(--c-text-primary);
+  }
+
+  .num,
+  .mono {
+    font-variant-numeric: tabular-nums;
+    font-family: var(--font-mono, 'JetBrains Mono', 'SF Mono', Menlo, monospace);
+  }
+
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--c-primary);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  [data-theme='dark'] .react-flow {
+    background-color: var(--c-background);
+    color: var(--c-text-primary);
+  }
+  [data-theme='dark'] .react-flow__background pattern path {
+    stroke: #1b2a44;
+  }
+  [data-theme='dark'] .react-flow__controls button {
+    background: var(--c-surface);
+    color: var(--c-text-primary);
+    border-color: var(--c-border);
+  }
+  [data-theme='dark'] .react-flow__minimap {
+    background: var(--c-surface);
+  }
+}
+
+@layer components {
+  .ep-card {
+    @apply bg-surface border border-border rounded-md;
+    box-shadow: var(--shadow-elev-1);
+  }
+
+  .ep-button {
+    @apply inline-flex items-center justify-center gap-2 h-10 px-4 rounded-md text-ep-md font-medium border border-border transition-colors;
+    @apply bg-surface text-text-primary hover:bg-canvas disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .ep-button-sm {
+    @apply h-8 px-3 text-ep-sm;
+  }
+
+  .ep-button-primary {
+    @apply bg-primary text-white border-primary hover:brightness-110;
+  }
+
+  .ep-button-danger {
+    @apply bg-error text-white border-error hover:brightness-110;
+  }
+
+  .ep-badge {
+    @apply inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-ep-xs font-medium border border-border bg-canvas;
+  }
+
+  .ep-input {
+    @apply h-9 px-3 rounded-md border border-border bg-surface text-text-primary text-ep-sm;
+    @apply focus:outline-none focus:ring-2 focus:border-primary;
+  }
+  .ep-input:focus {
+    --tw-ring-color: color-mix(in srgb, var(--c-primary) 30%, transparent);
+  }
+
+  .ep-table {
+    @apply w-full text-ep-sm;
+  }
+  .ep-table thead th {
+    @apply text-left font-medium text-text-secondary text-ep-xs uppercase tracking-wider;
+    @apply border-b border-border px-3 py-2;
+  }
+  .ep-table tbody td {
+    @apply border-b border-border px-3 py-2 align-middle;
+  }
+  .ep-table tbody tr:hover {
+    background: color-mix(in srgb, var(--c-primary) 4%, transparent);
+  }
+  .ep-table tbody tr[data-selected='true'] {
+    background: color-mix(in srgb, var(--c-primary) 8%, transparent);
+  }
+}
