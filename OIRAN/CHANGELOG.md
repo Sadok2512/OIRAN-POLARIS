@@ -1,5 +1,42 @@
 # Changelog
 
+## oiran-api 2.21.148, session-engine 0.5.28 — 2026-11-22 — publication : passe des représentants allégée, résultat identique
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.147 @ `ed34119` (branche `fix/oiran-2.21.148-representatives-pass`). Lot « 2a » de la publication proportionnelle au delta (audit #9 7085113630, GO #9 7085198470). La version 2.21.145, d'abord réservée à ce lot, n'a jamais été publiée.
+
+### Ce qui change (`session-engine`)
+
+La passe des représentants (`load_paths_spilling_representatives_with_progress`) relit tous les events du jeu à chaque cycle de publication (193 s sur 561 au lab). Deux coûts inutiles sont retirés, sans changer aucun format ni aucun résultat :
+
+- **Conversion d'un event** (`parse_event`) : les deux sous-arbres les plus lourds — IE décodés et références de paquet — sont **sortis** de l'arbre lu, au lieu d'être recopiés en profondeur puis jetés avec lui.
+- **Taille d'un enregistrement** : elle ne sert qu'à décider quand écrire un passage sur disque. Elle est mesurée exactement sur un enregistrement sur 16, et estimée par la moyenne courante pour les autres, au lieu de sérialiser chaque enregistrement uniquement pour le mesurer.
+
+### Mesure
+
+Banc `session-engine/examples/representatives_bench.rs`, livré avec le lot : jeu synthétique fait des events d'un jeu réel du dépôt, répétés avec des identifiants décalés (450 000 events, 1,15 Go, 39 % de représentants — 39 % au lab), plafond mémoire de production (64 Mio), binaire `--release`, trois passes alternées avant / après sur la même machine :
+
+| | Passe 1 | Passe 2 | Passe 3 | Moyenne |
+|---|---|---|---|---|
+| Avant | 47,3 s | 45,9 s | 46,0 s | 46,4 s |
+| Après | 38,7 s | 41,0 s | 38,0 s | 39,2 s |
+
+**−15 %**. L'empreinte de la liste des représentants (SHA-256 chaîné de chaque représentant sérialisé, dans l'ordre) est la même sur les six passes : la liste est identique event par event. Pic de mémoire résidente inchangé (1,15 Go).
+
+### Ce que le banc a appris, à l'encontre de l'audit
+
+- L'audit attendait « un quart à un tiers » de gain et désignait la sérialisation de mesure comme premier coût. **C'était faux** : seule, elle ne gagne rien de mesurable. Le gain vient de la copie évitée dans la conversion.
+- La passe n'a **pas d'étape dominante** (profil sur 36 s : analyse JSON en arbre 8,6 s, écriture des passages 6,9 s, conversion 6,3 s, lecture 5,6 s, fusion 4,1 s, compactage 1,9 s, clé 1,5 s, tri final 1,3 s). Aller plus loin demande de réécrire l'analyse d'un event sans arbre intermédiaire : ce n'est plus « sans changer aucun résultat », et le lot « jeu chaud » rend ce coût indépendant de la taille du jeu.
+
+### Tests
+
+- `representatives_do_not_depend_on_the_run_memory_cap_2_21_148` : avec un plafond mémoire minuscule ou énorme, la liste des représentants est identique event par event — ce qui autorise l'estimation de taille.
+- Les tests d'équivalence existants (`spilling_representatives_match_legacy_*`) passent sans changement.
+
+### OUVERT
+
+- **Le banc n'a pas pu tourner à la taille du lab** (1,8 million d'events) : il lui faut environ 4,6 Go de mémoire résidente, plus que la machine de développement n'en avait de disponible (3,7 Go, sans swap). Mesure faite sur un jeu quatre fois plus petit ; le gain relatif est à confirmer au lab.
+- À l'échelle du lab, −15 % de 193 s fait une trentaine de secondes sur un cycle de 561 s. Le gain décisif reste l'archivage du monolithe, puis le lot « jeu chaud ».
+
 ## oiran-api 2.21.147, live-probe 0.6.34 — 2026-11-22 — restauration d'une archive dans un jeu en fragments : rien n'est perdu
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.146 @ `3f9abd3` (branche `fix/oiran-2.21.147-restore-fragments`). Ordre du cœur #9 7085626859, point 3 ; défaut décrit en #9 7085580313.

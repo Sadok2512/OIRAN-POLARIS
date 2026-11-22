@@ -1101,6 +1101,10 @@ struct SpilledRepresentative {
 
 static REPRESENTATIVE_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// 2.21.148 — un enregistrement sur N est sérialisé pour mesurer sa
+/// taille exacte ; les autres prennent la moyenne courante.
+const REPRESENTATIVE_SIZE_SAMPLE_EVERY: usize = 16;
+
 fn flush_representative_run(
     staging_dir: &Path,
     run_index: usize,
@@ -1193,6 +1197,9 @@ where
     let mut run_paths = Vec::<PathBuf>::new();
     let mut source_event_count = 0usize;
     let mut ordinal = 0u64;
+    let mut sampled_records = 0usize;
+    let mut sampled_bytes = 0usize;
+    let mut sampled_count = 0usize;
     for path in paths {
         let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
         let mut reader = BufReader::new(&file);
@@ -1226,11 +1233,27 @@ where
                 ordinal,
                 event,
             };
-            retained_bytes = retained_bytes.saturating_add(
-                serde_json::to_vec(&record)
+            // 2.21.148 / session-engine 0.5.28 — la taille d'un
+            // enregistrement ne sert qu'à décider QUAND écrire un passage
+            // sur disque. Avant : chaque enregistrement était sérialisé en
+            // entier, uniquement pour être mesuré (une sérialisation JSON
+            // de plus par event lu, à chaque cycle de publication). La
+            // taille est maintenant mesurée exactement sur un
+            // enregistrement sur `REPRESENTATIVE_SIZE_SAMPLE_EVERY`, et
+            // estimée par la moyenne courante pour les autres. Le
+            // résultat de la passe ne dépend pas du découpage en
+            // passages (le dernier observé l'emporte, dans un passage
+            // comme entre passages) : seule la mémoire tenue avant
+            // écriture varie, de quelques pour cent autour du plafond.
+            if sampled_records % REPRESENTATIVE_SIZE_SAMPLE_EVERY == 0 {
+                let exact = serde_json::to_vec(&record)
                     .map_err(|error| error.to_string())?
-                    .len(),
-            );
+                    .len();
+                sampled_bytes = sampled_bytes.saturating_add(exact);
+                sampled_count = sampled_count.saturating_add(1);
+            }
+            sampled_records = sampled_records.wrapping_add(1);
+            retained_bytes = retained_bytes.saturating_add(sampled_bytes / sampled_count.max(1));
             records.push(record);
             if retained_bytes >= memory_cap_bytes {
                 let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
@@ -1671,6 +1694,16 @@ pub fn load_jsonl_slim<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String
 }
 
 fn parse_event(v: Value) -> Result<EventRecord, String> {
+    // 2.21.148 / session-engine 0.5.28 — les deux sous-arbres les plus
+    // lourds d'un event (IE décodés, références de paquet) sont SORTIS de
+    // l'arbre lu, au lieu d'être recopiés en profondeur puis jetés avec
+    // lui. Même valeur, une allocation complète de moins par event.
+    let mut v = v;
+    let (owned_information_elements, owned_packet_references) = match v.as_object_mut() {
+        Some(map) => (map.remove("information_elements"), map.remove("packet_references")),
+        None => (None, None),
+    };
+    let v = v;
     let string = |path: &[&str]| -> Result<String, String> {
         let mut p = &v;
         for key in path {
@@ -1723,9 +1756,7 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         })
         .collect();
     let packet_references: Vec<PacketRef> = serde_json::from_value(
-        v.get("packet_references")
-            .cloned()
-            .ok_or("missing packet_references")?,
+        owned_packet_references.ok_or("missing packet_references")?,
     )
     .map_err(|e| format!("invalid packet_references: {e}"))?;
     let errors = v
@@ -1806,10 +1837,7 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         destination_participant,
         direction: string(&["direction"])?,
         identifiers,
-        information_elements: v
-            .get("information_elements")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new())),
+        information_elements: owned_information_elements.unwrap_or(Value::Array(Vec::new())),
         decoding_status: string(&["decoding_status"])?,
         decoder_name: string(&["decoder_name"])?,
         decoder_version: string(&["decoder_version"])?,
@@ -6508,5 +6536,40 @@ mod in_packet_order_tests {
         assert_eq!(key("evt-ffff"), "n2_00001.pcapng|0|7|0|NGAP|0");
         assert_eq!(key("evt-0001"), "n2_00001.pcapng|0|7|0|NAS-5GMM|1");
         assert_eq!(events[0].event_id, "evt-ffff", "parent d'abord dans l'ordre canonique");
+    }
+    /// 2.21.148 / session-engine 0.5.28 — la liste des représentants ne
+    /// dépend pas du découpage en passages : avec un plafond mémoire
+    /// minuscule (un passage tous les quelques events) ou énorme (un seul
+    /// passage), elle est identique event par event. C'est ce qui permet
+    /// d'ESTIMER la taille d'un enregistrement au lieu de le sérialiser
+    /// pour le mesurer.
+    #[test]
+    fn representatives_do_not_depend_on_the_run_memory_cap_2_21_148() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
+        // Le même jeu trois fois : des clés qui reviennent d'un passage à l'autre.
+        let paths = vec![source.clone(), source.clone(), source];
+        let staging = std::env::temp_dir().join(format!("oiran-representatives-cap-{}", std::process::id()));
+        let run = |cap: usize| {
+            let index = load_paths_spilling_representatives_with_progress(&paths, &staging, cap, |_, _| {})
+                .expect("représentants");
+            (
+                index.source_event_count,
+                index
+                    .events
+                    .iter()
+                    .map(|event| serde_json::to_string(event).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (count, single_run) = run(usize::MAX / 4);
+        assert_eq!(count, 192, "trois lectures des 64 events du jeu");
+        assert!(!single_run.is_empty());
+        for cap in [1usize, 4 * 1024, 64 * 1024] {
+            let (_, many_runs) = run(cap);
+            assert_eq!(many_runs, single_run, "plafond {cap} : liste identique, event par event");
+        }
     }
 }
