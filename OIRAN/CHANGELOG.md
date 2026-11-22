@@ -1,5 +1,40 @@
 # Changelog
 
+## oiran-api 2.21.142 — 2026-11-22 — trace live : le call flow de la trace, servi sans attendre la publication
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.141 @ `4979d58` (branche `fix/oiran-2.21.142-trace-callflow`). GO cœur #9 7084290861 ; contrat de la route annoncé à ANR1 en #10 7084316531. Aucun crate partagé modifié.
+
+### Pourquoi
+
+Recette ANR2 (#10 7083623180) : 105 messages en live, 0 session filtrable, donc aucun call flow. Cause (audit #9 7083792263, relevés #9 7084128918) : le segment d'un run n'est fermé qu'au bout de 3 600 s et une publication dure 393 à 584 s. La publication proportionnelle au delta est un chantier en plusieurs lots (design #9 7084281004) ; ce lot est la voie courte pour les tests.
+
+### Ce qui change
+
+- **La trace garde ses events de signalisation** rattachés et émis en `message`, dans leur forme normalisée (`TraceState::signalling`), sous le même quota que le tampon de rejeu (2 000). Une révision d'un flux RTP remplace la précédente.
+- **`GET /live/traces/:id/callflow?limit=&cursor=`** rend leur call flow, construit par le même code que la publication (`session_engine::load_jsonl` + `reconstruct` + `callflow_schema::build_callflow`), paginé par la même fonction que `GET /sessions/:id/callflow` et assaini de la même façon. Champs ajoutés : `provisional: true`, `source: "live-trace"`, `trace_id`, `complete`, `dropped_events`.
+- `session_id` vaut `live-<trace_id>` ; `correlation_edges` est présent et vide, `correlation_status.E2E = "LIVE_TRACE_NOT_CORRELATED"` : aucune arête n'est inventée.
+- **Jamais de troncature silencieuse** : au-delà du quota, le plus ancien event sort, `complete` passe à `false` et `dropped_events` le compte.
+- **`GET /live/traces/:id/sessions`** annonce `provisional_session` (id, nombre d'events, `complete`, chemin du call flow).
+- **Refus explicites** : `404 LIVE_TRACE_NOT_FOUND`, `410 LIVE_TRACE_EXPIRED` (les 64 derniers ids de traces expirées sont retenus, pour répondre « expirée » même après la purge), `403 OPERATOR_REQUIRED`, `422 CALLFLOW_LIMIT_INVALID`, `400 CALLFLOW_CURSOR_INVALID`.
+- La route est en lecture seule et ne prend pas le verrou mémoire de la publication : pas de `503` pendant une publication.
+- Isolement : le call flow ne porte que ce que la trace a rattaché, par ses gardes existants ; aucune nouvelle règle d'appartenance.
+
+### Tests
+
+- `live_trace_callflow_is_served_without_publication_with_the_published_contract_2_21_142` (routeur réel, capture réelle à cinq abonnés : trace vide → 200 sans event ; run → call flow complet en plusieurs pages, total identique sur chaque page, aucun doublon, ordre canonique, champs du call flow publié, annonce dans `/sessions`, servi pendant une publication, rien à masquer). Avant : la route n'existe pas.
+- `live_trace_callflow_refusals_are_explicit_2_21_142` (inconnue, `limit`, `cursor`, expirée).
+- `trace_callflow_holds_exactly_the_attached_signalling_in_canonical_order_2_21_142` (les cinq abonnés : 70 / 68 / 67 / 69 / 65 events, exactement les messages émis, aucun pseudonyme d'un autre abonné).
+- `trace_callflow_carries_the_voice_call_attached_by_the_ue_address_2_21_142` (REGISTER, INVITE, réponses, BYE de l'abonné ; rien de l'autre UE).
+- `trace_signalling_beyond_the_quota_is_counted_not_silently_dropped_2_21_142`.
+
+### OUVERT
+
+- **SIP vu sur IMS et sur N3-IMS** : ce sont deux observations du même message à deux points de capture ; le call flow de la trace les montre toutes les deux, comme le call flow publié. Figé par le test voix ; pas de dédoublonnage dans ce lot.
+- Le test voix utilise des events SIP construits à la main (aucune capture du dépôt ne porte de SIP) ; à rejouer au lab sur un appel réel.
+- Un seul call flow par trace : enregistrement, session de données et appel sont dans le même ladder.
+- Ne couvre pas : un UE non tracé, ce qui précède l'ouverture de la trace, la liste `/sessions/filter`, la corrélation de bout en bout. Perdu à l'expiration de la trace et au redémarrage de l'API.
+- Mémoire : jusqu'à 2 000 events normalisés de plus par trace (10 traces au plus) ; non mesurée au lab.
+
 ## oiran-api 2.21.141 — 2026-11-22 — trace live : le débit n'évince plus les messages du tampon de rejeu
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.140 @ `7b2bf0a` (branche `fix/oiran-2.21.141-replay-buffer-quotas`). GO cœur #9 7083987761 : « je ne veux pas que le débit évince les messages ». Aucun crate partagé modifié.

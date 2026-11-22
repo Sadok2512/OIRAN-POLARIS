@@ -26,6 +26,8 @@ const MAX_EVENTS: usize = 2_000;
 const MAX_THROUGHPUT_EVENTS: usize = 1_800;
 /// 2.21.141 — quota des instantanés `stats` : seuls les derniers servent.
 const MAX_STATS_EVENTS: usize = 8;
+/// 2.21.142 — nombre d'ids de traces expirées retenus.
+const MAX_REMEMBERED_EXPIRED_TRACES: usize = 64;
 
 #[derive(Clone, Serialize)]
 pub(crate) struct LiveTrace {
@@ -470,6 +472,22 @@ impl TraceState {
     /// rejouait presque plus que du débit. Désormais chaque classe a
     /// son quota : au dépassement, c'est le plus ancien event DE LA
     /// MÊME CLASSE qui sort. Mémoire bornée à la somme des quotas.
+    /// 2.21.142 — garde l'event de signalisation qui vient d'être émis
+    /// en `message`. Une révision d'un flux RTP (même
+    /// `stable_event_key`) REMPLACE la précédente, comme dans le tampon
+    /// de rejeu : un flux n'apparaît qu'une fois dans le call flow.
+    fn keep_signalling(&mut self, event: &event_schema::NormalizedEvent, replaces_flow: bool) {
+        if replaces_flow && !event.stable_event_key.is_empty() {
+            self.signalling
+                .retain(|kept| kept.stable_event_key != event.stable_event_key);
+        }
+        self.signalling.push_back(event.clone());
+        while self.signalling.len() > MAX_EVENTS {
+            self.signalling.pop_front();
+            self.signalling_dropped = self.signalling_dropped.saturating_add(1);
+        }
+    }
+
     fn buffer(&mut self, item: BufferedEvent) {
         let class = BufferClass::of(&item.kind);
         self.events.push_back(item);
@@ -494,6 +512,15 @@ struct TraceState {
     /// active. JAMAIS sérialisée ni journalisée ; vide pour une trace
     /// qui n'a pas été ouverte par `create`.
     request_fingerprint: String,
+    /// 2.21.142 — les events de signalisation que la trace a rattachés
+    /// et émis en `message`, dans leur forme normalisée (celle que la
+    /// publication consomme). Source du call flow de la trace
+    /// (`GET /live/traces/:id/callflow`). Même quota que le tampon de
+    /// rejeu (`MAX_EVENTS`) ; au-delà, le plus ancien sort et
+    /// `signalling_dropped` le compte. Jamais sérialisé tel quel.
+    signalling: VecDeque<event_schema::NormalizedEvent>,
+    /// 2.21.142 — events sortis de `signalling` par le quota.
+    signalling_dropped: u64,
     next_id: u64,
     events: VecDeque<BufferedEvent>,
     tx: broadcast::Sender<BufferedEvent>,
@@ -1229,6 +1256,10 @@ fn is_pfcp_node_message(message_name: &str) -> bool {
 
 pub(crate) struct LiveTraceRegistry {
     traces: Mutex<HashMap<String, TraceState>>,
+    /// 2.21.142 — ids des dernières traces expirées, pour répondre
+    /// « expirée » plutôt que « inconnue » une fois la trace purgée.
+    /// Borné (`MAX_REMEMBERED_EXPIRED_TRACES`) ; perdu au redémarrage.
+    expired_trace_ids: Mutex<VecDeque<String>>,
     reader_running: AtomicBool,
     audit: Mutex<VecDeque<Value>>,
     /// 2.21.105 — durée (ms) de la dernière passe complète du lecteur
@@ -1275,6 +1306,7 @@ impl LiveTraceRegistry {
             resume_resets: AtomicU64::new(0),
             reader_io: Mutex::new(BTreeMap::new()),
             reader_files_tracked: AtomicU64::new(0),
+            expired_trace_ids: Mutex::new(VecDeque::new()),
             reader_files_decoded: AtomicU64::new(0),
             reader_scan_ms: AtomicU64::new(0),
             reader_files_examined: AtomicU64::new(0),
@@ -1312,9 +1344,31 @@ impl LiveTraceRegistry {
             "at_epoch_s": at_epoch_s,
         }));
     }
-    fn purge(map: &mut HashMap<String, TraceState>) {
+    /// Retire les traces expirées. 2.21.142 : leur id est retenu, pour
+    /// qu'une route puisse dire « expirée » après la purge.
+    fn purge(&self, map: &mut HashMap<String, TraceState>) {
         let now = epoch_seconds();
-        map.retain(|_, state| state.trace.expires_at > now);
+        let expired: Vec<String> = map
+            .iter()
+            .filter(|(_, state)| state.trace.expires_at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let mut remembered = self.expired_trace_ids.lock().unwrap();
+        for id in expired {
+            map.remove(&id);
+            remembered.push_back(id);
+        }
+        while remembered.len() > MAX_REMEMBERED_EXPIRED_TRACES {
+            remembered.pop_front();
+        }
+    }
+
+    /// 2.21.142 — cette trace a-t-elle expiré récemment ?
+    fn recently_expired(&self, trace_id: &str) -> bool {
+        self.expired_trace_ids.lock().unwrap().iter().any(|id| id == trace_id)
     }
 
     /// 2.21.105 — ouvre une passe d'amorçage : les traces en attente
@@ -1413,7 +1467,7 @@ impl LiveTraceRegistry {
     /// état reste lisible par `GET /live/traces`.
     pub(crate) fn emit_stats(&self) {
         let mut traces = self.traces.lock().unwrap();
-        Self::purge(&mut traces);
+        self.purge(&mut traces);
         for state in traces.values_mut() {
             state.next_id += 1;
             let payload = self.stats_payload(&state.trace);
@@ -1482,7 +1536,7 @@ impl LiveTraceRegistry {
     pub(crate) fn flush_idle_throughput_buckets(&self) {
         let now = epoch_seconds();
         let mut traces = self.traces.lock().unwrap();
-        Self::purge(&mut traces);
+        self.purge(&mut traces);
         for state in traces.values_mut() {
             if state.throughput_second == 0 {
                 continue;
@@ -1517,6 +1571,17 @@ impl LiveTraceRegistry {
             state.dl_bytes = 0;
             state.unknown_bytes = 0;
             state.throughput_second = 0;
+        }
+    }
+    /// 2.21.142 — pour les tests du routeur : présente des events
+    /// décodés aux traces, comme le fait le lecteur après l'amorçage.
+    #[cfg(test)]
+    pub(crate) fn route_for_test(&self, events: &[event_schema::NormalizedEvent]) {
+        for state in self.traces.lock().unwrap().values_mut() {
+            state.needs_seed = false;
+        }
+        for event in events {
+            self.route_normalized(event);
         }
     }
     #[cfg(test)]
@@ -1819,7 +1884,7 @@ impl LiveTraceRegistry {
             .find(|v| v.starts_with("type=") && v.contains(",address="))
             .and_then(|v| parse_pdu_address(v));
         let mut traces = self.traces.lock().unwrap();
-        Self::purge(&mut traces);
+        self.purge(&mut traces);
         let is_gpdu = !seed_only && event.protocol.as_str() == "GTP-U";
         let lag_ms = {
             let wall_ms = SystemTime::now()
@@ -2823,6 +2888,7 @@ impl LiveTraceRegistry {
                     payload,
                 };
                 state.buffer(item.clone());
+                state.keep_signalling(event, is_flow_update);
                 let _ = state.tx.send(item);
             }
             let second = event.timestamp.seconds.max(0) as u64;
@@ -3909,7 +3975,7 @@ pub(crate) async fn create(
     let digest = sha256_hex(format!("{now}:{request_fingerprint}").as_bytes());
     let trace_id = format!("trace-{}", &digest[..16]);
     let mut traces = state.inner.live_traces.traces.lock().unwrap();
-    LiveTraceRegistry::purge(&mut traces);
+    state.inner.live_traces.purge(&mut traces);
     // 2.21.139 (recette ANR2 #10 7083623180, ordre #9 7083690925,
     // défaut B) — ouverture IDEMPOTENTE. Avant : chaque `POST` créait
     // une trace neuve, tampon vide, `created_at = now` ; « rouvrir »
@@ -3994,6 +4060,8 @@ pub(crate) async fn create(
         TraceState {
             trace: trace.clone(),
             request_fingerprint,
+            signalling: VecDeque::new(),
+            signalling_dropped: 0,
             next_id: 0,
             events: VecDeque::new(),
             tx,
@@ -4074,7 +4142,7 @@ pub(crate) fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<Role
 
 pub(crate) async fn list(State(state): State<AppState>) -> Response {
     let mut traces = state.inner.live_traces.traces.lock().unwrap();
-    LiveTraceRegistry::purge(&mut traces);
+    state.inner.live_traces.purge(&mut traces);
     live_ok(json!(traces.values().map(|s| &s.trace).collect::<Vec<_>>()))
 }
 pub(crate) async fn remove(
@@ -4276,11 +4344,141 @@ fn canonical_sort_key(event: &BufferedEvent) -> (String, u64, u64) {
 /// pas `/sessions` ni `/callflow`). Lecture seule, pas de CSRF ;
 /// les valeurs renvoyées sont des `session_id` + `dataset_id` +
 /// `technology` — jamais d'IMSI/SUPI clair-text.
+/// 2.21.142 — identifiant du call flow provisoire d'une trace. Ce
+/// n'est PAS l'id de la future session publiée.
+fn trace_callflow_session_id(trace_id: &str) -> String {
+    format!("live-{trace_id}")
+}
+
+/// 2.21.142 — construit le call flow des events de signalisation
+/// d'une trace, par le même code que la publication (`reconstruct` +
+/// `build_callflow`), comme `runtime_pdu_callflow` côté live-probe.
+/// Tous les events sont ceux que la trace a rattachés : ils sont
+/// associés à la session, sans nouveau tri d'appartenance. Aucune
+/// arête de corrélation n'est calculée ni inventée.
+fn build_trace_callflow(
+    trace_id: &str,
+    subscriber_pseudonym: Option<String>,
+    events: Vec<event_schema::NormalizedEvent>,
+) -> Result<Value, String> {
+    // Même chemin que la publication : la ligne JSONL de l'event,
+    // relue par le chargeur du moteur de sessions.
+    let mut jsonl = String::new();
+    for event in &events {
+        jsonl.push_str(&event.to_json());
+        jsonl.push('\n');
+    }
+    let records = session_engine::load_jsonl(std::io::Cursor::new(jsonl.into_bytes()))?;
+    let mut reconstruction = session_engine::reconstruct(
+        records,
+        session_engine::ReconstructionHints {
+            ue_pseudonym: subscriber_pseudonym,
+            ..Default::default()
+        },
+    );
+    reconstruction.session_id = trace_callflow_session_id(trace_id);
+    for event in &reconstruction.events {
+        reconstruction
+            .association
+            .insert(event.event_id.clone(), session_engine::Association::Session);
+    }
+    let mut flow = callflow_schema::build_callflow(&reconstruction, Vec::new());
+    flow.correlation_status
+        .insert("E2E".into(), "LIVE_TRACE_NOT_CORRELATED".into());
+    serde_json::to_value(flow).map_err(|error| error.to_string())
+}
+
+/// 2.21.142 (GO cœur #9 7084290861 ; contrat #10 7084316531) — le call
+/// flow d'une trace, servi sans attendre la publication (une
+/// publication dure 8 minutes au lab et le segment d'un run n'est
+/// fermé qu'au bout d'une heure). Même contrat que
+/// `GET /sessions/:id/callflow` — mêmes champs, même pagination — plus
+/// `provisional`, `source`, `trace_id`, `complete`, `dropped_events`.
+/// Lecture seule ; ne prend pas le verrou mémoire de la publication.
+pub(crate) async fn callflow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<crate::CallflowQuery>,
+) -> Response {
+    let role = role_from_headers(&state, &headers);
+    let limit = query.limit.unwrap_or(crate::DEFAULT_CALLFLOW_PAGE_EVENTS);
+    if !(1..=crate::MAX_CALLFLOW_PAGE_EVENTS).contains(&limit) {
+        return crate::callflow_read_error("CALLFLOW_LIMIT_INVALID");
+    }
+    let expired = || {
+        api_error(
+            StatusCode::GONE,
+            "LIVE_TRACE_EXPIRED",
+            "trace expired; its call flow is no longer available",
+        )
+    };
+    let (pseudonym, events, dropped) = {
+        let traces = state.inner.live_traces.traces.lock().unwrap();
+        let Some(s) = traces.get(&id) else {
+            drop(traces);
+            if state.inner.live_traces.recently_expired(&id) {
+                return expired();
+            }
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "LIVE_TRACE_NOT_FOUND",
+                "trace not found",
+            );
+        };
+        if s.trace.expires_at <= epoch_seconds() {
+            return expired();
+        }
+        if s.trace.key_type != "pseudonym" && !role.can_control() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "OPERATOR_REQUIRED",
+                "operator role required for identity trace",
+            );
+        }
+        (
+            s.trace.subscriber_pseudonyms.first().cloned(),
+            s.signalling.iter().cloned().collect::<Vec<_>>(),
+            s.signalling_dropped,
+        )
+    };
+    let cursor = query.cursor.clone();
+    let trace_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let page = build_trace_callflow(&trace_id, pseudonym, events)
+            .and_then(|flow| crate::callflow_page_from_value(&flow, cursor.as_deref(), limit));
+        match page {
+            Ok(mut value) => {
+                if let Some(events) = value.get_mut("events").and_then(Value::as_array_mut) {
+                    crate::read_time_patch::fill_unknown_participants_by_interface(events);
+                }
+                value["provisional"] = json!(true);
+                value["source"] = json!("live-trace");
+                value["trace_id"] = json!(trace_id);
+                value["complete"] = json!(dropped == 0);
+                value["dropped_events"] = json!(dropped);
+                // Même assainissement que le call flow publié.
+                crate::sanitize_value(&mut value);
+                live_ok(value)
+            }
+            Err(error) => crate::callflow_read_error(&error),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "LIVE_TRACE_CALLFLOW_FAILED",
+            "trace callflow handler panicked",
+        )
+    })
+}
+
 pub(crate) async fn sessions_for_trace(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let (pseudos, armed) = {
+    let (pseudos, armed, provisional_session) = {
         let traces = state.inner.live_traces.traces.lock().unwrap();
         let Some(s) = traces.get(&id) else {
             return api_error(
@@ -4289,7 +4487,18 @@ pub(crate) async fn sessions_for_trace(
                 "trace not found",
             );
         };
-        (s.trace.subscriber_pseudonyms.clone(), s.trace.armed)
+        // 2.21.142 — annonce du call flow de la trace, disponible
+        // sans attendre la publication.
+        let provisional_session = json!({
+            "session_id": trace_callflow_session_id(&id),
+            "provisional": true,
+            "source": "live-trace",
+            "events": s.signalling.len(),
+            "complete": s.signalling_dropped == 0,
+            "dropped_events": s.signalling_dropped,
+            "callflow": format!("/api/v1/live/traces/{id}/callflow"),
+        });
+        (s.trace.subscriber_pseudonyms.clone(), s.trace.armed, provisional_session)
     };
     // 2.21.34 (ordre #9 6956890331) — `correlate_sessions_by_pseudonyms`
     // parcourt `state.inner.flows`, puis toutes les sessions de chaque
@@ -4310,6 +4519,7 @@ pub(crate) async fn sessions_for_trace(
             "armed": armed,
             "subscriber_pseudonyms": pseudos,
             "sessions": matches,
+            "provisional_session": provisional_session,
         }))
     })
     .await
@@ -4377,6 +4587,8 @@ mod tests {
         let (tx, _) = broadcast::channel(MAX_EVENTS);
         TraceState {
             request_fingerprint: String::new(),
+            signalling: VecDeque::new(),
+            signalling_dropped: 0,
             trace: LiveTrace {
                 trace_id: "t".into(),
                 key_type: "pseudonym".into(),
@@ -8523,7 +8735,7 @@ mod tests {
             r.append("t", "message", json!({"n":n}));
         }
         let mut traces = r.traces.lock().unwrap();
-        LiveTraceRegistry::purge(&mut traces);
+        r.purge(&mut traces);
         assert!(!traces.contains_key("old"));
         let replay = traces["t"]
             .events
@@ -10717,5 +10929,239 @@ mod tests {
         assert_eq!(count(&trace, "throughput"), MAX_THROUGHPUT_EVENTS, "le débit n'est pas touché par la signalisation");
         // Mémoire bornée : jamais plus que la somme des quotas.
         assert_eq!(trace.events.len(), MAX_EVENTS + MAX_THROUGHPUT_EVENTS + MAX_STATS_EVENTS);
+    }
+    // ===== 2.21.142 — call flow de la trace =====
+
+    /// Le call flow de la trace `t`, comme le sert la route.
+    fn trace_flow_2_21_142(registry: &LiveTraceRegistry) -> Value {
+        let (pseudonym, events) = {
+            let traces = registry.traces.lock().unwrap();
+            let t = &traces["t"];
+            (t.trace.subscriber_pseudonyms.first().cloned(), t.signalling.iter().cloned().collect::<Vec<_>>())
+        };
+        build_trace_callflow("t", pseudonym, events).unwrap()
+    }
+
+    /// 2.21.142 (GO cœur #9 7084290861) — data seule, capture réelle à
+    /// cinq abonnés : le call flow de la trace porte exactement les
+    /// messages que la trace a rattachés, dans l'ordre canonique, avec
+    /// leur `stable_event_key`, sans arête inventée et sans rien d'un
+    /// autre abonné. Avant : aucun call flow tant que la publication
+    /// (une heure de rotation, huit minutes de calcul) n'est pas passée.
+    #[test]
+    fn trace_callflow_holds_exactly_the_attached_signalling_in_canonical_order_2_21_142() {
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap",
+        );
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events: Vec<event_schema::NormalizedEvent> = Vec::new();
+        for interface in ["N2", "N4", "SBI"] {
+            let config = oiran_decode::DecodeConfig {
+                input: capture.clone(),
+                capture_id: format!("sha256:{}", sha256_hex(interface.as_bytes())),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "multi-imsi.pcap".into(),
+            };
+            let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            });
+        }
+        let packet_of = |event: &event_schema::NormalizedEvent| {
+            event.packet_references.first().map(|p| p.packet_number).unwrap_or(0)
+        };
+        events.sort_by(|a, b| {
+            packet_of(a)
+                .cmp(&packet_of(b))
+                .then_with(|| a.interface.cmp(&b.interface))
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        let mut carriers: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+        for event in events.iter().filter(|e| e.interface == "N2") {
+            let ran = event.session_identifiers.iter().find(|id| id.name == "ran_ue_ngap_id");
+            let pseudonym = event.session_identifiers.iter().find(|id| id.name == "subscriber_pseudonym");
+            if let (Some(ran), Some(pseudonym)) = (ran, pseudonym) {
+                carriers.entry(pseudonym.value.clone()).or_default().insert(ran.value.clone());
+            }
+        }
+        let subscribers: Vec<String> = carriers
+            .iter()
+            .filter(|(_, contexts)| contexts.len() == 1)
+            .map(|(pseudonym, _)| pseudonym.clone())
+            .collect();
+        assert_eq!(subscribers.len(), 5);
+        let mut totals = Vec::new();
+        for pseudonym in &subscribers {
+            let registry = trace_on(pseudonym);
+            registry.traces.lock().unwrap().get_mut("t").unwrap().needs_seed = false;
+            for event in &events {
+                registry.route_normalized(event);
+            }
+            let (messages, emitted): (u64, Vec<String>) = {
+                let traces = registry.traces.lock().unwrap();
+                let t = &traces["t"];
+                (
+                    t.trace.messages,
+                    t.events
+                        .iter()
+                        .filter(|e| e.kind == "message")
+                        .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+                        .collect(),
+                )
+            };
+            let flow = trace_flow_2_21_142(&registry);
+            let flow_events = flow["events"].as_array().unwrap();
+            // Exactement les messages de la trace.
+            assert_eq!(flow_events.len() as u64, messages, "autant d'events que de messages émis");
+            let flow_ids: BTreeSet<&str> = flow_events.iter().map(|e| e["event_id"].as_str().unwrap()).collect();
+            assert_eq!(flow_ids.len(), flow_events.len(), "aucun doublon d'event_id");
+            assert_eq!(flow_ids, emitted.iter().map(String::as_str).collect::<BTreeSet<_>>());
+            // Ordre canonique (capture_id, numéro de paquet), jamais l'ordre d'arrivée.
+            let keys: Vec<(String, u64)> = flow_events
+                .iter()
+                .map(|e| {
+                    (
+                        e["capture_id"].as_str().unwrap().to_owned(),
+                        e["packet_references"][0]["packet_number"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]), "ordre canonique");
+            assert!(
+                flow_events.iter().all(|e| e["stable_event_key"].as_str().is_some_and(|k| !k.is_empty())),
+                "chaque event garde sa stable_event_key"
+            );
+            // Même contrat que le call flow publié.
+            for field in [
+                "callflow_id", "session_id", "technology", "start_timestamp", "end_timestamp", "participants",
+                "interfaces", "procedures", "events", "correlation_edges", "correlation_status",
+                "decoder_versions", "schema_version", "capture_references", "accounting", "unresolved_fields",
+            ] {
+                assert!(!flow[field].is_null(), "champ {field} présent");
+            }
+            assert_eq!(flow["session_id"], "live-t");
+            assert_eq!(flow["correlation_edges"], json!([]), "aucune arête inventée");
+            assert_eq!(flow["correlation_status"]["E2E"], "LIVE_TRACE_NOT_CORRELATED");
+            // Isolement : aucun pseudonyme d'un autre abonné.
+            let text = flow.to_string();
+            for other in subscribers.iter().filter(|other| *other != pseudonym) {
+                assert!(!text.contains(other.as_str()), "aucun event d'un autre abonné");
+            }
+            // Pagination : mêmes règles que le publié, total identique sur chaque page.
+            let mut cursor: Option<String> = None;
+            let mut paged: Vec<String> = Vec::new();
+            loop {
+                let page = crate::callflow_page_from_value(&flow, cursor.as_deref(), 25).unwrap();
+                assert_eq!(page["pagination"]["total_events"], flow_events.len());
+                paged.extend(page["events"].as_array().unwrap().iter().map(|e| e["event_id"].as_str().unwrap().to_owned()));
+                match page["pagination"]["next_cursor"].as_str() {
+                    Some(next) => cursor = Some(next.to_owned()),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                paged,
+                flow_events.iter().map(|e| e["event_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>(),
+                "les pages rendent tous les events, une fois, dans l'ordre"
+            );
+            totals.push(flow_events.len());
+        }
+        totals.sort_unstable();
+        assert_eq!(totals, vec![65, 67, 68, 69, 70], "les cinq traces de la capture réelle");
+    }
+
+    /// 2.21.142 — voix : REGISTER, INVITE, réponses, flux RTP et BYE
+    /// rattachés par l'adresse de l'UE sont dans le call flow de la
+    /// trace ; rien de l'autre UE. Une révision du flux RTP remplace la
+    /// précédente.
+    /// OUVERT, déclaré : un même message SIP vu sur IMS (N6) et sur
+    /// N3-IMS (tunnel) est DEUX observations, à deux points de capture ;
+    /// le call flow les montre toutes les deux, comme le call flow
+    /// publié. Ce test fige ce comportement.
+    #[test]
+    fn trace_callflow_carries_the_voice_call_attached_by_the_ue_address_2_21_142() {
+        use event_schema::{Direction, Protocol};
+        let (ip_a, ip_c, pcscf) = ("10.45.0.7", "10.45.0.9", "10.46.0.2");
+        let accept = |packet: u64, pseudonym: &str, address: &str| {
+            let value = format!("type=IPv4,address={address}");
+            let mut event = mk_event(
+                "N2",
+                Protocol::Ngap,
+                "PDU Session Establishment Accept",
+                packet,
+                Direction::Unknown,
+                vec![("subscriber_pseudonym", pseudonym), ("pdu_session_id", "2")],
+                vec![("PDU address", value.as_str())],
+            );
+            event.event_id = format!("evt-nas-{packet:04}");
+            event
+        };
+        let mut tunnel_register = sip_from(13, "REGISTER", "1 REGISTER", "reg-a@ims", "psn-alias-a", ip_a, pcscf);
+        tunnel_register.interface = "N3-IMS".into();
+        tunnel_register.event_id = "evt-sip-n3-0013".into();
+        let events = vec![
+            accept(1, "psn-ue-a", ip_a),
+            accept(2, "psn-ue-c", ip_c),
+            sip_from(3, "REGISTER", "1 REGISTER", "reg-a@ims", "psn-alias-a", ip_a, pcscf),
+            sip_from(4, "200 OK", "1 REGISTER", "reg-a@ims", "psn-alias-a", pcscf, ip_a),
+            sip_from(5, "REGISTER", "1 REGISTER", "reg-c@ims", "psn-alias-c", ip_c, pcscf),
+            sip_from(6, "INVITE", "1 INVITE", "call-c@ims", "psn-alias-c", ip_c, pcscf),
+            sip_from(7, "INVITE", "1 INVITE", "call-a@ims", "psn-alias-a", ip_a, pcscf),
+            sip_from(8, "200 OK", "1 INVITE", "call-a@ims", "psn-alias-a", pcscf, ip_a),
+            sip_from(11, "BYE", "2 BYE", "call-a@ims", "psn-alias-a", ip_a, pcscf),
+            sip_from(12, "200 OK", "2 BYE", "call-a@ims", "psn-alias-a", pcscf, ip_a),
+            tunnel_register,
+        ];
+        let a = trace_on("psn-ue-a");
+        for event in &events {
+            a.route_normalized(event);
+        }
+        let flow = trace_flow_2_21_142(&a);
+        let names: Vec<(String, String)> = flow["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["interface"].as_str().unwrap().to_owned(), e["message_name"].as_str().unwrap().to_owned()))
+            .collect();
+        let sip: Vec<&str> = names.iter().filter(|(i, _)| i == "IMS").map(|(_, n)| n.as_str()).collect();
+        assert_eq!(sip, ["REGISTER", "200 OK", "INVITE", "200 OK", "BYE", "200 OK"], "le SIP de A, dans l'ordre");
+        let ids: Vec<&str> = flow["events"].as_array().unwrap().iter().map(|e| e["event_id"].as_str().unwrap()).collect();
+        assert!(!ids.contains(&"evt-sip-0005") && !ids.contains(&"evt-sip-0006") && !ids.contains(&"evt-nas-0002"), "rien de C");
+        assert!(!flow.to_string().contains("psn-ue-c"));
+        // OUVERT figé : l'observation N3-IMS du même REGISTER est un second event.
+        assert_eq!(names.iter().filter(|(_, n)| n == "REGISTER").count(), 2, "IMS et N3-IMS : deux observations");
+        assert!(names.contains(&("N3-IMS".to_owned(), "REGISTER".to_owned())));
+    }
+
+    /// 2.21.142 — jamais de troncature silencieuse : au-delà du quota,
+    /// le plus ancien event sort et il est COMPTÉ ; une révision de flux
+    /// RTP remplace la précédente sans rien compter.
+    #[test]
+    fn trace_signalling_beyond_the_quota_is_counted_not_silently_dropped_2_21_142() {
+        use event_schema::{Direction, Protocol};
+        let mut trace = state(u64::MAX, false, vec!["psn-quota".into()]);
+        let event = |n: usize| {
+            let mut event = mk_event("N2", Protocol::Ngap, "UplinkNASTransport", n as u64, Direction::Unknown, vec![], vec![]);
+            event.event_id = format!("evt-{n:05}");
+            event.stable_event_key = format!("n2.pcapng|0|{n}|0|NGAP|0");
+            event
+        };
+        for n in 0..MAX_EVENTS {
+            trace.keep_signalling(&event(n), false);
+        }
+        assert_eq!((trace.signalling.len(), trace.signalling_dropped), (MAX_EVENTS, 0));
+        for n in MAX_EVENTS..MAX_EVENTS + 5 {
+            trace.keep_signalling(&event(n), false);
+        }
+        assert_eq!((trace.signalling.len(), trace.signalling_dropped), (MAX_EVENTS, 5));
+        assert_eq!(trace.signalling.front().unwrap().event_id, "evt-00005", "les plus anciens sortent");
+        // Révision d'un flux : même clé stable, autre event_id → remplacement.
+        let mut revision = event(MAX_EVENTS + 4);
+        revision.event_id = "evt-revision".into();
+        trace.keep_signalling(&revision, true);
+        assert_eq!((trace.signalling.len(), trace.signalling_dropped), (MAX_EVENTS, 5), "ni ajout ni perte");
+        assert_eq!(trace.signalling.back().unwrap().event_id, "evt-revision");
+        assert!(trace.signalling.iter().all(|kept| kept.event_id != format!("evt-{:05}", MAX_EVENTS + 4)));
     }
 }

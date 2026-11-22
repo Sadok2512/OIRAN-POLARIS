@@ -1123,6 +1123,7 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         )
         .route("/live/traces/:id/markers", post(live_trace::marker))
         .route("/live/traces/:id/stream", get(live_trace::stream))
+        .route("/live/traces/:id/callflow", get(live_trace::callflow))
         // 2.21.78 (ordre #9 7013448739) — débit live par session,
         // indépendant de la live trace. SSE : un event
         // `throughput_bucket` par (qfi, direction) par seconde + un
@@ -15800,6 +15801,220 @@ mod tests {
         assert_eq!(body["data"]["callflow_schema"], callflow_schema::VERSION);
         assert_eq!(body["data"]["event_schema"], event_schema::NormalizedEvent::SCHEMA_VERSION);
         assert_eq!(body["data"]["backend_api"], API_VERSION);
+    }
+
+    // ===== 2.21.142 — call flow de la trace, par le routeur réel =====
+
+    /// La capture réelle à cinq abonnés, décodée avec la clé de l'état,
+    /// horodatée après `after_epoch_s` (une trace n'accepte rien de
+    /// capturé avant son ouverture), et le pseudonyme d'un abonné.
+    fn five_subscribers_events_2_21_142(state: &AppState, after_epoch_s: i64) -> (Vec<event_schema::NormalizedEvent>, String) {
+        let capture = FsPath::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap",
+        );
+        let key = state.inner.capture_manager.pseudonym_key();
+        let mut events: Vec<event_schema::NormalizedEvent> = Vec::new();
+        for interface in ["N2", "N4", "SBI"] {
+            let config = oiran_decode::DecodeConfig {
+                input: capture.clone(),
+                capture_id: format!("sha256:{}", sha256_hex(interface.as_bytes())),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "multi-imsi.pcap".into(),
+            };
+            let _ = oiran_decode::decode_capture_streaming(&config, key.as_ref(), |event| {
+                events.push(event);
+                Ok(())
+            });
+        }
+        let packet_of = |event: &event_schema::NormalizedEvent| {
+            event.packet_references.first().map(|p| p.packet_number).unwrap_or(0)
+        };
+        events.sort_by(|a, b| {
+            packet_of(a)
+                .cmp(&packet_of(b))
+                .then_with(|| a.interface.cmp(&b.interface))
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        let first = events.iter().map(|e| e.timestamp.seconds).min().unwrap();
+        for event in events.iter_mut() {
+            event.timestamp.seconds += after_epoch_s - first;
+        }
+        let mut carriers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for event in events.iter().filter(|e| e.interface == "N2") {
+            let ran = event.session_identifiers.iter().find(|id| id.name == "ran_ue_ngap_id");
+            let pseudonym = event.session_identifiers.iter().find(|id| id.name == "subscriber_pseudonym");
+            if let (Some(ran), Some(pseudonym)) = (ran, pseudonym) {
+                carriers.entry(pseudonym.value.clone()).or_default().insert(ran.value.clone());
+            }
+        }
+        let subscriber = carriers
+            .into_iter()
+            .find(|(_, contexts)| contexts.len() == 1)
+            .map(|(pseudonym, _)| pseudonym)
+            .expect("un abonné");
+        (events, subscriber)
+    }
+
+    async fn get_json_2_21_142(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, json_body(response).await)
+    }
+
+    /// 2.21.142 (GO cœur #9 7084290861 ; contrat #10 7084316531) — par
+    /// le routeur réel : une trace ouverte, un run capturé après son
+    /// ouverture, et `GET /live/traces/:id/callflow` rend le call flow
+    /// du run sans aucune publication — même contrat que le call flow
+    /// publié, pagination comprise — et `/sessions` l'annonce.
+    /// Avant : la route n'existe pas ; aucun call flow avant la
+    /// publication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_trace_callflow_is_served_without_publication_with_the_published_contract_2_21_142() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let (events, subscriber) = five_subscribers_events_2_21_142(&state, now + 5);
+        let opened = json_body(
+            app.clone()
+                .oneshot(live_trace_request_2_21_139(
+                    "/api/v1/live/traces",
+                    "POST",
+                    json!({"key_type":"pseudonym","value":subscriber,"duration_s":600,"interfaces":[]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let trace_id = opened["data"]["trace_id"].as_str().unwrap().to_owned();
+        // Trace vide : 200, aucun event, jamais une erreur.
+        let (status, empty) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/callflow")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(empty["data"]["pagination"]["total_events"], 0);
+        assert_eq!(empty["data"]["events"], json!([]));
+        // Le run.
+        state.inner.live_traces.route_for_test(&events);
+        let (_, list) = get_json_2_21_142(&app, "/api/v1/live/traces").await;
+        let messages = list["data"][0]["messages"].as_u64().unwrap();
+        assert!(messages >= 60, "la trace a rattaché le run : {messages}");
+        // Le call flow, page par page.
+        let mut cursor: Option<String> = None;
+        let mut ids: Vec<String> = Vec::new();
+        let mut keys: Vec<(String, u64)> = Vec::new();
+        let mut pages = 0;
+        loop {
+            let uri = match &cursor {
+                Some(cursor) => format!("/api/v1/live/traces/{trace_id}/callflow?limit=20&cursor={cursor}"),
+                None => format!("/api/v1/live/traces/{trace_id}/callflow?limit=20"),
+            };
+            let (status, body) = get_json_2_21_142(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let data = &body["data"];
+            assert_eq!(body["meta"]["api_version"], API_VERSION);
+            assert_eq!(data["provisional"], true);
+            assert_eq!(data["source"], "live-trace");
+            assert_eq!(data["trace_id"], trace_id.as_str());
+            assert_eq!(data["complete"], true);
+            assert_eq!(data["dropped_events"], 0);
+            assert_eq!(data["session_id"], format!("live-{trace_id}"));
+            assert_eq!(data["correlation_edges"], json!([]));
+            assert_eq!(data["correlation_status"]["E2E"], "LIVE_TRACE_NOT_CORRELATED");
+            assert_eq!(data["pagination"]["total_events"], messages, "total identique sur chaque page");
+            assert_eq!(data["pagination"]["limit"], 20);
+            for field in [
+                "callflow_id", "technology", "start_timestamp", "end_timestamp", "participants", "interfaces",
+                "procedures", "decoder_versions", "schema_version", "capture_references", "accounting", "unresolved_fields",
+            ] {
+                assert!(!data[field].is_null(), "champ {field} du call flow publié");
+            }
+            for event in data["events"].as_array().unwrap() {
+                assert!(event["stable_event_key"].as_str().is_some_and(|k| !k.is_empty()));
+                ids.push(event["event_id"].as_str().unwrap().to_owned());
+                keys.push((
+                    event["capture_id"].as_str().unwrap().to_owned(),
+                    event["packet_references"][0]["packet_number"].as_u64().unwrap(),
+                ));
+            }
+            pages += 1;
+            match data["pagination"]["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert!(pages >= 3, "plusieurs pages");
+        assert_eq!(ids.len() as u64, messages, "tous les events servis");
+        assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), ids.len(), "aucun doublon entre pages");
+        assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]), "ordre canonique (capture_id, seq) d'une page à l'autre");
+        // `/sessions` annonce la session provisoire.
+        let (status, sessions) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/sessions")).await;
+        assert_eq!(status, StatusCode::OK);
+        let provisional = &sessions["data"]["provisional_session"];
+        assert_eq!(provisional["provisional"], true);
+        assert_eq!(provisional["session_id"], format!("live-{trace_id}"));
+        assert_eq!(provisional["events"], messages);
+        assert_eq!(provisional["complete"], true);
+        assert_eq!(provisional["callflow"], format!("/api/v1/live/traces/{trace_id}/callflow"));
+        // La route ne prend pas le verrou mémoire : pas de 503 pendant une publication.
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            let (status, _) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/callflow?limit=1")).await;
+            assert_eq!(status, StatusCode::OK, "servi pendant une publication");
+        }
+        // Aucune identité en clair : la réponse est déjà passée par le même
+        // assainissement que le call flow publié — le rejouer ne change rien.
+        let (_, full) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/callflow?limit=256")).await;
+        let mut sanitized = full["data"].clone();
+        sanitize_value(&mut sanitized);
+        assert_eq!(sanitized, full["data"], "rien à masquer dans la réponse");
+        let text = full.to_string();
+        assert!(!text.contains("imsi-") && !text.contains("msisdn-"), "aucune identité en clair");
+    }
+
+    /// 2.21.142 — refus explicites de la route : trace inconnue, trace
+    /// expirée, `limit` et `cursor` invalides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_trace_callflow_refusals_are_explicit_2_21_142() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let (status, body) = get_json_2_21_142(&app, "/api/v1/live/traces/trace-inconnue/callflow").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "LIVE_TRACE_NOT_FOUND");
+        let opened = json_body(
+            app.clone()
+                .oneshot(live_trace_request_2_21_139(
+                    "/api/v1/live/traces",
+                    "POST",
+                    json!({"key_type":"pseudonym","value":"psn-live-callflow-0001","duration_s":1,"interfaces":[]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let trace_id = opened["data"]["trace_id"].as_str().unwrap().to_owned();
+        let (status, body) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/callflow?limit=0")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "CALLFLOW_LIMIT_INVALID");
+        let (status, body) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/callflow?limit=257")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "CALLFLOW_LIMIT_INVALID");
+        let (status, body) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/callflow?cursor=evt-inconnu")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "CALLFLOW_CURSOR_INVALID");
+        // Expiration : refus explicite, pas un call flow vide.
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        let (status, body) = get_json_2_21_142(&app, &format!("/api/v1/live/traces/{trace_id}/callflow")).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"]["code"], "LIVE_TRACE_EXPIRED");
     }
 
     /// 2.21.22 (FAIL lab 2.21.21) — sans instantané et avec un calcul en
