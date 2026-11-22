@@ -1,5 +1,45 @@
 # Changelog
 
+## oiran-api 2.21.146, live-probe 0.6.33 — 2026-11-22 — restauration et réparation : refus d'un jeu en fragments, plus aucune suppression du jeu remplacé
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.144 @ `1bda06d` (branche `fix/oiran-2.21.146-restore-refuses-fragments`). Essai hors lab d'archivage (#9 7085572347, corrigé par #9 7085580313) : **FAIL sur la restauration**. Ordre du cœur #9 7085626859 : désarmer d'abord. La restauration correcte en mode fragments est le lot suivant (2.21.147).
+
+### Le défaut
+
+`restore_from_archive_segment` (outil `dataset-restore`) date d'avant les fragments d'events. Elle ne lisait que `dataset/oiran_events.jsonl`, republiait sans aucun fragment, remplaçait le jeu, puis **supprimait le jeu remplacé** — qui contenait `event-shards/`. Sur un jeu en fragments, tout ce que portent les fragments sortait du jeu **et du disque**. Mesuré dans l'essai : 0 fragment restant après restauration. Le défaut était armé au lab dès aujourd'hui : le fichier plat hérité du 11/11 y existe à côté de 432 fragments.
+
+L'audit a trouvé le même schéma dans `repair_partial_imports` (outil `dataset-repair-partial-imports`) : même lecture du seul fichier plat, même suppression du jeu remplacé.
+
+### Correctif (désarmement)
+
+- **Refus, échec fermé** : restauration et réparation refusent de s'exécuter dès que le manifeste du jeu courant référence au moins un fichier sous `event-shards/` (fragment ordinaire ou fragment retenu après rétention) — ou, manifeste illisible, dès que ce dossier contient un fichier. Codes `RESTORE_REFUSED_FRAGMENTED_DATASET` et `REPAIR_REFUSED_FRAGMENTED_DATASET`. Le message dit que rien n'a été modifié et de ne pas contourner. Le refus précède toute écriture : ni `.dataset-next`, ni échange. Les deux binaires portent ce refus, puisqu'ils appellent ces fonctions.
+- **Plus aucune suppression du jeu remplacé** : sur un jeu sans fragments, où les deux outils fonctionnent comme avant, le jeu remplacé est gardé sous un nom daté (`.dataset-previous-<epoch_ms>`), avant comme après l'échange. Le nettoyage de démarrage ne touche pas à ces dossiers ; ils restent jusqu'à un geste explicite de l'opérateur. Événement `DATASET_PREVIOUS_KEPT` au journal.
+
+### Autres chemins qui suppriment un dossier du jeu (audit demandé)
+
+| Chemin | Ce qu'il supprime | Peut perdre des fragments ? |
+|---|---|---|
+| `restore_from_archive_segment` | `.dataset-previous`, avant et après l'échange | **oui** — corrigé ici |
+| `repair_partial_imports` | idem | **oui** — corrigé ici |
+| Rétention, dans `process_capture_into_selected` | `event-shards/` du dossier **de préparation** (des liens vers les fragments, pas les fragments) | non : les fragments d'origine restent sur le disque, non référencés |
+| `commit_incremental_publication` | un fragment de préparation identique à celui déjà en place ; l'ancienne génération de call flows | non : données dérivées, reconstruites |
+| `clean_continuous_import_root` (démarrage) | `.dataset-next`, `.dataset-gc-*` ; **pas** `.dataset-previous` | non |
+| Fragment vide du cycle | le fragment nouveau s'il est vide | non |
+| `cleanup_native_capture` | le dossier d'une capture native | mode natif seulement, inactif au lab |
+| `process_continuous_capture` (publication complète, hors worker) | — | **non audité en détail** : il n'est appelé que par les outils et les tests, pas par le worker |
+
+### Tests
+
+- `archiving_keeps_the_remaining_sessions_and_restore_refuses_a_fragmented_dataset_2_21_146` — l'essai, devenu permanent : forme du lab (fichier plat hérité + fragments), rétention un cycle → archive écrite avec son manifeste et tous les events anciens, fichier plat d'origine intact, sessions archivées sorties, **ids des sessions restantes inchangés**, cycle suivant sain avec la reprise de 2.21.143 active ; puis restauration et réparation (à blanc et réelle) **refusent**, manifeste et fragments intacts, rien laissé derrière. Échec quand le refus est neutralisé (mutation).
+- `restore_keeps_the_replaced_dataset_under_a_dated_name_2_21_146`.
+- `a_dataset_is_fragmented_when_it_references_or_holds_event_shards_2_21_146`.
+
+### OUVERT
+
+- **Il n'y a plus de retour arrière par outil pour un jeu en fragments** : la restauration refuse. C'est voulu jusqu'à 2.21.147.
+- Les dossiers `.dataset-previous-<epoch_ms>` s'accumulent : leur purge est un geste d'opérateur, à décider.
+- Risques de l'« aller » à l'échelle du lab que l'essai ne couvre pas : voir le rapport du lot (#9).
+
 ## oiran-api 2.21.144 — 2026-11-22 — trace live : le pseudonyme d'un autre abonné n'est jamais appris, et il est masqué dans tout ce que la trace sert
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.143 @ `b475aa8` (branche `fix/oiran-2.21.144-mixed-subscriber-event`). Relecture indépendante d'ANR1 (#10 7085078423) : **FAIL bloquant sur 2.21.142**. Décisions du cœur : #9 7085198470 (masquer, ne pas jeter) et #9 7085354184 (exception bornée, côté SIP inféré). Audit #9 7085241182. Aucun crate partagé modifié.
