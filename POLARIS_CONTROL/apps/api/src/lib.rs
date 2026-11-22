@@ -204,6 +204,28 @@ fn startup_attestation_profiles(
         .collect()
 }
 
+fn apply_startup_subscription_verification(
+    profiles: &mut [UeProfileSpec],
+    profile_registry: &mut UeProfileRegistry,
+    attested_profiles: &[UeProfileSpec],
+    covered_ue_ids: &BTreeSet<String>,
+) {
+    let candidate_ue_ids = attested_profiles
+        .iter()
+        .map(|profile| profile.ue_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for profile in profiles {
+        if candidate_ue_ids.contains(profile.ue_id.as_str()) {
+            profile.subscription_verified = covered_ue_ids.contains(&profile.ue_id);
+        }
+    }
+    for record in &mut profile_registry.profiles {
+        if candidate_ue_ids.contains(record.profile.ue_id.as_str()) {
+            record.profile.subscription_verified = covered_ue_ids.contains(&record.profile.ue_id);
+        }
+    }
+}
+
 fn verify_startup_profiles_against_open5gs(
     profile_store: &ProfileStore,
     registry: &UeProfileRegistry,
@@ -3456,14 +3478,12 @@ impl AppState {
             provisioning_error,
         );
         audit_provisioning_attestation(&audit_path_for_startup, &provisioning_attestation);
-        if let Ok(verified) = provisioning_verification {
-            for profile in profiles.iter_mut().take(configuration.ue_count) {
-                profile.subscription_verified = verified.contains_key(&profile.ue_id);
-            }
-            for record in &mut profile_registry.profiles {
-                record.profile.subscription_verified = verified.contains_key(&record.profile.ue_id);
-            }
-        }
+        apply_startup_subscription_verification(
+            &mut profiles,
+            &mut profile_registry,
+            &attested_profiles,
+            &covered_ue_ids,
+        );
         let mut multi_ue = MultiUeController::new(profiles, ueransim_adapter::MAX_LIVE_UES)?;
         multi_ue.configure_count(configuration.ue_count)?;
         if let Ok(value) = fs::read_to_string(&ue_job_state_path) {
@@ -20672,6 +20692,87 @@ mod p0_tests {
         let transferred = startup_attestation_profiles(&profiles[..3], true);
         assert_eq!(transferred.len(), 3);
         assert_eq!(transferred[0].ue_id, "UE-01");
+    }
+
+    #[test]
+    fn startup_attestation_failure_revokes_persisted_verification() {
+        let test_state = state();
+        let mut registry = test_state.profile_registry.lock().unwrap().clone();
+        let mut profiles = registry
+            .profiles
+            .iter()
+            .map(|record| record.profile.clone())
+            .collect::<Vec<_>>();
+        for profile in profiles.iter_mut().take(3) {
+            profile.configured = true;
+            profile.subscription_verified = true;
+        }
+        for record in registry.profiles.iter_mut().take(3) {
+            record.profile.configured = true;
+            record.profile.subscription_verified = true;
+        }
+
+        let candidates = startup_attestation_profiles(&profiles[..3], false);
+        apply_startup_subscription_verification(
+            &mut profiles,
+            &mut registry,
+            &candidates,
+            &BTreeSet::new(),
+        );
+
+        assert!(profiles[0].subscription_verified, "shared UE remains untouched");
+        assert!(registry.profiles[0].profile.subscription_verified);
+        for profile in &profiles[1..3] {
+            assert!(!profile.subscription_verified);
+        }
+        for record in &registry.profiles[1..3] {
+            assert!(!record.profile.subscription_verified);
+        }
+
+        let mut controller =
+            MultiUeController::new(profiles, ueransim_adapter::MAX_LIVE_UES).unwrap();
+        controller.configure_count(3).unwrap();
+        assert_eq!(
+            controller.start_offline("UE-02").unwrap_err(),
+            "SUBSCRIBER_PROVISIONING_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn startup_attestation_success_keeps_only_current_coverage() {
+        let test_state = state();
+        let mut registry = test_state.profile_registry.lock().unwrap().clone();
+        let mut profiles = registry
+            .profiles
+            .iter()
+            .map(|record| record.profile.clone())
+            .collect::<Vec<_>>();
+        for profile in profiles.iter_mut().take(3) {
+            profile.configured = true;
+            profile.subscription_verified = true;
+        }
+        for record in registry.profiles.iter_mut().take(3) {
+            record.profile.configured = true;
+            record.profile.subscription_verified = true;
+        }
+
+        let candidates = startup_attestation_profiles(&profiles[..3], false);
+        let covered = [profiles[1].ue_id.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        apply_startup_subscription_verification(
+            &mut profiles,
+            &mut registry,
+            &candidates,
+            &covered,
+        );
+
+        assert!(profiles[0].subscription_verified, "shared UE remains untouched");
+        assert!(profiles[1].subscription_verified);
+        assert!(!profiles[2].subscription_verified);
+        assert!(registry.profiles[0].profile.subscription_verified);
+        assert!(registry.profiles[1].profile.subscription_verified);
+        assert!(!registry.profiles[2].profile.subscription_verified);
     }
 
     /// 0.19.2 — Small traffic template now interleaves a 1 MiB
