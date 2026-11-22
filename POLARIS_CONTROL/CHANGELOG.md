@@ -28,6 +28,13 @@
 - L'UE-01 partagé est exclu de cette attestation tant que son transfert de propriété à Control n'est pas actif ; son ancien profil minimal ne bloque donc plus UE-201 et UE-05.
 - Le fichier d'attestation périmé n'est plus utilisé comme repli pour déclarer une couverture actuelle. Une base indisponible ou une divergence reste visible comme attestation incomplète, sans écriture Open5GS.
 
+## 0.36.21 — 2026-11-21 — Gate et télémétrie du trafic certifié
+
+- Le Start certifié choisit le gate selon la cible validée : le parcours partagé conserve l'exigence du runtime historique, tandis qu'une cible appartenant à Control utilise le gate sans UE historique.
+- Les refus certifiés attachent une extension interne typée ; le middleware journalise code, action, scénario et cible pseudonymisée sans relire le corps HTTP.
+- Les erreurs de Start 422, 423 et 503 alimentent History avec leur cause et leur cible pseudonymisée. La même réponse expose une agrégation en lecture seule des refus de validation et de Start par code, cible, action et statut ; les arrêts opérateur en sont exclus.
+- Les tests couvrent la sélection des gates, deux cibles distinctes, la projection History sans identité ni adresse et le passage de l'extension typée vers l'audit.
+
 ## 0.36.20 — 2026-11-21 — Identités abonné masquées sur les GET Control
 
 - `/ues`, les profils UE, les vues abonnés et Activity JSON/SSE projettent uniquement les quatre derniers chiffres (`…0201`), quel que soit le rôle.
