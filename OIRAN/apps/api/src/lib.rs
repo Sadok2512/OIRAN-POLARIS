@@ -1766,7 +1766,12 @@ async fn version(State(state): State<AppState>) -> Json<Value> {
     let flow = primary_flow(&state);
     ok(json!({
         "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":WEB_FRONTEND_VERSION,
-        "event_schema":"1.2.0","callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or("UNKNOWN"),
+        // 2.21.139 (recette ANR2 #10 7083623180) — versions de schéma
+        // lues dans les crates. Avant : `event_schema` figé à "1.2.0",
+        // et `callflow_schema` lu dans le call flow « primaire », absent
+        // en mode opérationnel → "UNKNOWN" en production.
+        "event_schema":event_schema::NormalizedEvent::SCHEMA_VERSION,
+        "callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or(callflow_schema::VERSION),
         "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
         "decoders":oiran_decode::installed_decoder_versions(),
@@ -15520,6 +15525,164 @@ mod tests {
         }
         let free = app.oneshot(build()).await.unwrap();
         assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ===== 2.21.139 — réouverture d'une trace live, /version =====
+
+    fn live_trace_request_2_21_139(uri: &str, method: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-operator-token")
+            .header(CSRF_HEADER, sha256_hex(b"oiran-csrf-v1:test-operator-token"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Nombre de traces actives, par la route publique.
+    async fn live_trace_count_2_21_139(app: &Router) -> usize {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/live/traces").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        json_body(response).await["data"].as_array().map_or(0, Vec::len)
+    }
+
+    /// Lit le flux SSE d'une trace jusqu'à `expected` events `marker`
+    /// (ou 2 s), et rend leurs libellés dans l'ordre de réception.
+    async fn replayed_marker_labels_2_21_139(app: &Router, trace_id: &str, expected: usize) -> Vec<String> {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/live/traces/{trace_id}/stream"))
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let mut text = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while text.matches("event: marker").count() < expected {
+            match tokio::time::timeout_at(deadline, body.frame()).await {
+                Ok(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        text.push_str(&String::from_utf8_lossy(data));
+                    }
+                }
+                _ => break,
+            }
+        }
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter_map(|value| value["label"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// 2.21.139 (recette ANR2 #10 7083623180, défaut B) — rouvrir une
+    /// trace depuis l'UI refait le même `POST /live/traces`. La même
+    /// demande sur une trace encore active doit rendre CETTE trace, et
+    /// son flux doit rejouer l'historique. Avant : une trace neuve et
+    /// vide (ou, dans la même seconde, le même id vidé) → « Messages 0 ».
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopening_a_live_trace_returns_the_same_trace_and_replays_its_history_2_21_139() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let request = json!({"key_type":"pseudonym","value":"psn-live-reopen-0001","duration_s":60,"interfaces":[]});
+        let first = json_body(app.clone().oneshot(live_trace_request_2_21_139("/api/v1/live/traces", "POST", request.clone())).await.unwrap()).await;
+        let trace_id = first["data"]["trace_id"].as_str().unwrap().to_owned();
+        assert!(first["data"]["reused"].is_null(), "première ouverture : une trace neuve");
+        for label in ["un", "deux", "trois"] {
+            let marked = app
+                .clone()
+                .oneshot(live_trace_request_2_21_139(&format!("/api/v1/live/traces/{trace_id}/markers"), "POST", json!({"label": label})))
+                .await
+                .unwrap();
+            assert_eq!(marked.status(), StatusCode::OK);
+        }
+        // Réouverture : même demande, espaces de bord et durée différents.
+        let again = json!({"key_type":"pseudonym","value":" psn-live-reopen-0001 ","duration_s":1800,"interfaces":[]});
+        let second = json_body(app.clone().oneshot(live_trace_request_2_21_139("/api/v1/live/traces", "POST", again)).await.unwrap()).await;
+        assert_eq!(second["data"]["trace_id"], trace_id.as_str(), "même trace");
+        assert_eq!(second["data"]["reused"], true);
+        assert_eq!(second["data"]["buffered_events"], 3);
+        assert_eq!(second["data"]["created_at"], first["data"]["created_at"], "l'ouverture d'origine est gardée");
+        assert!(
+            second["data"]["expires_at"].as_u64().unwrap() >= first["data"]["created_at"].as_u64().unwrap() + 1800,
+            "expiration prolongée"
+        );
+        assert_eq!(live_trace_count_2_21_139(&app).await, 1, "une seule trace");
+        assert_eq!(
+            replayed_marker_labels_2_21_139(&app, &trace_id, 3).await,
+            vec!["un", "deux", "trois"],
+            "le flux de la trace rouverte rejoue l'historique dans l'ordre"
+        );
+        // Une demande plus courte ne raccourcit pas l'expiration.
+        let short = json!({"key_type":"pseudonym","value":"psn-live-reopen-0001","duration_s":30,"interfaces":[]});
+        let third = json_body(app.clone().oneshot(live_trace_request_2_21_139("/api/v1/live/traces", "POST", short)).await.unwrap()).await;
+        assert_eq!(third["data"]["expires_at"], second["data"]["expires_at"]);
+    }
+
+    /// 2.21.139 — la réutilisation ne confond pas deux demandes
+    /// différentes : autre abonné, ou autres interfaces → autre trace.
+    /// L'ordre et les doublons des interfaces ne comptent pas.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_different_live_trace_request_opens_another_trace_2_21_139() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let open = |value: &str, interfaces: Value| {
+            let app = app.clone();
+            let body = json!({"key_type":"pseudonym","value":value,"duration_s":60,"interfaces":interfaces});
+            async move {
+                let response = app.oneshot(live_trace_request_2_21_139("/api/v1/live/traces", "POST", body)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                json_body(response).await["data"].clone()
+            }
+        };
+        let a = open("psn-live-reopen-000a", json!(["N2", "N4"])).await;
+        // même seconde, autre abonné : jamais la trace de A
+        let b = open("psn-live-reopen-000b", json!(["N2", "N4"])).await;
+        assert_ne!(a["trace_id"], b["trace_id"]);
+        assert!(b["reused"].is_null());
+        assert_eq!(b["subscriber_pseudonyms"], json!(["psn-live-reopen-000b"]));
+        // mêmes interfaces, autre ordre et doublon : la trace de A
+        let a_again = open("psn-live-reopen-000a", json!(["N4", "N2", "N4"])).await;
+        assert_eq!(a_again["trace_id"], a["trace_id"]);
+        assert_eq!(a_again["reused"], true);
+        // autres interfaces : une autre trace
+        let a_other = open("psn-live-reopen-000a", json!(["N2"])).await;
+        assert!(a_other["reused"].is_null());
+        assert_eq!(live_trace_count_2_21_139(&app).await, 3);
+    }
+
+    /// 2.21.139 (recette ANR2 #10 7083623180) — en mode opérationnel,
+    /// sans call flow primaire, `/version` annonce la version réelle des
+    /// schémas. Avant : `callflow_schema = "UNKNOWN"`, `event_schema =
+    /// "1.2.0"` figé.
+    #[tokio::test]
+    async fn version_reports_real_schema_versions_without_a_primary_flow_2_21_139() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let mut config = test_config(workspace, "version-operational");
+        config.reference_dataset_enabled = false;
+        config.capture_root = temporary_directory("version-operational-captures");
+        let state = AppState::load(config).unwrap();
+        assert!(primary_flow(&state).is_none(), "mode opérationnel : pas de call flow primaire");
+        let app = router(state, None);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/version").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["data"]["callflow_schema"], callflow_schema::VERSION);
+        assert_eq!(body["data"]["event_schema"], event_schema::NormalizedEvent::SCHEMA_VERSION);
+        assert_eq!(body["data"]["backend_api"], API_VERSION);
     }
 
     /// 2.21.22 (FAIL lab 2.21.21) — sans instantané et avec un calcul en

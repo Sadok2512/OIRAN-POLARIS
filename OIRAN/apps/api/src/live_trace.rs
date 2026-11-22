@@ -431,6 +431,12 @@ impl FromIterator<String> for MatchKeys {
 
 struct TraceState {
     trace: LiveTrace,
+    /// 2.21.139 — empreinte de la demande d'ouverture (type de clé,
+    /// valeur, interfaces), calculée avec la clé de pseudonymisation.
+    /// Sert à reconnaître une demande identique sur une trace encore
+    /// active. JAMAIS sérialisée ni journalisée ; vide pour une trace
+    /// qui n'a pas été ouverte par `create`.
+    request_fingerprint: String,
     next_id: u64,
     events: VecDeque<BufferedEvent>,
     tx: broadcast::Sender<BufferedEvent>,
@@ -3726,6 +3732,32 @@ pub(crate) struct Marker {
     label: String,
 }
 
+/// 2.21.139 — empreinte d'une demande d'ouverture de trace. Deux
+/// demandes ont la même empreinte si et seulement si elles portent le
+/// même type de clé, la même valeur (espaces de bord ignorés) et le
+/// même ensemble d'interfaces (ordre et doublons ignorés). La valeur
+/// passe par la clé de pseudonymisation : l'empreinte ne permet pas
+/// de retrouver une identité, et reste de toute façon en mémoire.
+fn trace_request_fingerprint(
+    key: &event_schema::PseudonymKey,
+    key_type: &str,
+    value: &str,
+    interfaces: &[String],
+) -> String {
+    let interfaces: std::collections::BTreeSet<&str> =
+        interfaces.iter().map(|i| i.trim()).filter(|i| !i.is_empty()).collect();
+    let mut input = Vec::new();
+    for part in [key_type.trim(), value.trim()] {
+        input.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        input.extend_from_slice(part.as_bytes());
+    }
+    for interface in interfaces {
+        input.extend_from_slice(&(interface.len() as u64).to_be_bytes());
+        input.extend_from_slice(interface.as_bytes());
+    }
+    event_schema::pseudonym(key, "live-trace-request", &input)
+}
+
 fn allowed_key(value: &str) -> bool {
     matches!(
         value,
@@ -3817,10 +3849,58 @@ pub(crate) async fn create(
         }
     }
     let now = epoch_seconds();
-    let digest = sha256_hex(format!("{}:{}:{}", now, input.key_type, input.value).as_bytes());
+    let request_fingerprint = trace_request_fingerprint(
+        state.inner.capture_manager.pseudonym_key().as_ref(),
+        &input.key_type,
+        &input.value,
+        &input.interfaces,
+    );
+    // 2.21.139 — l'id dérive de l'empreinte de la demande, interfaces
+    // comprises. Avant : `sha256(now:key_type:value)` ; deux demandes
+    // sur le même abonné dans la même seconde, avec des interfaces
+    // différentes, recevaient le MÊME id et la seconde écrasait la
+    // première. L'id ne porte plus non plus de dérivé direct de la
+    // valeur saisie.
+    let digest = sha256_hex(format!("{now}:{request_fingerprint}").as_bytes());
     let trace_id = format!("trace-{}", &digest[..16]);
     let mut traces = state.inner.live_traces.traces.lock().unwrap();
     LiveTraceRegistry::purge(&mut traces);
+    // 2.21.139 (recette ANR2 #10 7083623180, ordre #9 7083690925,
+    // défaut B) — ouverture IDEMPOTENTE. Avant : chaque `POST` créait
+    // une trace neuve, tampon vide, `created_at = now` ; « rouvrir »
+    // une trace depuis l'UI (qui fait toujours ce `POST`) perdait donc
+    // tout l'historique — et depuis 2.21.135 la trace neuve écarte ce
+    // qui a été capturé avant elle : « Messages 0 » après un run de
+    // 105 messages. Deux `POST` dans la même seconde donnaient même le
+    // MÊME id et remplaçaient la trace par une vide. Désormais une
+    // demande identique sur une trace encore active renvoie CETTE
+    // trace : le client s'y connecte et `stream` lui rejoue le tampon
+    // dans l'ordre canonique. L'expiration est prolongée, jamais
+    // raccourcie.
+    if let Some(existing) = traces
+        .values_mut()
+        .find(|s| !s.request_fingerprint.is_empty() && s.request_fingerprint == request_fingerprint)
+    {
+        existing.trace.expires_at = existing.trace.expires_at.max(now + input.duration_s);
+        let reused = existing.trace.clone();
+        let buffered = existing.events.len();
+        drop(traces);
+        state.inner.live_traces.audit(json!({
+            "action": "live_trace.reuse",
+            "actor_role": role.name(),
+            "trace_id": reused.trace_id,
+            "key_type": reused.key_type,
+            "subscriber_pseudonyms": reused.subscriber_pseudonyms,
+            "duration_s": input.duration_s,
+            "buffered_events": buffered,
+            "at_epoch_s": now,
+        }));
+        start_reader(state);
+        let mut value = serde_json::to_value(reused).unwrap();
+        value["reused"] = json!(true);
+        value["buffered_events"] = json!(buffered);
+        return live_ok(value);
+    }
     if traces.len() >= MAX_TRACES {
         return api_error(
             StatusCode::CONFLICT,
@@ -3868,6 +3948,7 @@ pub(crate) async fn create(
         trace_id.clone(),
         TraceState {
             trace: trace.clone(),
+            request_fingerprint,
             next_id: 0,
             events: VecDeque::new(),
             tx,
@@ -4250,6 +4331,7 @@ mod tests {
     ) -> TraceState {
         let (tx, _) = broadcast::channel(MAX_EVENTS);
         TraceState {
+            request_fingerprint: String::new(),
             trace: LiveTrace {
                 trace_id: "t".into(),
                 key_type: "pseudonym".into(),
@@ -10450,5 +10532,94 @@ mod tests {
             assert!(keys_str.contains(&"psn-supi-xyz".to_string()));
             assert!(keys_str.contains(&"psn-gpsi-abc".to_string()));
         }
+    }
+    /// 2.21.139 (recette ANR2 #10 7083623180, « deux arrivées tardives
+    /// dans l'ordre SSE brut ») — sur la capture réelle à cinq abonnés,
+    /// les seuls messages émis en retard dans leur capture sont les
+    /// `PFCP Session Establishment Request` rattachés APRÈS COUP : la
+    /// requête précède le message qui fait connaître sa session, elle
+    /// est donc émise après la réponse. Chaque retard est compté
+    /// (`out_of_order`) et marqué `late:true`, jamais masqué ; le rejeu
+    /// à la connexion (`stream`) remet tout dans l'ordre canonique.
+    #[test]
+    fn the_only_late_live_messages_are_establishment_requests_attached_after_the_fact_2_21_139() {
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap",
+        );
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events: Vec<event_schema::NormalizedEvent> = Vec::new();
+        for interface in ["N2", "N4", "SBI"] {
+            let config = oiran_decode::DecodeConfig {
+                input: capture.clone(),
+                capture_id: format!("sha256:{}", sha256_hex(interface.as_bytes())),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "multi-imsi.pcap".into(),
+            };
+            let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            });
+        }
+        let packet_of = |event: &event_schema::NormalizedEvent| {
+            event.packet_references.first().map(|p| p.packet_number).unwrap_or(0)
+        };
+        events.sort_by(|a, b| {
+            packet_of(a)
+                .cmp(&packet_of(b))
+                .then_with(|| a.interface.cmp(&b.interface))
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        // Les abonnés : pseudonymes portés par un seul contexte UE.
+        let mut carriers: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+        for event in events.iter().filter(|e| e.interface == "N2") {
+            let ran = event.session_identifiers.iter().find(|id| id.name == "ran_ue_ngap_id");
+            let pseudonym = event.session_identifiers.iter().find(|id| id.name == "subscriber_pseudonym");
+            if let (Some(ran), Some(pseudonym)) = (ran, pseudonym) {
+                carriers.entry(pseudonym.value.clone()).or_default().insert(ran.value.clone());
+            }
+        }
+        let subscribers: Vec<String> = carriers
+            .iter()
+            .filter(|(_, contexts)| contexts.len() == 1)
+            .map(|(pseudonym, _)| pseudonym.clone())
+            .collect();
+        assert_eq!(subscribers.len(), 5, "la capture porte cinq abonnés");
+        let mut total_late = 0u64;
+        for pseudonym in &subscribers {
+            let registry = trace_on(pseudonym);
+            registry.traces.lock().unwrap().get_mut("t").unwrap().needs_seed = false;
+            for event in &events {
+                registry.route_normalized(event);
+            }
+            let traces = registry.traces.lock().unwrap();
+            let trace = &traces["t"];
+            let messages: Vec<&BufferedEvent> = trace.events.iter().filter(|e| e.kind == "message").collect();
+            let late: Vec<&str> = messages
+                .iter()
+                .filter(|e| e.payload["late"] == true)
+                .map(|e| e.payload["message_name"].as_str().unwrap())
+                .collect();
+            assert_eq!(trace.trace.out_of_order as usize, late.len(), "chaque retard est compté et marqué");
+            assert_eq!(
+                late,
+                vec!["PFCP Session Establishment Request"],
+                "un seul retard par session : la requête d'établissement rattachée après coup"
+            );
+            assert!(trace.trace.pfcp_attached_after_the_fact >= 1);
+            total_late += trace.trace.out_of_order;
+            // Le rejeu à la connexion est dans l'ordre canonique : aucun
+            // numéro de paquet ne recule à l'intérieur d'une capture.
+            let mut replay: Vec<BufferedEvent> = trace.events.iter().cloned().collect();
+            replay.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
+            let mut last: HashMap<String, u64> = HashMap::new();
+            for event in replay.iter().filter(|e| e.kind == "message") {
+                let capture_id = event.payload["capture_id"].as_str().unwrap().to_owned();
+                let packet = event.payload["packet_number"].as_u64().unwrap();
+                assert!(last.get(&capture_id).is_none_or(|previous| packet >= *previous), "rejeu ordonné");
+                last.insert(capture_id, packet);
+            }
+        }
+        assert_eq!(total_late, 5, "cinq sessions, cinq requêtes rattachées après coup");
     }
 }

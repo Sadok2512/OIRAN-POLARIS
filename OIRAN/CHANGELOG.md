@@ -1,5 +1,38 @@
 # Changelog
 
+## oiran-api 2.21.139 — 2026-11-22 — trace live : rouvrir une trace rend la même trace et rejoue son historique ; `/version` annonce les vrais schémas
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.138 @ `4c3a777` (branche `fix/oiran-2.21.139-session-visible`). Recette de référence ANR2 (#10 7083623180, prod 2.21.138), ordre #9 7083690925, audit #9 7083792263. Aucun crate partagé modifié.
+
+### Défaut B — rouvrir une trace n'affichait rien
+
+- **Constat.** p900 ouvert sur la trace après le run : « Messages 0 », aucun débit, alors que le SSE avait livré 105 messages et 37 échantillons.
+- **Cause.** L'API garde l'historique d'une trace et le rejoue à la connexion (`stream`, tri canonique `(capture_id, packet_number, id)`). Mais « rouvrir » depuis l'UI refait `POST /live/traces`, et `create` fabriquait toujours une trace neuve : tampon vide, `created_at = now`. Depuis 2.21.135, cette trace écarte en plus tout ce qui a été capturé avant son ouverture — le run entier.
+- **Correctif.** `create` est idempotent : une demande identique (même type de clé, même valeur, même ensemble d'interfaces) sur une trace encore active renvoie **cette trace**, avec `reused: true` et `buffered_events`. L'expiration est prolongée à `now + duration_s`, jamais raccourcie ; `created_at` est gardé. Le client s'y connecte et reçoit tout le tampon. La demande est reconnue par une empreinte calculée avec la clé de pseudonymisation (domaine `live-trace-request`), gardée en mémoire, jamais sérialisée ni journalisée. Audit : action `live_trace.reuse`.
+- **Second défaut, trouvé par le test.** L'id de trace valait `sha256(now:key_type:value)` : deux demandes sur le même abonné dans la même seconde, avec des interfaces différentes, recevaient le même id et la seconde écrasait la première. L'id dérive maintenant de l'empreinte de la demande, interfaces comprises.
+
+### `/version`
+
+`callflow_schema` était lu dans le call flow « primaire », absent en mode opérationnel : `UNKNOWN` en production. `event_schema` était figé à `"1.2.0"`. Les deux viennent maintenant des crates (`callflow_schema::VERSION`, `NormalizedEvent::SCHEMA_VERSION`).
+
+### Arrivées tardives dans l'ordre SSE brut — fermé, par un test
+
+Sur la capture réelle à cinq abonnés, le seul message émis en retard dans sa capture est, pour chaque session, le `PFCP Session Establishment Request` rattaché après coup (la requête précède le message qui fait connaître sa session ; elle est émise après la réponse). Chaque retard est compté (`out_of_order`) et marqué `late:true` ; le rejeu à la connexion est dans l'ordre canonique. Aucun changement de code.
+
+### Tests (échec avant, succès après)
+
+- `reopening_a_live_trace_returns_the_same_trace_and_replays_its_history_2_21_139` (routeur réel : deux `POST`, puis lecture du flux SSE).
+- `a_different_live_trace_request_opens_another_trace_2_21_139` (autre abonné, autres interfaces, même seconde).
+- `version_reports_real_schema_versions_without_a_primary_flow_2_21_139`.
+- `the_only_late_live_messages_are_establishment_requests_attached_after_the_fact_2_21_139` (garde, vert avant et après).
+
+### OUVERT
+
+- **Défaut A (session du run non filtrable)** : la cause est hors du code Rust — segments `dumpcap` fermés au bout de 3 600 s, et l'import n'admet jamais le segment le plus récent d'un plan. Voie proposée : rotation bornée dans le temps ; coût à chiffrer par trois relevés au lab (audit #9 7083792263).
+- **Filtre `search` large > 30 s** : un call flow relu par session de la fenêtre. Correctif prévu en 2.21.140 (index des pseudonymes).
+- Le tampon d'une trace (2 000 events) est commun aux messages et au débit : sur une trace longue, le débit évince les messages les plus anciens du rejeu.
+- Côté UI : au rejeu, p900 date les points de débit à l'heure de réception ; ils se superposent.
+
 ## oiran-api 2.21.138 — 2026-11-21 — trace voix : alias des plans capturés N6/N3 vers IMS/N3-IMS
 
 Upgrade **patch** au-dessus de 2.21.137 @ `74c8b94`. Le G7 de production 2.21.136 a prouvé que N6 contenait les REGISTER, que l'établissement PFCP IMS et son IP UE étaient appris avant eux, mais que les deux traces publiaient `IMS.filtered=49`, `N3-IMS.filtered=49`, SIP=0 et RTP=0.
