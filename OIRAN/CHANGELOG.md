@@ -1,5 +1,62 @@
 # Changelog
 
+## oiran-api 2.21.151, session-engine 0.5.30 — 2026-11-22 — passe des représentants : le plafond borne la mémoire réellement allouée
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.150 @ `44ddb5b` (branche `fix/oiran-2.21.151-run-cap-real-bytes`). Relecture indépendante d'ANR1 (#10 7087035661) : **FAIL sur 2.21.150**.
+
+### Ce qui était faux dans 2.21.150
+
+2.21.150 annonçait : « la mémoire retenue avant l'écriture d'un passage ne dépasse jamais le plafond de plus d'un enregistrement ». **C'était faux.** Le compteur additionnait la longueur du JSON **sérialisé** de chaque enregistrement, pas les octets qu'il occupe en mémoire ; et le test « indépendant » refaisait la même sérialisation : il comparait le compteur à lui-même. Le code d'avant 2.21.148 comptait de la même façon : le défaut est ancien, 2.21.150 l'a rétabli en le présentant comme une garantie.
+
+Mesuré par le test de ce lot, avec un allocateur qui compte les octets réellement demandés, pour un plafond de 524 288 octets et le compteur de 2.21.150 :
+
+| Forme des events | Octets réellement alloués | Rapport au plafond |
+|---|---|---|
+| Petits puis gros (contre-exemple de 2.21.148) | 673 060 | 1,3 |
+| JSON court, arbre lourd (48 petits objets par event) | 2 665 881 | 5,1 |
+| Jeu certifié du dépôt | 1 491 694 | 2,8 |
+
+Au lab le plafond est de 64 Mio : sur des events de la forme du jeu certifié, le tampon d'un passage en tenait donc de l'ordre de 180 Mio. Ce dernier chiffre est une extrapolation du rapport 2,8, pas un relevé.
+
+### Correctif (`session-engine`)
+
+- `retained_heap_bytes` majore les octets alloués par un enregistrement : chaque chaîne à sa capacité, chaque tableau à sa capacité, chaque objet JSON au coût de son arbre (160 octets par entrée, un nœud entier au minimum), plus l'en-tête d'allocation. La déstructuration d'`EventRecord` y est exhaustive : un champ ajouté sans être compté ne compile pas.
+- Le tableau des enregistrements compte aussi, à sa **capacité** ; elle est rendue après chaque passage.
+- Le tri d'un passage se fait sur place (`sort_unstable_by`) : le tri stable allouait un tampon de la moitié du tableau, hors plafond. La clé `(clé, ordinal)` est unique, l'ordre est le même.
+- L'optimisation de copie de `parse_event` (2.21.148) est gardée.
+
+### Ce que le plafond borne, et ce qu'il ne borne pas
+
+Il borne le **tampon d'un passage** : plafond, plus un enregistrement, plus les tampons de lecture (64 Kio dans le test). Il ne borne ni la fusion des passages, ni la liste finale des représentants, tenue entière en mémoire : c'est elle qui fait le pic de la publication, et seul le lot « jeu chaud » la réduit.
+
+### Conséquence en exploitation
+
+À plafond égal, un passage contient moins d'enregistrements qu'avant (le compteur ne sous-estime plus) : **davantage de fichiers de passage**, de l'ordre de trois fois plus sur des events de la forme du jeu certifié. Le résultat ne dépend pas du nombre de passages (test de 2.21.148).
+
+### Mesure, refaite
+
+Même banc, même jeu (450 000 events, 1,15 Go), binaires `--release`, trois passes alternées :
+
+| | Passe 1 | Passe 2 | Passe 3 | Moyenne |
+|---|---|---|---|---|
+| Avant (code de 2.21.147) | 44,4 s | 47,1 s | 44,3 s | 45,3 s |
+| 2.21.150 | 42,1 s | 42,7 s | 40,6 s | 41,8 s |
+| 2.21.151 | 36,8 s | 36,2 s | 34,5 s | 35,8 s |
+
+**−21 %** par rapport au code de 2.21.147 : parcourir un enregistrement pour en compter les octets coûte moins que le sérialiser. Même empreinte de la liste des représentants sur les neuf passes ; pic de mémoire résidente 1 128 Mo contre 1 155 Mo.
+
+### Tests
+
+- `the_run_memory_cap_bounds_the_bytes_really_allocated_2_21_151` — remplace le test de 2.21.150, qui était circulaire. Un allocateur de test compte, par fil, les octets demandés et encore vivants ; la borne `plafond + un enregistrement + 64 Kio` est affirmée sur les trois formes ci-dessus. Avec le compteur de 2.21.150 (par mutation) : **échec sur les trois**. Après : 500 977, 360 856 et 468 836 octets, tous sous le plafond.
+- `representatives_do_not_depend_on_the_run_memory_cap_2_21_148` et les équivalences existantes passent sans changement.
+
+### OUVERT
+
+- L'allocateur de test compte les octets **demandés** ; l'arrondi et l'en-tête de l'allocateur système ne sont pas mesurés, seulement majorés dans le calcul (16 octets par allocation, bloc minimal de 24).
+- Le majorant est vérifié sur trois formes d'events, pas démontré pour toutes.
+- Nombre de fichiers de passage et durée de la fusion au lab : non mesurés.
+- Le gain reste mesuré sur un jeu quatre fois plus petit que celui du lab.
+
 ## oiran-api 2.21.150, session-engine 0.5.29, live-probe 0.6.36 — 2026-11-22 — passe des représentants : le plafond mémoire redevient une borne ; le ramassage ne retire plus une génération en service
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.149 @ `26d4d16` (branche `fix/oiran-2.21.149-restore-validates-first`). Relectures indépendantes d'ANR1 : **FAIL sur 2.21.148** (#10 7086356084) et **FAIL sur 2.21.149** (#10 7086494861). Ordres du cœur #9 7086361017 et #9 7086439869.

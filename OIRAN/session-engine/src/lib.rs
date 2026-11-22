@@ -1101,13 +1101,191 @@ struct SpilledRepresentative {
 
 static REPRESENTATIVE_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// 2.21.151 — octets comptés pour une allocation de `capacity` octets
+/// demandés : la demande, arrondie au plus petit bloc de l'allocateur,
+/// plus son en-tête. Zéro si rien n'est alloué.
+fn allocation_bytes(capacity: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        capacity.max(24).saturating_add(16)
+    }
+}
+
+fn string_heap_bytes(value: &str, capacity: usize) -> usize {
+    allocation_bytes(capacity.max(value.len()))
+}
+
+/// 2.21.151 — majorant des octets alloués par un arbre JSON. Un objet
+/// `serde_json` est un arbre B : un nœud tient onze entrées de 56 octets
+/// et peut n'être rempli qu'à moitié ; on compte 160 octets par entrée,
+/// et au moins un nœud entier (648) pour un objet non vide.
+fn json_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(text) => string_heap_bytes(text, text.capacity()),
+        Value::Array(items) => allocation_bytes(items.capacity().saturating_mul(std::mem::size_of::<Value>()))
+            .saturating_add(items.iter().map(json_heap_bytes).sum::<usize>()),
+        Value::Object(map) => {
+            if map.is_empty() {
+                return 0;
+            }
+            let entries = map
+                .iter()
+                .map(|(key, item)| string_heap_bytes(key, key.capacity()).saturating_add(json_heap_bytes(item)))
+                .sum::<usize>();
+            entries.saturating_add(map.len().saturating_mul(160).max(648))
+        }
+    }
+}
+
+/// 2.21.151 — majorant des octets alloués sur le tas par un enregistrement
+/// retenu (hors sa place dans le tableau `records`, comptée à part). La
+/// déstructuration est exhaustive : un champ ajouté à `EventRecord` sans
+/// être compté ici ne compile pas.
+fn retained_heap_bytes(record: &SpilledRepresentative) -> usize {
+    let SpilledRepresentative { key, ordinal: _, event } = record;
+    let EventRecord {
+        event_id,
+        stable_event_key,
+        parent_event_id,
+        capture_id,
+        capture_point_id,
+        timestamp,
+        timestamp_ns: _,
+        raw_ticks: _,
+        interface,
+        protocol,
+        message_name,
+        source_address,
+        destination_address,
+        source_participant,
+        destination_participant,
+        direction,
+        identifiers,
+        information_elements,
+        decoding_status,
+        decoder_name,
+        decoder_version,
+        raw_payload_reference,
+        packet_references,
+        errors,
+        source_json,
+        probe_id,
+        probe_type,
+        physical_link,
+        timestamp_source,
+    } = event;
+    let text = |value: &String| string_heap_bytes(value, value.capacity());
+    let optional = |value: &Option<String>| value.as_ref().map(text).unwrap_or(0);
+    let mut bytes = text(key);
+    for value in [
+        event_id,
+        stable_event_key,
+        capture_id,
+        capture_point_id,
+        timestamp,
+        interface,
+        protocol,
+        message_name,
+        source_address,
+        destination_address,
+        source_participant,
+        destination_participant,
+        direction,
+        decoding_status,
+        decoder_name,
+        decoder_version,
+        raw_payload_reference,
+    ] {
+        bytes = bytes.saturating_add(text(value));
+    }
+    for value in [parent_event_id, probe_id, probe_type, physical_link, timestamp_source] {
+        bytes = bytes.saturating_add(optional(value));
+    }
+    bytes = bytes.saturating_add(allocation_bytes(
+        identifiers.capacity().saturating_mul(std::mem::size_of::<(String, String)>()),
+    ));
+    for (name, value) in identifiers {
+        bytes = bytes.saturating_add(text(name)).saturating_add(text(value));
+    }
+    bytes = bytes.saturating_add(allocation_bytes(
+        packet_references.capacity().saturating_mul(std::mem::size_of::<PacketRef>()),
+    ));
+    for reference in packet_references {
+        bytes = bytes.saturating_add(text(&reference.source_file));
+    }
+    bytes = bytes.saturating_add(allocation_bytes(errors.capacity().saturating_mul(std::mem::size_of::<String>())));
+    for error in errors {
+        bytes = bytes.saturating_add(text(error));
+    }
+    bytes
+        .saturating_add(json_heap_bytes(information_elements))
+        .saturating_add(json_heap_bytes(source_json))
+}
+
+/// 2.21.151 — pour le test du plafond : un allocateur qui compte, par
+/// fil, les octets réellement demandés et encore vivants. C'est la mesure
+/// indépendante du compteur de production.
 #[cfg(test)]
-thread_local! {
-    /// 2.21.150 — plus grande taille (octets sérialisés, mesurés) retenue
-    /// en mémoire avant l'écriture d'un passage, pour le test du plafond.
-    static TEST_MAX_RETAINED_RUN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// 2.21.150 — octets réellement retenus dans le passage en cours.
-    static TEST_RETAINED_RUN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static BASELINE: Cell<isize> = const { Cell::new(0) };
+        static MAX_RUN_BUFFER: Cell<isize> = const { Cell::new(0) };
+    }
+
+    fn add(delta: isize) {
+        let _ = LIVE.try_with(|live| live.set(live.get() + delta));
+    }
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = System.alloc(layout);
+            if !pointer.is_null() {
+                add(layout.size() as isize);
+            }
+            pointer
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            System.dealloc(pointer, layout);
+            add(-(layout.size() as isize));
+        }
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let moved = System.realloc(pointer, layout, new_size);
+            if !moved.is_null() {
+                add(new_size as isize - layout.size() as isize);
+            }
+            moved
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    /// Début de la passe : les octets vivants du fil à cet instant.
+    pub fn start_run_buffer() {
+        BASELINE.with(|baseline| baseline.set(LIVE.with(Cell::get)));
+    }
+
+    /// Après chaque enregistrement gardé : octets vivants depuis le début.
+    pub fn note_run_buffer() {
+        let held = LIVE.with(Cell::get) - BASELINE.with(Cell::get);
+        MAX_RUN_BUFFER.with(|max| max.set(max.get().max(held)));
+    }
+
+    pub fn reset_max_run_buffer() {
+        MAX_RUN_BUFFER.with(|max| max.set(0));
+    }
+
+    pub fn max_run_buffer() -> usize {
+        MAX_RUN_BUFFER.with(Cell::get).max(0) as usize
+    }
 }
 
 fn flush_representative_run(
@@ -1115,7 +1293,10 @@ fn flush_representative_run(
     run_index: usize,
     records: &mut Vec<SpilledRepresentative>,
 ) -> Result<PathBuf, String> {
-    records.sort_by(|left, right| {
+    // 2.21.151 — tri sur place. `sort_by` (stable) alloue un tampon de la
+    // moitié du tableau, hors plafond ; `(clé, ordinal)` est unique, donc
+    // le tri instable rend exactement le même ordre.
+    records.sort_unstable_by(|left, right| {
         left.key
             .cmp(&right.key)
             .then_with(|| left.ordinal.cmp(&right.ordinal))
@@ -1197,6 +1378,8 @@ where
     fs::create_dir_all(&staging_dir)
         .map_err(|error| format!("{}: {error}", staging_dir.display()))?;
 
+    #[cfg(test)]
+    test_alloc::start_run_buffer();
     let mut records = Vec::<SpilledRepresentative>::new();
     let mut retained_bytes = 0usize;
     let mut run_paths = Vec::<PathBuf>::new();
@@ -1235,40 +1418,30 @@ where
                 ordinal,
                 event,
             };
-            // 2.21.150 / session-engine 0.5.29 (relecture ANR1 #10
-            // 7086356084, FAIL de 2.21.148) — la taille de CHAQUE
-            // enregistrement est mesurée exactement. 2.21.148 n'en
-            // mesurait qu'un sur seize et comptait les autres à la
-            // moyenne de l'échantillon, tout en les gardant en entier :
-            // une série de gros events aux positions non échantillonnées
-            // dépassait le plafond sans borne — or ce plafond existe pour
-            // qu'un service déjà à sa limite mémoire ne soit pas tué. La
-            // mesure exacte ne coûte rien de mesurable (banc du lot).
-            // Garantie : la mémoire retenue avant écriture d'un passage
-            // ne dépasse jamais le plafond de plus d'un enregistrement.
-            retained_bytes = retained_bytes.saturating_add(
-                serde_json::to_vec(&record)
-                    .map_err(|error| error.to_string())?
-                    .len(),
-            );
-            // Pour le test du plafond : les octets RÉELLEMENT retenus,
-            // mesurés indépendamment du compteur ci-dessus.
-            #[cfg(test)]
-            {
-                let exact = serde_json::to_vec(&record).map(|bytes| bytes.len()).unwrap_or(0);
-                let held = TEST_RETAINED_RUN_BYTES.with(|held| {
-                    held.set(held.get().saturating_add(exact));
-                    held.get()
-                });
-                TEST_MAX_RETAINED_RUN_BYTES.with(|max| max.set(max.get().max(held)));
-            }
+            // 2.21.151 / session-engine 0.5.30 (relecture ANR1 #10
+            // 7087035661, FAIL de 2.21.150) — le plafond porte sur la
+            // MÉMOIRE retenue, pas sur la longueur du JSON sérialisé.
+            // 2.21.150 (comme le code d'avant 2.21.148) comptait
+            // `serde_json::to_vec(&record).len()` : un objet JSON de
+            // trente octets occupe plusieurs centaines d'octets une fois
+            // en arbre. `retained_heap_bytes` majore les octets alloués
+            // par l'enregistrement ; s'y ajoute le tableau `records`
+            // lui-même, à sa capacité. Garantie, vérifiée par un test qui
+            // compte les octets réellement alloués : avant l'écriture
+            // d'un passage, la mémoire retenue ne dépasse pas le plafond
+            // de plus d'un enregistrement.
+            retained_bytes = retained_bytes.saturating_add(retained_heap_bytes(&record));
             records.push(record);
-            if retained_bytes >= memory_cap_bytes {
+            #[cfg(test)]
+            test_alloc::note_run_buffer();
+            let buffered = retained_bytes
+                .saturating_add(records.capacity().saturating_mul(std::mem::size_of::<SpilledRepresentative>()));
+            if buffered >= memory_cap_bytes {
                 let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
                 run_paths.push(path);
                 retained_bytes = 0;
-                #[cfg(test)]
-                TEST_RETAINED_RUN_BYTES.with(|held| held.set(0));
+                // La capacité est rendue : elle compte dans le plafond.
+                records = Vec::new();
             }
             if source_event_count % 100_000 == 0 {
                 progress(source_event_count, 0);
@@ -6580,76 +6753,111 @@ mod in_packet_order_tests {
             assert_eq!(many_runs, single_run, "plafond {cap} : liste identique, event par event");
         }
     }
-    /// 2.21.150 (relecture ANR1 #10 7086356084, FAIL de 2.21.148) — le
-    /// plafond mémoire des passages est une BORNE : la mémoire retenue
-    /// avant écriture ne le dépasse jamais de plus d'un enregistrement.
-    /// Contre-exemple d'ANR1 : des enregistrements petits aux positions
-    /// que l'échantillonnage de 2.21.148 mesurait (une sur seize), gros
-    /// partout ailleurs. Avant : la moyenne de l'échantillon restait
-    /// petite, et quinze gros enregistrements sur seize s'accumulaient
-    /// sans compter — plus de dix fois le plafond.
+    /// 2.21.151 (relectures ANR1 #10 7086356084 et 7087035661) — le
+    /// plafond des passages borne la mémoire RÉELLEMENT retenue. La mesure
+    /// vient d'un allocateur qui compte les octets demandés et encore
+    /// vivants sur le fil : elle ne doit rien au compteur de production.
+    ///
+    /// Trois formes d'events, chacune contre une version passée :
+    /// * `petits_puis_gros` — petits aux positions que 2.21.148 mesurait
+    ///   (une sur seize), gros ailleurs : 2.21.148 dépassait sans borne ;
+    /// * `json_court_arbre_lourd` — beaucoup de petits objets JSON : peu
+    ///   d'octets sérialisés, beaucoup en mémoire. 2.21.150 comptait la
+    ///   longueur sérialisée et dépassait de plusieurs fois le plafond ;
+    /// * `jeu_certifie` — les events réels du dépôt.
     #[test]
-    fn the_run_memory_cap_bounds_what_is_retained_whatever_the_record_sizes_2_21_150() {
+    fn the_run_memory_cap_bounds_the_bytes_really_allocated_2_21_151() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
-        let template: Value = std::fs::read_to_string(&fixture)
+        let source: Vec<Value> = std::fs::read_to_string(&fixture)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .find(|event| event["protocol"] == "NGAP")
-            .expect("un event NGAP dans le jeu");
-        // 480 events : petits aux positions multiples de 16, gros ailleurs.
-        // Le remplissage est un IE que la compaction garde (son nom porte « teid »).
-        const BIG_PADDING: usize = 8 * 1024;
-        let directory = std::env::temp_dir().join(format!("oiran-run-cap-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("events.jsonl");
-        let mut lines = String::new();
-        for index in 0..480usize {
+            .collect();
+        let template = source.iter().find(|event| event["protocol"] == "NGAP").expect("un event NGAP").clone();
+        // Un IE que la compaction garde : son nom porte « teid ».
+        let padding = |name: String, value: String| {
+            let mut item = template["information_elements"][0].clone();
+            item["name"] = Value::from(name);
+            item["value"] = Value::from(value);
+            item
+        };
+        let shaped = |index: usize, items: Vec<Value>| {
             let mut event = template.clone();
-            event["event_id"] = Value::from(format!("evt-cap-{index:04}"));
+            event["event_id"] = Value::from(format!("evt-cap-{index:05}"));
             event["packet_references"][0]["packet_number"] = Value::from(index as u64 + 1);
-            if index % 16 != 0 {
-                let mut padding = event["information_elements"][0].clone();
-                padding["name"] = Value::from("teid_padding");
-                padding["value"] = Value::from(format!("teid={}", "x".repeat(BIG_PADDING)));
-                event["information_elements"].as_array_mut().unwrap().push(padding);
+            event["information_elements"].as_array_mut().unwrap().extend(items);
+            event
+        };
+        let small_then_big: Vec<Value> = (0..640usize)
+            .map(|index| {
+                let items = if index % 16 == 0 { Vec::new() } else { vec![padding("teid_padding".into(), "x".repeat(8 * 1024))] };
+                shaped(index, items)
+            })
+            .collect();
+        let short_json_heavy_tree: Vec<Value> = (0..640usize)
+            .map(|index| shaped(index, (0..48).map(|item| padding(format!("teid{item}"), "1".into())).collect()))
+            .collect();
+        let certified: Vec<Value> = (0..40usize)
+            .flat_map(|round| {
+                source.iter().enumerate().map(move |(index, event)| {
+                    let mut event = event.clone();
+                    event["event_id"] = Value::from(format!("evt-{round:02}-{index:03}"));
+                    event["packet_references"][0]["packet_number"] = Value::from((round * 1000 + index) as u64 + 1);
+                    event
+                })
+            })
+            .collect();
+        const CAP: usize = 512 * 1024;
+        // Hors enregistrements : tampon de lecture (8 Kio), ligne en cours,
+        // chemins des passages. Borne : plafond + un enregistrement + cela.
+        const SLACK: usize = 64 * 1024;
+        let directory = std::env::temp_dir().join(format!("oiran-run-cap-real-{}", std::process::id()));
+        let mut violations = Vec::new();
+        for (shape, events) in [
+            ("petits_puis_gros", small_then_big),
+            ("json_court_arbre_lourd", short_json_heavy_tree),
+            ("jeu_certifie", certified),
+        ] {
+            let stage = directory.join(shape);
+            std::fs::create_dir_all(&stage).unwrap();
+            let path = stage.join("events.jsonl");
+            let mut lines = String::new();
+            for event in &events {
+                lines.push_str(&serde_json::to_string(event).unwrap());
+                lines.push('\n');
             }
-            lines.push_str(&serde_json::to_string(&event).unwrap());
-            lines.push('\n');
+            std::fs::write(&path, &lines).unwrap();
+            let serialized = lines.len();
+            drop(lines);
+            test_alloc::reset_max_run_buffer();
+            let index = load_paths_spilling_representatives_with_progress(&[path], &stage.join("staging"), CAP, |_, _| {})
+                .unwrap();
+            let held = test_alloc::max_run_buffer();
+            assert_eq!(index.source_event_count, events.len(), "{shape}");
+            let largest = index
+                .events
+                .iter()
+                .map(|event| {
+                    retained_heap_bytes(&SpilledRepresentative { key: String::new(), ordinal: 0, event: event.clone() })
+                })
+                .max()
+                .unwrap();
+            let bound = CAP + largest + SLACK;
+            if held > bound {
+                violations.push(format!(
+                    "{shape} : {held} octets réellement alloués > borne {bound} (plafond {CAP} + un enregistrement {largest} + {SLACK})"
+                ));
+            }
+            // Le test est significatif : le jeu dépasse le plafond, donc
+            // des passages ont été écrits, et le plafond a été approché.
+            assert!(serialized > 2 * CAP, "{shape} : jeu trop petit ({serialized})");
+            assert!(held >= CAP / 4, "{shape} : le tampon s'est rempli ({held})");
+            println!("RUN_CAP {shape} plafond={CAP} alloues_max={held} borne={bound} plus_gros={largest} json={serialized}");
         }
-        std::fs::write(&path, lines).unwrap();
-        const CAP: usize = 64 * 1024;
-        TEST_MAX_RETAINED_RUN_BYTES.with(|max| max.set(0));
-        TEST_RETAINED_RUN_BYTES.with(|held| held.set(0));
-        let index = load_paths_spilling_representatives_with_progress(
-            &[path],
-            &directory.join("staging"),
-            CAP,
-            |_, _| {},
-        )
-        .unwrap();
-        assert_eq!(index.source_event_count, 480);
-        // Le test est significatif : les gros enregistrements le restent après compaction.
-        let largest = index
-            .events
-            .iter()
-            .map(|event| serde_json::to_vec(event).unwrap().len())
-            .max()
-            .unwrap();
-        assert!(largest > BIG_PADDING, "un gros enregistrement garde son remplissage : {largest}");
-        let retained = TEST_MAX_RETAINED_RUN_BYTES.with(|max| max.get());
-        // Borne chiffrée : le plafond, plus au plus un enregistrement
-        // (celui dont l'arrivée déclenche l'écriture du passage), avec sa
-        // clé et son ordinal — moins du double du plus gros event.
-        let bound = CAP + 2 * largest;
-        assert!(
-            retained <= bound,
-            "mémoire retenue {retained} octets > borne {bound} (plafond {CAP} + un enregistrement)"
-        );
-        assert!(retained >= CAP, "le plafond est bien atteint avant écriture : {retained}");
         let _ = std::fs::remove_dir_all(&directory);
+        assert!(violations.is_empty(), "{}", violations.join(" ; "));
     }
 }
