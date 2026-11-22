@@ -5798,6 +5798,17 @@ fn sessions_filter_blocking(
         || run_id_filter.is_some()
         || free_text_search.is_some()
         || search_pseudonym.is_some();
+    // 2.21.140 (recette ANR2 #10 7083623180 : filtre large > 30 s) —
+    // quand la recherche EST un pseudonyme, l'index des sessions répond
+    // (`pseudonym_tokens`), sans relire un call flow par session de la
+    // fenêtre. Les autres prédicats qui lisent les events gardent leur
+    // chemin.
+    let pseudonym_search_token: Option<String> = search_pseudonym
+        .clone()
+        .or_else(|| free_text_search.clone())
+        .filter(|text| session_filters::is_pseudonym_token(text));
+    let needs_flow_besides_search =
+        !criteria.is_empty() || !network_elements_scope.is_empty() || run_id_filter.is_some();
     let needs_summary_for_match = !technologies.is_empty()
         || !dataset_kinds.is_empty()
         || !states.is_empty()
@@ -5924,6 +5935,34 @@ fn sessions_filter_blocking(
                         continue;
                     }
                 }
+                // 2.21.140 — recherche d'un pseudonyme : l'index tranche
+                // avant toute lecture. Absent → session écartée ; présent
+                // → retenue pour ce prédicat. Session non indexée →
+                // l'ancien chemin (lecture du call flow).
+                let search_decided_by_index = match pseudonym_search_token.as_deref() {
+                    Some(token) => {
+                        let presence = match generation.as_ref() {
+                            Some(gen) => gen.filter_index.pseudonym_token_presence(session_id, token),
+                            None => state
+                                .inner
+                                .session_filter_index
+                                .read()
+                                .expect("session_filter_index poisoned")
+                                .pseudonym_token_presence(session_id, token),
+                        };
+                        match presence {
+                            Some(false) => continue,
+                            Some(true) => true,
+                            None => false,
+                        }
+                    }
+                    None => false,
+                };
+                let needs_flow_for_match = if search_decided_by_index {
+                    needs_flow_besides_search
+                } else {
+                    needs_flow_for_match
+                };
                 #[cfg(test)]
                 if needs_flow_for_match {
                     state
@@ -5999,7 +6038,7 @@ fn sessions_filter_blocking(
                     }
                 }
                 // 2.19.1 : free text search.
-                if let Some(needle) = &free_text_search {
+                if let Some(needle) = free_text_search.as_ref().filter(|_| !search_decided_by_index) {
                     let hit = events_ref.iter().any(|event| {
                         event.message_name.to_ascii_lowercase().contains(needle)
                             || event
@@ -6014,7 +6053,7 @@ fn sessions_filter_blocking(
                 }
                 // 2.19.1 : search IMSI → pseudonyme (substring sur
                 // decoded_ie_tree, même sémantique que live_trace).
-                if let Some(pseudo) = &search_pseudonym {
+                if let Some(pseudo) = search_pseudonym.as_ref().filter(|_| !search_decided_by_index) {
                     let hit = events_ref.iter().any(|event| {
                         event.decoded_ie_tree.to_string().contains(pseudo)
                     });
@@ -14266,6 +14305,84 @@ mod tests {
             .collect();
         assert!(ids.contains(&lte_session_id.as_str()), "new LTE session missing after cache");
         assert!(after["meta"]["total"].as_u64().unwrap() > before_total);
+    }
+
+    /// 2.21.140 (recette ANR2 #10 7083623180 : filtre large > 30 s) —
+    /// la recherche d'un pseudonyme rend EXACTEMENT les sessions que
+    /// rendait la lecture de chaque call flow (pseudonyme présent dans
+    /// `decoded_ie_tree` d'au moins un event), sans en relire aucun.
+    /// Avant : un call flow résolu par session.
+    #[tokio::test]
+    async fn sessions_filter_pseudonym_search_is_answered_by_the_index_with_equivalent_result_2_21_140() {
+        use std::sync::atomic::Ordering;
+
+        let state = state();
+        let flows = queryable_flows(&state);
+        // Référence : la sémantique historique, calculée ici à la main.
+        let mut sessions_by_token: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for flow in flows.values() {
+            for event in &flow.events {
+                let text = event.decoded_ie_tree.to_string().to_ascii_lowercase();
+                let mut at = 0;
+                while let Some(found) = text[at..].find("psn-") {
+                    let start = at + found;
+                    if let Some(token) = text.get(start..start + 36) {
+                        if session_filters::is_pseudonym_token(token) {
+                            sessions_by_token
+                                .entry(token.to_owned())
+                                .or_default()
+                                .insert(flow.session_id.clone());
+                        }
+                    }
+                    at = start + 4;
+                }
+            }
+        }
+        assert!(
+            sessions_by_token.len() >= 3,
+            "le jeu de référence doit porter des pseudonymes : {}",
+            sessions_by_token.len()
+        );
+        assert!(
+            sessions_by_token.values().any(|sessions| sessions.len() < flows.len()),
+            "au moins un pseudonyme doit écarter des sessions"
+        );
+        for (token, expected) in sessions_by_token.iter().take(12) {
+            state.inner.filter_flow_resolutions.store(0, Ordering::SeqCst);
+            let (status, body) =
+                post_sessions_filter(&state, json!({"limit": 100, "search": token}), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let actual: BTreeSet<String> = body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|row| row["session_id"].as_str().map(str::to_owned))
+                .collect();
+            assert_eq!(&actual, expected, "résultat de la recherche d'un pseudonyme");
+            assert_eq!(
+                state.inner.filter_flow_resolutions.load(Ordering::SeqCst),
+                0,
+                "aucun call flow relu pour une recherche de pseudonyme"
+            );
+        }
+        // Pseudonyme inconnu : aucune session, aucun call flow relu.
+        state.inner.filter_flow_resolutions.store(0, Ordering::SeqCst);
+        let unknown = format!("psn-{}", "0".repeat(32));
+        assert!(!sessions_by_token.contains_key(&unknown));
+        let (status, body) =
+            post_sessions_filter(&state, json!({"limit": 100, "search": unknown}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["data"].as_array().unwrap().is_empty());
+        assert_eq!(state.inner.filter_flow_resolutions.load(Ordering::SeqCst), 0);
+        // Un texte qui n'est pas un pseudonyme garde l'ancien chemin.
+        state.inner.filter_flow_resolutions.store(0, Ordering::SeqCst);
+        let (status, _) =
+            post_sessions_filter(&state, json!({"limit": 100, "search": "psn-"}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state.inner.filter_flow_resolutions.load(Ordering::SeqCst) > 0,
+            "une recherche de texte libre lit toujours les call flows"
+        );
     }
 
     /// 2.21.50 — équivalence de résultat avec la sémantique historique

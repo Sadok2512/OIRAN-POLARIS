@@ -80,6 +80,15 @@ pub struct SessionFilterEntry {
     pub messages: BTreeSet<(String, String)>, // (interface, message_name)
     pub causes: BTreeSet<(String, String, bool)>, // (domain, value, is_failure)
     pub pseudonyms: BTreeSet<String>,
+    /// 2.21.140 — tous les pseudonymes (`psn-` + 32 hexadécimaux) lus
+    /// n'importe où dans les IE décodés de la session : valeurs
+    /// entières, mais aussi jetons inclus dans une valeur (URI SBI
+    /// `…/subscriber-psn-…/…`, `pseudonym=psn-…`, `ue_ip=psn-…`).
+    /// C'est exactement ce que trouve la recherche textuelle d'un
+    /// pseudonyme dans `decoded_ie_tree` ; `/sessions/filter` y répond
+    /// sans relire le call flow. Distinct de `pseudonyms`, qui ne porte
+    /// que les IE d'identité et sert au filtre `identity`.
+    pub pseudonym_tokens: BTreeSet<String>,
     pub has_failure: bool,
     /// 2.21.52 — intervalle temporel fermé de la session. Les timestamps
     /// invalides sont ignorés ; une session sans timestamp valide ne matche
@@ -136,6 +145,9 @@ impl SessionFilterIndex {
             }
             for pseudo in &entry.pseudonyms {
                 total = total.saturating_add(pseudo.capacity() as u64);
+            }
+            for token in &entry.pseudonym_tokens {
+                total = total.saturating_add(token.capacity() as u64);
             }
             total = total.saturating_add(std::mem::size_of::<SessionFilterEntry>() as u64);
         }
@@ -202,6 +214,7 @@ impl SessionFilterIndex {
             messages: BTreeSet::new(),
             causes: BTreeSet::new(),
             pseudonyms: BTreeSet::new(),
+            pseudonym_tokens: BTreeSet::new(),
             has_failure: false,
             first_timestamp_ns,
             last_timestamp_ns,
@@ -227,6 +240,7 @@ impl SessionFilterIndex {
                 entry.causes.insert(cause);
             }
             collect_pseudonyms(&event.decoded_ie_tree, &mut entry.pseudonyms);
+            collect_pseudonym_tokens(&event.decoded_ie_tree, &mut entry.pseudonym_tokens);
         }
         self.sessions.insert(flow.session_id.clone(), entry);
     }
@@ -263,6 +277,15 @@ impl SessionFilterIndex {
 
     pub fn entry(&self, session_id: &str) -> Option<&SessionFilterEntry> {
         self.sessions.get(session_id)
+    }
+
+    /// 2.21.140 — la session porte-t-elle ce pseudonyme, où que ce soit
+    /// dans ses IE décodés ? `None` si la session n'est pas indexée :
+    /// l'appelant retombe alors sur la lecture du call flow.
+    pub fn pseudonym_token_presence(&self, session_id: &str, token: &str) -> Option<bool> {
+        self.sessions
+            .get(session_id)
+            .map(|entry| entry.pseudonym_tokens.contains(token))
     }
 
     /// 2.21.52 — préfiltre temporel O(1), sans relecture du callflow.
@@ -363,6 +386,60 @@ impl SessionFilterIndex {
 /// Parcours récursif de l'IE tree ; les IE dont le nom est dans
 /// `PSEUDONYM_IE_NAMES` contribuent leur valeur string (pseudonyme
 /// `psn-...`) au set.
+/// Longueur de la partie hexadécimale d'un pseudonyme
+/// (`event_schema::pseudonym` : `psn-` + 32 hexadécimaux).
+const PSEUDONYM_HEX_LEN: usize = 32;
+
+/// 2.21.140 — `text` est-il exactement un pseudonyme, en minuscules ?
+pub fn is_pseudonym_token(text: &str) -> bool {
+    text.strip_prefix("psn-").is_some_and(|hex| {
+        hex.len() == PSEUDONYM_HEX_LEN
+            && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// 2.21.140 — ajoute à `out` chaque pseudonyme présent dans `text`, à
+/// n'importe quelle position. La casse est ignorée, comme dans la
+/// recherche textuelle ; le jeton est rendu en minuscules.
+fn pseudonym_tokens_in(text: &str, out: &mut BTreeSet<String>) {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut at = 0;
+    while let Some(found) = lower[at..].find("psn-") {
+        let start = at + found;
+        let hex_start = start + 4;
+        let hex_end = hex_start + PSEUDONYM_HEX_LEN;
+        if hex_end <= bytes.len()
+            && bytes[hex_start..hex_end]
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        {
+            out.insert(lower[start..hex_end].to_owned());
+        }
+        at = hex_start;
+    }
+}
+
+/// 2.21.140 — parcourt TOUT l'arbre (clés et valeurs textuelles), comme
+/// le fait une recherche dans `decoded_ie_tree.to_string()`.
+fn collect_pseudonym_tokens(ies: &Value, out: &mut BTreeSet<String>) {
+    match ies {
+        Value::String(text) => pseudonym_tokens_in(text, out),
+        Value::Array(items) => {
+            for item in items {
+                collect_pseudonym_tokens(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                pseudonym_tokens_in(key, out);
+                collect_pseudonym_tokens(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_pseudonyms(ies: &Value, out: &mut BTreeSet<String>) {
     match ies {
         Value::Array(items) => {
@@ -861,5 +938,35 @@ mod tests {
             Some("psn-abc"),
         );
         assert_eq!(matches, vec!["pass"]);
+    }
+    /// 2.21.140 — les pseudonymes sont trouvés où qu'ils soient dans
+    /// l'arbre : valeur entière, jeton dans une URI, clé, casse.
+    #[test]
+    fn pseudonym_tokens_are_collected_anywhere_in_the_tree_2_21_140() {
+        let a = format!("psn-{}", "a".repeat(32));
+        let b = format!("psn-{}", "b".repeat(32));
+        let c = format!("psn-{}", "c".repeat(32));
+        let d = format!("psn-{}", "d".repeat(32));
+        let tree = serde_json::json!([
+            {"name": "subscriber_pseudonym", "value": a},
+            {"name": "Request URI (sanitized)", "value": format!("/nudm/v1/subscriber-{b}/x")},
+            {"name": "NAS-PDU", "value": format!("nas_protected=false,pseudonym={}", c.to_ascii_uppercase())},
+            {"name": "x", "children": [{d.clone(): 1}]},
+            {"name": "short", "value": "psn-1234"},
+            {"name": "not-hex", "value": format!("psn-{}", "z".repeat(32))},
+            {"name": "twice", "value": format!("psn-psn-{}", "e".repeat(32))},
+        ]);
+        let mut tokens = BTreeSet::new();
+        collect_pseudonym_tokens(&tree, &mut tokens);
+        let e = format!("psn-{}", "e".repeat(32));
+        assert_eq!(tokens, BTreeSet::from([a.clone(), b, c, d, e]));
+        // Le filtre `identity` garde sa propre liste, plus étroite.
+        let mut identities = BTreeSet::new();
+        collect_pseudonyms(&tree, &mut identities);
+        assert_eq!(identities, BTreeSet::from([a.clone()]));
+        assert!(is_pseudonym_token(&a));
+        assert!(!is_pseudonym_token("psn-1234"));
+        assert!(!is_pseudonym_token(&a.to_ascii_uppercase()));
+        assert!(!is_pseudonym_token(&format!("{a}0")));
     }
 }

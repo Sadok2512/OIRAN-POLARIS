@@ -1,5 +1,32 @@
 # Changelog
 
+## oiran-api 2.21.140 — 2026-11-22 — `/sessions/filter` : la recherche d'un pseudonyme est servie par l'index, sans relire les call flows
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.139 @ `d9de83f` (branche `fix/oiran-2.21.140-filter-pseudonym-index`). Recette de référence ANR2 (#10 7083623180) : « un filtre historique large sur la même cible dépasse 30 s ». Audit #9 7083792263. Aucun crate partagé modifié.
+
+### Cause
+
+Un `search` obligeait à charger le call flow de **chaque** session de la fenêtre (`live_flow_for` : liste des jeux clonée, recherche linéaire de l'id, call flow relu sur disque), puis à sérialiser l'arbre d'IE de chaque event pour y chercher le texte. Coût : sessions de la fenêtre × (lecture disque + sérialisation).
+
+### Correctif
+
+- `SessionFilterIndex` porte, par session, `pseudonym_tokens` : tous les pseudonymes (`psn-` + 32 hexadécimaux) lus n'importe où dans les IE décodés — valeur entière, jeton dans une URI SBI, `pseudonym=…`, `ue_ip=…`, clé. C'est exactement ce que trouvait la recherche dans `decoded_ie_tree.to_string()`.
+- Quand `search` est un pseudonyme (saisi tel quel, ou dérivé d'une saisie de forme IMSI), `/sessions/filter` répond par cet index : session écartée ou retenue sans lire son call flow. Une session absente de l'index garde l'ancien chemin. Les autres prédicats (critères, éléments de réseau, `run_id`, texte libre qui n'est pas un pseudonyme) sont inchangés.
+- `pseudonyms` (IE d'identité seulement) reste tel quel : le filtre `identity` ne change pas de sens.
+- Données déjà stockées : l'index est reconstruit en mémoire à partir des call flows à chaque démarrage et à chaque publication ; aucun redécodage.
+
+### Tests
+
+- `sessions_filter_pseudonym_search_is_answered_by_the_index_with_equivalent_result_2_21_140` : pour 12 pseudonymes du jeu de référence, le résultat est identique à la sémantique historique recalculée à la main, avec **0** call flow relu ; pseudonyme inconnu → 0 session, 0 call flow ; texte libre → ancien chemin. Avant (index désactivé) : échec, des call flows sont relus.
+- `pseudonym_tokens_are_collected_anywhere_in_the_tree_2_21_140`.
+
+### OUVERT
+
+- Le gain au lab n'est pas mesuré ici : à rejouer par ANR sur le filtre large de la recette.
+- Un texte libre qui n'est pas un pseudonyme relit toujours un call flow par session de la fenêtre.
+- Coût mémoire de l'index : quelques pseudonymes de 36 octets par session, comptés dans `estimated_bytes`.
+- Défaut A (session du run non filtrable) : inchangé, voir 2.21.139.
+
 ## oiran-api 2.21.139 — 2026-11-22 — trace live : rouvrir une trace rend la même trace et rejoue son historique ; `/version` annonce les vrais schémas
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.138 @ `4c3a777` (branche `fix/oiran-2.21.139-session-visible`). Recette de référence ANR2 (#10 7083623180, prod 2.21.138), ordre #9 7083690925, audit #9 7083792263. Aucun crate partagé modifié.
