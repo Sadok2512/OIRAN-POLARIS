@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.30 — 2026-11-22 — Pseudonymes à clé et état detach observé par UE
+
+- Remplace les pseudonymes sensibles dérivés d'un SHA-256 nu par un HMAC-SHA-256 à domaines séparés, alimenté par un secret privé stable du service ; l'absence de clé produit un masque opaque et jamais un digest réversible par dictionnaire.
+- Publie dans les mesures `detach` l'état réellement observé de chaque UE : l'UE préexistant reste actif et enregistré, tandis que seul le pair démarré par le scénario est arrêté et désenregistré.
+- Ajoute les tests adverses de clé, séparation de domaine, repli fail-closed, valeur de retour et History à deux UE ; aligne les versions API et web sur 0.36.30.
+
 ## 0.36.29 — 2026-11-22 — Nettoyage voix et History sans adresse sensible
 
 - Préserve un UE déjà actif à l'étape finale d'un scénario voix : seuls les clients IMS et les PDU créés par le scénario sont libérés ; un UE lancé par le scénario reste arrêté normalement.

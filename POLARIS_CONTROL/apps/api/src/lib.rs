@@ -39,7 +39,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     net::{Ipv4Addr, Ipv6Addr},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -7787,6 +7787,14 @@ fn telemetry_reference_is_sensitive(value: &str) -> bool {
 }
 
 fn safe_telemetry_reference(prefix: &str, value: &str) -> String {
+    safe_telemetry_reference_with_key(prefix, value, telemetry_pseudonym_key())
+}
+
+fn safe_telemetry_reference_with_key(
+    prefix: &str,
+    value: &str,
+    key: Option<&[u8]>,
+) -> String {
     let lower = value.to_ascii_lowercase();
     let trusted_shape = if prefix == "psn" {
         lower.starts_with("psn-") || lower.starts_with("ue-pseudonym-")
@@ -7796,12 +7804,60 @@ fn safe_telemetry_reference(prefix: &str, value: &str) -> String {
     if trusted_shape && !telemetry_reference_is_sensitive(value) {
         return value.to_string();
     }
-    let digest = Sha256::digest(value.as_bytes());
+    let Some(key) = key.filter(|key| key.len() >= 32) else {
+        return format!("{prefix}-redacted");
+    };
+    let mut message = format!("polaris-control/v1/{prefix}").into_bytes();
+    message.push(0);
+    message.extend_from_slice(value.as_bytes());
+    let digest = hmac_sha256(key, &message);
     let suffix = digest[..6]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("{prefix}-{suffix}")
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    let mut normalized = [0_u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK_SIZE];
+    let mut outer_pad = [0x5c_u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn telemetry_pseudonym_key() -> Option<&'static [u8]> {
+    static KEY: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let path = std::env::var("POLARIS_TELEMETRY_PSEUDONYM_KEY_FILE")
+            .unwrap_or_else(|_| "/etc/oiran/secrets/polaris-control-telemetry.key".into());
+        let metadata = fs::metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.mode() & 0o077 != 0 {
+            return None;
+        }
+        let mut key = fs::read(path).ok()?;
+        while key.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            key.pop();
+        }
+        (key.len() >= 32).then_some(key)
+    })
+    .as_deref()
 }
 
 fn safe_telemetry_code(value: &str) -> String {
@@ -10424,10 +10480,14 @@ fn sanitize_history_value(value: &mut Value) {
 }
 
 fn sanitize_history_text(value: &str) -> String {
-    let without_v4 = replace_address_tokens(value, |candidate| {
+    sanitize_history_text_with_key(value, telemetry_pseudonym_key())
+}
+
+fn sanitize_history_text_with_key(value: &str, key: Option<&[u8]>) -> String {
+    let without_v4 = replace_address_tokens(value, key, |candidate| {
         candidate.contains('.') && candidate.parse::<Ipv4Addr>().is_ok()
     });
-    let without_addresses = replace_address_tokens(&without_v4, |candidate| {
+    let without_addresses = replace_address_tokens(&without_v4, key, |candidate| {
         candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok()
     });
     let lower = without_addresses.to_ascii_lowercase();
@@ -10442,13 +10502,17 @@ fn sanitize_history_text(value: &str) -> String {
         })
         .0;
     if identity_marker || long_digit_run {
-        safe_telemetry_reference("history", &without_addresses)
+        safe_telemetry_reference_with_key("history", &without_addresses, key)
     } else {
         without_addresses
     }
 }
 
-fn replace_address_tokens(value: &str, is_address: impl Fn(&str) -> bool) -> String {
+fn replace_address_tokens(
+    value: &str,
+    key: Option<&[u8]>,
+    is_address: impl Fn(&str) -> bool,
+) -> String {
     let mut output = String::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
@@ -10466,7 +10530,9 @@ fn replace_address_tokens(value: &str, is_address: impl Fn(&str) -> bool) -> Str
             }
             let candidate = &value[start..end];
             if is_address(candidate) {
-                output.push_str(&safe_telemetry_reference("addr", candidate));
+                output.push_str(&safe_telemetry_reference_with_key(
+                    "addr", candidate, key,
+                ));
                 index = end;
                 continue;
             }
@@ -14035,6 +14101,7 @@ fn execute_live_definition_step(
             Ok(json!({"duration_ms":duration_ms,"pdu_preserved":true}))
         }
         "detach" => {
+            let mut per_ue = Vec::with_capacity(ue_ids.len());
             for ue_id in ue_ids {
                 stop_definition_ims_client(control, ue_id);
                 let job = if let Some(approval) = definition_job_approval(control, ue_id)? {
@@ -14108,11 +14175,19 @@ fn execute_live_definition_step(
                         "detach",
                         "OK",
                         json!({
-                            "process_state": observation.process_state,
-                            "registration_state": observation.registration_state,
+                            "process_state": &observation.process_state,
+                            "registration_state": &observation.registration_state,
                             "preexisting_ue_preserved": true,
                         }),
                     );
+                    per_ue.push(json!({
+                        "ue_id": ue_id,
+                        "process_state": observation.process_state,
+                        "registration_state": observation.registration_state,
+                        "pdu_session_state": observation.pdu_session_state,
+                        "scenario_started_ue": false,
+                        "completion_evidence": "PREEXISTING_UE_OBSERVED_PRESERVED"
+                    }));
                     control
                         .started_jobs
                         .lock()
@@ -14158,6 +14233,14 @@ fn execute_live_definition_step(
                         "pdu_state": &final_job.pdu_session_state,
                     }),
                 );
+                per_ue.push(json!({
+                    "ue_id": ue_id,
+                    "process_state": final_job.process_state,
+                    "registration_state": final_job.registration_state,
+                    "pdu_session_state": final_job.pdu_session_state,
+                    "scenario_started_ue": true,
+                    "completion_evidence": "CONTROLLER_TERMINAL_STATE_OBSERVED"
+                }));
                 control
                     .started_ues
                     .lock()
@@ -14178,11 +14261,8 @@ fn execute_live_definition_step(
                 decode_parked_n2(state, ue_id);
             }
             Ok(json!({
-                "pdu_state":"INACTIVE",
-                "registration_state":"DEREGISTERED",
-                "process_state":"STOPPED",
-                "release_evidence":"UERANSIM_PS_RELEASE_REQUEST_ACCEPTED",
-                "completion_evidence":"CONTROLLER_STOPPED_AND_PDU_INACTIVE"
+                "ues":per_ue,
+                "completion_evidence":"OBSERVED_PER_UE"
             }))
         }
         "ims_register" => execute_ims_register(state, ue_ids, control),
@@ -21751,6 +21831,50 @@ mod p0_tests {
         );
     }
 
+    #[test]
+    fn control_03630_sensitive_references_use_keyed_domain_separated_hmac() {
+        let key_a = [0x11_u8; 32];
+        let key_b = [0x22_u8; 32];
+        let value = "198.51.100.7";
+        let first = safe_telemetry_reference_with_key("addr", value, Some(&key_a));
+        let repeated = safe_telemetry_reference_with_key("addr", value, Some(&key_a));
+        let other_key = safe_telemetry_reference_with_key("addr", value, Some(&key_b));
+        let other_domain = safe_telemetry_reference_with_key("psn", value, Some(&key_a));
+        let raw_digest = Sha256::digest(value.as_bytes());
+        let raw_suffix = raw_digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_key);
+        assert_ne!(first, other_domain);
+        assert_ne!(first, format!("addr-{raw_suffix}"));
+        let history_text = sanitize_history_text_with_key(
+            "route src 198.51.100.7",
+            Some(&key_a),
+        );
+        assert!(!history_text.contains(value));
+        assert!(history_text.contains(&first));
+        assert_eq!(
+            safe_telemetry_reference_with_key("addr", value, None),
+            "addr-redacted"
+        );
+    }
+
+    #[test]
+    fn control_03630_hmac_sha256_matches_the_standard_vector() {
+        let digest = hmac_sha256(&[0x0b; 20], b"Hi There");
+        let encoded = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            encoded,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
     #[tokio::test]
     async fn control_03628_masks_preexisting_sensitive_codes_when_history_is_read() {
         let sensitive = "REFUS_12345_SYNTHETIQUE";
@@ -21854,7 +21978,9 @@ mod p0_tests {
             .as_str()
             .unwrap()
             .contains(first_reference));
-        assert_ne!(first_reference, record["steps"][0]["measurements"]["route"]);
+        assert!(record["steps"][0]["measurements"]["route"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("addr-")));
     }
 
     #[tokio::test]
@@ -24443,8 +24569,21 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             .lock()
             .unwrap()
             .insert("UE-05".into(), BTreeSet::from(["ims".into()]));
-        execute_live_definition_step(&test_state, &step(4, "detach"), &ue_ids, &control)
-            .unwrap();
+        let measurements =
+            execute_live_definition_step(&test_state, &step(4, "detach"), &ue_ids, &control)
+                .unwrap();
+
+        let observed = measurements["ues"].as_array().unwrap();
+        let preserved = observed.iter().find(|item| item["ue_id"] == "UE-05").unwrap();
+        assert_eq!(preserved["process_state"], "RUNNING");
+        assert_eq!(preserved["registration_state"], "REGISTERED");
+        assert_eq!(preserved["pdu_session_state"], "ACTIVE");
+        assert_eq!(preserved["scenario_started_ue"], false);
+        let stopped_peer = observed.iter().find(|item| item["ue_id"] == "UE-06").unwrap();
+        assert_eq!(stopped_peer["process_state"], "STOPPED");
+        assert_eq!(stopped_peer["registration_state"], "DEREGISTERED");
+        assert_eq!(stopped_peer["pdu_session_state"], "INACTIVE");
+        assert_eq!(stopped_peer["scenario_started_ue"], true);
 
         let actions = stopped.lock().unwrap();
         assert!(actions.contains(&"PDU_DNN_RELEASED:UE-05:ims".into()));
@@ -24562,6 +24701,23 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert_eq!(record["initial_ue_states"][0]["process_state"], "RUNNING");
         assert_eq!(record["initial_ue_states"][1]["ue_id"], "UE-06");
         assert_eq!(record["initial_ue_states"][1]["process_state"], "STOPPED");
+        let detach_measurements = &record["steps"][1]["measurements"]["ues"];
+        let preserved = detach_measurements
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["ue_id"] == "UE-05")
+            .unwrap();
+        assert_eq!(preserved["process_state"], "RUNNING");
+        assert_eq!(preserved["registration_state"], "REGISTERED");
+        let stopped_peer = detach_measurements
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["ue_id"] == "UE-06")
+            .unwrap();
+        assert_eq!(stopped_peer["process_state"], "STOPPED");
+        assert_eq!(stopped_peer["registration_state"], "DEREGISTERED");
     }
 
     #[test]
