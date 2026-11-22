@@ -82,7 +82,7 @@ describe('POLARIS Control shell', () => {
     expect(maskSubscriberIdentity('not-an-identity')).toBe('PROTECTED');
   });
   it('B11 never invents an absent UERANSIM state', () => expect(reportedState('UNKNOWN')).toBe('-- (non rapporté par UERANSIM)'));
-  it('B12 renders the failure cause from timeline detail', () => expect(eventFailureDetail({detail:{error:'SHARED_UE_PROTECTED'}})).toBe('SHARED_UE_PROTECTED'));
+  it('B12 renders the safe failure cause from timeline detail', () => expect(eventFailureDetail({detail:{error:'SHARED_UE_PROTECTED'}})).toContain('UE partagée protégée'));
   it('C13 requires both measured directions', () => expect({ul_bytes:544,dl_bytes:1024}).toMatchObject({ul_bytes:expect.any(Number),dl_bytes:expect.any(Number)}));
 
   it('C5 searches templates by exact identifier and explains validation failures', () => {
@@ -120,6 +120,13 @@ describe('POLARIS Control shell', () => {
     }
   });
 
+  it('C5b gives every dedicated refusal a French corrective action', () => {
+    expect(Object.keys(actionReasonMessages).length).toBeGreaterThan(70);
+    for (const message of Object.values(actionReasonMessages)) {
+      expect(message).toContain('Action :');
+    }
+  });
+
   it('C5 translates a known API refusal and discards its raw suggestion', () => {
     const message = humanApiRefusal(new Error('SHARED_UE_PROTECTED: retry the unsafe operation'));
     expect(message).toContain('UE partagée protégée');
@@ -137,6 +144,22 @@ describe('POLARIS Control shell', () => {
   it('C5 fail-closes an empty API refusal with a French corrective action', () => {
     const message = humanApiRefusal(null);
     expect(message).toBe('L’API a refusé l’opération. Action : réessayer, puis demander une vérification si le refus persiste.');
+  });
+
+  it('C5b suppresses a raw synthetic identity from an API refusal', () => {
+    const clearIdentity = ['001', '01', '0000000201'].join('');
+    const message = humanApiRefusal(new Error(`refus pour ${clearIdentity}`));
+    expect(message).not.toContain(clearIdentity);
+    expect(message).toBe('L’API a refusé l’opération. Action : réessayer, puis demander une vérification si le refus persiste.');
+  });
+
+  it('C5b inspects the whole psn-prefixed refusal instead of trusting its prefix', () => {
+    const clearIdentity = ['001', '01', '0000000201'].join('');
+    const message = humanApiRefusal(new Error(`psn-lab contenant ${clearIdentity}`));
+    expect(message).not.toContain(clearIdentity);
+    expect(message).not.toContain('psn-lab');
+    expect(message).toContain('Action :');
+    expect(eventFailureDetail({detail:{error:`psn-lab contenant ${clearIdentity}`}})).not.toContain(clearIdentity);
   });
 
   it('C5 sorts History newest first and filters target or cause', () => {
@@ -182,5 +205,25 @@ describe('POLARIS Control shell', () => {
     expect((await screen.findAllByText(/Validation Control requise/)).length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: 'Ouvrir la gestion des UE' })).toBeTruthy();
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/scenarios/start'))).toBe(false);
+  });
+
+  it.each([
+    ['UE_NOT_STARTED', 'UE non démarré dans ce job'],
+    [`psn-lab contenant ${['001', '01', '0000000201'].join('')}`, 'L’API a refusé l’opération.'],
+  ])('C5b clicking Run shows a safe actionable refusal for %s', async (refusal, expected) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith('/scenario-definitions')) return { ok: true, json: async () => ({ items: [{ id: 'tpl-safe', name: 'Safe template', version: 1, loop_count: 1, steps: [], created_at_epoch_s: 1, updated_at_epoch_s: 1, catalog_scope: 'SYSTEM', mutable: false, cloneable: true, assigned_ues: 0, backend_support: 'SUPPORTED', executable: true, execution_block_reason: null, execution_message: null }], total: 1, schema_version: 1 }) };
+      if (path.endsWith('/ues')) return { ok: true, json: async () => ({ items: [{ id: 'UE-LAB', internal_ue_id: 'UE-SAFE', registration_state: 'DEREGISTERED', pdu_session: 'INACTIVE', ue_ip: null, traffic_state: 'IDLE', last_event: null, controller_owned: true, actions: { start: true, start_reason: 'READY', stop: false, pdu_start: false, pdu_stop: false, traffic: false, reason: 'READY' } }], configured_profiles: [], configured_count: 1, active_count: 0, registered_count: 0, source: 'test' }) };
+      if (path.endsWith('/scenarios/start') && init?.method === 'POST') return { ok: false, json: async () => ({ error: refusal }) };
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<MemoryRouter initialEntries={['/scenarios']}><Routes><Route path="/scenarios" element={<Scenarios/>}/></Routes></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Run Safe template' }));
+    fireEvent.click(await screen.findByRole('radio', { name: /UE-LAB/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le scénario' }));
+    expect(await screen.findByText(expected, { exact: false })).toBeTruthy();
+    expect(document.body.textContent).not.toContain(['001', '01', '0000000201'].join(''));
   });
 });

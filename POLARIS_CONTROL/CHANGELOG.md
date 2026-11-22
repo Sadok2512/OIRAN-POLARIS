@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.36.25 — 2026-11-22 — Refus C5 sans fuite et actions explicites
+
+- Reprise de la base C5 `c46360d` : un refus API ne restitue jamais un texte brut ; seul un code strictement conforme peut être affiché, et les préfixes `psn-` ne contournent pas l’inspection.
+- Les refus opérateur 5G (UE, scénarios, trafic UL/DL, PDU, IMS/voix, réconciliation, CPU, session, CSRF et permissions) ont un libellé français et une action corrective dédiée.
+- Les codes LTE, grant, migration ou import non encore dédiés utilisent uniquement le code assaini et une action générique ; aucun texte serveur libre n’est propagé.
+- Tous les boutons désactivés exposent visiblement un motif français avec `Action :`, sans transformation directe d’un motif serveur.
+- Les versions API, web et `apps/simulator-control` sont alignées sur 0.36.25.
+- OUVERT : les trois tests manuels `#[ignore]` (deux benchmarks de volume et un contrat MongoDB restauré) restent volontairement exclus des suites automatiques.
+
 ## 0.36.23 — 2026-11-21 — Ergonomie Control C5
 
 - Les modèles sont visibles par défaut, recherchables par nom ou identifiant, avec l'état réel du backend et un bouton Run direct.
