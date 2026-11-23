@@ -1211,6 +1211,27 @@ pub struct LiveDataset {
     /// l'AMF réattribue : la lecture les sert sous `s_tmsi_pseudonym`.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub s_tmsi_tokens: BTreeSet<String>,
+    /// 2.21.156 (ordre cœur #9 7105668821) — paires d'alias d'abonné
+    /// prouvées par un même message Diameter (AVP 1 + AVP 701), relevées
+    /// avant compaction. Purement ADDITIVES : absente, vide ou illisible,
+    /// la liste vaut vide et le parcours reste en sûreté (une session à
+    /// deux identités est ambiguë).
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        deserialize_with = "lenient_subscriber_alias_pairs"
+    )]
+    pub subscriber_alias_pairs: BTreeSet<(String, String)>,
+}
+
+/// 2.21.156 — une liste d'alias illisible ne fait pas échouer le manifeste
+/// et ne rouvre aucune fusion : elle vaut vide.
+fn lenient_subscriber_alias_pairs<'de, D>(deserializer: D) -> Result<BTreeSet<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// 2.21.154 — (dé)sérialisation de la découverte partagée : même JSON
@@ -2690,6 +2711,16 @@ impl CaptureManager {
         self.equipment_and_temporary_tokens(dataset_id).0
     }
 
+    /// 2.21.156 — paires d'alias d'abonné typées de tous les jeux publiés.
+    pub fn subscriber_alias_pairs(&self) -> BTreeSet<(String, String)> {
+        self.datasets
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|dataset| dataset.subscriber_alias_pairs.iter().cloned())
+            .collect()
+    }
+
     /// 2.21.155 — jetons d'IMEISV masqué et de 5G-S-TMSI connus pour un jeu.
     pub fn equipment_and_temporary_tokens(&self, dataset_id: &str) -> (BTreeSet<String>, BTreeSet<String>) {
         self.datasets
@@ -3166,6 +3197,7 @@ impl CaptureManager {
             callflow_reuse_keys: BTreeMap::new(),
             masked_imeisv_tokens: BTreeSet::new(),
             s_tmsi_tokens: BTreeSet::new(),
+            subscriber_alias_pairs: BTreeSet::new(),
         };
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
@@ -7618,6 +7650,7 @@ impl CaptureManager {
         let event_count = index.source_event_count;
         let masked_imeisv_tokens = index.masked_imeisv_tokens;
         let s_tmsi_tokens = index.s_tmsi_tokens;
+        let subscriber_alias_pairs = index.subscriber_alias_pairs;
         let mut events = index.events;
         // The legacy BTreeMap kept keys, tree nodes and freed allocation pages
         // resident through phase 07. Runs are gone at this point; return those
@@ -8337,6 +8370,7 @@ impl CaptureManager {
             callflow_reuse_keys,
             masked_imeisv_tokens,
             s_tmsi_tokens,
+            subscriber_alias_pairs,
         };
         trace_publication_rss(
             publication_started_epoch_ms,
@@ -16699,6 +16733,7 @@ mod tests {
                 callflow_reuse_keys: BTreeMap::new(),
             masked_imeisv_tokens: BTreeSet::new(),
             s_tmsi_tokens: BTreeSet::new(),
+            subscriber_alias_pairs: BTreeSet::new(),
             },
         );
         manager.jobs.lock().unwrap().insert(
@@ -18831,6 +18866,7 @@ Content-Length: 0\r\n\
             callflow_reuse_keys: BTreeMap::new(),
             masked_imeisv_tokens: BTreeSet::new(),
             s_tmsi_tokens: BTreeSet::new(),
+            subscriber_alias_pairs: BTreeSet::new(),
         };
         fs::write(source.join("dataset/oiran_events.jsonl"), b"").unwrap();
         fs::write(
@@ -24146,5 +24182,21 @@ Content-Length: 0\r\n\
         write_jsonl(&events_path, &lines);
         archive_stale_captures(&events_path, &archive_root, 5000).unwrap();
         assert_eq!(fs::read_dir(&archive_root).unwrap().count(), 1, "un segment d'archive");
+    }
+    /// 2.21.156 (ordre cœur #9 7105668821) — la liste d'alias du manifeste
+    /// est additive : absente ou illisible, le manifeste se lit et la liste
+    /// vaut vide ; présente, elle se relit telle quelle.
+    #[test]
+    fn an_absent_or_unreadable_alias_list_reads_as_empty_2_21_156() {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(default, deserialize_with = "lenient_subscriber_alias_pairs")]
+            subscriber_alias_pairs: BTreeSet<(String, String)>,
+        }
+        let read = |json: &str| serde_json::from_str::<Probe>(json).unwrap().subscriber_alias_pairs;
+        assert!(read("{}").is_empty());
+        assert!(read(r#"{"subscriber_alias_pairs": "illisible"}"#).is_empty());
+        assert!(read(r#"{"subscriber_alias_pairs": [["psn-a"]]}"#).is_empty());
+        assert_eq!(read(r#"{"subscriber_alias_pairs": [["psn-a","psn-b"]]}"#).len(), 1);
     }
 }

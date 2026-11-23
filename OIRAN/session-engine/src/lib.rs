@@ -1099,12 +1099,82 @@ pub struct StreamingRepresentativesIndex {
     /// relevés de même avant compaction. Identités TEMPORAIRES : la
     /// lecture les sert sous `s_tmsi_pseudonym`.
     pub s_tmsi_tokens: BTreeSet<String>,
+    /// 0.5.34 (POLARIS 2.21.156) — paires d'alias d'abonné prouvées par un
+    /// message Diameter (AVP 1 + AVP 701), relevées avant compaction.
+    pub subscriber_alias_pairs: BTreeSet<(String, String)>,
 }
 
 /// 0.5.31 (POLARIS 2.21.154) — ajoute à `out` les jetons `psn-…` portés
 /// par l'IE NGAP 34 (*Masked IMEISV*) d'un event, avant sa compaction.
 pub fn collect_masked_imeisv_tokens(event: &EventRecord, out: &mut BTreeSet<String>) {
     collect_ngap_ie_tokens(event, 34, out);
+}
+
+/// 0.5.34 (POLARIS 2.21.156, ordre cœur #9 7105668821) — LA SEULE preuve
+/// d'équivalence entre deux identités d'abonné : dans UN MÊME message
+/// Diameter, une AVP 1 (*User-Name*, sans vendeur : l'IMSI) et une AVP 701
+/// (*MSISDN*, vendeur 10415) — TS 29.272, données d'abonnement de cet IMSI.
+///
+/// Reconnaissance par contenu : le protocole de l'event, l'identifiant de
+/// l'IE (= code de l'AVP lu dans le message, `decoder-diameter::emit_avp`)
+/// et le jeton `psn-…` de sa valeur ; jamais par nom d'IE. Le vendeur
+/// n'est pas recopié dans l'IE : il est vérifié par le décodeur, qui
+/// n'émet un pseudonyme que pour les couples exacts `(1, aucun)` et
+/// `(701, 10415)` (`decoder-diameter::decode_avp`) ; garde :
+/// `only_user_name_without_vendor_and_msisdn_of_vendor_10415_carry_a_pseudonym_2_21_156`.
+///
+/// Exactement une valeur de chaque côté, distinctes ; sinon aucune paire
+/// (plusieurs AVP 1 différentes : rien n'est réuni). Une autre paire
+/// n'entre que par un lot, nommée.
+pub fn diameter_subscriber_alias_pair(protocol: &str, information_elements: &Value) -> Option<(String, String)> {
+    if !protocol.eq_ignore_ascii_case("DIAMETER") {
+        return None;
+    }
+    fn token(value: &str) -> Option<String> {
+        let start = value.find("psn-")?;
+        let token: String = value[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        (token.len() > 4).then_some(token)
+    }
+    fn walk(value: &Value, user_names: &mut BTreeSet<String>, msisdns: &mut BTreeSet<String>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| walk(item, user_names, msisdns)),
+            Value::Object(map) => {
+                let found = map.get("value").and_then(Value::as_str).and_then(token);
+                match (map.get("id").and_then(Value::as_u64), found) {
+                    (Some(1), Some(t)) => {
+                        user_names.insert(t);
+                    }
+                    (Some(701), Some(t)) => {
+                        msisdns.insert(t);
+                    }
+                    _ => {}
+                }
+                map.values().for_each(|item| walk(item, user_names, msisdns));
+            }
+            _ => {}
+        }
+    }
+    let (mut user_names, mut msisdns) = (BTreeSet::new(), BTreeSet::new());
+    walk(information_elements, &mut user_names, &mut msisdns);
+    if user_names.len() != 1 || msisdns.len() != 1 {
+        return None;
+    }
+    let user_name = user_names.into_iter().next()?;
+    let msisdn = msisdns.into_iter().next()?;
+    if user_name == msisdn {
+        return None;
+    }
+    Some(if user_name < msisdn { (user_name, msisdn) } else { (msisdn, user_name) })
+}
+
+/// 0.5.34 — relève la paire typée d'un event avant sa compaction.
+pub fn collect_subscriber_alias_pairs(event: &EventRecord, out: &mut BTreeSet<(String, String)>) {
+    if let Some(pair) = diameter_subscriber_alias_pair(&event.protocol, &event.information_elements) {
+        out.insert(pair);
+    }
 }
 
 /// 0.5.33 (POLARIS 2.21.155) — ajoute à `out` les jetons `psn-…` portés
@@ -1422,6 +1492,7 @@ where
     let mut retained_bytes = 0usize;
     let mut masked_imeisv_tokens = BTreeSet::<String>::new();
     let mut s_tmsi_tokens = BTreeSet::<String>::new();
+    let mut subscriber_alias_pairs = BTreeSet::<(String, String)>::new();
     let mut run_paths = Vec::<PathBuf>::new();
     let mut source_event_count = 0usize;
     let mut ordinal = 0u64;
@@ -1454,6 +1525,7 @@ where
             ordinal = ordinal.saturating_add(1);
             collect_masked_imeisv_tokens(&event, &mut masked_imeisv_tokens);
             collect_s_tmsi_tokens(&event, &mut s_tmsi_tokens);
+            collect_subscriber_alias_pairs(&event, &mut subscriber_alias_pairs);
             compact_publication_event(&mut event);
             let record = SpilledRepresentative {
                 key: publication_semantic_key(&event),
@@ -1551,6 +1623,7 @@ where
         source_event_count,
         masked_imeisv_tokens,
         s_tmsi_tokens,
+        subscriber_alias_pairs,
     })
 }
 
@@ -1610,6 +1683,7 @@ where
     let mut source_event_count = 0usize;
     let mut masked_imeisv_tokens = BTreeSet::<String>::new();
     let mut s_tmsi_tokens = BTreeSet::<String>::new();
+    let mut subscriber_alias_pairs = BTreeSet::<(String, String)>::new();
     for path in paths {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let reader = io::BufReader::new(file);
@@ -1626,6 +1700,7 @@ where
             source_event_count = source_event_count.saturating_add(1);
             collect_masked_imeisv_tokens(&event, &mut masked_imeisv_tokens);
             collect_s_tmsi_tokens(&event, &mut s_tmsi_tokens);
+            collect_subscriber_alias_pairs(&event, &mut subscriber_alias_pairs);
             compact_publication_event(&mut event);
             let key = publication_semantic_key(&event);
             // A shard list is the logical concatenation of its immutable
@@ -1646,6 +1721,7 @@ where
         source_event_count,
         masked_imeisv_tokens,
         s_tmsi_tokens,
+        subscriber_alias_pairs,
     })
 }
 
@@ -6909,5 +6985,47 @@ mod in_packet_order_tests {
         }
         let _ = std::fs::remove_dir_all(&directory);
         assert!(violations.is_empty(), "{}", violations.join(" ; "));
+    }
+}
+
+#[cfg(test)]
+mod subscriber_alias_pair_tests_0_5_34 {
+    use super::*;
+
+    const A: &str = "psn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "psn-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const M: &str = "psn-cccccccccccccccccccccccccccccccc";
+
+    fn ie(id: u64, token: &str) -> Value {
+        serde_json::json!({"id": id, "name": "identity_pseudonym", "value": format!("subscriber_pseudonym={token}")})
+    }
+
+    /// 2.21.156 — seule la paire AVP 1 + AVP 701 d'un même message
+    /// Diameter est une preuve ; deux AVP 1 différentes, un autre protocole
+    /// ou d'autres identifiants d'IE ne le sont pas.
+    #[test]
+    fn only_user_name_with_msisdn_in_one_diameter_message_is_an_alias_pair_2_21_156() {
+        let pair = diameter_subscriber_alias_pair("DIAMETER", &serde_json::json!([ie(1, A), ie(701, M)]));
+        assert_eq!(pair, Some((A.to_owned(), M.to_owned())));
+        assert_eq!(diameter_subscriber_alias_pair("Diameter", &serde_json::json!([ie(701, M), ie(1, A)])), pair);
+        assert_eq!(diameter_subscriber_alias_pair("DIAMETER", &serde_json::json!([ie(1, A), ie(1, B)])), None);
+        assert_eq!(diameter_subscriber_alias_pair("DIAMETER", &serde_json::json!([ie(1, A), ie(1, B), ie(701, M)])), None);
+        assert_eq!(diameter_subscriber_alias_pair("NGAP", &serde_json::json!([ie(1, A), ie(701, M)])), None);
+        assert_eq!(diameter_subscriber_alias_pair("DIAMETER", &serde_json::json!([ie(26, A), ie(701, M)])), None);
+        assert_eq!(diameter_subscriber_alias_pair("DIAMETER", &serde_json::json!([ie(1, A)])), None);
+        let mut out = BTreeSet::new();
+        let mut event: EventRecord = serde_json::from_value(serde_json::json!({
+            "event_id": "evt-1", "parent_event_id": null, "capture_id": "sha256:x", "capture_point_id": "",
+            "timestamp": "", "timestamp_ns": 0, "raw_ticks": 0, "interface": "S6a", "protocol": "DIAMETER",
+            "message_name": "Update-Location Answer", "source_address": "", "destination_address": "",
+            "source_participant": "", "destination_participant": "", "direction": "", "identifiers": [],
+            "information_elements": [ie(1, A), ie(701, M)], "decoding_status": "", "decoder_name": "",
+            "decoder_version": "", "raw_payload_reference": "", "packet_references": [], "errors": [],
+            "source_json": null
+        })).unwrap();
+        collect_subscriber_alias_pairs(&event, &mut out);
+        event.protocol = "SIP".into();
+        collect_subscriber_alias_pairs(&event, &mut out);
+        assert_eq!(out.len(), 1);
     }
 }

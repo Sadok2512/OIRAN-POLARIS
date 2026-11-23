@@ -3921,6 +3921,9 @@ fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::
     // simultanément (= OOM lab pour gros datasets, même profil que
     // /packets pré-2.21.21).
     let mut builder = subscriber_journey::JourneyIndex::builder();
+    // 2.21.156 (ordre cœur #9 7105668821) — paires d'alias typées relevées
+    // avant compaction ; additives : sans elles, le parcours reste en sûreté.
+    builder.add_alias_pairs(state.inner.capture_manager.subscriber_alias_pairs());
     stream_queryable_flows(state, |flow| {
         builder.observe(flow);
     });
@@ -4902,6 +4905,7 @@ async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuer
         // entrée, et comptées ici au lieu d'être silencieuses.
         page.0["meta"]["ambiguous_sessions"] = json!(index.ambiguous_sessions());
         page.0["meta"]["alias_groups_with_several_tokens"] = json!(index.alias_groups_with_several_tokens());
+        page.0["meta"]["alias_pairs_conflicting"] = json!(index.alias_pairs_conflicting());
         page
     })
     .await

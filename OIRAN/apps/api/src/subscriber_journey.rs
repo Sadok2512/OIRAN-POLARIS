@@ -79,10 +79,6 @@ struct SessionNode {
     /// Identités d'abonné de la session. Après `resolve` : les
     /// représentants de leurs groupes d'alias.
     subscribers: BTreeSet<String>,
-    /// 2.21.155 — jetons d'abonné portés ENSEMBLE par un même message hors
-    /// SIP : des alias du même abonné (IMSI et MSISDN d'une réponse
-    /// Diameter, SUCI et SUPI d'un échange).
-    aliases: Vec<BTreeSet<String>>,
     assignments: BTreeMap<String, Vec<CanonicalRef>>,
     presentations: BTreeMap<String, Vec<CanonicalRef>>,
 }
@@ -98,6 +94,9 @@ pub struct JourneyIndex {
     ambiguous_sessions: usize,
     /// 2.21.155 — groupes d'alias de plus d'un jeton (réunions faites).
     alias_groups_with_several_tokens: usize,
+    /// 2.21.156 — paires typées écartées parce qu'un de leurs jetons
+    /// figure dans une autre paire : aucune chaîne de réunions.
+    alias_pairs_conflicting: usize,
 }
 
 fn values_named(value: &Value, names: &[&str], out: &mut BTreeSet<String>) {
@@ -173,6 +172,10 @@ fn anchor(flow: &CallFlow) -> (String, u64) {
 #[derive(Debug, Default)]
 pub struct JourneyIndexBuilder {
     nodes: BTreeMap<String, SessionNode>,
+    /// 2.21.156 — paires d'alias typées (AVP 1 + AVP 701 d'un même message
+    /// Diameter) : lues dans les call flows non compactés et ajoutées depuis
+    /// le manifeste. Sans elles, aucune réunion.
+    alias_pairs: BTreeSet<(String, String)>,
 }
 
 impl JourneyIndexBuilder {
@@ -187,7 +190,6 @@ impl JourneyIndexBuilder {
                 procedures: flow.procedures.iter().map(|p| p.name.clone()).collect(),
             },
             subscribers: BTreeSet::new(),
-            aliases: Vec::new(),
             assignments: BTreeMap::new(),
             presentations: BTreeMap::new(),
         };
@@ -210,8 +212,14 @@ impl JourneyIndexBuilder {
             let mut in_event = BTreeSet::new();
             values_named(&event.decoded_ie_tree, SUBSCRIBER_NAMES, &mut in_event);
             in_event.retain(|token| !excluded.contains(token));
-            if in_event.len() > 1 {
-                node.aliases.push(in_event.clone());
+            // 2.21.156 (REFUS ANR1 #10 7105482150, ordre cœur #9
+            // 7105668821) — la présence de deux identités dans un même
+            // message n'est PAS une preuve : seule la paire typée AVP 1 +
+            // AVP 701 d'un message Diameter réunit. En 2.21.155, toute
+            // cooccurrence hors SIP réunissait, et une session portant deux
+            // abonnés réels était attribuée à l'un d'eux.
+            if let Some(pair) = session_engine::diameter_subscriber_alias_pair(&event.protocol, &event.decoded_ie_tree) {
+                self.alias_pairs.insert(pair);
             }
             node.subscribers.extend(in_event);
             let mut temporary = BTreeSet::new();
@@ -234,15 +242,24 @@ impl JourneyIndexBuilder {
         self.nodes.insert(flow.session_id.clone(), node);
     }
 
+    /// 2.21.156 — ajoute les paires typées relevées avant compaction
+    /// (`LiveDataset.subscriber_alias_pairs`). Additif : une liste vide
+    /// laisse le parcours en sûreté.
+    pub fn add_alias_pairs(&mut self, pairs: impl IntoIterator<Item = (String, String)>) {
+        self.alias_pairs.extend(pairs);
+    }
+
     pub fn finish(self) -> JourneyIndex {
+        let alias_pairs = self.alias_pairs;
         let mut index = JourneyIndex {
             nodes: self.nodes,
             sessions_by_subscriber: BTreeMap::new(),
             alias_of: BTreeMap::new(),
             ambiguous_sessions: 0,
             alias_groups_with_several_tokens: 0,
+            alias_pairs_conflicting: 0,
         };
-        index.resolve();
+        index.resolve(&alias_pairs);
         index
     }
 }
@@ -260,45 +277,28 @@ impl JourneyIndex {
         builder.finish()
     }
 
-    fn resolve(&mut self) {
-        // 2.21.155 — groupes d'alias : les jetons portés ensemble par un
-        // même message hors SIP désignent le même abonné. Le représentant
-        // d'un groupe est son plus petit jeton.
-        let mut parent: BTreeMap<String, String> = BTreeMap::new();
-        fn find(parent: &mut BTreeMap<String, String>, token: &str) -> String {
-            let mut root = token.to_owned();
-            while let Some(next) = parent.get(&root).filter(|next| **next != root).cloned() {
-                root = next;
-            }
-            parent.insert(token.to_owned(), root.clone());
-            root
+    fn resolve(&mut self, alias_pairs: &BTreeSet<(String, String)>) {
+        // 2.21.156 (ordre cœur #9 7105668821) — SÛRETÉ PAR DÉFAUT : chaque
+        // jeton est son propre représentant. Seule une paire typée (AVP 1 +
+        // AVP 701 d'un même message Diameter) réunit deux jetons, et
+        // seulement si aucun des deux ne figure dans une autre paire : un
+        // groupe compte au plus deux jetons, aucune chaîne. Le représentant
+        // est le plus petit jeton de la paire.
+        let mut uses: BTreeMap<&str, usize> = BTreeMap::new();
+        for (a, b) in alias_pairs {
+            *uses.entry(a.as_str()).or_default() += 1;
+            *uses.entry(b.as_str()).or_default() += 1;
         }
-        for node in self.nodes.values() {
-            for token in &node.subscribers {
-                parent.entry(token.clone()).or_insert_with(|| token.clone());
-            }
-        }
-        for node in self.nodes.values() {
-            for group in &node.aliases {
-                let mut tokens = group.iter();
-                let Some(first) = tokens.next() else { continue };
-                for other in tokens {
-                    let (a, b) = (find(&mut parent, first), find(&mut parent, other));
-                    if a != b {
-                        let (low, high) = if a < b { (a, b) } else { (b, a) };
-                        parent.insert(high, low);
-                    }
-                }
+        for (a, b) in alias_pairs {
+            if uses.get(a.as_str()) == Some(&1) && uses.get(b.as_str()) == Some(&1) {
+                let (low, high) = if a < b { (a, b) } else { (b, a) };
+                self.alias_of.insert(high.clone(), low.clone());
+                self.alias_of.insert(low.clone(), low.clone());
+                self.alias_groups_with_several_tokens += 1;
+            } else {
+                self.alias_pairs_conflicting += 1;
             }
         }
-        let tokens: Vec<String> = parent.keys().cloned().collect();
-        let mut group_sizes: BTreeMap<String, usize> = BTreeMap::new();
-        for token in tokens {
-            let root = find(&mut parent, &token);
-            *group_sizes.entry(root.clone()).or_default() += 1;
-            self.alias_of.insert(token, root);
-        }
-        self.alias_groups_with_several_tokens = group_sizes.values().filter(|size| **size > 1).count();
         // Une session appartient à un abonné si toutes ses identités sont
         // des alias de ce seul abonné ; sinon elle est ambiguë : rangée
         // sous aucun, et comptée (2.21.155, ordre cœur #9 7102937368).
@@ -391,6 +391,11 @@ impl JourneyIndex {
     /// 2.21.155 — groupes d'alias de plus d'un jeton.
     pub fn alias_groups_with_several_tokens(&self) -> usize {
         self.alias_groups_with_several_tokens
+    }
+
+    /// 2.21.156 — paires typées écartées faute d'être exclusives.
+    pub fn alias_pairs_conflicting(&self) -> usize {
+        self.alias_pairs_conflicting
     }
 
     /// 2.21.155 — représentant du groupe d'alias d'un jeton d'abonné.
@@ -900,15 +905,19 @@ mod journey_identity_tests_2_21_155 {
         assert!(index.sessions(IMSI_B).is_empty());
     }
 
-    /// Test 5 : IMSI et MSISDN d'un même abonné, portés ensemble par un
-    /// message Diameter, sont des alias. Une autre session ne porte que le
-    /// MSISDN. Une seule entrée, deux sessions, toutes deux décorées. Avant :
-    /// deux entrées, et la première session sans décoration.
+    fn avp(code: u64, value: &str) -> Value {
+        serde_json::json!({"id": code, "name": "identity_pseudonym", "value": format!("subscriber_pseudonym={value}")})
+    }
+
+    /// 2.21.156 (ordre cœur #9 7105668821) — IMSI (AVP 1) et MSISDN (AVP
+    /// 701) d'un même message Diameter : la seule preuve typée. Une autre
+    /// session ne porte que le MSISDN. Une seule entrée, deux sessions,
+    /// toutes deux décorées ; on la retrouve par l'un ou l'autre jeton.
     #[test]
-    fn imsi_and_msisdn_carried_together_are_one_subscriber_2_21_155() {
+    fn user_name_and_msisdn_of_one_diameter_message_are_one_subscriber_2_21_156() {
         let attach = flow(
             "lte-session-1",
-            &[("DIAMETER", serde_json::json!([id("subscriber_pseudonym", IMSI_A), id("subscriber_pseudonym", MSISDN_A)]))],
+            &[("DIAMETER", serde_json::json!([avp(1, IMSI_A), avp(701, MSISDN_A), id("subscriber_pseudonym", IMSI_A), id("subscriber_pseudonym", MSISDN_A)]))],
         );
         let later = flow("lte-session-2", &[("DIAMETER", serde_json::json!([id("subscriber_pseudonym", MSISDN_A)]))]);
         let index = JourneyIndex::from_flows([&attach, &later]);
@@ -919,6 +928,96 @@ mod journey_identity_tests_2_21_155 {
         assert_eq!(index.sessions(MSISDN_A).len(), 2, "ou par le MSISDN");
         assert_eq!(index.ambiguous_sessions(), 0);
         assert_eq!(index.alias_groups_with_several_tokens(), 1);
+    }
+
+    /// 2.21.156 — contre-test d'ANR1 (#10 7105482150,
+    /// `anr1_non_sip_message_with_two_distinct_subscribers_must_not_alias_them`),
+    /// permanent : un même message NGAP, hors SIP, porte deux abonnés
+    /// distincts. Sur 2.21.155 : la session était attribuée à A. Attendu :
+    /// ambiguë, rangée sous aucun.
+    #[test]
+    fn anr1_non_sip_message_with_two_distinct_subscribers_must_not_alias_them_2_21_156() {
+        let mixed = flow(
+            "5g-session-mixte",
+            &[("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_A), id("subscriber_pseudonym", IMSI_B)]))],
+        );
+        let a = flow("5g-session-ue-a", &[("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_A)]))]);
+        let b = flow("5g-session-ue-b", &[("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_B)]))]);
+        let index = JourneyIndex::from_flows([&mixed, &a, &b]);
+        assert_eq!(index.subscriber_for_session("5g-session-mixte"), None);
+        assert_eq!(index.ambiguous_sessions(), 1);
+        assert_eq!(index.subscribers().len(), 2);
+        assert_eq!(index.sessions(IMSI_A).len(), 1);
+        assert_eq!(index.sessions(IMSI_B).len(), 1);
+        assert_eq!(index.alias_groups_with_several_tokens(), 0);
+    }
+
+    /// 2.21.156 — deux AVP 1 différentes dans un même message Diameter :
+    /// aucune preuve, aucune réunion, session ambiguë.
+    #[test]
+    fn two_different_user_names_in_one_diameter_message_stay_apart_2_21_156() {
+        let mixed = flow(
+            "lte-session-mixte",
+            &[("DIAMETER", serde_json::json!([avp(1, IMSI_A), avp(1, IMSI_B), avp(701, MSISDN_A), id("subscriber_pseudonym", IMSI_A), id("subscriber_pseudonym", IMSI_B)]))],
+        );
+        let index = JourneyIndex::from_flows([&mixed]);
+        assert_eq!(index.subscriber_for_session("lte-session-mixte"), None);
+        assert_eq!(index.ambiguous_sessions(), 1);
+        assert_eq!(index.alias_groups_with_several_tokens(), 0);
+    }
+
+    /// 2.21.156 — liste d'alias vide ou absente (call flows compactés, sans
+    /// IE Diameter, manifeste sans paires) : la session qui porte IMSI et
+    /// MSISDN est ambiguë, jamais attribuée. La même paire fournie par le
+    /// manifeste la rattache. Une paire en conflit (un jeton dans deux
+    /// paires) ne réunit rien.
+    #[test]
+    fn without_a_typed_pair_a_mixed_session_is_ambiguous_and_the_manifest_pair_is_additive_2_21_156() {
+        let compacted = || {
+            flow(
+                "lte-session-1",
+                &[
+                    ("DIAMETER", serde_json::json!([id("subscriber_pseudonym", IMSI_A)])),
+                    ("DIAMETER", serde_json::json!([id("subscriber_pseudonym", MSISDN_A)])),
+                ],
+            )
+        };
+        let without = JourneyIndex::from_flows([&compacted()]);
+        assert_eq!(without.subscriber_for_session("lte-session-1"), None);
+        assert_eq!(without.ambiguous_sessions(), 1);
+        let mut builder = JourneyIndex::builder();
+        builder.add_alias_pairs(Vec::new());
+        builder.observe(&compacted());
+        assert_eq!(builder.finish().ambiguous_sessions(), 1, "liste vide : sûreté");
+        let mut builder = JourneyIndex::builder();
+        builder.add_alias_pairs([(IMSI_A.to_owned(), MSISDN_A.to_owned())]);
+        builder.observe(&compacted());
+        let with = builder.finish();
+        assert_eq!(with.subscriber_for_session("lte-session-1"), Some(IMSI_A));
+        assert_eq!(with.ambiguous_sessions(), 0);
+        let mut builder = JourneyIndex::builder();
+        builder.add_alias_pairs([(IMSI_A.to_owned(), MSISDN_A.to_owned()), (IMSI_B.to_owned(), MSISDN_A.to_owned())]);
+        builder.observe(&compacted());
+        let conflicting = builder.finish();
+        assert_eq!(conflicting.subscriber_for_session("lte-session-1"), None);
+        assert_eq!(conflicting.alias_pairs_conflicting(), 2);
+        assert_eq!(conflicting.alias_groups_with_several_tokens(), 0);
+    }
+
+    /// 2.21.156 — cas légitime toujours vert : un abonné change de S-TMSI.
+    /// La session 1 porte son IMSI et l'attribution de T ; la session 2 ne
+    /// présente que T. Un abonné, deux sessions ; un second UE reste à part.
+    #[test]
+    fn a_subscriber_changing_tmsi_stays_one_subscriber_with_two_sessions_2_21_156() {
+        let mut first = flow("5g-session-1", &[("NAS-5GMM", serde_json::json!([id("subscriber_pseudonym", IMSI_A), id("guti_pseudonym", TMSI)]))]);
+        first.events[0].message_name = "Registration Accept".into();
+        let mut second = flow("5g-session-2", &[("NAS-5GMM", serde_json::json!([id("guti_pseudonym", TMSI)]))]);
+        second.events[0].message_name = "Service Request".into();
+        let other = flow("5g-session-ue-b", &[("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_B)]))]);
+        let index = JourneyIndex::from_flows([&first, &second, &other]);
+        assert_eq!(index.sessions(IMSI_A).len(), 2);
+        assert_eq!(index.sessions(IMSI_B).len(), 1);
+        assert_eq!(index.ambiguous_sessions(), 0);
     }
 
     /// Test 4 : non-régression sur la capture du banc lab à cinq abonnés,

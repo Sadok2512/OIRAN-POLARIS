@@ -1,5 +1,49 @@
 # Changelog
 
+## oiran-api 2.21.156, live-probe 0.6.41, session-engine 0.5.34, decoder-diameter 0.2.8 — 2026-11-23 — alias d'abonné : une seule preuve typée, la sûreté par défaut
+
+Upgrade **patch**, sans déploiement. Au-dessus de 2.21.155 @ `8a9cebc` (base `0fe302e`, en prod), branche `fix/oiran-2.21.156-typed-subscriber-alias`.
+- REFUS d'ANR1 sur 2.21.155 : #10 7105482150.
+- Proposition : #9 7105570938.
+- GO du cœur : #9 7105668821.
+
+**Défaut de 2.21.155** (reproduit par ANR1) : deux identités portées par un même message hors SIP devenaient des alias. Une session qui portait deux vrais abonnés distincts était attribuée à l'un d'eux au lieu d'être ambiguë.
+
+**Correctif** :
+- **Sûreté par défaut** : chaque jeton d'abonné est son propre représentant. Une session à deux identités distinctes est ambiguë : rangée sous aucune entrée, comptée dans `meta.ambiguous_sessions`. Ce comportement ne dépend d'aucune liste.
+- **Une seule preuve d'équivalence** : une AVP 1 (User-Name, sans vendeur) et une AVP 701 (MSISDN, vendeur 10415), dans un même message Diameter, avec exactement une valeur de chaque côté.
+  - La reconnaissance se fait par contenu : protocole, identifiant de l'IE (le code de l'AVP lu dans le message) et jeton `psn-…`, jamais par nom d'IE.
+  - Le vendeur n'est pas recopié dans l'IE. C'est le décodeur qui le vérifie : il n'émet de pseudonyme que pour les couples exacts (1, sans vendeur) et (701, 10415). Le test de garde est dans `decoder-diameter`.
+- **Relevé avant compaction** dans la passe des représentants (`collect_subscriber_alias_pairs`), rangé au manifeste (`LiveDataset.subscriber_alias_pairs`), puis ajouté au parcours (`JourneyIndexBuilder::add_alias_pairs`).
+  - Les paires sont **additives**. Une liste absente, vide ou illisible vaut vide : le manifeste se lit quand même, et aucune fusion n'est rouverte.
+  - Les paires d'un call flow non compacté sont lues de la même façon.
+- **Aucune chaîne de réunions** : une paire dont un jeton figure dans une autre paire est écartée, et comptée dans `meta.alias_pairs_conflicting`.
+- `meta.ambiguous_sessions` et `meta.alias_groups_with_several_tokens` restent servis.
+- **Conservé de 2.21.155** : l'exclusion du SIP, la 5G-S-TMSI servie comme identité temporaire, la rétention sans archive sur option.
+
+**Données déjà publiées** : leur manifeste n'a pas encore de paires. Jusqu'à la publication suivante, une session LTE qui porte IMSI et MSISDN y est ambiguë, jamais mélangée.
+
+Une ligne par composant :
+- **oiran-api 2.21.156** : le parcours n'admet que des paires typées ; nouveau compteur `meta.alias_pairs_conflicting`.
+- **live-probe 0.6.41** : `LiveDataset.subscriber_alias_pairs`, avec un lecteur tolérant ; `CaptureManager::subscriber_alias_pairs`.
+- **session-engine 0.5.34** : `diameter_subscriber_alias_pair`, `collect_subscriber_alias_pairs`, et le champ d'index `subscriber_alias_pairs`.
+- **decoder-diameter 0.2.8** : ajout d'un test de garde, code inchangé.
+
+Tests permanents :
+
+| Test | Sur 2.21.155 `8a9cebc` | Sur 2.21.156 |
+|---|---|---|
+| `anr1_non_sip_message_with_two_distinct_subscribers_must_not_alias_them_2_21_156` | **échoue** : `Some(A)` au lieu de `None` | passe |
+| `two_different_user_names_in_one_diameter_message_stay_apart_2_21_156` | **échoue** : `Some(A)` au lieu de `None` | passe |
+| `user_name_and_msisdn_of_one_diameter_message_are_one_subscriber_2_21_156` | passe (cas légitime) | passe |
+| `a_subscriber_changing_tmsi_stays_one_subscriber_with_two_sessions_2_21_156` | passe (cas légitime) | passe |
+| `without_a_typed_pair_a_mixed_session_is_ambiguous_and_the_manifest_pair_is_additive_2_21_156` | n'existe pas en 2.21.155 (`add_alias_pairs`) | passe |
+| `an_absent_or_unreadable_alias_list_reads_as_empty_2_21_156` (live-probe) | sans objet | passe |
+| `only_user_name_with_msisdn_in_one_diameter_message_is_an_alias_pair_2_21_156` (session-engine) | sans objet | passe |
+| `only_user_name_without_vendor_and_msisdn_of_vendor_10415_carry_a_pseudonym_2_21_156` (decoder-diameter) | sans objet | passe |
+
+La preuve « avant » a été rejouée dans un arbre séparé, retiré ensuite. Patch : `~/oiran-polaris-archives/2.21.156-preuve-echec-avant-sur-8a9cebc.patch`.
+
 ## oiran-api 2.21.155, live-probe 0.6.40, session-engine 0.5.33, callflow-schema 1.5.3 — 2026-11-23 — un abonné n'est plus servi avec les sessions d'un autre
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.154 @ `0fe302e` (en prod), branche `fix/oiran-2.21.155-journey-identities`. Deux sujets. Ordre du cœur #9 7102937368. Audit #9 7102975186, corrigé par 7102995729.

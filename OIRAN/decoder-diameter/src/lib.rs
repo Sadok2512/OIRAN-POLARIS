@@ -894,6 +894,32 @@ mod tests {
         }
     }
 
+    /// POLARIS 2.21.156 (ordre cœur #9 7105668821) — garde du relevé
+    /// d'alias typé (`session_engine::diameter_subscriber_alias_pair`) :
+    /// celui-ci reconnaît l'AVP par son code (identifiant de l'IE) et le
+    /// jeton `psn-…` de sa valeur, le vendeur n'étant pas recopié dans
+    /// l'IE. Ce test garantit que seuls les couples exacts (1, aucun
+    /// vendeur) et (701, vendeur 10415) portent un pseudonyme : une AVP 701
+    /// d'un autre vendeur, ou une AVP 1 avec vendeur, n'en porte aucun.
+    #[test]
+    fn only_user_name_without_vendor_and_msisdn_of_vendor_10415_carry_a_pseudonym_2_21_156() {
+        let digits = b"001010000000012";
+        let psn_ids = |body: Vec<u8>| -> Vec<u16> {
+            let bytes = message(316, false, 16777251, &body);
+            let (p, t) = fixtures();
+            let key = PseudonymKey::from_bytes([0xbb; 32]);
+            let out = DiameterDecoder.decode(&input(&bytes, &p, &t, &key, "HSS", "MME"));
+            out.events[0]
+                .information_elements
+                .iter()
+                .filter(|ie| ie.value.as_deref().is_some_and(|v| v.contains("psn-")))
+                .filter_map(|ie| ie.id)
+                .collect()
+        };
+        assert_eq!(psn_ids([avp(1, None, 0x40, digits), avp(701, Some(10415), 0xc0, digits)].concat()), vec![1, 701]);
+        assert!(psn_ids([avp(1, Some(10415), 0x40, digits), avp(701, Some(9), 0xc0, digits), avp(701, None, 0x40, digits)].concat()).is_empty());
+    }
+
     #[test]
     fn ulr_flags_user_name_as_pseudonymised_identity() {
         // Synthetic BCD-style User-Name (IMSI-form), not a real identity.
