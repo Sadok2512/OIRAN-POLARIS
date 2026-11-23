@@ -1484,6 +1484,19 @@ fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
         .map(|flow| (dataset_id, flow))
 }
 
+/// 2.21.154 — l'index des parcours abonné pour une requête de DÉTAIL :
+/// celui du cache, sans calculer la signature (qui liste tous les jeux et
+/// lit la date de chaque call flow) et sans jamais le reconstruire ici.
+/// `None` tant qu'aucun index n'a été construit.
+fn journey_index_for_detail(state: &AppState) -> Option<std::sync::Arc<subscriber_journey::JourneyIndex>> {
+    state
+        .inner
+        .journey_index_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().map(|(_, index)| index.clone()))
+}
+
 /// 2.21.13 — calcul des compteurs de `/health` (lourd : relit les
 /// callflows de chaque session). Exécuté UNIQUEMENT en `spawn_blocking`.
 fn compute_health_counters(state: &AppState) -> Value {
@@ -6946,8 +6959,8 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
 }
 
 fn session_blocking(state: &AppState, id: &str) -> Response {
-    let journey_index = cached_journey_index(state);
     if let Some(flow) = flow_for(state, id) {
+        let journey_index = cached_journey_index(state);
         let mut summary = session_summary(state, flow);
         decorate_subscriber_summary(&mut summary, flow, &journey_index);
         return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
@@ -6959,6 +6972,16 @@ fn session_blocking(state: &AppState, id: &str) -> Response {
             .dataset(&dataset_id)
             .expect("live flow dataset remains registered");
         let mut summary = live_session_summary(&dataset, &flow);
+        // 2.21.154 (ordre cœur #9 7097032838, point 3) — l'index des
+        // parcours abonné n'est plus reconstruit pendant la requête dès
+        // qu'il en existe un : la reconstruction relit TOUS les call flows
+        // publiés (3,6 s pour 310 sessions dans le test du lot, en debug).
+        // Celui du cache sert, quelle que soit sa génération ; le
+        // préchauffage le reconstruit après chaque publication. Les champs
+        // servis sont les mêmes ; leurs valeurs peuvent avoir une
+        // génération de retard jusqu'à la fin du préchauffage. Sans aucun
+        // index encore construit (démarrage), il est construit comme avant.
+        let journey_index = journey_index_for_detail(state).unwrap_or_else(|| cached_journey_index(state));
         decorate_subscriber_summary(&mut summary, &flow, &journey_index);
         return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
@@ -10112,6 +10135,142 @@ mod tests {
     /// a continuous manifest on disk, lets `recover_continuous_dataset_from_disk`
     /// rehydrate it, adds a DIFFERENT recovered dataset in RAM, and
     /// asserts /health still reflects exactly the continuous manifest.
+    /// 2.21.154 (ordre cœur #9 7097032838) — les trois routes de détail
+    /// d'une session répondent PENDANT une publication simulée, sur un jeu
+    /// de la taille du lab (310 sessions, 700 000 identifiants d'events hors
+    /// session dans la découverte). La publication est simulée comme elle
+    /// pèse sur le verrou de la table des jeux : son préchauffage, et les
+    /// listes que l'interface rafraîchit, appellent `datasets()` sans
+    /// arrêt ; trois fils le font en boucle pendant la mesure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_detail_routes_answer_during_a_simulated_publication_2_21_154() {
+        use live_probe::{CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::fs;
+        use std::io::Write as _;
+        const SESSIONS: usize = 310;
+        const BACKGROUND_IDS: usize = 700_000;
+        const BOUND: std::time::Duration = std::time::Duration::from_millis(1500);
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let mut config = test_config(workspace, "operational-detail-lock-2-21-154");
+        config.reference_dataset_enabled = false;
+        let capture_root = temporary_directory("detail-lock-2-21-154");
+        config.capture_root = capture_root.clone();
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(dataset_dir.join("callflows")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let mut flow: Value =
+            serde_json::from_slice(&fs::read(workspace.join("OIRAN_5G_E2E_CALLFLOW.json")).unwrap()).unwrap();
+        let session_ids: Vec<String> = (0..SESSIONS).map(|i| format!("5g-session-bench{i:011}")).collect();
+        for id in &session_ids {
+            flow["session_id"] = Value::from(id.clone());
+            fs::write(dataset_dir.join("callflows").join(format!("{id}.json")), serde_json::to_vec(&flow).unwrap()).unwrap();
+            fs::write(dataset_dir.join("callflows").join(format!("{id}.html")), b"<html></html>").unwrap();
+        }
+        let mut events = std::io::BufWriter::new(fs::File::create(dataset_dir.join("oiran_events.jsonl")).unwrap());
+        for i in 0..8usize {
+            writeln!(events, "{}", serde_json::json!({
+                "event_id": format!("evt-{i:04}"), "capture_id": "sha256:stub", "capture_point_id": "N2",
+                "interface": "N2", "protocol": "NGAP", "message_name": "InitialUEMessage",
+                "decoding_status": "DECODED", "decoder_name": "stub", "decoder_version": "0",
+                "raw_payload_reference": "sha256:stub", "direction": "RAN_TO_CORE",
+                "source_endpoint": {"address": "10.0.0.1", "network_function": "gNB"},
+                "destination_endpoint": {"address": "10.0.0.2", "network_function": "AMF"},
+                "session_identifiers": [], "information_elements": [],
+                "packet_references": [{"source_file": "/captures/CONT/N2.pcapng", "packet_number": (i + 1) as u64,
+                    "byte_offset": 0, "interface_id": 0, "captured_length": 10, "original_length": 10}],
+                "errors": [],
+                "timestamp": {"seconds": 1_792_872_462_i64 + i as i64, "nanoseconds": 0_u64,
+                    "raw_ticks": 1_792_872_462_000_000_000_u64, "resolution_base": 10, "resolution_exponent": 9,
+                    "display": "1792872462.000000000Z"}
+            })).unwrap();
+        }
+        drop(events);
+        let manifest = serde_json::json!({
+            "dataset_id": CONTINUOUS_DATASET_ID, "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
+            "event_count": 8, "session_ids": session_ids, "decode_reports": {}, "checksums": {},
+            "state": "PUBLISHED",
+            "discovery": {
+                "ue_contexts": [], "pfcp_sessions": [], "gtpu_tunnels": [], "procedures": [],
+                "pdu_sessions": session_ids.iter().map(|id| serde_json::json!({
+                    "session_id": id, "ue_context_id": "uectx-bench", "pdu_session_id": "1", "dnn": null, "snssai": null,
+                    "state": "ESTABLISHED", "establishment_timestamp_ns": 0, "release_timestamp_ns": null,
+                    "interfaces": ["N2"], "correlation_status": "CORRELATED", "event_ids": []
+                })).collect::<Vec<_>>(),
+                "background_event_ids": (0..BACKGROUND_IDS).map(|i| format!("evt-{i:016x}")).collect::<Vec<_>>(),
+                "unmatched_event_ids": [], "duplicate_observations": [], "event_accounting": {}
+            },
+            "capture_started_epoch_ms": null, "last_packet_epoch_ms": null, "fresh_packet_count": 0,
+            "active_ue_ips": [], "active_pdu_contexts": [],
+        });
+        fs::write(dataset_dir.join("dataset_manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let state = AppState::load(config).unwrap();
+        state.inner.capture_manager.recover_continuous_dataset_from_disk(&base).expect("hydrate");
+        // Publication simulée : trois fils listent les jeux sans arrêt.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammers: Vec<_> = (0..3)
+            .map(|_| {
+                let state = state.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut calls = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = state.inner.capture_manager.datasets();
+                        calls += 1;
+                    }
+                    calls
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let app = router(state.clone(), None);
+        let target = &session_ids[SESSIONS / 2];
+        let mut measured = Vec::new();
+        // Démarrage : un premier index des parcours, comme le préchauffage
+        // le construit (hors mesure).
+        let _ = cached_journey_index(&state);
+        for round in 0..3 {
+            for route in [format!("/api/v1/sessions/{target}"), format!("/api/v1/sessions/{target}/events"), format!("/api/v1/sessions/{target}/procedures")] {
+                let started = std::time::Instant::now();
+                let response = app.clone().oneshot(req(&route, false)).await.unwrap();
+                let elapsed = started.elapsed();
+                let status = response.status();
+                println!("DETAIL_LOCK round={round} route={route} status={status} elapsed_ms={}", elapsed.as_millis());
+                assert_eq!(status, StatusCode::OK, "{route}");
+                measured.push((route, elapsed));
+            }
+        }
+        // L'écran de détail appelle six routes EN PARALLÈLE (hypothèse du
+        // cœur #9 7097237993) : on mesure la plus lente.
+        let parallel_started = std::time::Instant::now();
+        let six = ["", "/events", "/procedures", "/callflow", "/correlations", "/identities"].map(|suffix| {
+            let app = app.clone();
+            let route = format!("/api/v1/sessions/{target}{suffix}");
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let status = app.oneshot(req(&route, false)).await.unwrap().status();
+                (route, status, started.elapsed())
+            })
+        });
+        for handle in six {
+            let (route, status, elapsed) = handle.await.unwrap();
+            println!("DETAIL_LOCK parallel route={route} status={status} elapsed_ms={}", elapsed.as_millis());
+            measured.push((format!("parallèle {route}"), elapsed));
+        }
+        println!("DETAIL_LOCK parallel_total_ms={}", parallel_started.elapsed().as_millis());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let calls: usize = hammers.into_iter().map(|hammer| hammer.join().unwrap()).sum();
+        println!("DETAIL_LOCK listings_pendant_la_mesure={calls}");
+        assert!(calls > 0, "la publication simulée a bien tourné");
+        let over: Vec<String> = measured
+            .iter()
+            .filter(|(_, elapsed)| *elapsed > BOUND)
+            .map(|(route, elapsed)| format!("{route} : {} ms", elapsed.as_millis()))
+            .collect();
+        assert!(over.is_empty(), "au-delà de {} ms pendant la publication simulée : {}", BOUND.as_millis(), over.join(" ; "));
+    }
+
     #[tokio::test]
     async fn health_published_counters_mirror_the_continuous_manifest_exclusively() {
         use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};

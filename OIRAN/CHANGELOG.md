@@ -28,6 +28,30 @@ Tests :
 - `listing_datasets_holds_the_lock_for_a_bounded_time_on_a_lab_sized_dataset_2_21_154` (live-probe) : borne de 50 ms. Avant : 181 ms, **échec**.
 - `shared_discovery_serializes_like_the_plain_one_2_21_154` (live-probe) : même JSON, découverte absente ou nulle comprise.
 
+### Sujet 2 — `/sessions/:id` ne reconstruit plus l'index des parcours pendant la requête
+
+**Lu** : `/sessions/:id` appelait `cached_journey_index`, qui reconstruit l'index des parcours abonné dès que la signature des call flows change, c'est-à-dire à chaque publication. La reconstruction relit **tous** les call flows publiés, pendant la requête.
+
+**Correctif** : dès qu'un index existe, celui du cache sert, quelle que soit sa génération ; le préchauffage le reconstruit après chaque publication. **Mêmes champs servis** ; leurs valeurs peuvent avoir une génération de retard jusqu'à la fin du préchauffage. Au démarrage, sans index, il est construit comme avant. Aucune autre route ne change de contrat de sortie.
+
+Mesures, pendant une publication simulée (trois fils appellent `datasets()` sans arrêt, comme le préchauffage et les listes rafraîchies par l'interface), sujets 1 et 2 appliqués :
+
+| Route | Avant (3 essais) | Après (3 essais) |
+|---|---|---|
+| `/sessions/:id` | 4 871 / **18 998** / 1 870 ms | 11 / 10 / 17 ms |
+| `/sessions/:id/events` | 1 785 / 1 036 / 1 148 ms | 107 / 83 / 90 ms |
+| `/sessions/:id/procedures` | 1 158 / 691 / 710 ms | 12 / 13 / 12 ms |
+| Six routes de l'écran en parallèle, la plus lente | 3 202 ms | 275 ms |
+
+Sans le sujet 2, le premier `/sessions/:id` restait à 3 612 ms (sujet 1 seul).
+
+Test : `session_detail_routes_answer_during_a_simulated_publication_2_21_154` (oiran-api) — borne de 1 500 ms par route pendant la publication simulée, six routes en parallèle comprises. Avant : jusqu'à 18 998 ms, **échec**.
+
+OUVERT des sujets 1 et 2 :
+- `/sessions/:id/identities` répond 403 dans le test (route authentifiée, appelée sans jeton) : son temps n'est pas mesuré.
+- Aucun délai côté serveur ; le client p900 abandonne seul à 30 s.
+- Index PFCP : au premier `/events` après un démarrage, il relit tous les fragments sous un verrou global. Lu, non traité (patch mis de côté, `~/oiran-polaris-archives/2.21.154-detail-routes-suspendu-sur-7ccf7cb.patch`).
+
 ## oiran-api 2.21.151, session-engine 0.5.30 — 2026-11-22 — passe des représentants : le plafond borne la mémoire réellement allouée
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.150 @ `44ddb5b` (branche `fix/oiran-2.21.151-run-cap-real-bytes`). Relecture indépendante d'ANR1 (#10 7087035661) : **FAIL sur 2.21.150**.
