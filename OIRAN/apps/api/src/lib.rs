@@ -16032,6 +16032,134 @@ mod tests {
         (status, json_body(response).await)
     }
 
+    /// 2.21.160 — ouvre une trace par le routeur réel et rend le corps.
+    async fn open_trace_2_21_160(app: &Router, key_type: &str, value: &str) -> Value {
+        json_body(
+            app.clone()
+                .oneshot(live_trace_request_2_21_139(
+                    "/api/v1/live/traces",
+                    "POST",
+                    json!({"key_type": key_type, "value": value, "duration_s": 600, "interfaces": []}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// 2.21.160 — le run réel du banc à cinq abonnés, où le pseudonyme d'un
+    /// abonné est remplacé par `target` : la forme exacte qu'aurait le run
+    /// d'un abonné dont le pseudonyme est `target`.
+    fn run_carrying_2_21_160(state: &AppState, target: &str) -> Vec<event_schema::NormalizedEvent> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let (mut events, subscriber) = five_subscribers_events_2_21_142(state, now + 5);
+        for event in &mut events {
+            for id in &mut event.session_identifiers {
+                if id.value == subscriber {
+                    id.value = target.to_owned();
+                }
+            }
+            for ie in &mut event.information_elements {
+                if let Some(value) = ie.value.as_mut() {
+                    *value = value.replace(&subscriber, target);
+                }
+            }
+        }
+        events
+    }
+
+    async fn messages_of_2_21_160(app: &Router, trace_id: &str) -> u64 {
+        let (_, list) = get_json_2_21_142(app, "/api/v1/live/traces").await;
+        list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["trace_id"] == trace_id)
+            .and_then(|t| t["messages"].as_u64())
+            .unwrap()
+    }
+
+    /// 2.21.160 (GO cœur #9 7116694153, audit #9 7116428144, FAIL T1 #10
+    /// 7116326688) — voûte qui ne connaît pas l'IMSI : la trace IMSI porte le
+    /// pseudonyme DÉRIVÉ avec la clé du `capture_manager` (celle des
+    /// décodeurs) et rattache le run de cet abonné. Avant (depuis 2.21.90) :
+    /// trace armée sans pseudonyme, 0 message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_imsi_trace_unknown_to_the_vault_attaches_the_derived_pseudonym_2_21_160() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let imsi = "imsi-001010000000601";
+        let derived = event_schema::pseudonym_subscriber_digits(
+            state.inner.capture_manager.pseudonym_key().as_ref(),
+            b"001010000000601",
+        );
+        assert!(state.inner.identity_vault.pseudonyms_for_value(imsi).unwrap().is_empty(), "précondition : voûte sans cet IMSI");
+        let opened = open_trace_2_21_160(&app, "imsi", imsi).await;
+        let trace_id = opened["data"]["trace_id"].as_str().unwrap().to_owned();
+        assert_eq!(opened["data"]["subscriber_pseudonyms"], json!([derived.clone()]), "{opened}");
+        assert_eq!(opened["data"]["armed"], false, "une cible dès l'ouverture");
+        state.inner.live_traces.route_for_test(&run_carrying_2_21_160(&state, &derived));
+        assert!(messages_of_2_21_160(&app, &trace_id).await > 0, "le run de l'abonné est rattaché");
+    }
+
+    /// 2.21.160 — voûte qui connaît l'IMSI avec ce même pseudonyme : il
+    /// n'apparaît qu'une fois, et la trace rattache (chemin qui marchait).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_imsi_trace_known_to_the_vault_still_attaches_without_duplicate_2_21_160() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let digits = "001010000000602";
+        let derived = event_schema::pseudonym_subscriber_digits(state.inner.capture_manager.pseudonym_key().as_ref(), digits.as_bytes());
+        state
+            .inner
+            .identity_vault
+            .upsert(vec![IdentityObservation {
+                session_id: "session-2-21-160".into(),
+                subscriber_pseudonym: Some(derived.clone()),
+                kind: "imsi".into(),
+                value: digits.into(),
+                value_type: Some("IMSI".into()),
+                role: "presented".into(),
+                event_id: "evt-2-21-160".into(),
+                capture_id: "cap-2-21-160".into(),
+                packet_number: 1,
+                cleartext: None,
+            }])
+            .unwrap();
+        let opened = open_trace_2_21_160(&app, "imsi", digits).await;
+        let trace_id = opened["data"]["trace_id"].as_str().unwrap().to_owned();
+        assert_eq!(opened["data"]["subscriber_pseudonyms"], json!([derived.clone()]), "pas de doublon : {opened}");
+        assert_eq!(opened["data"]["armed"], false);
+        state.inner.live_traces.route_for_test(&run_carrying_2_21_160(&state, &derived));
+        assert!(messages_of_2_21_160(&app, &trace_id).await > 0);
+    }
+
+    /// 2.21.160 — un IMSI VOISIN ne rattache rien : le chemin est ouvert,
+    /// pas permissif.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_neighbouring_imsi_attaches_nothing_2_21_160() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let other = event_schema::pseudonym_subscriber_digits(state.inner.capture_manager.pseudonym_key().as_ref(), b"001010000000603");
+        let opened = open_trace_2_21_160(&app, "imsi", "001010000000604").await;
+        let trace_id = opened["data"]["trace_id"].as_str().unwrap().to_owned();
+        state.inner.live_traces.route_for_test(&run_carrying_2_21_160(&state, &other));
+        assert_eq!(messages_of_2_21_160(&app, &trace_id).await, 0);
+    }
+
+    /// 2.21.160 — MSISDN, IMEI et TMSI ne gagnent AUCUN pseudonyme dérivé :
+    /// leurs domaines diffèrent de celui des décodeurs d'abonné.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn msisdn_imei_and_tmsi_traces_gain_no_derived_pseudonym_2_21_160() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        for (key_type, value) in [("msisdn", "msisdn-33600000605"), ("imei", "imei-490154203237518"), ("tmsi", "0x0000a605")] {
+            let opened = open_trace_2_21_160(&app, key_type, value).await;
+            assert_eq!(opened["data"]["subscriber_pseudonyms"], json!([]), "{key_type} : {opened}");
+            assert_eq!(opened["data"]["armed"], true, "{key_type}");
+        }
+    }
+
     /// 2.21.142 (GO cœur #9 7084290861 ; contrat #10 7084316531) — par
     /// le routeur réel : une trace ouverte, un run capturé après son
     /// ouverture, et `GET /live/traces/:id/callflow` rend le call flow

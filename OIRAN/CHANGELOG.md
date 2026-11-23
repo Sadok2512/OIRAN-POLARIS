@@ -1,5 +1,37 @@
 # Changelog
 
+## oiran-api 2.21.160 — 2026-11-23 — trace par clé IMSI : le pseudonyme dérivé est rendu à la cible
+
+Upgrade **patch**, sans déploiement. Base `f419573` (2.21.158, en prod), indépendante de 2.21.159. Branche `fix/oiran-2.21.160-imsi-trace-derived-pseudonym`.
+- GO du cœur : #9 7116694153.
+- Audit : #9 7116428144, rétractation du point 4 : #9 7116733943.
+- FAIL T1 : #10 7116326688.
+
+**Défaut.** Depuis 2.21.90 (`44ba484`, 20/11), la cible d'une trace `key_type = "imsi"` ne venait **que** de la voûte d'identités. Quand la voûte ne connaissait pas l'IMSI, la trace s'ouvrait sans pseudonyme, `armed: true`, avec pour seule clé les chiffres en clair. Les events, eux, ne portent que des pseudonymes. Au lab : 2 567 events vus, 0 rattaché.
+
+**Correctif.** Pour `imsi` uniquement, le pseudonyme **dérivé** de la saisie est **ajouté** à ceux de la voûte. Il n'y a pas de doublon si la voûte rend le même.
+- La dérivation est `pseudonym_subscriber_text(clé du capture_manager, saisie)` : même fonction et même clé que la voûte (`tshark_identities`), même domaine `subscriber` que les décodeurs.
+- `armed` vaut `false` dès que la trace a au moins un pseudonyme, comme avec la voûte : elle a une cible.
+
+**Ce qui ne change pas** :
+- **MSISDN, IMEI et TMSI** : aucune dérivation, parce que leurs domaines diffèrent. Un test le vérifie.
+- **`supi`** n'est pas un type de clé accepté par l'API (`allowed_key`). Ce lot ne l'ajoute pas.
+
+**La clé, vérifiée.** La voûte utilise la clé du `capture_manager`. En production, celle-ci vient de `resolve_default_path()`, puisque `pseudonym_key_path` vaut `None` hors tests. Le lecteur live décode le ring avec `load_or_generate(resolve_default_path())` : c'est **le même fichier**. **Risque résiduel déclaré** : un déploiement qui renseignerait un `pseudonym_key_path` différent ferait diverger le `capture_manager` et le lecteur live. Cela casserait aussi la trace par pseudonyme : ce n'est pas propre à ce lot.
+
+**OUVERT** : pourquoi 2.21.90 a jugé que l'ancien repli « ne matchait aucun event ». Ce n'était ni le domaine pour l'IMSI, ni probablement la clé (#9 7116733943).
+
+Tests, par le routeur réel. Le run est celui du banc à cinq abonnés (`multi-imsi.pcap`) décodé avec la clé du `capture_manager`, où le pseudonyme d'un abonné est remplacé par le pseudonyme visé. Les IMSI sont synthétiques (PLMN 001-01).
+
+| Test | Sur `f419573` (arbre séparé) | Sur 2.21.160 |
+|---|---|---|
+| `an_imsi_trace_unknown_to_the_vault_attaches_the_derived_pseudonym_2_21_160` | **échoue** : `armed: true`, `subscriber_pseudonyms: []` | passe : pseudonyme dérivé, `armed: false`, run rattaché |
+| `an_imsi_trace_known_to_the_vault_still_attaches_without_duplicate_2_21_160` | passe (chemin qui marchait) | passe : un seul pseudonyme, run rattaché |
+| `a_neighbouring_imsi_attaches_nothing_2_21_160` | passe | passe : 0 message |
+| `msisdn_imei_and_tmsi_traces_gain_no_derived_pseudonym_2_21_160` | passe | passe : aucun pseudonyme, `armed: true` |
+
+Patch de la preuve : `~/oiran-polaris-archives/2.21.160-preuve-echec-avant-sur-f419573.patch`.
+
 ## oiran-api 2.21.158 — 2026-11-23 — amorçage de trace : les « 3 derniers segments » se choisissent par date de fichier
 
 Upgrade **patch**, sans déploiement. Base `23d613d` (2.21.157, PASS d'ANR1 #10 7111397052), branche `fix/oiran-2.21.158-seed-segments-by-mtime`.
