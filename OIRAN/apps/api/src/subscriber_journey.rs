@@ -200,6 +200,13 @@ impl JourneyIndexBuilder {
                 }
             }
         }
+        // 2.21.154 (décision du cœur #9 7099347809) — un IMEISV masqué
+        // (IE NGAP 34, émis sous le nom `subscriber_pseudonym`) désigne un
+        // équipement commun à tous les terminaux d'un même modèle, jamais
+        // un abonné. Avant : deux UE qui ne partageaient que ce jeton
+        // formaient un seul « abonné » et un seul parcours.
+        let equipment = callflow_schema::masked_imeisv_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree));
+        node.subscribers.retain(|token| !equipment.contains(token));
         self.nodes.insert(flow.session_id.clone(), node);
     }
 
@@ -638,5 +645,63 @@ mod tests {
             serde_json::to_value(legacy.subscribers()).unwrap(),
             serde_json::to_value(streaming.subscribers()).unwrap(),
         );
+    }
+}
+
+#[cfg(test)]
+mod masked_imeisv_journey_tests_2_21_154 {
+    use super::*;
+
+    /// 2.21.154 (sonde #9 7098759157, devenue permanente) — deux sessions de
+    /// deux UE qui ne partagent que l'IMEISV masqué ne forment pas un
+    /// abonné, ni un parcours. Une session qui porte aussi son IMSI est
+    /// rattachée à son seul abonné (avant : deux « abonnés », donc aucun).
+    #[test]
+    fn two_ues_sharing_only_the_masked_imeisv_are_not_one_subscriber_2_21_154() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().join("OIRAN_5G_E2E_CALLFLOW.json");
+        let template: CallFlow = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let imeisv = "psn-0123456789abcdef0123456789abcdef";
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Array(items) => {
+                    items.retain(|item| !item.to_string().contains("psn-"));
+                    items.iter_mut().for_each(strip)
+                }
+                Value::Object(map) => map.values_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let flow = |session: &str, imsi: Option<&str>| {
+            let mut flow = template.clone();
+            flow.session_id = session.into();
+            for event in &mut flow.events {
+                strip(&mut event.decoded_ie_tree);
+            }
+            let event = flow.events.iter_mut().find(|e| e.protocol == "NGAP").unwrap();
+            let mut tree = vec![
+                serde_json::json!({"id": 34, "name": "identity_pseudonym", "value": format!("subscriber_pseudonym={imeisv}")}),
+                serde_json::json!({"name": "subscriber_pseudonym", "value": imeisv, "source": "session_identifiers"}),
+            ];
+            if let Some(imsi) = imsi {
+                tree.push(serde_json::json!({"name": "subscriber_pseudonym", "value": imsi, "source": "session_identifiers"}));
+            }
+            event.decoded_ie_tree = Value::Array(tree);
+            flow
+        };
+        // Deux UE, seul l'IMEISV en commun.
+        let (a, b) = (flow("5g-session-ue-a", None), flow("5g-session-ue-b", None));
+        let index = JourneyIndex::from_flows([&a, &b]);
+        assert!(index.subscribers().is_empty(), "l'IMEISV masqué n'est pas un abonné : {:?}", index.subscribers().iter().map(|r| &r.subscriber_pseudonym).collect::<Vec<_>>());
+        assert_eq!(index.subscriber_for_session("5g-session-ue-a"), None);
+        assert!(index.sessions(imeisv).is_empty(), "aucun parcours par ce jeton");
+        // Avec l'IMSI de chacun : deux abonnés distincts, une session chacun.
+        let imsi_a = "psn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let imsi_b = "psn-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (a, b) = (flow("5g-session-ue-a", Some(imsi_a)), flow("5g-session-ue-b", Some(imsi_b)));
+        let index = JourneyIndex::from_flows([&a, &b]);
+        assert_eq!(index.subscriber_for_session("5g-session-ue-a"), Some(imsi_a), "rattachée à son seul abonné");
+        assert_eq!(index.subscriber_for_session("5g-session-ue-b"), Some(imsi_b));
+        assert_eq!(index.sessions(imsi_a).len(), 1);
+        assert_eq!(index.subscribers().len(), 2);
     }
 }

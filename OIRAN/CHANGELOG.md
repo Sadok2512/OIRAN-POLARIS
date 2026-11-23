@@ -1,8 +1,8 @@
 # Changelog
 
-## oiran-api 2.21.154, live-probe 0.6.39 — 2026-11-23 — détail d'une session sans attente pendant une publication ; IMEISV masqué servi sous son nom
+## oiran-api 2.21.154, live-probe 0.6.39, session-engine 0.5.32, callflow-schema 1.5.2 — 2026-11-23 — détail d'une session sans attente pendant une publication ; l'IMEISV masqué n'est plus un abonné
 
-Upgrade **patch** sans déploiement, au-dessus de 2.21.151 @ `7ccf7cb` (branche `fix/oiran-2.21.154-trace-isolation`). Trois sujets, trois commits, une version (décision du cœur #9 7098608248). live-probe passe de 0.6.36 à **0.6.39** : 0.6.37 est prise par 2.21.152 (refusée) et 0.6.38 par 2.21.153 (annulée).
+Upgrade **patch** sans déploiement, au-dessus de 2.21.151 @ `7ccf7cb` (branche `fix/oiran-2.21.154-trace-isolation`). Trois sujets, trois commits, une version (décision du cœur #9 7098608248). live-probe passe de 0.6.36 à **0.6.39** et session-engine de 0.5.30 à **0.5.32** : 0.6.37 et 0.5.31 sont prises par 2.21.152 (refusée), 0.6.38 par 2.21.153 (annulée).
 
 FAIL de la recette de clôture, point 7 : Sadok voit le détail d'une session expirer à 30 s, par intermittence. Ordres du cœur #9 7097032838 et 7097237993 ; audits #9 7096603566 et 7097078822.
 
@@ -51,6 +51,36 @@ OUVERT des sujets 1 et 2 :
 - `/sessions/:id/identities` répond 403 dans le test (route authentifiée, appelée sans jeton) : son temps n'est pas mesuré.
 - Aucun délai côté serveur ; le client p900 abandonne seul à 30 s.
 - Index PFCP : au premier `/events` après un démarrage, il relit tous les fragments sous un verrou global. Lu, non traité (patch mis de côté, `~/oiran-polaris-archives/2.21.154-detail-routes-suspendu-sur-7ccf7cb.patch`).
+
+### Sujet 3 — l'IMEISV masqué n'est plus jamais servi ni compté comme un abonné (session-engine 0.5.32, callflow-schema 1.5.2)
+
+Décisions du cœur #9 7098608248 (choix B) et 7099347809 (B élargi à l'index des parcours). FAIL A2 point C (#10 7094331695) ; fait d'ANR2 #9 7096178020 ; analyse #9 7096225901 ; sonde #9 7098759157.
+
+**Lu** : le décodeur NGAP émet l'IE 34 (*Masked IMEISV*) sous la forme `subscriber_pseudonym=psn-…` et la promeut en identifiant de session `subscriber_pseudonym`, dont hérite l'enfant NAS (`decoder-ngap/src/lib.rs:206-212`). Ce jeton désigne un **équipement** : sur la capture du banc lab à cinq abonnés, les cinq UE portent le même. Servi sous un nom d'abonné :
+- **donnée fausse à l'écran**, en production depuis longtemps : le parcours abonné (`JourneyIndex`) range ce jeton parmi les abonnés d'une session. Deux UE qui ne partagent que lui forment un seul « abonné » : `subscriber_session_count = 2`, un `previous_session_id` ou un `next_session_id` qui pointe vers la session d'un **autre UE**, et le jeton listé dans `/subscribers` ;
+- la recette de l'isolement le comptait comme un abonné étranger dans la trace de la cible (FAIL A2 point C) ;
+- une session qui porte aussi son IMSI appartenait à deux « abonnés » : `subscriber_for_session` rendait `None`, et rien n'était décoré, sans le dire.
+
+**Correctif, à la lecture, sans réécrire aucune donnée stockée** :
+- **Une règle unique** (`callflow_schema::relabel_masked_imeisv`) : un jeton d'IMEISV masqué est servi sous `masked_imeisv_pseudonym`, en identifiant comme dans le texte brut de l'IE 34. Les vrais pseudonymes d'abonné ne changent pas.
+- **Les jetons** : la compaction de la publication retire l'IE 34 des call flows. La passe des représentants, qui relit tous les events bruts à chaque cycle, relève donc ces jetons **avant** compaction (`collect_masked_imeisv_tokens`) et les inscrit au manifeste (`LiveDataset::masked_imeisv_tokens`, un jeton par modèle de terminal).
+- **Appliquée** par le gestionnaire des captures à chaque lecture d'un call flow et d'une page de call flow, ce qui couvre `/events`, `/callflow`, le détail, la liste, le filtre et le parcours ; par la trace live, sur son flux et sur son call flow, avec les jetons reconnus comme équipement depuis 2.21.124.
+- **Parcours abonné** : un jeton d'IMEISV masqué n'est plus jamais un abonné, ni dans `subscribers()`, ni dans `subscriber_for_session`, ni dans `sessions()`, donc ni dans `/subscribers`.
+- **L'échec silencieux est fermé** : une session qui porte son IMSI et l'IMEISV n'a plus qu'un abonné, et elle est décorée.
+- Le jeton reste **visible** sous son vrai nom, et indexé par `/sessions/filter` : chercher un terminal reste possible.
+
+**Tests** — tous rejoués sur le code de 2.21.151 dans un arbre séparé : **échec avant**, succès après.
+- `two_ues_sharing_only_the_masked_imeisv_are_not_one_subscriber_2_21_154` (oiran-api) — la sonde, devenue permanente. Deux UE qui ne partagent que l'IMEISV : aucun abonné, aucun parcours. Avec l'IMSI de chacun : deux abonnés distincts, chaque session rattachée au sien.
+- `a_trace_never_serves_the_masked_imeisv_as_a_subscriber_2_21_154` (oiran-api) — capture à cinq abonnés : la trace d'un abonné ne sert l'IMEISV ni dans son flux ni dans son call flow sous `subscriber_pseudonym` ; elle le sert sous `masked_imeisv_pseudonym` ; le vrai pseudonyme de l'abonné reste servi sous son nom.
+- `served_callflows_keep_real_subscribers_and_rename_only_the_masked_imeisv_2_21_154` (live-probe) — capture à cinq abonnés publiée : un seul IMEISV, commun aux cinq UE, jamais servi comme abonné ; les vrais pseudonymes d'abonné servis tels qu'ils sont stockés, aucun partagé entre deux UE ; même règle pour les pages.
+- `the_masked_imeisv_is_relabelled_and_real_subscribers_are_untouched_1_5_2` (callflow-schema) — la règle seule.
+
+**OUVERT du sujet 3** :
+- **Premier cycle après le déploiement** : le manifeste en place ne porte pas encore les jetons. Jusqu'à la fin de la première publication sous 2.21.154, les call flows publiés sont servis comme avant ; la trace live est corrigée dès le démarrage.
+- **Recette de l'isolement** : le relevé d'ANR2 cherche la **valeur** du jeton dans la trace ; elle y reste, sous `masked_imeisv_pseudonym`. Le critère doit compter les pseudonymes servis **sous un nom d'abonné**.
+- Le fait d'ANR2 qui dirait que le jeton porté par la trace est bien celui de la **cible** n'est pas reçu ; le cœur a jugé que la sonde suffit à prouver le défaut corrigé ici.
+- L'IE NGAP 26 (5G-S-TMSI) est émise de la même façon, sous `subscriber_pseudonym` ; c'est une identité **temporaire**, que le parcours traite comme une identité d'abonné. Lu, non traité.
+- `/sessions/filter` indexe le jeton (recherche d'un terminal) : chercher ce jeton rend les sessions de tous les UE du modèle, et c'est voulu.
 
 ## oiran-api 2.21.151, session-engine 0.5.30 — 2026-11-22 — passe des représentants : le plafond borne la mémoire réellement allouée
 

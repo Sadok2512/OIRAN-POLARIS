@@ -73,6 +73,97 @@ fn decoded_tree_with_identifiers(event: &EventRecord) -> Value {
     tree
 }
 
+/// 1.5.2 (POLARIS 2.21.154, décision du cœur #9 7098608248 et
+/// 7099347809) — nom sous lequel un IMEISV masqué est servi. Le décodeur
+/// NGAP émet l'IE 34 (*Masked IMEISV*) sous la forme
+/// `subscriber_pseudonym=psn-…` et le promeut en identifiant de session
+/// `subscriber_pseudonym` (hérité par l'enfant NAS). Ce jeton désigne un
+/// ÉQUIPEMENT, commun à tous les terminaux d'un même modèle : servi sous
+/// un nom d'abonné, il reliait des UE différents dans le parcours abonné.
+pub const MASKED_IMEISV_PSEUDONYM: &str = "masked_imeisv_pseudonym";
+
+/// 1.5.2 — identifiant NGAP de l'IE *Masked IMEISV* (TS 38.413 §9.3.1.54).
+const NGAP_MASKED_IMEISV_IE: u64 = 34;
+
+/// 1.5.2 — jetons d'IMEISV masqué portés par des arbres d'IE : valeurs
+/// `psn-…` de toute IE d'identifiant 34. Lecture seule.
+pub fn masked_imeisv_tokens<'a>(trees: impl IntoIterator<Item = &'a Value>) -> BTreeSet<String> {
+    fn walk(value: &Value, out: &mut BTreeSet<String>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            Value::Object(map) => {
+                if map.get("id").and_then(Value::as_u64) == Some(NGAP_MASKED_IMEISV_IE) {
+                    if let Some(text) = map.get("value").and_then(Value::as_str) {
+                        for field in text.split(',') {
+                            let candidate = field.split_once('=').map(|(_, value)| value).unwrap_or(field).trim();
+                            if candidate.starts_with("psn-") {
+                                out.insert(candidate.to_owned());
+                            }
+                        }
+                    }
+                }
+                map.values().for_each(|item| walk(item, out));
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    for tree in trees {
+        walk(tree, &mut out);
+    }
+    out
+}
+
+/// 1.5.2 — renomme en `masked_imeisv_pseudonym` toute entrée
+/// `{"name": "subscriber_pseudonym", "value": <jeton>}`, et tout texte
+/// `subscriber_pseudonym=<jeton>` (IE 34 brute), dont le jeton est dans
+/// `tokens`, où qu'ils soient dans `value`. Rend le nombre d'entrées
+/// renommées. Les autres valeurs, et les vrais pseudonymes d'abonné, ne
+/// changent pas. Correction à la lecture : rien de stocké n'est réécrit.
+pub fn relabel_masked_imeisv(value: &mut Value, tokens: &BTreeSet<String>) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+    match value {
+        // Forme texte de l'IE 34 brute : `subscriber_pseudonym=psn-…`.
+        Value::String(text) => {
+            let mut renamed = 0;
+            for token in tokens {
+                let from = format!("subscriber_pseudonym={token}");
+                if text.contains(&from) {
+                    *text = text.replace(&from, &format!("{MASKED_IMEISV_PSEUDONYM}={token}"));
+                    renamed += 1;
+                }
+            }
+            renamed
+        }
+        Value::Array(items) => items.iter_mut().map(|item| relabel_masked_imeisv(item, tokens)).sum(),
+        Value::Object(map) => {
+            let mut renamed = 0;
+            let is_imeisv = map.get("name").and_then(Value::as_str) == Some("subscriber_pseudonym")
+                && map.get("value").and_then(Value::as_str).is_some_and(|token| tokens.contains(token));
+            if is_imeisv {
+                map.insert("name".into(), Value::from(MASKED_IMEISV_PSEUDONYM));
+                renamed += 1;
+            }
+            renamed + map.values_mut().map(|item| relabel_masked_imeisv(item, tokens)).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+/// 1.5.2 — applique `relabel_masked_imeisv` à tout un call flow, avec les
+/// jetons d'IMEISV masqué trouvés dans ses events (l'enfant NAS, qui
+/// hérite de l'identifiant sans porter l'IE 34, est couvert par son
+/// parent présent dans le même call flow).
+pub fn relabel_masked_imeisv_in_flow(flow: &mut CallFlow) -> usize {
+    let tokens = masked_imeisv_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree));
+    flow.events
+        .iter_mut()
+        .map(|event| relabel_masked_imeisv(&mut event.decoded_ie_tree, &tokens))
+        .sum()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CorrelationEdge {
     pub edge_id: String,
@@ -1124,5 +1215,35 @@ mod tests {
         });
         let event: CallFlowEvent = serde_json::from_value(json).unwrap();
         assert_eq!(event.stable_event_key, "capture.pcapng|0|42|100|NGAP|0");
+    }
+}
+
+#[cfg(test)]
+mod masked_imeisv_tests_1_5_2 {
+    use super::*;
+
+    #[test]
+    fn the_masked_imeisv_is_relabelled_and_real_subscribers_are_untouched_1_5_2() {
+        let imeisv = "psn-0123456789abcdef0123456789abcdef";
+        let imsi = "psn-ffffffffffffffffffffffffffffffff";
+        let mut ngap = serde_json::json!([
+            {"id": 34, "name": "identity_pseudonym", "value": format!("subscriber_pseudonym={imeisv}")},
+            {"name": "subscriber_pseudonym", "value": imeisv, "source": "session_identifiers"},
+            {"name": "subscriber_pseudonym", "value": imsi, "source": "session_identifiers"}
+        ]);
+        let mut nas_child = serde_json::json!([{"name": "subscriber_pseudonym", "value": imeisv, "source": "session_identifiers"}]);
+        let tokens = masked_imeisv_tokens([&ngap]);
+        assert_eq!(tokens, BTreeSet::from([imeisv.to_owned()]));
+        assert_eq!(relabel_masked_imeisv(&mut ngap, &tokens), 2);
+        assert_eq!(relabel_masked_imeisv(&mut nas_child, &tokens), 1, "l'enfant NAS est couvert par le jeton de son parent");
+        assert_eq!(ngap[1]["name"], MASKED_IMEISV_PSEUDONYM);
+        assert_eq!(ngap[2]["name"], "subscriber_pseudonym", "le vrai pseudonyme d'abonné ne change pas");
+        assert_eq!(nas_child[0]["name"], MASKED_IMEISV_PSEUDONYM);
+        assert_eq!(ngap[0]["value"], format!("{MASKED_IMEISV_PSEUDONYM}={imeisv}"), "la forme texte de l'IE 34 est renommée aussi");
+        // Sans IE 34, rien n'est renommé.
+        let mut alone = serde_json::json!([{"name": "subscriber_pseudonym", "value": imsi}]);
+        let none = masked_imeisv_tokens([&alone]);
+        assert!(none.is_empty());
+        assert_eq!(relabel_masked_imeisv(&mut alone, &none), 0);
     }
 }

@@ -3149,6 +3149,16 @@ impl LiveTraceRegistry {
                 // call flow de la trace.
                 let foreign = foreign_on_event.clone();
                 let masked = mask_pseudonyms(&mut payload, &foreign);
+                // 2.21.154 (décision du cœur #9 7099347809) — un IMEISV
+                // masqué (équipement) n'est pas servi sous un nom d'abonné.
+                // Jetons : l'IE 34 de cet event, et ceux que la trace a déjà
+                // reconnus comme équipement (enfant NAS de cet event).
+                let equipment: BTreeSet<String> = ev_equipment_pseudonyms
+                    .iter()
+                    .cloned()
+                    .chain(state.equipment_keys.iter().cloned())
+                    .collect();
+                callflow_schema::relabel_masked_imeisv(&mut payload, &equipment);
                 if sip_side_inferred {
                     payload["subscriber_side_inferred"] = json!("ue-address");
                 }
@@ -4662,6 +4672,8 @@ fn build_trace_callflow(
     let mut flow = callflow_schema::build_callflow(&reconstruction, Vec::new());
     flow.correlation_status
         .insert("E2E".into(), "LIVE_TRACE_NOT_CORRELATED".into());
+    // 2.21.154 — l'IMEISV masqué sous son nom d'équipement, comme partout.
+    callflow_schema::relabel_masked_imeisv_in_flow(&mut flow);
     let mut value = serde_json::to_value(flow).map_err(|error| error.to_string())?;
     // 2.21.144 — même masquage que dans le flux de la trace.
     let masked = mask_pseudonyms(&mut value, foreign);
@@ -5963,6 +5975,91 @@ mod tests {
             .unwrap()
             .insert("t".into(), state(u64::MAX, false, vec![pseudonym.into()]));
         r
+    }
+
+    /// 2.21.154 (décision du cœur #9 7099347809) — sur la capture du banc
+    /// lab à cinq abonnés, la trace d'un abonné ne sert JAMAIS l'IMEISV
+    /// masqué (commun aux cinq UE) sous `subscriber_pseudonym`, ni dans son
+    /// flux, ni dans son call flow ; elle le sert sous
+    /// `masked_imeisv_pseudonym`. Les vrais pseudonymes d'abonné ne changent
+    /// pas. Avant : l'`InitialContextSetupRequest` de la cible et son enfant
+    /// NAS le servaient sous `subscriber_pseudonym`, et le relevé de la
+    /// recette le comptait comme un abonné étranger (FAIL A2 point C).
+    #[test]
+    fn a_trace_never_serves_the_masked_imeisv_as_a_subscriber_2_21_154() {
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap",
+        );
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events: Vec<event_schema::NormalizedEvent> = Vec::new();
+        for interface in ["N2", "N4", "SBI"] {
+            let config = oiran_decode::DecodeConfig {
+                input: capture.clone(),
+                capture_id: format!("sha256:{}", sha256_hex(interface.as_bytes())),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+                stable_source_file: "multi-imsi.pcap".into(),
+            };
+            let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                events.push(event);
+                Ok(())
+            });
+        }
+        events.sort_by_key(|e| e.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        // Le jeton d'IMEISV masqué : la valeur de l'IE NGAP 34.
+        let imeisv: BTreeSet<String> = events
+            .iter()
+            .flat_map(|event| event.information_elements.iter())
+            .filter(|ie| ie.id == Some(34))
+            .filter_map(|ie| ie.value.as_deref())
+            .filter_map(|value| value.split_once('=').map(|(_, token)| token.trim().to_owned()))
+            .collect();
+        assert_eq!(imeisv.len(), 1, "un seul IMEISV masqué, commun aux cinq UE");
+        let shared = imeisv.iter().next().unwrap().clone();
+        // Un vrai pseudonyme d'abonné : porté sur N2 par un seul contexte UE.
+        let subscriber = events
+            .iter()
+            .flat_map(|event| event.session_identifiers.iter())
+            .filter(|id| id.name == "subscriber_pseudonym" && id.value != shared)
+            .map(|id| id.value.clone())
+            .next()
+            .expect("un pseudonyme d'abonné réel");
+        let r = trace_on(&subscriber);
+        for event in &events {
+            r.route_normalized(event);
+        }
+        let traces = r.traces.lock().unwrap();
+        let trace = &traces["t"];
+        let messages: Vec<&Value> = trace.events.iter().filter(|e| e.kind == "message").map(|e| &e.payload).collect();
+        assert!(!messages.is_empty());
+        let labelled = |value: &Value, name: &str, token: &str| -> usize {
+            fn walk(value: &Value, name: &str, token: &str) -> usize {
+                match value {
+                    Value::Array(items) => items.iter().map(|item| walk(item, name, token)).sum(),
+                    Value::Object(map) => {
+                        let hit = map.get("name").and_then(Value::as_str) == Some(name)
+                            && map.get("value").and_then(Value::as_str) == Some(token);
+                        usize::from(hit) + map.values().map(|item| walk(item, name, token)).sum::<usize>()
+                    }
+                    // Forme texte de l'IE brute : `<nom>=<jeton>`.
+                    Value::String(text) => text.matches(&format!("{name}={token}")).count(),
+                    _ => 0,
+                }
+            }
+            walk(value, name, token)
+        };
+        let as_subscriber: usize = messages.iter().map(|m| labelled(m, "subscriber_pseudonym", &shared)).sum();
+        let as_equipment: usize = messages.iter().map(|m| labelled(m, callflow_schema::MASKED_IMEISV_PSEUDONYM, &shared)).sum();
+        let real: usize = messages.iter().map(|m| labelled(m, "subscriber_pseudonym", &subscriber)).sum();
+        assert_eq!(as_subscriber, 0, "le flux ne sert pas l'IMEISV masqué comme abonné");
+        assert!(as_equipment > 0, "il le sert sous son nom d'équipement");
+        assert!(real > 0, "le vrai pseudonyme de l'abonné reste servi sous son nom");
+        // Le call flow de la trace suit la même règle.
+        let kept: Vec<event_schema::NormalizedEvent> = trace.signalling.iter().map(|kept| kept.event.clone()).collect();
+        assert!(!kept.is_empty());
+        let (flow, _) = build_trace_callflow("t", Some(subscriber.clone()), kept, &BTreeSet::new()).unwrap();
+        assert_eq!(labelled(&flow, "subscriber_pseudonym", &shared), 0, "le call flow de la trace non plus");
+        assert!(labelled(&flow, callflow_schema::MASKED_IMEISV_PSEUDONYM, &shared) > 0);
     }
 
     /// 2.21.113 (relecture CLAUDE2 #9 7050861203, E1) — handover avec

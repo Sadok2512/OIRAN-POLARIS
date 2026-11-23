@@ -1090,6 +1090,30 @@ pub fn load_path_streaming_index(path: &std::path::Path) -> Result<StreamingEven
 pub struct StreamingRepresentativesIndex {
     pub events: Vec<EventRecord>,
     pub source_event_count: usize,
+    /// 0.5.31 (POLARIS 2.21.154) — jetons d'IMEISV masqué (IE NGAP 34)
+    /// relevés sur les events bruts AVANT compaction, qui retire cette IE.
+    /// Ils désignent des équipements : la lecture s'en sert pour ne jamais
+    /// servir ces jetons sous le nom `subscriber_pseudonym`.
+    pub masked_imeisv_tokens: BTreeSet<String>,
+}
+
+/// 0.5.31 (POLARIS 2.21.154) — ajoute à `out` les jetons `psn-…` portés
+/// par l'IE NGAP 34 (*Masked IMEISV*) d'un event, avant sa compaction.
+pub fn collect_masked_imeisv_tokens(event: &EventRecord, out: &mut BTreeSet<String>) {
+    if !protocol_is(event, "NGAP") {
+        return;
+    }
+    for item in event.information_elements.as_array().into_iter().flatten() {
+        if item.get("id").and_then(Value::as_u64) != Some(34) {
+            continue;
+        }
+        for field in item.get("value").and_then(Value::as_str).unwrap_or("").split(',') {
+            let candidate = field.split_once('=').map(|(_, value)| value).unwrap_or(field).trim();
+            if candidate.starts_with("psn-") {
+                out.insert(candidate.to_owned());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1382,6 +1406,7 @@ where
     test_alloc::start_run_buffer();
     let mut records = Vec::<SpilledRepresentative>::new();
     let mut retained_bytes = 0usize;
+    let mut masked_imeisv_tokens = BTreeSet::<String>::new();
     let mut run_paths = Vec::<PathBuf>::new();
     let mut source_event_count = 0usize;
     let mut ordinal = 0u64;
@@ -1412,6 +1437,7 @@ where
                 .map_err(|error| format!("{} line {}: {error}", path.display(), line_no))?;
             source_event_count = source_event_count.saturating_add(1);
             ordinal = ordinal.saturating_add(1);
+            collect_masked_imeisv_tokens(&event, &mut masked_imeisv_tokens);
             compact_publication_event(&mut event);
             let record = SpilledRepresentative {
                 key: publication_semantic_key(&event),
@@ -1507,6 +1533,7 @@ where
     Ok(StreamingRepresentativesIndex {
         events,
         source_event_count,
+        masked_imeisv_tokens,
     })
 }
 
@@ -1564,6 +1591,7 @@ where
 {
     let mut representatives = BTreeMap::<String, EventRecord>::new();
     let mut source_event_count = 0usize;
+    let mut masked_imeisv_tokens = BTreeSet::<String>::new();
     for path in paths {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let reader = io::BufReader::new(file);
@@ -1578,6 +1606,7 @@ where
             let mut event = parse_event(value)
                 .map_err(|e| format!("{} line {}: {e}", path.display(), line_no + 1))?;
             source_event_count = source_event_count.saturating_add(1);
+            collect_masked_imeisv_tokens(&event, &mut masked_imeisv_tokens);
             compact_publication_event(&mut event);
             let key = publication_semantic_key(&event);
             // A shard list is the logical concatenation of its immutable
@@ -1596,6 +1625,7 @@ where
     Ok(StreamingRepresentativesIndex {
         events,
         source_event_count,
+        masked_imeisv_tokens,
     })
 }
 

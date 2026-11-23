@@ -1199,6 +1199,13 @@ pub struct LiveDataset {
     /// Absent d'un manifeste antérieur : tout est alors reconstruit.
     #[serde(default)]
     pub callflow_reuse_keys: BTreeMap<String, String>,
+    /// 2.21.154 (décision du cœur #9 7099347809) — jetons d'IMEISV masqué
+    /// (IE NGAP 34) relevés par la passe des représentants sur les events
+    /// bruts, avant la compaction qui retire cette IE des call flows. Ils
+    /// désignent des équipements, communs à tous les terminaux d'un même
+    /// modèle : la lecture ne les sert jamais sous `subscriber_pseudonym`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub masked_imeisv_tokens: BTreeSet<String>,
 }
 
 /// 2.21.154 — (dé)sérialisation de la découverte partagée : même JSON
@@ -2673,6 +2680,16 @@ impl CaptureManager {
             .map(|dataset| dataset.dataset_id.clone())
     }
 
+    /// 2.21.154 — jetons d'IMEISV masqué connus pour un jeu (manifeste).
+    pub fn masked_imeisv_tokens(&self, dataset_id: &str) -> BTreeSet<String> {
+        self.datasets
+            .lock()
+            .unwrap()
+            .get(dataset_id)
+            .map(|dataset| dataset.masked_imeisv_tokens.clone())
+            .unwrap_or_default()
+    }
+
     pub fn dataset(&self, id: &str) -> Option<LiveDataset> {
         self.datasets
             .lock()
@@ -2702,7 +2719,16 @@ impl CaptureManager {
 
     pub fn callflow(&self, dataset_id: &str, session_id: &str) -> Option<CallFlow> {
         let path = self.callflow_path(dataset_id, session_id)?;
-        serde_json::from_slice(&fs::read(path).ok()?).ok()
+        let mut flow: CallFlow = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        // 2.21.154 — l'IMEISV masqué est servi sous son nom d'équipement,
+        // pas sous `subscriber_pseudonym` (correction à la lecture) : jetons
+        // relevés par la publication, plus ceux d'une IE 34 encore présente.
+        let mut tokens = self.masked_imeisv_tokens(dataset_id);
+        tokens.extend(callflow_schema::masked_imeisv_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree)));
+        for event in &mut flow.events {
+            callflow_schema::relabel_masked_imeisv(&mut event.decoded_ie_tree, &tokens);
+        }
+        Some(flow)
     }
 
     /// 2.18.12 — signature (taille, mtime ns) du fichier callflow d'une
@@ -2804,7 +2830,17 @@ impl CaptureManager {
         if !path.is_file() {
             return Ok(None);
         }
-        read_callflow_page(&path, cursor, limit).map(Some)
+        let mut page = read_callflow_page(&path, cursor, limit)?;
+        // 2.21.154 — même correction à la lecture que `callflow`, avec les
+        // jetons d'IMEISV masqué trouvés dans les events de la page.
+        if let Some(events) = page.get_mut("events") {
+            let mut tokens = self.masked_imeisv_tokens(dataset_id);
+            tokens.extend(callflow_schema::masked_imeisv_tokens(
+                events.as_array().into_iter().flatten().map(|event| &event["decoded_ie_tree"]),
+            ));
+            callflow_schema::relabel_masked_imeisv(events, &tokens);
+        }
+        Ok(Some(page))
     }
 
     /// Resolves a persisted call flow without cloning `LiveDataset.discovery`.
@@ -3111,6 +3147,7 @@ impl CaptureManager {
             publication_files_created: 0,
             callflows_path: None,
             callflow_reuse_keys: BTreeMap::new(),
+            masked_imeisv_tokens: BTreeSet::new(),
         };
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
@@ -7561,6 +7598,7 @@ impl CaptureManager {
         // indexeurs read-time les reliront plus tard, sous la garde, si besoin.
         advise_files_no_longer_needed(&event_paths);
         let event_count = index.source_event_count;
+        let masked_imeisv_tokens = index.masked_imeisv_tokens;
         let mut events = index.events;
         // The legacy BTreeMap kept keys, tree nodes and freed allocation pages
         // resident through phase 07. Runs are gone at this point; return those
@@ -8278,6 +8316,7 @@ impl CaptureManager {
             publication_files_created: 0,
             callflows_path: None,
             callflow_reuse_keys,
+            masked_imeisv_tokens,
         };
         trace_publication_rss(
             publication_started_epoch_ms,
@@ -16586,6 +16625,7 @@ mod tests {
                 publication_files_created: 0,
                 callflows_path: None,
                 callflow_reuse_keys: BTreeMap::new(),
+            masked_imeisv_tokens: BTreeSet::new(),
             },
         );
         manager.jobs.lock().unwrap().insert(
@@ -18716,6 +18756,7 @@ Content-Length: 0\r\n\
             publication_files_created: 0,
             callflows_path: None,
             callflow_reuse_keys: BTreeMap::new(),
+            masked_imeisv_tokens: BTreeSet::new(),
         };
         fs::write(source.join("dataset/oiran_events.jsonl"), b"").unwrap();
         fs::write(
@@ -23932,5 +23973,77 @@ Content-Length: 0\r\n\
         assert!(serde_json::from_value::<LiveDataset>(none.clone()).unwrap().discovery.is_none());
         none.as_object_mut().unwrap().remove("discovery");
         assert!(serde_json::from_value::<LiveDataset>(none).unwrap().discovery.is_none(), "champ absent : défaut");
+    }
+    /// 2.21.154 (décision du cœur #9 7099347809, point 5) — sur la capture du
+    /// banc lab à cinq abonnés : les call flows servis gardent les vrais
+    /// pseudonymes d'abonné tels quels ; seul l'IMEISV masqué, commun aux
+    /// cinq UE, est servi sous `masked_imeisv_pseudonym`, et jamais sous
+    /// `subscriber_pseudonym`. Rien de stocké n'est réécrit.
+    #[test]
+    fn served_callflows_keep_real_subscribers_and_rename_only_the_masked_imeisv_2_21_154() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let corpus = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
+        let root = temporary_root("masked-imeisv-five-2-21-154");
+        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let mut selected = BTreeSet::new();
+        for name in ["N2.pcap-five.pcapng", "N4.pcap-five.pcapng"] {
+            let path = base.join("pcap").join(name);
+            fs::copy(&corpus, &path).unwrap();
+            selected.insert(path);
+        }
+        let dataset = manager
+            .process_continuous_capture_selected(&base, &interface_specs(), 1024 * 1024 * 1024, &selected)
+            .unwrap();
+        assert_eq!(dataset.session_ids.len(), 5);
+        let named = |tree: &serde_json::Value, wanted: &str, out: &mut BTreeSet<String>| {
+            fn walk(value: &serde_json::Value, wanted: &str, out: &mut BTreeSet<String>) {
+                match value {
+                    serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, wanted, out)),
+                    serde_json::Value::Object(map) => {
+                        if map.get("name").and_then(serde_json::Value::as_str) == Some(wanted) {
+                            if let Some(value) = map.get("value").and_then(serde_json::Value::as_str) {
+                                out.insert(value.to_owned());
+                            }
+                        }
+                        map.values().for_each(|item| walk(item, wanted, out));
+                    }
+                    _ => {}
+                }
+            }
+            walk(tree, wanted, out)
+        };
+        let callflows = dataset_callflows_dir(&base.join("dataset"), &dataset);
+        let (mut stored_subscribers, mut served_subscribers, mut served_imeisv) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        let mut per_session_real = Vec::new();
+        for id in &dataset.session_ids {
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(callflows.join(format!("{id}.json"))).unwrap()).unwrap();
+            named(&stored, "subscriber_pseudonym", &mut stored_subscribers);
+            let served = serde_json::to_value(manager.callflow(&dataset.dataset_id, id).unwrap()).unwrap();
+            let mut real = BTreeSet::new();
+            named(&served, "subscriber_pseudonym", &mut real);
+            named(&served, callflow_schema::MASKED_IMEISV_PSEUDONYM, &mut served_imeisv);
+            served_subscribers.extend(real.iter().cloned());
+            per_session_real.push(real);
+            // La page lue par `/callflow` suit la même règle.
+            let page = manager.callflow_page(&dataset.dataset_id, id, None, 200).unwrap().unwrap();
+            let mut page_real = BTreeSet::new();
+            named(&page["events"], "subscriber_pseudonym", &mut page_real);
+            assert!(page_real.iter().all(|token| !served_imeisv.contains(token)), "{id} : page sans IMEISV sous un nom d'abonné");
+        }
+        assert_eq!(served_imeisv.len(), 1, "un seul IMEISV masqué, commun aux cinq UE");
+        assert!(served_subscribers.is_disjoint(&served_imeisv), "l'IMEISV n'est jamais servi comme abonné");
+        let expected: BTreeSet<String> = stored_subscribers.difference(&served_imeisv).cloned().collect();
+        assert_eq!(served_subscribers, expected, "les vrais pseudonymes d'abonné sont servis tels quels");
+        assert!(served_subscribers.len() >= 5, "au moins un pseudonyme d'abonné par UE : {}", served_subscribers.len());
+        for (i, left) in per_session_real.iter().enumerate() {
+            for right in &per_session_real[i + 1..] {
+                assert!(left.is_disjoint(right), "deux UE ne partagent aucun pseudonyme d'abonné servi");
+            }
+        }
+        // Rien de stocké n'est réécrit.
+        assert!(stored_subscribers.is_superset(&served_imeisv));
     }
 }
