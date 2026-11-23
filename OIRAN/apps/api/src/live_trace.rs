@@ -12503,4 +12503,131 @@ mod tests {
         assert_eq!(n2_first, reference, "N2 puis N4, même rang");
         assert_eq!(n4_first, reference, "N4 puis N2, même rang");
     }
+
+    /// Garde ANR1 — l'amorçage suit d'abord le rang du segment, même si les
+    /// timestamps et les capture_id disent l'inverse. À rang égal, le contrat
+    /// redevient `(capture_id, seq)`, toujours sans consulter le timestamp.
+    #[test]
+    fn anr1_seed_order_is_rank_then_capture_id_then_seq_never_timestamp_guard() {
+        use event_schema::{Direction, Protocol};
+
+        let outcome = |same_rank: bool| {
+            let registry = trace_on("psn-anr1-rank-guard");
+            assert!(registry.begin_seed());
+            let mut setup = mk_event(
+                "N2",
+                Protocol::Ngap,
+                "PDUSessionResourceSetupRequest",
+                9,
+                Direction::RanToCore,
+                vec![("subscriber_pseudonym", "psn-anr1-rank-guard")],
+                vec![(
+                    "PDUSessionResourceSetupRequestTransfer",
+                    "item_0_tunnel_ip_ul=192.0.2.10,item_0_gtp_teid_ul=0x0000a001",
+                )],
+            );
+            setup.capture_id = if same_rank { "capture-a" } else { "capture-z" }.into();
+            setup.timestamp.seconds = 20;
+
+            let mut detach = mk_event(
+                "N2",
+                Protocol::Ngap,
+                "Deregistration Accept",
+                1,
+                Direction::CoreToRan,
+                vec![("subscriber_pseudonym", "psn-anr1-rank-guard")],
+                vec![],
+            );
+            detach.capture_id = "capture-b".into();
+            detach.timestamp.seconds = 10;
+
+            let detach_rank = if same_rank { 1 } else { 2 };
+            learn_ranked_history(
+                &registry,
+                vec![(Some(detach_rank), detach), (Some(1), setup)],
+            );
+            let empty = registry.traces.lock().unwrap()["t"]
+                .tunnel_endpoints
+                .is_empty();
+            empty
+        };
+
+        assert!(
+            outcome(false),
+            "rangs distincts : rang 1 setup puis rang 2 detach, malgré ts et capture_id inverses"
+        );
+        assert!(
+            outcome(true),
+            "rangs égaux : capture-a/9 setup puis capture-b/1 detach, jamais le ts"
+        );
+    }
+
+    /// Garde ANR1 volontairement rouge avant le correctif du lecteur live.
+    /// Après une renumérotation 99 -> 1, le rattrapage doit décoder le segment
+    /// réellement le plus récent, pas celui dont le nom est le plus grand.
+    #[test]
+    fn anr1_live_reader_follows_newest_segment_after_ring_renumbering_guard() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let traffic = fs::read(source).unwrap();
+        let empty = empty_pcap_2_21_157();
+        let root = seed_ring_root_2_21_157("live-reader-renumbering-guard");
+        let n2 = root.join("n2");
+        fs::create_dir_all(&n2).unwrap();
+        let base = UNIX_EPOCH + Duration::from_secs(1_795_000_000);
+
+        for segment in 97..=99 {
+            let path = n2.join(format!("n2_{segment:05}.pcapng"));
+            fs::write(&path, &empty).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + Duration::from_secs(segment))
+                .unwrap();
+        }
+        let newest = n2.join("n2_00003.pcapng");
+        for segment in 1..=3 {
+            let path = n2.join(format!("n2_{segment:05}.pcapng"));
+            fs::write(&path, if segment == 3 { &traffic } else { &empty }).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + Duration::from_secs(200 + segment))
+                .unwrap();
+        }
+        assert!(
+            newest.metadata().unwrap().modified().unwrap()
+                > n2.join("n2_00099.pcapng").metadata().unwrap().modified().unwrap(),
+            "précondition : le segment 3 est plus récent que le segment 99"
+        );
+
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let registry = trace_on("psn-anr1-live-reader-guard");
+        let mut states = HashMap::new();
+        let mut sessions = HashMap::new();
+        let mut dirs = HashMap::new();
+        let mut hooks = CountingHooks::default();
+        reader_pass(
+            &root,
+            &key,
+            &registry,
+            &mut states,
+            &mut sessions,
+            &mut dirs,
+            true,
+            false,
+            std::time::Instant::now(),
+            &mut hooks,
+        );
+        let newest_consumed = states.get(&newest).map_or(0, |state| state.consumed_bytes);
+        let observed = hooks.observed;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            newest_consumed > 0 && observed > 0,
+            "DÉFAUT : le lecteur a suivi le segment 99 par nom et ignoré le segment 3, plus récent"
+        );
+    }
 }
