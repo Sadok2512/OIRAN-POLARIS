@@ -128,6 +128,12 @@ pub(crate) struct LiveTrace {
     /// 2.21.135 — events capturés avant l'ouverture de la trace, écartés.
     #[serde(default)]
     events_before_open: u64,
+    /// 2.21.157 (ordre cœur #9 7110886701) — events du ring présentés à la
+    /// trace APRÈS son ouverture, toutes cibles confondues (somme des
+    /// `feed.*.seen`). Non nul avec `messages = 0` : le lecteur voit du
+    /// trafic, la cible n'en a pas.
+    #[serde(default)]
+    live_events_since_open: u64,
     /// 2.21.119 — libérations d'une session nommée dont aucun tunnel
     /// n'était rangé par session : rien n'a pu être oublié.
     #[serde(default)]
@@ -178,6 +184,22 @@ pub(crate) struct SeedStats {
     /// 2.21.130 — durée de la relecture, en ms.
     #[serde(default)]
     duration_ms: u64,
+    /// 2.21.157 (ordre cœur #9 7110886701) — segments relus qui n'ont
+    /// donné aucun event décodé (en-tête seul, ou trafic non décodable).
+    /// Explique un `files > 0` avec `events_scanned = 0` ; `files` garde
+    /// sa définition (segments retenus).
+    #[serde(default)]
+    files_without_events: u64,
+    /// 2.21.157 — segments dont le décodage a rendu une erreur, bloc
+    /// partiel d'un segment en cours d'écriture compris. Les events
+    /// complets lus avant l'erreur restent utilisés, comme avant.
+    #[serde(default)]
+    decode_errors: u64,
+    /// 2.21.157 — events PFCP de niveau nœud (heartbeat, association…)
+    /// écartés avant d'atteindre la trace, donc absents de
+    /// `events_scanned`.
+    #[serde(default)]
+    node_messages_skipped: u64,
 }
 
 /// 2.21.105 — interfaces de signalisation relues à l'ouverture d'une
@@ -287,6 +309,10 @@ pub(crate) struct SeedReport {
     bytes: u64,
     truncated: bool,
     duration_ms: u64,
+    /// 2.21.157 — voir `SeedStats`.
+    files_without_events: u64,
+    decode_errors: u64,
+    node_messages_skipped: u64,
 }
 
 /// 2.21.105 (ordre #9 7048974175) — relit le ring de signalisation et
@@ -350,16 +376,26 @@ fn seed_from_ring(
             // Un fichier en cours d'écriture se termine par un bloc
             // partiel : les events complets sont gardés, l'erreur de
             // fin de fichier est attendue.
-            let _ = oiran_decode::decode_capture_streaming(&config, key, |event| {
+            // 2.21.157 — l'erreur reste sans effet sur le comportement ;
+            // elle est seulement comptée, comme un segment sans event.
+            let decoded = oiran_decode::decode_capture_streaming(&config, key, |event| {
                 events.push(event);
                 Ok(())
             });
+            if decoded.is_err() {
+                report.decode_errors += 1;
+            }
+            if events.is_empty() {
+                report.files_without_events += 1;
+            }
             sort_by_capture_order(&mut events);
             history.append(&mut events);
             report.files += 1;
             report.bytes = report.bytes.saturating_add(size);
         }
     }
+    // 2.21.157 — compté ici, écarté comme avant par `route_event_with`.
+    report.node_messages_skipped = history.iter().filter(|event| is_pfcp_node_event(event)).count() as u64;
     learn_history(registry, history);
     report.duration_ms = started.elapsed().as_millis() as u64;
     report
@@ -1396,6 +1432,14 @@ fn is_subscriber_scoped_key(name: &str, value: &str, pseudonymized: bool) -> boo
 /// rejoués par le routage via IE values communes apprises (recovery_time_ntp,
 /// node_id). La liste est explicite — l'ajout d'un nouveau type PFCP côté
 /// décodeur n'autorise pas automatiquement son routage s'il est node-level.
+/// 2.21.157 — prédicat de l'écart des PFCP de niveau nœud, extrait sans
+/// changement de `route_event_with` (2.21.103 / 2.21.113) pour être aussi
+/// compté par l'amorçage.
+fn is_pfcp_node_event(event: &event_schema::NormalizedEvent) -> bool {
+    event.protocol.as_str() == "PFCP"
+        && (is_pfcp_node_message(&event.message_name) || (1..50).contains(&event.message_type))
+}
+
 fn is_pfcp_node_message(message_name: &str) -> bool {
     matches!(
         message_name,
@@ -1562,6 +1606,9 @@ impl LiveTraceRegistry {
                 state.trace.seed.bytes = report.bytes;
                 state.trace.seed.truncated = report.truncated;
                 state.trace.seed.duration_ms = report.duration_ms;
+                state.trace.seed.files_without_events = report.files_without_events;
+                state.trace.seed.decode_errors = report.decode_errors;
+                state.trace.seed.node_messages_skipped = report.node_messages_skipped;
             }
         }
     }
@@ -1604,6 +1651,7 @@ impl LiveTraceRegistry {
             "session_releases_without_filed_tunnels": trace.session_releases_without_filed_tunnels,
             "fresh_registrations": trace.fresh_registrations,
             "events_before_open": trace.events_before_open,
+            "live_events_since_open": trace.live_events_since_open,
             "rtp": {
                 "flow_updates": trace.rtp_flow_updates,
             },
@@ -1830,9 +1878,7 @@ impl LiveTraceRegistry {
         // nœud (types 1 à 15 : Association Update / Release, PFD
         // Management, Node Report, …) sortent en « Unknown PFCP Message »
         // et passaient le filtre par nom.
-        if event.protocol.as_str() == "PFCP"
-            && (is_pfcp_node_message(&event.message_name) || (1..50).contains(&event.message_type))
-        {
+        if is_pfcp_node_event(event) {
             return attached_here;
         }
         let value = serde_json::from_str(&event.to_json()).unwrap_or(Value::Null);
@@ -2102,6 +2148,7 @@ impl LiveTraceRegistry {
                 state.trace.seed.events_scanned =
                     state.trace.seed.events_scanned.saturating_add(1);
             } else if !targeted {
+                state.trace.live_events_since_open = state.trace.live_events_since_open.saturating_add(1);
                 let feed = state.trace.feed.entry(event.interface.clone()).or_default();
                 feed.seen = feed.seen.saturating_add(1);
                 feed.last_event_timestamp_s = Some(event.timestamp.seconds);
@@ -4337,6 +4384,7 @@ pub(crate) async fn create(
         rtp_flow_updates: 0,
         pfcp_establishment_reused_identifiers: 0,
         events_before_open: 0,
+        live_events_since_open: 0,
         session_releases_without_filed_tunnels: 0,
         feed: BTreeMap::new(),
         seed: SeedStats::default(),
@@ -4919,6 +4967,7 @@ mod tests {
                 rtp_flow_updates: 0,
                 pfcp_establishment_reused_identifiers: 0,
                 events_before_open: 0,
+                live_events_since_open: 0,
                 session_releases_without_filed_tunnels: 0,
                 feed: BTreeMap::new(),
                 seed: SeedStats::default(),
@@ -5138,6 +5187,7 @@ mod tests {
             bytes: 400,
             truncated: false,
             duration_ms: 0,
+            ..SeedReport::default()
         });
         assert!(!r.begin_seed(), "une trace n'est amorcée qu'une fois");
         {
@@ -5392,6 +5442,137 @@ mod tests {
     /// AVANT l'ouverture de la trace ; `seed_from_ring` la relit ; les
     /// G-PDU N3 décodés ensuite sont rattachés et la somme des buckets
     /// égale les octets des G-PDU décodés. Sans amorçage : 0 rattaché.
+    /// 2.21.157 — garde un pcapng de référence réduit : ses blocs d'en-tête
+    /// (SHB, IDB…) et ses `keep` premiers paquets (EPB). Les blocs se
+    /// lisent par leur longueur (pcapng petit-boutiste du jeu de référence).
+    fn pcapng_prefix(bytes: &[u8], keep: usize) -> Vec<u8> {
+        assert_eq!(&bytes[..4], &[0x0a, 0x0d, 0x0d, 0x0a], "pcapng attendu");
+        let mut out = Vec::new();
+        let (mut offset, mut packets) = (0usize, 0usize);
+        while offset + 8 <= bytes.len() {
+            let kind = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            if kind == 6 {
+                if packets == keep {
+                    break;
+                }
+                packets += 1;
+            }
+            out.extend_from_slice(&bytes[offset..offset + len]);
+            offset += len;
+        }
+        out
+    }
+
+    /// 2.21.157 — ring simulé 6 plans × 3 segments, état du lab à 18:06
+    /// (#10 7110763070) : N2, S1-MME, S11, S5-C réduits à l'en-tête (N2 sans
+    /// NGAP d'abonné), N4 et Sxab en heartbeats PFCP seulement.
+    fn idle_ring(root: &std::path::Path) {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let n4 = fs::read(source.join("N4.pcapng")).unwrap();
+        let header_only = pcapng_prefix(&n4, 0);
+        // Les 4 premiers paquets de N4.pcapng : Heartbeat Request /
+        // Response, deux fois (`tshark -T fields -e pfcp.msg_type` : 1 2 1 2).
+        let heartbeats = pcapng_prefix(&n4, 4);
+        let _ = fs::remove_dir_all(root);
+        for (plane, bytes) in [
+            ("n2", &header_only),
+            ("s1mme", &header_only),
+            ("s11", &header_only),
+            ("s5c", &header_only),
+            ("n4", &heartbeats),
+            ("sxab", &heartbeats),
+        ] {
+            fs::create_dir_all(root.join(plane)).unwrap();
+            for segment in 1..=3 {
+                fs::write(root.join(plane).join(format!("{plane}_0000{segment}.pcapng")), bytes).unwrap();
+            }
+        }
+    }
+
+    /// 2.21.157 (ordre cœur #9 7110886701, recette A #10 7110539781) —
+    /// `files=18`, `events_scanned=0` devient lisible : 12 segments sans
+    /// event, 0 erreur de décodage, 24 PFCP de niveau nœud écartés. Le
+    /// comportement ne change pas : 0 event scanné, 0 appris, 0 message.
+    /// Avant : les trois compteurs n'existaient pas.
+    #[test]
+    fn an_idle_ring_explains_eighteen_files_and_zero_events_2_21_157() {
+        let root = std::env::temp_dir().join(format!("oiran-seed-idle-{}-{:?}", std::process::id(), std::thread::current().id()));
+        idle_ring(&root);
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let r = LiveTraceRegistry::new();
+        r.traces.lock().unwrap().insert("t".into(), state(u64::MAX, false, vec!["psn-cible".into()]));
+        assert!(r.begin_seed());
+        let report = seed_from_ring(&root, &key, &r);
+        r.finish_seed(&report);
+        let traces = r.traces.lock().unwrap();
+        let seed = serde_json::to_value(&traces["t"].trace.seed).unwrap();
+        assert_eq!(seed["files"], 18, "`files` garde sa définition : segments retenus");
+        assert_eq!(seed["events_scanned"], 0);
+        assert_eq!(seed["events_learned"], 0);
+        assert_eq!(traces["t"].trace.messages, 0);
+        assert_eq!(seed["files_without_events"], 12, "{seed}");
+        assert_eq!(seed["decode_errors"], 0, "{seed}");
+        assert_eq!(seed["node_messages_skipped"], 24, "6 segments × 4 heartbeats : {seed}");
+        drop(traces);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 2.21.157 — cible récente : l'amorçage apprend (`events_learned > 0`)
+    /// sans rien émettre (`messages = 0`, `live_events_since_open = 0`) ;
+    /// dès qu'un event live de la cible arrive après l'ouverture, il est
+    /// servi (`messages > 0`) et compté dans `live_events_since_open`.
+    /// Avant : `live_events_since_open` n'existait pas dans `stats`.
+    #[test]
+    fn a_recent_target_is_learned_silently_then_served_on_live_traffic_2_21_157() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let root = std::env::temp_dir().join(format!("oiran-seed-recent-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("n2")).unwrap();
+        fs::copy(source.join("N2.pcapng"), root.join("n2").join("n2_00001.pcapng")).unwrap();
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let config = oiran_decode::DecodeConfig {
+            input: root.join("n2").join("n2_00001.pcapng"),
+            capture_id: format!("sha256:{}", "d".repeat(64)),
+            interface: "N2".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: String::new(),
+        };
+        let mut live = Vec::new();
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            live.push(event);
+            Ok(())
+        })
+        .unwrap();
+        sort_by_capture_order(&mut live);
+        let pseudonym = live
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .expect("le jeu N2 porte un subscriber_pseudonym");
+        let r = LiveTraceRegistry::new();
+        r.traces.lock().unwrap().insert("t".into(), state(u64::MAX, false, vec![pseudonym]));
+        assert!(r.begin_seed());
+        let report = seed_from_ring(&root, &key, &r);
+        r.finish_seed(&report);
+        let stats = |r: &LiveTraceRegistry| {
+            let traces = r.traces.lock().unwrap();
+            r.stats_payload(&traces["t"].trace)
+        };
+        let quiet = stats(&r);
+        assert!(quiet["seed"]["events_learned"].as_u64().unwrap() > 0, "{quiet}");
+        assert_eq!(quiet["messages"], 0, "l'amorçage n'émet rien");
+        assert_eq!(quiet["live_events_since_open"], 0, "aucun trafic depuis l'ouverture : {quiet}");
+        for event in &live {
+            r.route_normalized(event);
+        }
+        let served = stats(&r);
+        assert!(served["messages"].as_u64().unwrap() > 0, "{served}");
+        assert_eq!(served["live_events_since_open"].as_u64().unwrap(), live.len() as u64, "{served}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn seed_from_ring_attaches_gpdu_of_a_session_older_than_the_trace_2_21_105() {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

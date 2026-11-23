@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.157 — 2026-11-23 — trace live : un « 0 message » devient lisible
+
+Upgrade **patch**, sans déploiement. Base `e99d95c` (2.21.156, en prod), branche `fix/oiran-2.21.157-trace-seed-observability`.
+- Ordre du cœur : #9 7110886701.
+- Audits : #9 7110735471 et 7110790369.
+- Faits d'ANR2 : #10 7110763070.
+
+**Contexte.** La recette A rendait `seed.files=18`, `events_scanned=0`, `messages=0`. Le code fait ce qu'il dit :
+- l'amorçage relit le ring pcap (3 derniers segments × 6 plans), apprend le contexte de la cible et n'émet rien (`live_trace.rs`, `if seed_only { … continue; }`) ;
+- depuis 2.21.135, `messages` ne compte que le trafic de la cible capturé après l'ouverture.
+
+Le défaut corrigé ici, c'est qu'un 0 ne s'expliquait pas sans aller lire le disque.
+
+**Ajouts, sans changement de comportement.** Aucun event n'est ajouté ni retiré. Le filtre d'ouverture, l'écart des PFCP de niveau nœud et le tri des segments par nom restent tels quels. `seed.files` garde sa définition : les segments retenus.
+- `seed.files_without_events` : segments relus qui n'ont donné aucun event.
+- `seed.decode_errors` : segments dont le décodage a rendu une erreur, bloc partiel d'un segment en cours d'écriture compris. Les events complets restent utilisés, comme avant.
+- `seed.node_messages_skipped` : PFCP de niveau nœud écartés avant la trace. Le prédicat est extrait tel quel dans `is_pfcp_node_event` et sert aux deux endroits.
+- `live_events_since_open`, dans `stats` et dans la trace : events du ring vus par la trace après son ouverture, toutes cibles confondues. C'est la somme des `feed.*.seen`.
+
+Tests, rejoués sur `e99d95c` dans un arbre séparé, retiré ensuite (patch `~/oiran-polaris-archives/2.21.157-preuve-echec-avant-sur-e99d95c.patch`) :
+
+| Test | Sur `e99d95c` | Sur 2.21.157 |
+|---|---|---|
+| `an_idle_ring_explains_eighteen_files_and_zero_events_2_21_157` : ring 6 × 3, N2, S1-MME, S11 et S5-C réduits à l'en-tête, N4 et Sxab en heartbeats | `files=18` et `events_scanned=0` déjà reproduits, puis **échoue** : `files_without_events` absent (`Null`) | passe : 12 sans event, 0 erreur, 24 PFCP de nœud écartés |
+| `a_recent_target_is_learned_silently_then_served_on_live_traffic_2_21_157` | `events_learned > 0` et `messages = 0` déjà vrais, puis **échoue** : `live_events_since_open` absent | passe : 0 sans trafic, puis `messages > 0` et un compte égal aux events live |
+
+Le chiffre 24 vient de 6 segments × 4 paquets. Les 4 premiers paquets de `N4.pcapng` sont des heartbeats : `tshark -T fields -e pfcp.msg_type` rend `1 2 1 2`.
+
 ## oiran-api 2.21.156, live-probe 0.6.41, session-engine 0.5.34, decoder-diameter 0.2.8 — 2026-11-23 — alias d'abonné : une seule preuve typée, la sûreté par défaut
 
 Upgrade **patch**, sans déploiement. Au-dessus de 2.21.155 @ `8a9cebc` (base `0fe302e`, en prod), branche `fix/oiran-2.21.156-typed-subscriber-alias`.
