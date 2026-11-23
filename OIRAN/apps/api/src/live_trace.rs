@@ -8939,6 +8939,234 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn empty_pcap_2_21_157() -> Vec<u8> {
+        // PCAP classique, Ethernet, sans paquet. Le suffixe reste `.pcapng`
+        // comme dans le ring : le loader choisit le format par le magic.
+        vec![
+            0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0xff,
+            0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    fn pfcp_heartbeat_pcap_2_21_157() -> Vec<u8> {
+        let mut packet = vec![0u8; 14];
+        packet[12..14].copy_from_slice(&[0x08, 0x00]);
+        packet.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x2c, 0, 1, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2,
+        ]);
+        packet.extend_from_slice(&[
+            0x22, 0x65, 0x22, 0x65, 0x00, 0x18, 0, 0,
+        ]);
+        // PFCP Heartbeat Request, séquence 1, IE Recovery Time Stamp.
+        packet.extend_from_slice(&[
+            0x20, 0x01, 0x00, 0x0c, 0x00, 0x00, 0x01, 0x00, 0x00, 0x60, 0x00, 0x04, 0, 0,
+            0, 1,
+        ]);
+        let mut pcap = empty_pcap_2_21_157();
+        let length = packet.len() as u32;
+        pcap.extend_from_slice(&1u32.to_le_bytes());
+        pcap.extend_from_slice(&0u32.to_le_bytes());
+        pcap.extend_from_slice(&length.to_le_bytes());
+        pcap.extend_from_slice(&length.to_le_bytes());
+        pcap.extend_from_slice(&packet);
+        pcap
+    }
+
+    fn seed_ring_root_2_21_157(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "oiran-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Ordre #10 7110900477 — 6 plans × 3 segments, dont un plan N4 qui
+    /// ne porte que des Heartbeat PFCP et des plans sans paquet abonné.
+    /// Un amorçage fini à zéro doit être un refus nommé, pas un succès
+    /// silencieux. Ce garde est volontairement rouge avant le lot 2.21.157.
+    #[test]
+    fn empty_eighteen_file_ring_seed_is_an_explicit_named_failure_2_21_157() {
+        let root = seed_ring_root_2_21_157("seed-empty-ring");
+        let empty = empty_pcap_2_21_157();
+        let heartbeat = pfcp_heartbeat_pcap_2_21_157();
+        for interface in SEED_INTERFACES {
+            let directory = root.join(ring_directory(interface));
+            fs::create_dir_all(&directory).unwrap();
+            for segment in 1..=3 {
+                let bytes = if interface == "N4" { &heartbeat } else { &empty };
+                fs::write(
+                    directory.join(format!("{}_{segment:05}.pcapng", ring_directory(interface))),
+                    bytes,
+                )
+                .unwrap();
+            }
+        }
+        let registry = trace_on("psn-no-subscriber-in-ring");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let heartbeat_path = root.join("n4/n4_00001.pcapng");
+        let heartbeat_config = oiran_decode::DecodeConfig {
+            input: heartbeat_path,
+            capture_id: format!("sha256:{}", "4".repeat(64)),
+            interface: "N4".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: "n4_00001.pcapng".into(),
+        };
+        let mut decoded = Vec::new();
+        oiran_decode::decode_capture_streaming(&heartbeat_config, &key, |event| {
+            decoded.push(event.message_name);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            decoded,
+            vec!["PFCP Heartbeat Request"],
+            "précondition : N4 porte bien un heartbeat décodable, exclu car sans portée abonné"
+        );
+        assert!(registry.begin_seed());
+        let report = seed_from_ring(&root, &key, &registry);
+        registry.finish_seed(&report);
+        let traces = registry.traces.lock().unwrap();
+        let trace = &traces["t"].trace;
+        let stats = registry.stats_payload(trace);
+        assert_eq!(report.files, 18);
+        assert_eq!(trace.seed.events_scanned, 0);
+        assert_eq!(trace.seed.events_learned, 0);
+        assert_eq!(
+            stats["seed"]["failure_code"],
+            "LIVE_TRACE_SEED_NO_SUBSCRIBER_EVENTS",
+            "GARDE ROUGE e99d95c : files=18/events_scanned=0 ne doit pas finir silencieusement"
+        );
+        drop(traces);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Contre-épreuve verte : le N2 réel contient du NGAP abonné. La même
+    /// passe doit effectivement scanner et apprendre du contexte.
+    #[test]
+    fn subscriber_ngap_ring_seed_scans_and_learns_2_21_157() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let root = seed_ring_root_2_21_157("seed-ngap-ring");
+        fs::create_dir_all(root.join("n2")).unwrap();
+        fs::copy(&source, root.join("n2/n2_00001.pcapng")).unwrap();
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let config = oiran_decode::DecodeConfig {
+            input: source,
+            capture_id: format!("sha256:{}", "c".repeat(64)),
+            interface: "N2".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: "N2.pcapng".into(),
+        };
+        let mut target = None;
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            if target.is_none() {
+                target = event
+                    .session_identifiers
+                    .iter()
+                    .find(|id| id.name == "subscriber_pseudonym")
+                    .map(|id| id.value.clone());
+            }
+            Ok(())
+        })
+        .unwrap();
+        let registry = trace_on(&target.expect("le N2 de référence porte un abonné"));
+        assert!(registry.begin_seed());
+        let report = seed_from_ring(&root, &key, &registry);
+        registry.finish_seed(&report);
+        let traces = registry.traces.lock().unwrap();
+        let seed = &traces["t"].trace.seed;
+        assert_eq!(report.files, 1);
+        assert!(seed.events_scanned > 0, "le NGAP abonné est décodé");
+        assert!(seed.events_learned > 0, "le contexte abonné est appris");
+        drop(traces);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Après redémarrage, dumpcap peut repartir à 1 alors que les anciens
+    /// noms élevés existent encore. Les trois derniers doivent être choisis
+    /// par fraîcheur disque, pas par le numéro lexical du segment.
+    #[test]
+    fn ring_segment_numbering_restart_selects_newest_files_2_21_157() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let old = fs::read(source).unwrap();
+        let recent = empty_pcap_2_21_157();
+        let root = seed_ring_root_2_21_157("seed-renumbered-ring");
+        let n2 = root.join("n2");
+        fs::create_dir_all(&n2).unwrap();
+        for segment in 97..=99 {
+            fs::write(n2.join(format!("n2_{segment:05}.pcapng")), &old).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for segment in 1..=3 {
+            fs::write(n2.join(format!("n2_{segment:05}.pcapng")), &recent).unwrap();
+        }
+        let old_mtime = fs::metadata(n2.join("n2_00099.pcapng"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let recent_mtime = fs::metadata(n2.join("n2_00003.pcapng"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(recent_mtime > old_mtime, "précondition : 1..3 sont les plus récents");
+
+        let registry = trace_on("psn-renumbering-guard");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        assert!(registry.begin_seed());
+        let report = seed_from_ring(&root, &key, &registry);
+        registry.finish_seed(&report);
+        assert_eq!(report.files, 3);
+        assert_eq!(
+            report.bytes,
+            3 * recent.len() as u64,
+            "DÉFAUT : le tri par nom a relu 97..99 (anciens) au lieu de 1..3 (récents après redémarrage)"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// L'apprentissage multi-capture suit le contrat `(capture_id, seq)`.
+    /// Les timestamps sont volontairement inversés pour empêcher leur usage.
+    #[test]
+    fn ring_seed_history_uses_capture_id_and_seq_never_timestamp_2_21_157() {
+        use event_schema::{Direction, Protocol};
+        let registry = trace_on("psn-order-guard");
+        assert!(registry.begin_seed());
+        let mut setup = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            9,
+            Direction::RanToCore,
+            vec![("subscriber_pseudonym", "psn-order-guard")],
+            vec![(
+                "PDUSessionResourceSetupRequestTransfer",
+                "item_0_tunnel_ip_ul=192.0.2.10,item_0_gtp_teid_ul=0x0000a001",
+            )],
+        );
+        setup.capture_id = "capture-a".into();
+        setup.timestamp.seconds = 20;
+        let mut detach = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "Deregistration Accept",
+            1,
+            Direction::CoreToRan,
+            vec![("subscriber_pseudonym", "psn-order-guard")],
+            vec![],
+        );
+        detach.capture_id = "capture-b".into();
+        detach.timestamp.seconds = 10;
+        learn_history(&registry, vec![detach, setup]);
+        let traces = registry.traces.lock().unwrap();
+        assert!(
+            traces["t"].tunnel_endpoints.is_empty(),
+            "ordre canonique attendu : capture-a/9 setup puis capture-b/1 detach ; un tri ts laisse le tunnel vivant"
+        );
+    }
+
     /// 2.21.120 (lot B1) — le lecteur reprend aussi à l'offset sur le
     /// plan N2 : capture N2 réelle du dépôt écrite en trois fois, somme
     /// des octets décodés = taille du fichier, events = décodage
