@@ -200,6 +200,17 @@ pub(crate) struct SeedStats {
     /// `events_scanned`.
     #[serde(default)]
     node_messages_skipped: u64,
+    /// 2.21.159 (arbitrage cœur #9 7113598180, accord #9 7116145380) —
+    /// source de la clé de rang des segments relus, par segment. Une seule
+    /// source par passe : un seul des deux compteurs est non nul.
+    #[serde(default)]
+    rank_source_created: u64,
+    #[serde(default)]
+    rank_source_name: u64,
+    /// 2.21.159 — segments dont la source retenue ne donne pas de rang :
+    /// ils passent en tête du tri (rang absent < rang présent).
+    #[serde(default)]
+    rank_source_missing: u64,
 }
 
 /// 2.21.105 — interfaces de signalisation relues à l'ouverture d'une
@@ -313,6 +324,10 @@ pub(crate) struct SeedReport {
     files_without_events: u64,
     decode_errors: u64,
     node_messages_skipped: u64,
+    /// 2.21.159 — voir `SeedStats`.
+    rank_source_created: u64,
+    rank_source_name: u64,
+    rank_source_missing: u64,
 }
 
 /// 2.21.105 (ordre #9 7048974175) — relit le ring de signalisation et
@@ -329,9 +344,10 @@ fn seed_from_ring(
 ) -> SeedReport {
     let started = std::time::Instant::now();
     let mut report = SeedReport::default();
-    // 2.21.134 (question 1 du cœur, ordre #9 7060289296) — les events de
-    // tous les plans sont rejoués ensemble, dans l'ordre du temps.
-    let mut history: Vec<event_schema::NormalizedEvent> = Vec::new();
+    // 2.21.134 — les events de tous les plans sont rejoués ensemble.
+    // 2.21.159 — dans l'ordre canonique : rang du segment, `capture_id`,
+    // numéro de paquet (`learn_ranked_history`), jamais le `ts`.
+    let mut selected_segments: Vec<(&str, std::path::PathBuf, u64, std::fs::Metadata)> = Vec::new();
     for interface in SEED_INTERFACES {
         let dir = root.join(ring_directory(interface));
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -363,6 +379,31 @@ fn seed_from_ring(
         let (selected, truncated) = select_seed_files(files, SEED_MAX_BYTES_PER_INTERFACE);
         report.truncated |= truncated;
         for (path, size) in selected {
+            if let Ok(meta) = path.metadata() {
+                selected_segments.push((interface, path, size, meta));
+            }
+        }
+    }
+    // 2.21.159 — une seule source de rang pour toute la passe : la date de
+    // création si TOUS les segments retenus la donnent, sinon l'horodatage
+    // de début de segment porté dans le nom dumpcap. Jamais la date de
+    // modification (elle avance pendant l'écriture), jamais le `ts`.
+    let source = if !selected_segments.is_empty()
+        && selected_segments.iter().all(|(_, path, _, meta)| segment_rank(path, meta, RankSource::Created).is_some())
+    {
+        RankSource::Created
+    } else {
+        RankSource::Name
+    };
+    let mut history: Vec<(Option<u128>, event_schema::NormalizedEvent)> = Vec::new();
+    for (interface, path, size, meta) in selected_segments {
+        let rank = segment_rank(&path, &meta, source);
+        match (rank, source) {
+            (None, _) => report.rank_source_missing += 1,
+            (Some(_), RankSource::Created) => report.rank_source_created += 1,
+            (Some(_), RankSource::Name) => report.rank_source_name += 1,
+        }
+        {
             let config = oiran_decode::DecodeConfig {
                 input: path.clone(),
                 capture_id: format!("sha256:{}", sha256_hex(path.to_string_lossy().as_bytes())),
@@ -391,14 +432,14 @@ fn seed_from_ring(
                 report.files_without_events += 1;
             }
             sort_by_capture_order(&mut events);
-            history.append(&mut events);
+            history.extend(events.into_iter().map(|event| (rank, event)));
             report.files += 1;
             report.bytes = report.bytes.saturating_add(size);
         }
     }
     // 2.21.157 — compté ici, écarté comme avant par `route_event_with`.
-    report.node_messages_skipped = history.iter().filter(|event| is_pfcp_node_event(event)).count() as u64;
-    learn_history(registry, history);
+    report.node_messages_skipped = history.iter().filter(|(_, event)| is_pfcp_node_event(event)).count() as u64;
+    learn_ranked_history(registry, history);
     report.duration_ms = started.elapsed().as_millis() as u64;
     report
 }
@@ -412,10 +453,60 @@ fn seed_from_ring(
 /// N2 qui porte ses tunnels — il s'y rattachait directement, ce que la
 /// règle d'établissement de 2.21.134 interdit. Dans l'ordre réel, il est
 /// rattaché après coup, comme en live.
-fn learn_history(registry: &LiveTraceRegistry, mut history: Vec<event_schema::NormalizedEvent>) {
-    history.sort_by_key(|event| (event.timestamp.seconds, event.timestamp.nanoseconds));
-    for event in &history {
+///
+/// 2.21.159 (gardes ANR1 #10 7111105810, arbitrage cœur #9 7113598180) —
+/// l'ordre n'est plus le `ts` : c'est l'ordre canonique `(capture_id, seq)`,
+/// précédé du rang du segment quand il est connu (`learn_ranked_history`).
+/// Sans rang (appel direct), tous les events ont le même rang.
+fn learn_history(registry: &LiveTraceRegistry, history: Vec<event_schema::NormalizedEvent>) {
+    learn_ranked_history(registry, history.into_iter().map(|event| (None, event)).collect());
+}
+
+/// 2.21.159 — tri `(rang du segment, capture_id, seq)`, stable. Le rang est
+/// une date de FICHIER portée à côté de l'event (`segment_rank`), jamais
+/// dans l'event : `capture_id` et `event_id` restent ceux du lecteur live.
+/// Entre segments de même rang (plans différents qui tournent ensemble),
+/// l'ordre est celui des `capture_id` : arbitraire, et déclaré.
+fn learn_ranked_history(registry: &LiveTraceRegistry, mut history: Vec<(Option<u128>, event_schema::NormalizedEvent)>) {
+    history.sort_by(|(rank_a, a), (rank_b, b)| {
+        let seq = |event: &event_schema::NormalizedEvent| {
+            event.packet_references.first().map(|reference| reference.packet_number).unwrap_or(u64::MAX)
+        };
+        rank_a
+            .cmp(rank_b)
+            .then_with(|| a.capture_id.cmp(&b.capture_id))
+            .then_with(|| seq(a).cmp(&seq(b)))
+    });
+    for (_, event) in &history {
         registry.learn_from_ring(event);
+    }
+}
+
+/// 2.21.159 — source de la clé de rang d'un segment du ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RankSource {
+    /// Date de création du fichier (statx), en ns depuis l'époque.
+    Created,
+    /// Horodatage de début de segment du nom dumpcap
+    /// (`<plan>_<démarrage>_<numéro>_<AAAAMMJJhhmmss>.pcapng`), en
+    /// secondes, sous la forme du nombre AAAAMMJJhhmmss.
+    Name,
+}
+
+/// 2.21.159 — rang d'un segment selon `source`, ou `None` si la source ne
+/// le donne pas. Les deux sources ne sont jamais mélangées dans un tri.
+fn segment_rank(path: &std::path::Path, meta: &std::fs::Metadata, source: RankSource) -> Option<u128> {
+    match source {
+        RankSource::Created => {
+            let created = meta.created().ok()?;
+            let nanos = created.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+            (nanos > 0).then_some(nanos)
+        }
+        RankSource::Name => {
+            let stem = path.file_stem()?.to_str()?;
+            let last = stem.rsplit('_').next()?;
+            (last.len() == 14 && last.bytes().all(|b| b.is_ascii_digit())).then(|| last.parse().ok()).flatten()
+        }
     }
 }
 
@@ -1611,6 +1702,9 @@ impl LiveTraceRegistry {
                 state.trace.seed.files_without_events = report.files_without_events;
                 state.trace.seed.decode_errors = report.decode_errors;
                 state.trace.seed.node_messages_skipped = report.node_messages_skipped;
+                state.trace.seed.rank_source_created = report.rank_source_created;
+                state.trace.seed.rank_source_name = report.rank_source_name;
+                state.trace.seed.rank_source_missing = report.rank_source_missing;
             }
         }
     }
@@ -5573,6 +5667,48 @@ mod tests {
         assert!(served["messages"].as_u64().unwrap() > 0, "{served}");
         assert_eq!(served["live_events_since_open"].as_u64().unwrap(), live.len() as u64, "{served}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // 2.21.159 — garde d'ANR1 repris TEL QUEL de `202c77a` ; il passe par le
+    // départage `capture_id` (rangs égaux). Son adaptation au rang : ANR1.
+    /// L'apprentissage multi-capture suit le contrat `(capture_id, seq)`.
+    /// Les timestamps sont volontairement inversés pour empêcher leur usage.
+    #[test]
+    fn ring_seed_history_uses_capture_id_and_seq_never_timestamp_2_21_157() {
+        use event_schema::{Direction, Protocol};
+        let registry = trace_on("psn-order-guard");
+        assert!(registry.begin_seed());
+        let mut setup = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            9,
+            Direction::RanToCore,
+            vec![("subscriber_pseudonym", "psn-order-guard")],
+            vec![(
+                "PDUSessionResourceSetupRequestTransfer",
+                "item_0_tunnel_ip_ul=192.0.2.10,item_0_gtp_teid_ul=0x0000a001",
+            )],
+        );
+        setup.capture_id = "capture-a".into();
+        setup.timestamp.seconds = 20;
+        let mut detach = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "Deregistration Accept",
+            1,
+            Direction::CoreToRan,
+            vec![("subscriber_pseudonym", "psn-order-guard")],
+            vec![],
+        );
+        detach.capture_id = "capture-b".into();
+        detach.timestamp.seconds = 10;
+        learn_history(&registry, vec![detach, setup]);
+        let traces = registry.traces.lock().unwrap();
+        assert!(
+            traces["t"].tunnel_endpoints.is_empty(),
+            "ordre canonique attendu : capture-a/9 setup puis capture-b/1 detach ; un tri ts laisse le tunnel vivant"
+        );
     }
 
     // 2.21.158 — garde d'ANR1 repris TEL QUEL de `test/anr1-ring-seed-guards`
@@ -12111,5 +12247,260 @@ mod tests {
             assert!(!t.match_keys.contains(unknown) && !t.exposed_keys.contains(unknown));
         }
         assert_eq!(t.trace.masked_foreign_pseudonyms, 2);
+    }
+    /// 2.21.159 (accord cœur #9 7116145380, condition 2) — sur un ring
+    /// nominal, les deux sources de rang donnent le MÊME ordre ; et une passe
+    /// d'amorçage n'utilise qu'une source (ici la date de création, que ce
+    /// système de fichiers rend : précondition vérifiée, pas sautée).
+    #[test]
+    fn both_rank_sources_give_the_same_order_on_a_nominal_ring_2_21_159() {
+        let root = std::env::temp_dir().join(format!("oiran-rank-sources-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = fs::remove_dir_all(&root);
+        let n2 = root.join("n2");
+        fs::create_dir_all(&n2).unwrap();
+        let empty = fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng")).unwrap();
+        // Un redémarrage au milieu : la numérotation repart de 1, le
+        // préfixe de démarrage change, l'horodatage de début croît.
+        let names = [
+            "n2_20261120T194956Z_00098_20261123130006.pcapng",
+            "n2_20261120T194956Z_00099_20261123140006.pcapng",
+            "n2_20261123T145900Z_00001_20261123150006.pcapng",
+            "n2_20261123T145900Z_00002_20261123160006.pcapng",
+        ];
+        for name in names {
+            fs::write(n2.join(name), &empty).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let order = |source: RankSource| -> Vec<String> {
+            let mut ranked: Vec<(u128, String)> = names
+                .iter()
+                .map(|name| {
+                    let path = n2.join(name);
+                    let meta = path.metadata().unwrap();
+                    (segment_rank(&path, &meta, source).expect("rang présent"), name.to_string())
+                })
+                .collect();
+            ranked.sort();
+            ranked.into_iter().map(|(_, name)| name).collect()
+        };
+        assert!(
+            n2.join(names[0]).metadata().unwrap().created().is_ok(),
+            "précondition : ce système de fichiers rend la date de création"
+        );
+        assert_eq!(order(RankSource::Created), names.to_vec(), "date de création");
+        assert_eq!(order(RankSource::Name), names.to_vec(), "horodatage du nom");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let r = trace_on("psn-rang");
+        assert!(r.begin_seed());
+        let report = seed_from_ring(&root, &key, &r);
+        assert_eq!(
+            (report.rank_source_created, report.rank_source_name, report.rank_source_missing),
+            (3, 0, 0),
+            "une seule source par passe, segment par segment"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 2.21.159 — l'apprentissage suit le RANG du segment : l'établissement
+    /// est dans le segment le plus ancien, la libération dans le suivant ;
+    /// les `ts` des paquets ET l'ordre des `capture_id` disent l'inverse.
+    /// Avant (tri par `ts`) : la libération était apprise d'abord et le
+    /// tunnel restait vivant.
+    #[test]
+    fn the_seed_follows_the_segment_rank_not_the_timestamp_nor_the_capture_id_2_21_159() {
+        use event_schema::{Direction, Protocol};
+        let registry = trace_on("psn-rank-guard");
+        assert!(registry.begin_seed());
+        let mut setup = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            9,
+            Direction::RanToCore,
+            vec![("subscriber_pseudonym", "psn-rank-guard")],
+            vec![("PDUSessionResourceSetupRequestTransfer", "item_0_tunnel_ip_ul=192.0.2.10,item_0_gtp_teid_ul=0x0000a001")],
+        );
+        setup.capture_id = "capture-z".into();
+        setup.timestamp.seconds = 20;
+        let mut detach = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "Deregistration Accept",
+            1,
+            Direction::CoreToRan,
+            vec![("subscriber_pseudonym", "psn-rank-guard")],
+            vec![],
+        );
+        detach.capture_id = "capture-a".into();
+        detach.timestamp.seconds = 10;
+        learn_ranked_history(&registry, vec![(Some(2), detach), (Some(1), setup)]);
+        let traces = registry.traces.lock().unwrap();
+        assert!(traces["t"].tunnel_endpoints.is_empty(), "rang 1 (établissement) puis rang 2 (libération)");
+    }
+
+    /// 2.21.159 (arbitrage cœur #9 7113598180, cas dur de 2.21.134) — deux
+    /// UE se réattribuent les tunnels ; l'établissement PFCP (N4) et le N2
+    /// porteur des tunnels sont dans DEUX segments distincts de MÊME rang :
+    /// leur ordre n'est plus celui du `ts` mais celui des `capture_id`,
+    /// arbitraire. Le résultat doit être celui du tri par `ts` d'avant,
+    /// dans les deux ordres possibles des `capture_id`.
+    #[test]
+    fn reused_tunnels_across_planes_of_the_same_rank_lose_nothing_against_the_timestamp_order_2_21_159() {
+        use event_schema::{Direction, Protocol};
+        let (gnb, upf, amf) = ("10.77.11.13", "10.77.22.13", "10.77.21.20");
+        struct Session {
+            pseudonym: &'static str,
+            amf_id: &'static str,
+            ran_id: &'static str,
+            teid_ul: &'static str,
+            teid_dl: &'static str,
+        }
+        let signalling = |s: &Session, first: u64| -> Vec<event_schema::NormalizedEvent> {
+            let ngap = |packet: u64, message: &str, extra: Vec<(&str, &str)>, ies: Vec<(&str, String)>| {
+                let mut ids: Vec<(&str, &str)> = vec![("amf_ue_ngap_id", s.amf_id), ("ran_ue_ngap_id", s.ran_id)];
+                ids.extend(extra);
+                let ies: Vec<(&str, &str)> = ies.iter().map(|(n, v)| (*n, v.as_str())).collect();
+                let mut event = mk_event("N2", Protocol::Ngap, message, packet, Direction::Downlink, ids, ies);
+                event.event_id = format!("evt-n2-{packet:06}");
+                event.source_endpoint.address = amf.into();
+                event.destination_endpoint.address = gnb.into();
+                event
+            };
+            let f_teid = format!("teid={},v4=true,v6=false,ipv4={upf}", s.teid_ul);
+            let mut est = mk_event(
+                "N4",
+                Protocol::Pfcp,
+                "Session Establishment Request",
+                first + 1,
+                Direction::Unknown,
+                vec![("seid", "0x0000000000000000"), ("pfcp_sequence", s.ran_id)],
+                vec![("F-TEID", f_teid.as_str())],
+            );
+            est.event_id = format!("evt-n4-{:06}", first + 1);
+            est.destination_endpoint.address = upf.into();
+            let setup = format!(
+                "item_0_tunnel_ip_ul={upf},item_0_gtp_teid_ul={},item_0_tunnel_ip_dl={gnb},item_0_gtp_teid_dl={}",
+                s.teid_ul, s.teid_dl
+            );
+            vec![
+                ngap(first, "DownlinkNASTransport", vec![("subscriber_pseudonym", s.pseudonym)], vec![]),
+                est,
+                ngap(
+                    first + 2,
+                    "PDUSessionResourceSetupRequest",
+                    vec![("pdu_session_id", "1")],
+                    vec![("PDUSessionResourceSetupRequestTransfer", setup)],
+                ),
+            ]
+        };
+        let gpdu = |s: &Session, packet: u64, uplink: bool, bytes: u32| {
+            let (teid, endpoint) = if uplink { (s.teid_ul, upf) } else { (s.teid_dl, gnb) };
+            let mut event = mk_event(
+                "N3",
+                Protocol::Gtpu,
+                "G-PDU",
+                packet,
+                if uplink { Direction::Uplink } else { Direction::Downlink },
+                vec![("teid", teid), ("tunnel_endpoint_ip", endpoint)],
+                vec![],
+            );
+            event.event_id = format!("evt-n3-{packet:06}");
+            event.destination_endpoint.address = endpoint.into();
+            event.packet_references[0].original_length = bytes;
+            event
+        };
+        let release = |s: &Session, packet: u64| {
+            let mut event = mk_event(
+                "N2",
+                Protocol::Ngap,
+                "UEContextReleaseComplete",
+                packet,
+                Direction::Uplink,
+                vec![("amf_ue_ngap_id", s.amf_id), ("ran_ue_ngap_id", s.ran_id)],
+                vec![],
+            );
+            event.event_id = format!("evt-n2-{packet:06}");
+            event
+        };
+        // Premier passage : A puis B.
+        let a1 = Session { pseudonym: "psn-ue-a", amf_id: "11", ran_id: "21", teid_ul: "0x0000a001", teid_dl: "0x0000a002" };
+        let b1 = Session { pseudonym: "psn-ue-b", amf_id: "12", ran_id: "22", teid_ul: "0x0000b001", teid_dl: "0x0000b002" };
+        let mut history = Vec::new();
+        history.extend(signalling(&a1, 10));
+        history.extend(signalling(&b1, 20));
+        history.push(gpdu(&a1, 30, true, 1_000));
+        history.push(gpdu(&b1, 31, true, 700));
+        history.push(release(&a1, 40));
+        history.push(release(&b1, 41));
+        // Second passage, 50 min plus tard, dans l'ordre inverse : B reçoit
+        // les tunnels de A, A ceux de B.
+        let b2 = Session { pseudonym: "psn-ue-b", amf_id: "32", ran_id: "42", teid_ul: "0x0000a001", teid_dl: "0x0000a002" };
+        let a2 = Session { pseudonym: "psn-ue-a", amf_id: "31", ran_id: "41", teid_ul: "0x0000b001", teid_dl: "0x0000b002" };
+        let mut live = Vec::new();
+        live.extend(signalling(&b2, 30_000));
+        live.extend(signalling(&a2, 30_010));
+        let (mut a_ul, mut a_dl) = (0u64, 0u64);
+        let mut packet = 30_100u64;
+        for round in 0..20u64 {
+            if round < 3 {
+                live.push(gpdu(&a2, packet, true, 1_000));
+                a_ul += 1_000;
+                packet += 1;
+            }
+            if round < 5 {
+                live.push(gpdu(&a2, packet, false, 1_000));
+                a_dl += 1_000;
+                packet += 1;
+            }
+            live.push(gpdu(&b2, packet, true, 700));
+            live.push(gpdu(&b2, packet + 1, false, 700));
+            packet += 2;
+        }
+        let run = |seeded: Vec<(Option<u128>, event_schema::NormalizedEvent)>| {
+            let r = trace_on("psn-ue-a");
+            assert!(r.begin_seed());
+            learn_ranked_history(&r, seeded);
+            r.finish_seed(&SeedReport::default());
+            for event in &live {
+                r.route_normalized(event);
+            }
+            r.flush_idle_throughput_buckets();
+            let traces = r.traces.lock().unwrap();
+            let t = &traces["t"];
+            let sum = |field: &str| -> u64 {
+                t.events.iter().filter(|e| e.kind == "throughput").map(|e| e.payload[field].as_u64().unwrap_or(0)).sum()
+            };
+            let routed: Vec<String> = t
+                .events
+                .iter()
+                .filter(|e| e.kind == "message")
+                .map(|e| e.payload["event_id"].as_str().unwrap().to_owned())
+                .collect();
+            (sum("ul_bytes_s"), sum("dl_bytes_s"), t.trace.gpdu_attached, t.trace.pfcp_establishment_reused_identifiers, routed)
+        };
+        let signalling_history: Vec<_> = history.into_iter().filter(|e| e.interface != "N3").collect();
+        // Référence : l'ordre du `ts` d'avant 2.21.159, tri stable, rendu par
+        // des rangs strictement croissants.
+        let mut by_ts = signalling_history.clone();
+        by_ts.sort_by_key(|event| (event.timestamp.seconds, event.timestamp.nanoseconds));
+        let reference = run(by_ts.into_iter().enumerate().map(|(i, e)| (Some(i as u128), e)).collect());
+        assert_eq!((reference.0, reference.1), (a_ul, a_dl), "la référence est bien celle de 2.21.134");
+        // N2 avant N4 (« cap-N2 » < « cap-N4 »), même rang.
+        let n2_first = run(signalling_history.iter().cloned().map(|e| (Some(1), e)).collect());
+        // N4 avant N2 : le `capture_id` du segment N4 passe devant.
+        let n4_first = run(
+            signalling_history
+                .iter()
+                .cloned()
+                .map(|mut e| {
+                    if e.interface == "N4" {
+                        e.capture_id = "cap-A-N4".into();
+                    }
+                    (Some(1), e)
+                })
+                .collect(),
+        );
+        assert_eq!(n2_first, reference, "N2 puis N4, même rang");
+        assert_eq!(n4_first, reference, "N4 puis N2, même rang");
     }
 }
