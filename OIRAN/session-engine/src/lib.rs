@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +35,13 @@ pub struct EventRecord {
     pub stable_event_key: String,
     pub parent_event_id: Option<String>,
     pub capture_id: String,
+    /// 2.21.152 / session-engine 0.5.31 — rang d'import de la capture
+    /// (`apply_capture_ranks`) : première clé de l'ordre canonique. Jamais
+    /// lu ni écrit dans le JSONL. `0` = rang non attribué : tous les
+    /// events sont alors à égalité et l'ordre retombe sur `capture_id`,
+    /// c'est-à-dire sur l'ordre d'avant 2.21.152.
+    #[serde(skip)]
+    pub capture_rank: u32,
     pub capture_point_id: String,
     pub timestamp: String,
     pub timestamp_ns: i128,
@@ -1090,6 +1097,13 @@ pub fn load_path_streaming_index(path: &std::path::Path) -> Result<StreamingEven
 pub struct StreamingRepresentativesIndex {
     pub events: Vec<EventRecord>,
     pub source_event_count: usize,
+    /// 2.21.152 — les `capture_id` dans l'ordre de leur première
+    /// apparition à la lecture des fichiers, eux-mêmes lus dans l'ordre
+    /// donné. C'est le rang d'import des captures.
+    pub capture_order: Vec<String>,
+    /// Le point de capture (`capture_point_id`) du premier event de
+    /// chaque capture, dans le même ordre que `capture_order`.
+    pub capture_points: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1175,6 +1189,7 @@ fn retained_heap_bytes(record: &SpilledRepresentative) -> usize {
         probe_type,
         physical_link,
         timestamp_source,
+        capture_rank: _,
     } = event;
     let text = |value: &String| string_heap_bytes(value, value.capacity());
     let optional = |value: &Option<String>| value.as_ref().map(text).unwrap_or(0);
@@ -1385,6 +1400,9 @@ where
     let mut run_paths = Vec::<PathBuf>::new();
     let mut source_event_count = 0usize;
     let mut ordinal = 0u64;
+    let mut capture_order = Vec::<String>::new();
+    let mut capture_points = Vec::<String>::new();
+    let mut captures_seen = HashSet::<String>::new();
     for path in paths {
         let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
         let mut reader = BufReader::new(&file);
@@ -1411,7 +1429,17 @@ where
             let mut event = parse_event(value)
                 .map_err(|error| format!("{} line {}: {error}", path.display(), line_no))?;
             source_event_count = source_event_count.saturating_add(1);
+            if !captures_seen.contains(&event.capture_id) {
+                captures_seen.insert(event.capture_id.clone());
+                capture_order.push(event.capture_id.clone());
+                capture_points.push(event.capture_point_id.clone());
+            }
             ordinal = ordinal.saturating_add(1);
+            if !captures_seen.contains(&event.capture_id) {
+                captures_seen.insert(event.capture_id.clone());
+                capture_order.push(event.capture_id.clone());
+                capture_points.push(event.capture_point_id.clone());
+            }
             compact_publication_event(&mut event);
             let record = SpilledRepresentative {
                 key: publication_semantic_key(&event),
@@ -1507,6 +1535,8 @@ where
     Ok(StreamingRepresentativesIndex {
         events,
         source_event_count,
+        capture_order,
+        capture_points,
     })
 }
 
@@ -1564,6 +1594,9 @@ where
 {
     let mut representatives = BTreeMap::<String, EventRecord>::new();
     let mut source_event_count = 0usize;
+    let mut capture_order = Vec::<String>::new();
+    let mut capture_points = Vec::<String>::new();
+    let mut captures_seen = HashSet::<String>::new();
     for path in paths {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let reader = io::BufReader::new(file);
@@ -1596,6 +1629,8 @@ where
     Ok(StreamingRepresentativesIndex {
         events,
         source_event_count,
+        capture_order,
+        capture_points,
     })
 }
 
@@ -2032,6 +2067,7 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         probe_type: opt_string(&["probe_type"]),
         physical_link: opt_string(&["physical_link"]),
         timestamp_source: opt_string(&["timestamp_source"]),
+        capture_rank: 0,
     })
 }
 
@@ -2055,8 +2091,74 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
 ///   3. puis l'`event_id`, comme avant.
 /// La clé reste une comparaison de valeurs portées par chaque event :
 /// l'ordre est total et ne dépend pas des autres events présents.
-pub fn canonical_sort_key<'a>(event: &'a EventRecord) -> (&'a str, u64, InPacketOrder<'a>) {
-    (event.capture_id.as_str(), event.packet_number(), in_packet_order(event))
+pub fn canonical_sort_key<'a>(event: &'a EventRecord) -> (u32, &'a str, u64, InPacketOrder<'a>) {
+    // 2.21.152 — le rang d'import de la capture passe devant son
+    // empreinte. Entre deux segments de rotation, l'ordre des empreintes
+    // (`sha256:…`) est un hasard : un contexte UE à cheval sur deux
+    // segments était parcouru à l'envers une fois sur deux et coupé en
+    // deux. Sans rang attribué (0 partout), l'ordre est celui d'avant.
+    (
+        event.capture_rank,
+        event.capture_id.as_str(),
+        event.packet_number(),
+        in_packet_order(event),
+    )
+}
+
+/// 2.21.152 — l'ordre canonique des captures d'un jeu : par point de
+/// capture, puis par ordre d'import (`first_appearance`, avec en regard
+/// le point de capture de chacune). Entre deux captures d'un MÊME point —
+/// deux segments de rotation — c'est l'ordre d'import qui décide, et lui
+/// seul. Entre deux points de capture, l'ordre est fixe (celui des noms)
+/// : il ne dépend ni des empreintes, ni du découpage en cycles d'import.
+pub fn canonical_capture_order(first_appearance: &[String], capture_points: &[String]) -> Vec<String> {
+    let mut indexed: Vec<(&str, usize, &String)> = first_appearance
+        .iter()
+        .enumerate()
+        .map(|(index, capture_id)| (capture_points.get(index).map(String::as_str).unwrap_or(""), index, capture_id))
+        .collect();
+    indexed.sort();
+    indexed.into_iter().map(|(_, _, capture_id)| capture_id.clone()).collect()
+}
+
+/// 2.21.152 — attribue à chaque event le rang d'import de sa capture :
+/// sa position (à partir de 1) dans `order`, la liste des `capture_id`
+/// dans l'ordre de leur première apparition quand on lit les fragments
+/// dans l'ordre du manifeste. Une capture absente de `order` prend le
+/// dernier rang (`u32::MAX`) ; leur nombre d'events est rendu, pour que
+/// l'appelant le journalise : un rang manquant ne se saute pas en silence.
+pub fn apply_capture_ranks(events: &mut [EventRecord], order: &[String]) -> usize {
+    let ranks: HashMap<&str, u32> = order
+        .iter()
+        .enumerate()
+        .map(|(index, capture_id)| (capture_id.as_str(), index as u32 + 1))
+        .collect();
+    let mut unknown = 0usize;
+    for event in events.iter_mut() {
+        event.capture_rank = match ranks.get(event.capture_id.as_str()) {
+            Some(rank) => *rank,
+            None => {
+                unknown += 1;
+                u32::MAX
+            }
+        };
+    }
+    unknown
+}
+
+/// 2.21.152 — comment `discover_sessions_with` nomme un contexte UE.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContextIdentityPolicy<'a> {
+    /// `false` : id historique, `hash(triplet | generation)`, où
+    /// `generation` est le rang du contexte parmi ceux du même triplet —
+    /// il dépend donc de tous les contextes parcourus avant lui.
+    /// `true` : id intrinsèque, `hash(triplet | ancre)`, l'ancre étant
+    /// l'`event_id` du premier event du contexte.
+    pub intrinsic: bool,
+    /// Ids déjà publiés, par ancre. Un contexte dont l'ancre s'y trouve
+    /// GARDE cet id (et donc son pseudonyme UE et l'id de ses sessions).
+    /// Ignoré si `intrinsic` est faux.
+    pub published_anchors: Option<&'a BTreeMap<String, String>>,
 }
 
 /// 0.5.27 — rang d'un event parmi ceux de son paquet : `(enfant ?,
@@ -2361,6 +2463,12 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
 /// a single subscriber or a single PDU session. The function is deterministic and
 /// side-effect free so repeated ingestion of the same observations is idempotent.
 pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
+    discover_sessions_with(events, ContextIdentityPolicy::default())
+}
+
+pub fn discover_sessions_with(events: &mut Vec<EventRecord>, policy: ContextIdentityPolicy<'_>) -> DiscoveryResult {
+    let mut contexts_keeping_published_id = 0usize;
+    let mut contexts_with_intrinsic_id = 0usize;
     deterministic_sort(events);
     let duplicate_observations = duplicate_observation_keys(events);
     let mut seen = HashSet::new();
@@ -2410,7 +2518,21 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
             );
             let generation = generations.entry(identity.clone()).or_default();
             *generation += 1;
-            let context_id = stable_id("uectx", &format!("{identity}|{generation}"));
+            let context_id = if policy.intrinsic {
+                // 2.21.152 — l'ancre est l'event qui ouvre le contexte.
+                match policy.published_anchors.and_then(|published| published.get(&event.event_id)) {
+                    Some(published) => {
+                        contexts_keeping_published_id += 1;
+                        published.clone()
+                    }
+                    None => {
+                        contexts_with_intrinsic_id += 1;
+                        stable_id("uectx", &format!("{identity}|anchor={}", event.event_id))
+                    }
+                }
+            } else {
+                stable_id("uectx", &format!("{identity}|{generation}"))
+            };
             contexts.push(DiscoveredUeContext {
                 pseudonym: stable_id("UE", &context_id),
                 context_id,
@@ -2608,6 +2730,10 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
         duplicate_observations.len(),
     );
 
+    if policy.intrinsic {
+        event_accounting.insert("contexts_keeping_published_id".into(), contexts_keeping_published_id);
+        event_accounting.insert("contexts_with_intrinsic_id".into(), contexts_with_intrinsic_id);
+    }
     contexts.sort_by(|a, b| a.context_id.cmp(&b.context_id));
     pdu_sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     procedures.sort_by(|a, b| a.procedure_id.cmp(&b.procedure_id));
@@ -6859,5 +6985,173 @@ mod in_packet_order_tests {
         }
         let _ = std::fs::remove_dir_all(&directory);
         assert!(violations.is_empty(), "{}", violations.join(" ; "));
+    }
+    // ---- 2.21.152 — ordre d'import des captures --------------------------
+
+    /// Le jeu certifié, dont la capture N2 est coupée en deux segments au
+    /// paquet `split` : le second reçoit `second_capture_id` et une
+    /// numérotation de paquets qui repart de 1, comme un nouveau fichier
+    /// de rotation. Rend les lignes JSONL (premier segment d'abord) et
+    /// l'ordre d'import des captures.
+    fn certified_cut_in_two_2_21_152(split: u64, second_capture_id: &str) -> (String, Vec<String>) {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
+        let text = std::fs::read_to_string(&fixture).unwrap();
+        let (mut first, mut second, mut order) = (String::new(), String::new(), Vec::<String>::new());
+        for line in text.lines() {
+            let mut event: Value = serde_json::from_str(line).unwrap();
+            let packet = event["packet_references"][0]["packet_number"].as_u64().unwrap();
+            let moved = event["capture_id"].as_str().unwrap().starts_with("sha256:2f2339") && packet >= split;
+            if moved {
+                event["capture_id"] = Value::from(second_capture_id);
+                event["packet_references"][0]["packet_number"] = Value::from(packet - split + 1);
+            } else {
+                let capture_id = event["capture_id"].as_str().unwrap().to_owned();
+                if !order.contains(&capture_id) {
+                    order.push(capture_id);
+                }
+            }
+            let target = if moved { &mut second } else { &mut first };
+            target.push_str(&serde_json::to_string(&event).unwrap());
+            target.push('\n');
+        }
+        order.push(second_capture_id.to_owned());
+        (first + &second, order)
+    }
+
+    /// Ce qu'une découverte décide : contextes (état, events) et sessions
+    /// PDU (id, events), sans rien qui dépende du nom d'une capture.
+    fn discovery_shape_2_21_152(discovery: &DiscoveryResult) -> (Vec<(String, String, Vec<String>)>, Vec<(String, Vec<String>)>) {
+        let mut contexts: Vec<_> = discovery
+            .ue_contexts
+            .iter()
+            .map(|context| {
+                let mut ids = context.event_ids.clone();
+                ids.sort();
+                (context.context_id.clone(), context.state.clone(), ids)
+            })
+            .collect();
+        contexts.sort();
+        let mut sessions: Vec<_> = discovery
+            .pdu_sessions
+            .iter()
+            .map(|session| {
+                let mut ids = session.event_ids.clone();
+                ids.sort();
+                (session.session_id.clone(), ids)
+            })
+            .collect();
+        sessions.sort();
+        (contexts, sessions)
+    }
+
+    /// 2.21.152 — un contexte UE à cheval sur deux segments de rotation est
+    /// découvert de la même façon quel que soit l'ordre des EMPREINTES des
+    /// deux segments : six points de coupe, empreinte du second segment
+    /// rangée après (`ffff`) puis avant (`0000`) celle du premier ; le
+    /// résultat est celui du jeu non coupé. Avant : l'ordre canonique
+    /// commençait par `capture_id` ; dans l'ordre inversé le moteur lisait
+    /// le segment récent d'abord et coupait le contexte en deux.
+    #[test]
+    fn a_ue_context_across_two_segments_does_not_depend_on_their_hashes_2_21_152() {
+        let policy = ContextIdentityPolicy { intrinsic: true, published_anchors: None };
+        let (uncut, uncut_order) = certified_cut_in_two_2_21_152(u64::MAX, "sha256:jamais");
+        let mut events = load_jsonl(std::io::Cursor::new(uncut)).unwrap();
+        assert_eq!(apply_capture_ranks(&mut events, &uncut_order), 0);
+        let expected = discovery_shape_2_21_152(&discover_sessions_with(&mut events, policy));
+        assert_eq!(expected.1.len(), 1, "le jeu certifié porte une session PDU");
+        for split in [4u64, 6, 9, 11, 14, 16] {
+            for second in ["sha256:ffff-second-segment", "sha256:0000-second-segment"] {
+                let (lines, order) = certified_cut_in_two_2_21_152(split, second);
+                let mut events = load_jsonl(std::io::Cursor::new(lines.clone())).unwrap();
+                assert_eq!(apply_capture_ranks(&mut events, &order), 0, "toutes les captures ont un rang");
+                let got = discovery_shape_2_21_152(&discover_sessions_with(&mut events, policy));
+                assert_eq!(got, expected, "coupe au paquet {split}, second segment {second}");
+            }
+            // Le défaut, tel qu'il était : sans rang, l'ordre inversé des
+            // empreintes change la découverte.
+            let (lines, _) = certified_cut_in_two_2_21_152(split, "sha256:0000-second-segment");
+            let mut events = load_jsonl(std::io::Cursor::new(lines)).unwrap();
+            let unranked = discovery_shape_2_21_152(&discover_sessions_with(&mut events, policy));
+            assert_ne!(unranked, expected, "coupe {split} : sans rang, le contexte est coupé (c'est le défaut)");
+        }
+    }
+
+    /// 2.21.152 — deux segments dans un MÊME fragment : le rang est celui
+    /// de la capture (ordre de première apparition à la lecture), pas celui
+    /// du fichier. La passe des représentants rend cet ordre.
+    #[test]
+    fn capture_order_is_first_appearance_even_inside_one_fragment_2_21_152() {
+        let policy = ContextIdentityPolicy { intrinsic: true, published_anchors: None };
+        let (uncut, uncut_order) = certified_cut_in_two_2_21_152(u64::MAX, "sha256:jamais");
+        let mut events = load_jsonl(std::io::Cursor::new(uncut)).unwrap();
+        apply_capture_ranks(&mut events, &uncut_order);
+        let expected = discovery_shape_2_21_152(&discover_sessions_with(&mut events, policy)).1;
+        let directory = std::env::temp_dir().join(format!("oiran-capture-order-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        // Un seul fichier ; le second segment, écrit après, a l'empreinte la plus petite.
+        let (lines, order) = certified_cut_in_two_2_21_152(11, "sha256:0000-second-segment");
+        let path = directory.join("fragment.jsonl");
+        std::fs::write(&path, lines).unwrap();
+        let mut index =
+            load_paths_spilling_representatives_with_progress(&[path], &directory.join("staging"), 1024 * 1024, |_, _| {})
+                .unwrap();
+        assert_eq!(index.capture_order, order, "ordre de première apparition, pas ordre des empreintes");
+        assert_eq!(index.capture_order.last().map(String::as_str), Some("sha256:0000-second-segment"));
+        assert_eq!(apply_capture_ranks(&mut index.events, &index.capture_order), 0);
+        let got = discover_sessions_with(&mut index.events, policy);
+        let mut sessions: Vec<String> = got.pdu_sessions.iter().map(|session| session.session_id.clone()).collect();
+        sessions.sort();
+        assert_eq!(sessions, expected.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>());
+        // Une capture sans rang prend le dernier rang et est comptée.
+        assert_eq!(apply_capture_ranks(&mut index.events, &index.capture_order[..1]), index.events.iter().filter(|e| e.capture_id != index.capture_order[0]).count());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 2.21.152 — aucun id déjà publié ne change : un contexte dont l'ancre
+    /// (son premier event) figure dans la table des ids publiés garde son
+    /// id de contexte, donc son pseudonyme UE et l'id de ses sessions.
+    /// Sans la table, l'id intrinsèque diffère de l'id historique : c'est
+    /// la table qui porte la garantie.
+    #[test]
+    fn a_published_context_keeps_its_id_pseudonym_and_session_ids_2_21_152() {
+        let (uncut, order) = certified_cut_in_two_2_21_152(u64::MAX, "sha256:jamais");
+        // Ce qui est publié aujourd'hui : ordre et ids historiques.
+        let mut events = load_jsonl(std::io::Cursor::new(uncut.clone())).unwrap();
+        let published = discover_sessions(&mut events);
+        let anchors: BTreeMap<String, String> = published
+            .ue_contexts
+            .iter()
+            .map(|context| (context.event_ids[0].clone(), context.context_id.clone()))
+            .collect();
+        assert_eq!(anchors.len(), published.ue_contexts.len(), "une ancre par contexte");
+        let ids = |discovery: &DiscoveryResult| {
+            let mut contexts: Vec<(String, String)> =
+                discovery.ue_contexts.iter().map(|c| (c.context_id.clone(), c.pseudonym.clone())).collect();
+            contexts.sort();
+            let mut sessions: Vec<String> = discovery.pdu_sessions.iter().map(|s| s.session_id.clone()).collect();
+            sessions.sort();
+            (contexts, sessions)
+        };
+        // Nouvel ordre, avec la table : mêmes ids.
+        let mut events = load_jsonl(std::io::Cursor::new(uncut.clone())).unwrap();
+        apply_capture_ranks(&mut events, &order);
+        let pinned = discover_sessions_with(
+            &mut events,
+            ContextIdentityPolicy { intrinsic: true, published_anchors: Some(&anchors) },
+        );
+        assert_eq!(ids(&pinned), ids(&published));
+        assert_eq!(pinned.event_accounting["contexts_keeping_published_id"], published.ue_contexts.len());
+        assert_eq!(pinned.event_accounting["contexts_with_intrinsic_id"], 0);
+        // Sans la table : ids intrinsèques, différents des ids publiés.
+        let mut events = load_jsonl(std::io::Cursor::new(uncut)).unwrap();
+        apply_capture_ranks(&mut events, &order);
+        let unpinned = discover_sessions_with(&mut events, ContextIdentityPolicy { intrinsic: true, published_anchors: None });
+        assert_ne!(ids(&unpinned).0, ids(&published).0);
+        assert_eq!(unpinned.event_accounting["contexts_with_intrinsic_id"], published.ue_contexts.len());
+        // Politique par défaut : exactement le résultat historique, sans compteur ajouté.
+        assert!(!published.event_accounting.contains_key("contexts_with_intrinsic_id"));
     }
 }

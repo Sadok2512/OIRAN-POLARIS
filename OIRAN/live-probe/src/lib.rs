@@ -1194,6 +1194,47 @@ pub struct LiveDataset {
     /// Absent d'un manifeste antérieur : tout est alors reconstruit.
     #[serde(default)]
     pub callflow_reuse_keys: BTreeMap<String, String>,
+    /// 2.21.152 — toutes les captures que le jeu a connues, dans leur
+    /// ordre d'IMPORT, chacune avec son point de capture. La liste ne fait
+    /// que s'allonger : une capture y est inscrite au cycle où elle
+    /// apparaît (à la suite, dans l'ordre de première apparition à la
+    /// lecture des fragments) et n'en bouge plus, ni n'en sort — même
+    /// archivée par la rétention, pour retrouver son rang si elle est
+    /// restaurée. L'ordre canonique s'en déduit : par point de capture,
+    /// puis par position dans cette liste (`capture_ids_in_canonical_order`).
+    /// Vide = garde coupée ou manifeste antérieur : l'ordre canonique
+    /// retombe alors sur `capture_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture_order: Vec<CaptureOrderEntry>,
+    /// 2.21.152 — ids de contexte UE déjà publiés, par ancre (`event_id`
+    /// du premier event du contexte). Un contexte qui y figure garde son
+    /// id, donc son pseudonyme UE et l'id de ses sessions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub published_context_anchors: BTreeMap<String, String>,
+    /// 2.21.152 — ids de session 5G que la découverte ne produit plus
+    /// alors que leurs events sont toujours dans le jeu (contexte recollé
+    /// par l'ordre d'import), et l'id de la session qui porte désormais ces
+    /// events (vide si aucune). Ces sessions RESTENT publiées avec leur
+    /// call flow d'origine (report des sessions du manifeste précédent) :
+    /// la table dit lesquelles sont dépassées, et par quoi. Cumulatif.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub superseded_session_ids: BTreeMap<String, String>,
+}
+
+/// 2.21.152 — une capture et son point de capture, à sa place dans
+/// l'ordre d'import (`LiveDataset::capture_order`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureOrderEntry {
+    pub capture_id: String,
+    pub capture_point_id: String,
+}
+
+/// 2.21.152 — l'ordre canonique des captures : par point de capture, puis
+/// par ordre d'import.
+pub fn capture_ids_in_canonical_order(import_order: &[CaptureOrderEntry]) -> Vec<String> {
+    let ids: Vec<String> = import_order.iter().map(|entry| entry.capture_id.clone()).collect();
+    let points: Vec<String> = import_order.iter().map(|entry| entry.capture_point_id.clone()).collect();
+    session_engine::canonical_capture_order(&ids, &points)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1809,6 +1850,10 @@ pub struct CaptureManager {
     /// Lue une fois dans `OIRAN_CALLFLOW_REUSE` (`0` la désactive : A/B
     /// au lab et retour arrière sans rebuild). Par instance, pas globale.
     callflow_reuse_enabled: Arc<AtomicBool>,
+    /// 2.21.152 — ordre canonique par rang d'import des captures et ids de
+    /// contexte intrinsèques, pour le jeu continu. `OIRAN_CAPTURE_RANK_ORDER=0`
+    /// le coupe : la publication est alors celle d'avant 2.21.152.
+    capture_rank_order_enabled: Arc<AtomicBool>,
     /// 2.21.143 — seuil d'events au-delà duquel les call flows sont
     /// construits par relecture des fragments, lot par lot
     /// (`IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS`). Par instance, pour
@@ -2238,6 +2283,9 @@ impl CaptureManager {
             sbi_hpack_carry_metrics_snapshot: Arc::new(Mutex::new(BTreeMap::new())),
             callflow_reuse_enabled: Arc::new(AtomicBool::new(
                 std::env::var("OIRAN_CALLFLOW_REUSE").map_or(true, |value| value.trim() != "0"),
+            )),
+            capture_rank_order_enabled: Arc::new(AtomicBool::new(
+                std::env::var("OIRAN_CAPTURE_RANK_ORDER").map_or(true, |value| value.trim() != "0"),
             )),
             in_memory_session_events_limit: Arc::new(std::sync::atomic::AtomicUsize::new(
                 IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS,
@@ -3079,6 +3127,9 @@ impl CaptureManager {
             publication_files_created: 0,
             callflows_path: None,
             callflow_reuse_keys: BTreeMap::new(),
+            capture_order: Vec::new(),
+            published_context_anchors: BTreeMap::new(),
+            superseded_session_ids: BTreeMap::new(),
         };
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
@@ -7530,6 +7581,57 @@ impl CaptureManager {
         advise_files_no_longer_needed(&event_paths);
         let event_count = index.source_event_count;
         let mut events = index.events;
+        // 2.21.152 — ordre d'import des captures (jeu continu seulement).
+        // Entre deux segments de rotation, l'ordre des empreintes est un
+        // hasard : un contexte UE à cheval était parcouru à l'envers une
+        // fois sur deux et coupé en deux.
+        let rank_order_enabled =
+            capture_id == CONTINUOUS_CAPTURE_ID && self.capture_rank_order_enabled.load(Ordering::SeqCst);
+        // L'ordre d'import est PERSISTANT : les captures déjà inscrites au
+        // manifeste précédent gardent leur place ; celles qui apparaissent
+        // à ce cycle sont inscrites à la suite, dans l'ordre de leur
+        // première apparition à la lecture des fragments. Une capture
+        // archivée reste inscrite, et retrouve son rang si elle revient.
+        let mut capture_import_order: Vec<CaptureOrderEntry> = Vec::new();
+        let mut captures_newly_ranked = 0usize;
+        if rank_order_enabled {
+            if let Some((_, prior)) = prior_continuous.as_ref() {
+                capture_import_order = prior.capture_order.clone();
+            }
+            let mut known: HashSet<String> = capture_import_order.iter().map(|entry| entry.capture_id.clone()).collect();
+            for (position, capture_id) in index.capture_order.iter().enumerate() {
+                if known.insert(capture_id.clone()) {
+                    captures_newly_ranked += 1;
+                    capture_import_order.push(CaptureOrderEntry {
+                        capture_id: capture_id.clone(),
+                        capture_point_id: index.capture_points.get(position).cloned().unwrap_or_default(),
+                    });
+                }
+            }
+        }
+        let capture_order: Vec<String> = capture_ids_in_canonical_order(&capture_import_order);
+        let events_without_rank = if rank_order_enabled {
+            session_engine::apply_capture_ranks(&mut events, &capture_order)
+        } else {
+            0
+        };
+        // Ids de contexte déjà publiés : la table du manifeste précédent,
+        // complétée par sa découverte (premier cycle sous 2.21.152).
+        let mut published_context_anchors: BTreeMap<String, String> = BTreeMap::new();
+        if rank_order_enabled {
+            if let Some((_, prior)) = prior_continuous.as_ref() {
+                published_context_anchors = prior.published_context_anchors.clone();
+                if let Some(prior_discovery) = prior.discovery.as_ref() {
+                    for context in &prior_discovery.ue_contexts {
+                        if let Some(anchor) = context.event_ids.first() {
+                            published_context_anchors
+                                .entry(anchor.clone())
+                                .or_insert_with(|| context.context_id.clone());
+                        }
+                    }
+                }
+            }
+        }
         // The legacy BTreeMap kept keys, tree nodes and freed allocation pages
         // resident through phase 07. Runs are gone at this point; return those
         // pages before discovery/correlation consumes the compact projections.
@@ -7617,7 +7719,112 @@ impl CaptureManager {
             .iter()
             .map(|context| context.ue_ip.clone())
             .collect::<Vec<_>>();
-        let mut discovery = discover_sessions(&mut events);
+        let mut discovery = if rank_order_enabled {
+            session_engine::discover_sessions_with(
+                &mut events,
+                session_engine::ContextIdentityPolicy {
+                    intrinsic: true,
+                    published_anchors: Some(&published_context_anchors),
+                },
+            )
+        } else {
+            discover_sessions(&mut events)
+        };
+        // 2.21.152 — une ligne par cycle, garde coupée comprise : ce que
+        // l'ordre d'import a changé aux contextes et aux ids de session.
+        let mut superseded_session_ids: BTreeMap<String, String> = BTreeMap::new();
+        {
+            let prior_discovery = prior_continuous.as_ref().and_then(|(_, prior)| prior.discovery.as_ref());
+            let prior_sessions: BTreeSet<&str> = prior_discovery
+                .map(|prior| prior.pdu_sessions.iter().map(|session| session.session_id.as_str()).collect())
+                .unwrap_or_default();
+            let prior_contexts: BTreeSet<&str> = prior_discovery
+                .map(|prior| prior.ue_contexts.iter().map(|context| context.context_id.as_str()).collect())
+                .unwrap_or_default();
+            let sessions: BTreeSet<&str> = discovery.pdu_sessions.iter().map(|session| session.session_id.as_str()).collect();
+            let contexts: BTreeSet<&str> = discovery.ue_contexts.iter().map(|context| context.context_id.as_str()).collect();
+            let retired: Vec<&str> = prior_sessions.difference(&sessions).copied().collect();
+            let created = sessions.difference(&prior_sessions).count();
+            let mut session_ids_superseded = 0usize;
+            let mut sessions_left_dataset = 0usize;
+            if rank_order_enabled {
+                if let Some((_, prior)) = prior_continuous.as_ref() {
+                    superseded_session_ids = prior.superseded_session_ids.clone();
+                }
+                if !retired.is_empty() {
+                    let mut holder: HashMap<&str, &str> = HashMap::new();
+                    for session in &discovery.pdu_sessions {
+                        for event_id in &session.event_ids {
+                            holder.entry(event_id.as_str()).or_insert(session.session_id.as_str());
+                        }
+                    }
+                    // Un id que la découverte ne produit plus est « remplacé »
+                    // si ses events sont encore dans le jeu : une autre
+                    // session les porte (redécoupage), ou plus aucune. S'ils
+                    // n'y sont plus, la session est sortie du jeu
+                    // (rétention) : ce n'est pas un remplacement.
+                    let present: HashSet<&str> = {
+                        let wanted: HashSet<&str> = retired
+                            .iter()
+                            .filter_map(|old| prior_discovery.and_then(|prior| prior.pdu_sessions.iter().find(|session| session.session_id == *old)))
+                            .flat_map(|session| session.event_ids.iter().map(String::as_str))
+                            .collect();
+                        events.iter().map(|event| event.event_id.as_str()).filter(|id| wanted.contains(id)).collect()
+                    };
+                    for old in &retired {
+                        let Some(prior_session) =
+                            prior_discovery.and_then(|prior| prior.pdu_sessions.iter().find(|session| session.session_id == *old))
+                        else {
+                            continue;
+                        };
+                        if !prior_session.event_ids.iter().any(|event_id| present.contains(event_id.as_str())) {
+                            sessions_left_dataset += 1;
+                            continue;
+                        }
+                        let replacement = prior_session
+                            .event_ids
+                            .iter()
+                            .find_map(|event_id| holder.get(event_id.as_str()))
+                            .map(|id| (*id).to_owned())
+                            .unwrap_or_default();
+                        if superseded_session_ids.insert((*old).to_owned(), replacement).is_none() {
+                            session_ids_superseded += 1;
+                        }
+                    }
+                }
+                for context in &discovery.ue_contexts {
+                    if let Some(anchor) = context.event_ids.first() {
+                        published_context_anchors
+                            .entry(anchor.clone())
+                            .or_insert_with(|| context.context_id.clone());
+                    }
+                }
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "CAPTURE_RANK_ORDER",
+                    "enabled": self.capture_rank_order_enabled.load(Ordering::SeqCst),
+                    "applied": rank_order_enabled,
+                    "captures": capture_order.len(),
+                    "captures_newly_ranked": captures_newly_ranked,
+                    "events_without_rank": events_without_rank,
+                    "contexts_before": prior_contexts.len(),
+                    "contexts_after": contexts.len(),
+                    "context_ids_retired": prior_contexts.difference(&contexts).count(),
+                    "context_ids_created": contexts.difference(&prior_contexts).count(),
+                    "contexts_keeping_published_id": discovery.event_accounting.get("contexts_keeping_published_id"),
+                    "contexts_with_intrinsic_id": discovery.event_accounting.get("contexts_with_intrinsic_id"),
+                    "sessions_before": prior_sessions.len(),
+                    "sessions_after": sessions.len(),
+                    "session_ids_not_rediscovered": retired.len(),
+                    "session_ids_superseded": session_ids_superseded,
+                    "sessions_left_dataset": sessions_left_dataset,
+                    "session_ids_created": created,
+                    "superseded_session_ids_total": superseded_session_ids.len(),
+                })
+            );
+        }
         trace_publication_rss(
             publication_started_epoch_ms,
             "03-after-discover-sessions",
@@ -7762,8 +7969,18 @@ impl CaptureManager {
         let prior_callflows_dir: Option<PathBuf> = prior_continuous
             .as_ref()
             .map(|(prior_dir, prior)| dataset_callflows_dir(prior_dir, prior));
+        // 2.21.152 — un call flow repris garde l'ordre de ses events tel
+        // qu'il a été construit. Si l'ordre des captures déjà connues a
+        // changé depuis le manifeste précédent (garde posée ou coupée,
+        // premier cycle sous 2.21.152), rien n'est repris à ce cycle : tous
+        // les call flows sont reconstruits dans le nouvel ordre. Un cycle
+        // au coût plein, une fois.
+        let capture_order_changed = prior_continuous
+            .as_ref()
+            .is_some_and(|(_, prior)| prior.capture_order.is_empty() != capture_order.is_empty());
         let reuse_delta: Option<HashSet<String>> = if self.callflow_reuse_enabled.load(Ordering::SeqCst)
             && !retention_active
+            && !capture_order_changed
         {
             delta_event_ids(
                 prior_continuous.as_ref().map(|(_, prior)| prior),
@@ -8030,6 +8247,12 @@ impl CaptureManager {
                 };
                 callflows_rebuilt += 1;
                 callflow_reuse_keys.insert(plan_session_id.clone(), reuse_key);
+                // 2.21.152 — les events relus pour ce call flow reprennent
+                // leur rang d'import avant la reconstruction.
+                let mut selected = selected;
+                if rank_order_enabled {
+                    session_engine::apply_capture_ranks(&mut selected, &capture_order);
+                }
                 let mut reconstruction = reconstruct(
                     selected,
                     ReconstructionHints {
@@ -8077,6 +8300,7 @@ impl CaptureManager {
             serde_json::json!({
                 "event": "CALLFLOW_REUSE",
                 "enabled": self.callflow_reuse_enabled.load(Ordering::SeqCst),
+                "capture_order_changed": capture_order_changed,
                 "delta_known": reuse_delta.is_some(),
                 "delta_events": reuse_delta.as_ref().map(HashSet::len),
                 "reused": callflows_reused,
@@ -8246,6 +8470,9 @@ impl CaptureManager {
             publication_files_created: 0,
             callflows_path: None,
             callflow_reuse_keys,
+            capture_order: capture_import_order,
+            published_context_anchors,
+            superseded_session_ids,
         };
         trace_publication_rss(
             publication_started_epoch_ms,
@@ -16554,6 +16781,9 @@ mod tests {
                 publication_files_created: 0,
                 callflows_path: None,
                 callflow_reuse_keys: BTreeMap::new(),
+                capture_order: Vec::new(),
+                published_context_anchors: BTreeMap::new(),
+                superseded_session_ids: BTreeMap::new(),
             },
         );
         manager.jobs.lock().unwrap().insert(
@@ -18684,6 +18914,9 @@ Content-Length: 0\r\n\
             publication_files_created: 0,
             callflows_path: None,
             callflow_reuse_keys: BTreeMap::new(),
+            capture_order: Vec::new(),
+            published_context_anchors: BTreeMap::new(),
+            superseded_session_ids: BTreeMap::new(),
         };
         fs::write(source.join("dataset/oiran_events.jsonl"), b"").unwrap();
         fs::write(
@@ -23831,5 +24064,409 @@ Content-Length: 0\r\n\
         assert!((17..42).contains(&bytes), "les octets des deux générations non référencées : {bytes}");
         // Rien n'a été modifié.
         assert_eq!(fs::read_dir(&generations).unwrap().count(), 4);
+    }
+    // ---- 2.21.152 — ordre d'import des captures --------------------------
+
+    /// Coupe un fichier pcapng en deux fichiers valides : les blocs
+    /// d'en-tête (section, interfaces) sont recopiés dans chacun, les
+    /// `first_packets` premiers paquets vont dans le premier.
+    fn split_pcapng_2_21_152(bytes: &[u8], first_packets: usize) -> (Vec<u8>, Vec<u8>) {
+        let (mut head, mut first, mut second) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut offset, mut packets) = (0usize, 0usize);
+        while offset + 12 <= bytes.len() {
+            let kind = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let block = &bytes[offset..offset + length];
+            match kind {
+                0x0A0D_0D0A | 1 => head.extend_from_slice(block),
+                2 | 3 | 6 => {
+                    packets += 1;
+                    if packets <= first_packets { first.extend_from_slice(block) } else { second.extend_from_slice(block) }
+                }
+                _ => {}
+            }
+            offset += length;
+        }
+        assert!(packets > first_packets, "le fichier a plus de {first_packets} paquets");
+        ([head.clone(), first].concat(), [head, second].concat())
+    }
+
+    /// Importe des fichiers N2 dans un jeu continu neuf — un cycle par
+    /// groupe — et rend ce que la découverte a décidé : états des
+    /// contextes UE, nombre de sessions PDU, taille de chaque session.
+    fn n2_import_shape_2_21_152(label: &str, rank_order: bool, cycles: &[Vec<&[u8]>]) -> (Vec<String>, Vec<usize>, LiveDataset) {
+        let cycles: Vec<(bool, Vec<&[u8]>)> = cycles.iter().map(|files| (rank_order, files.clone())).collect();
+        n2_import_cycles_2_21_152(label, &cycles).pop().unwrap()
+    }
+
+    /// Comme `n2_import_shape_2_21_152`, la garde étant choisie cycle par
+    /// cycle ; rend l'état du jeu après CHAQUE cycle.
+    fn n2_import_cycles_2_21_152(label: &str, cycles: &[(bool, Vec<&[u8]>)]) -> Vec<(Vec<String>, Vec<usize>, LiveDataset)> {
+        let root = temporary_root(label);
+        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let mut index = 0usize;
+        let mut states_after_each_cycle = Vec::new();
+        for (rank_order, files) in cycles {
+            manager.capture_rank_order_enabled.store(*rank_order, Ordering::SeqCst);
+            let mut selected = BTreeSet::new();
+            for bytes in files {
+                let path = base.join("pcap").join(format!("N2.pcap-segment-{index:02}.pcapng"));
+                fs::write(&path, bytes).unwrap();
+                selected.insert(path);
+                index += 1;
+            }
+            manager
+                .process_continuous_capture_selected(&base, &interface_specs(), 1024 * 1024 * 1024, &selected)
+                .unwrap();
+            let manifest: LiveDataset =
+                serde_json::from_slice(&fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap();
+            let discovery = manifest.discovery.clone().unwrap();
+            let mut states: Vec<String> = discovery.ue_contexts.iter().map(|context| format!("{}:{}", context.state, context.event_ids.len())).collect();
+            states.sort();
+            let mut sessions: Vec<usize> = discovery.pdu_sessions.iter().map(|session| session.event_ids.len()).collect();
+            sessions.sort();
+            // Chaque session publiée a son call flow, lisible.
+            let callflows = dataset_callflows_dir(&base.join("dataset"), &manifest);
+            for id in &manifest.session_ids {
+                let _flow: CallFlow = serde_json::from_slice(&fs::read(callflows.join(format!("{id}.json"))).unwrap()).unwrap();
+            }
+            states_after_each_cycle.push((states, sessions, manifest));
+        }
+        states_after_each_cycle
+    }
+
+    /// 2.21.152 — de bout en bout, avec de vrais fichiers de capture : le
+    /// fichier N2 du jeu certifié est coupé en deux fichiers pcapng,
+    /// importés en deux cycles (deux fragments) puis en un seul (un
+    /// fragment, deux segments). Le `capture_id` de chacun est l'empreinte
+    /// de son contenu : selon le point de coupe, celle du second fichier se
+    /// range avant ou après celle du premier. Dans tous les cas la
+    /// découverte est celle du fichier non coupé. Garde coupée, l'ordre
+    /// inversé coupe le contexte : c'est le défaut.
+    #[test]
+    fn a_ue_context_across_two_rotation_files_is_whole_whatever_their_hashes_2_21_152() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let whole = fs::read(workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng")).unwrap();
+        let (expected_states, expected_sessions, uncut) = n2_import_shape_2_21_152("rank-uncut", true, &[vec![&whole]]);
+        assert_eq!(expected_sessions.len(), 1, "le fichier porte une session PDU");
+        assert_eq!(uncut.capture_order.len(), 1);
+        let (mut inverted, mut natural, mut defect_seen) = (0usize, 0usize, 0usize);
+        for cut in [4usize, 6, 9, 11, 14, 16] {
+            let (first, second) = split_pcapng_2_21_152(&whole, cut - 1);
+            let hash_inverted = sha256_hex(&second) < sha256_hex(&first);
+            if hash_inverted { inverted += 1 } else { natural += 1 }
+            let (states, sessions, manifest) =
+                n2_import_shape_2_21_152(&format!("rank-two-cycles-{cut}"), true, &[vec![&first], vec![&second]]);
+            assert_eq!((&states, &sessions), (&expected_states, &expected_sessions), "coupe {cut}, deux fragments, empreintes inversées : {hash_inverted}");
+            assert_eq!(
+                capture_ids_in_canonical_order(&manifest.capture_order),
+                vec![format!("sha256:{}", sha256_hex(&first)), format!("sha256:{}", sha256_hex(&second))],
+                "ordre d'import, pas ordre des empreintes"
+            );
+            let (states, sessions, manifest) =
+                n2_import_shape_2_21_152(&format!("rank-one-cycle-{cut}"), true, &[vec![&first, &second]]);
+            assert_eq!((&states, &sessions), (&expected_states, &expected_sessions), "coupe {cut}, un fragment à deux segments");
+            assert_eq!(manifest.event_shards.len(), 1);
+            assert_eq!(manifest.capture_order.len(), 2);
+            if hash_inverted {
+                let (states, sessions, manifest) =
+                    n2_import_shape_2_21_152(&format!("rank-off-{cut}"), false, &[vec![&first], vec![&second]]);
+                assert!(manifest.capture_order.is_empty(), "garde coupée : pas d'ordre d'import au manifeste");
+                if (&states, &sessions) != (&expected_states, &expected_sessions) {
+                    defect_seen += 1;
+                }
+            }
+        }
+        assert!(inverted > 0 && natural > 0, "les deux ordres d'empreinte sont couverts : {inverted} inversés, {natural} naturels");
+        assert!(defect_seen > 0, "garde coupée, au moins une coupe à empreintes inversées montre le défaut");
+    }
+
+    /// 2.21.152 — aucun id déjà publié ne change au passage à l'ordre
+    /// d'import. Trois cycles sous l'ancien ordre (garde coupée), puis deux
+    /// sous le nouveau : les ids de contexte, les pseudonymes UE et les ids
+    /// de session publiés sont tous retrouvés ; rien n'est retiré ; le
+    /// manifeste porte la table des ancres.
+    #[test]
+    fn published_ids_and_pseudonyms_survive_the_switch_to_capture_rank_order_2_21_152() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let corpus = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED");
+        let one = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let root = temporary_root("rank-migration");
+        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let cycle = |segments: &[(&str, PathBuf)]| -> LiveDataset {
+            let mut selected = BTreeSet::new();
+            for (name, source) in segments {
+                let path = base.join("pcap").join(name);
+                fs::copy(source, &path).unwrap();
+                selected.insert(path);
+            }
+            manager
+                .process_continuous_capture_selected(&base, &interface_specs(), 1024 * 1024 * 1024, &selected)
+                .unwrap();
+            serde_json::from_slice(&fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap()
+        };
+        let ids = |manifest: &LiveDataset| {
+            let discovery = manifest.discovery.as_ref().unwrap();
+            let contexts: BTreeSet<(String, String)> =
+                discovery.ue_contexts.iter().map(|c| (c.context_id.clone(), c.pseudonym.clone())).collect();
+            let pdu: BTreeSet<String> = discovery.pdu_sessions.iter().map(|s| s.session_id.clone()).collect();
+            let listed: BTreeSet<String> = manifest.session_ids.iter().cloned().collect();
+            (contexts, pdu, listed)
+        };
+        // Ancien ordre.
+        manager.capture_rank_order_enabled.store(false, Ordering::SeqCst);
+        cycle(&[("N2.pcap-five.pcapng", corpus.join("multi-imsi.pcap")), ("N4.pcap-five.pcapng", corpus.join("multi-imsi.pcap"))]);
+        cycle(&[("N2.pcap-one.pcapng", one.join("N2.pcapng")), ("N4.pcap-one.pcapng", one.join("N4.pcapng"))]);
+        let legacy = cycle(&[("N2.pcap-registration.pcapng", corpus.join("5gc-registration.pcap"))]);
+        let (legacy_contexts, legacy_pdu, legacy_listed) = ids(&legacy);
+        assert!(legacy_pdu.len() >= 6 && legacy_contexts.len() >= 6, "{} sessions, {} contextes", legacy_pdu.len(), legacy_contexts.len());
+        assert!(legacy.capture_order.is_empty() && legacy.published_context_anchors.is_empty());
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap();
+        for field in ["capture_order", "published_context_anchors", "superseded_session_ids"] {
+            assert!(raw.get(field).is_none(), "garde coupée : le manifeste ne porte pas `{field}`");
+        }
+        // Nouvel ordre : un cycle sans nouvel UE, puis un cycle avec.
+        manager.capture_rank_order_enabled.store(true, Ordering::SeqCst);
+        let switched = cycle(&[("N3.pcap-one.pcapng", one.join("N3.pcapng"))]);
+        let (contexts, pdu, listed) = ids(&switched);
+        assert_eq!(contexts, legacy_contexts, "ids de contexte et pseudonymes UE inchangés");
+        assert_eq!(pdu, legacy_pdu, "ids de session PDU inchangés");
+        assert_eq!(listed, legacy_listed, "liste des sessions publiées inchangée");
+        assert!(switched.superseded_session_ids.is_empty(), "aucun id retiré");
+        assert_eq!(switched.published_context_anchors.len(), legacy_contexts.len(), "une ancre par contexte publié");
+        assert!(!switched.capture_order.is_empty());
+        let accounting = &switched.discovery.as_ref().unwrap().event_accounting;
+        assert_eq!(accounting["contexts_keeping_published_id"], legacy_contexts.len());
+        assert_eq!(accounting["contexts_with_intrinsic_id"], 0);
+        let grown = cycle(&[("N2.pcap-e2e.pcapng", corpus.join("5gc-e2e.pcap"))]);
+        let (contexts, pdu, listed) = ids(&grown);
+        assert!(contexts.is_superset(&legacy_contexts), "les contextes publiés restent, avec leur pseudonyme");
+        assert!(pdu.is_superset(&legacy_pdu) && listed.is_superset(&legacy_listed), "les sessions publiées restent");
+        assert!(contexts.len() > legacy_contexts.len(), "le nouvel UE a son contexte");
+        assert!(grown.superseded_session_ids.is_empty());
+        assert_eq!(
+            &grown.capture_order[..switched.capture_order.len()],
+            &switched.capture_order[..],
+            "une capture inscrite garde sa place : la liste ne fait que s'allonger"
+        );
+    }
+    /// 2.21.152 — ce que deviennent les sessions DÉJÀ publiées mal
+    /// découpées. Deux cycles sous l'ancien ordre publient un contexte
+    /// coupé en deux (empreintes inversées). Au premier cycle sous le
+    /// nouvel ordre, le contexte est recollé : la découverte est celle du
+    /// fichier non coupé. Si l'id de la session change, l'ancien id RESTE
+    /// publié avec son call flow d'origine, et le manifeste inscrit qu'il
+    /// est dépassé et par quel id : rien ne disparaît, rien ne change en
+    /// silence. Le cycle suivant ne change plus rien.
+    #[test]
+    fn a_context_published_split_is_rejoined_and_retired_ids_are_recorded_2_21_152() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let fixture = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let whole = fs::read(fixture.join("N2.pcapng")).unwrap();
+        let n4 = fs::read(fixture.join("N4.pcapng")).unwrap();
+        let n3 = fs::read(fixture.join("N3.pcapng")).unwrap();
+        let (expected_states, expected_sessions, _) = n2_import_shape_2_21_152("rejoin-uncut", true, &[vec![&whole]]);
+        let mut rejoined = 0usize;
+        let mut ids_replaced = 0usize;
+        for cut in [4usize, 6, 9, 11, 14, 16] {
+            let (first, second) = split_pcapng_2_21_152(&whole, cut - 1);
+            if sha256_hex(&second) >= sha256_hex(&first) {
+                continue;
+            }
+            let cycles = n2_import_cycles_2_21_152(
+                &format!("rejoin-{cut}"),
+                &[(false, vec![&first]), (false, vec![&second]), (true, vec![&n4]), (true, vec![&n3])],
+            );
+            let (legacy_states, legacy_sessions, legacy) = &cycles[1];
+            if (legacy_states, legacy_sessions) == (&expected_states, &expected_sessions) {
+                continue; // cette coupe ne montrait pas le défaut
+            }
+            rejoined += 1;
+            let (states, _, switched) = &cycles[2];
+            assert_eq!(states, &expected_states, "coupe {cut} : contexte recollé au premier cycle sous le nouvel ordre");
+            let pdu = |manifest: &LiveDataset| -> BTreeSet<String> {
+                manifest.discovery.as_ref().unwrap().pdu_sessions.iter().map(|session| session.session_id.clone()).collect()
+            };
+            let (before, after) = (pdu(legacy), pdu(switched));
+            assert_eq!(after.len(), 1, "coupe {cut} : une seule session, comme dans le fichier non coupé");
+            let gone: BTreeSet<String> = before.difference(&after).cloned().collect();
+            assert_eq!(
+                switched.superseded_session_ids.keys().cloned().collect::<BTreeSet<_>>(),
+                gone,
+                "coupe {cut} : tout id retiré est inscrit au manifeste, et seulement eux"
+            );
+            for (old, replacement) in &switched.superseded_session_ids {
+                assert!(after.contains(replacement), "coupe {cut} : {old} est remplacé par une session publiée");
+                assert!(switched.session_ids.contains(replacement));
+                // L'ancien id n'a pas disparu : il reste publié (son call
+                // flow d'origine a été relu par `n2_import_cycles`).
+                assert!(switched.session_ids.contains(old), "coupe {cut} : l'id publié {old} est toujours servi");
+            }
+            ids_replaced += gone.len();
+            // Cycle suivant : stable, la trace des ids retirés est gardée.
+            let (states, _, next) = &cycles[3];
+            assert_eq!(states, &expected_states);
+            assert_eq!(pdu(next), after, "coupe {cut} : plus aucun id ne bouge");
+            assert_eq!(next.superseded_session_ids, switched.superseded_session_ids);
+        }
+        assert!(rejoined > 0, "au moins une coupe publiait un contexte coupé");
+        println!("REJOINED contextes_recolles={rejoined} ids_de_session_remplaces={ids_replaced}");
+    }
+
+    /// 2.21.152 — rétention puis restauration : les ids publiés sous
+    /// l'ancien ordre survivent aux deux, et l'archive restaurée reprend sa
+    /// place AVANT les captures restées dans le jeu (rang le plus ancien).
+    #[test]
+    fn published_ids_survive_retention_then_restore_under_capture_rank_order_2_21_152() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let corpus = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED");
+        let one = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let root = temporary_root("rank-retention-restore");
+        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let cycle = |segments: &[(&str, PathBuf)]| -> LiveDataset {
+            let mut selected = BTreeSet::new();
+            for (name, source) in segments {
+                let path = base.join("pcap").join(name);
+                fs::copy(source, &path).unwrap();
+                selected.insert(path);
+            }
+            manager
+                .process_continuous_capture_selected(&base, &interface_specs(), 1024 * 1024 * 1024, &selected)
+                .unwrap();
+            serde_json::from_slice(&fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap()
+        };
+        let manifest = || -> LiveDataset {
+            serde_json::from_slice(&fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap()
+        };
+        let ids = |manifest: &LiveDataset| {
+            let discovery = manifest.discovery.as_ref().unwrap();
+            let contexts: BTreeSet<(String, String)> =
+                discovery.ue_contexts.iter().map(|c| (c.context_id.clone(), c.pseudonym.clone())).collect();
+            let pdu: BTreeSet<String> = discovery.pdu_sessions.iter().map(|s| s.session_id.clone()).collect();
+            (contexts, pdu)
+        };
+        // Ancien ordre : deux captures anciennes (août), importées dans
+        // l'ordre du temps, comme au lab.
+        manager.capture_rank_order_enabled.store(false, Ordering::SeqCst);
+        cycle(&[("N2.pcap-five.pcapng", corpus.join("multi-imsi.pcap")), ("N4.pcap-five.pcapng", corpus.join("multi-imsi.pcap"))]);
+        let legacy = cycle(&[("N2.pcap-registration.pcapng", corpus.join("5gc-registration.pcap"))]);
+        let (legacy_contexts, legacy_pdu) = ids(&legacy);
+        assert_eq!(legacy_pdu.len(), 6);
+        // Nouvel ordre : une capture récente (octobre) ; puis rétention, un cycle.
+        manager.capture_rank_order_enabled.store(true, Ordering::SeqCst);
+        let switched = cycle(&[("N2.pcap-one.pcapng", one.join("N2.pcapng")), ("N4.pcap-one.pcapng", one.join("N4.pcapng"))]);
+        assert!(ids(&switched).1.is_superset(&legacy_pdu));
+        assert_eq!(ids(&switched).1.len(), 7);
+        TEST_RETENTION_DAYS.with(|value| value.set(Some(60)));
+        let archived = cycle(&[("N3.pcap-one.pcapng", one.join("N3.pcapng"))]);
+        TEST_RETENTION_DAYS.with(|value| value.set(None));
+        let (archived_contexts, archived_pdu) = ids(&archived);
+        assert_eq!(archived_pdu.len(), 1, "les sessions des captures anciennes sont sorties avec l'archive");
+        assert!(archived_pdu.iter().all(|id| ids(&switched).1.contains(id)), "celles qui restent gardent leur id");
+        assert!(archived_contexts.iter().all(|context| ids(&switched).0.contains(context)), "et leur pseudonyme");
+        assert!(archived.superseded_session_ids.is_empty(), "une session archivée n'est pas un id dépassé par redécoupage");
+        assert!(
+            archived.published_context_anchors.len() >= legacy_contexts.len(),
+            "la table garde les ancres des contextes archivés : {}",
+            archived.published_context_anchors.len()
+        );
+        // Restauration : tout revient, sous les mêmes ids.
+        let segments: Vec<PathBuf> = fs::read_dir(base.join("archive")).unwrap().flatten().map(|entry| entry.path()).collect();
+        assert_eq!(segments.len(), 1);
+        manager.restore_from_archive_segment(&segments[0]).unwrap();
+        let restored = manifest();
+        let (restored_contexts, restored_pdu) = ids(&restored);
+        assert!(restored_pdu.is_superset(&legacy_pdu), "ids de session d'origine retrouvés après restauration");
+        assert!(restored_contexts.is_superset(&legacy_contexts), "ids de contexte et pseudonymes UE d'origine retrouvés");
+        assert_eq!(restored_pdu, ids(&switched).1, "exactement les sessions d'avant l'archivage");
+        assert!(restored.superseded_session_ids.is_empty());
+        // La liste d'import a gardé les captures archivées pendant leur
+        // absence, et elle est la même après restauration : chaque capture
+        // a retrouvé son rang.
+        assert_eq!(archived.capture_order, switched.capture_order[..].to_vec().into_iter().chain(archived.capture_order[switched.capture_order.len()..].iter().cloned()).collect::<Vec<_>>());
+        assert_eq!(restored.capture_order, archived.capture_order, "aucune capture ne change de rang à la restauration");
+    }
+
+    /// 2.21.152 — le rang d'une capture est inscrit à son import et n'en
+    /// bouge plus, même quand l'ordre de lecture des fragments change. Une
+    /// capture ANCIENNE importée TARD (après une capture plus récente) est
+    /// archivée par la rétention puis restaurée : l'archive revient en tête
+    /// des fragments, donc cette capture est LUE avant celle importée avant
+    /// elle. Avec un rang recalculé à chaque cycle par « première
+    /// apparition », leur ordre s'inversait à la restauration. Avec le rang
+    /// inscrit au manifeste, il ne bouge pas.
+    #[test]
+    fn a_capture_keeps_its_import_rank_when_restore_changes_the_reading_order_2_21_152() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let corpus = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED");
+        let one = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let root = temporary_root("rank-late-import");
+        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let cycle = |segments: &[(&str, PathBuf)]| -> LiveDataset {
+            let mut selected = BTreeSet::new();
+            for (name, source) in segments {
+                let path = base.join("pcap").join(name);
+                fs::copy(source, &path).unwrap();
+                selected.insert(path);
+            }
+            manager
+                .process_continuous_capture_selected(&base, &interface_specs(), 1024 * 1024 * 1024, &selected)
+                .unwrap();
+            serde_json::from_slice(&fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap()
+        };
+        let pdu = |manifest: &LiveDataset| -> BTreeSet<String> {
+            manifest.discovery.as_ref().unwrap().pdu_sessions.iter().map(|session| session.session_id.clone()).collect()
+        };
+        // Import : ancienne (août), récente (octobre), puis une AUTRE ancienne (août).
+        cycle(&[("N2.pcap-five.pcapng", corpus.join("multi-imsi.pcap"))]);
+        cycle(&[("N2.pcap-one.pcapng", one.join("N2.pcapng"))]);
+        let before = cycle(&[("N2.pcap-registration.pcapng", corpus.join("5gc-registration.pcap"))]);
+        let import_order: Vec<String> = before.capture_order.iter().map(|entry| entry.capture_id.clone()).collect();
+        assert_eq!(import_order.len(), 3);
+        // Rétention : les deux anciennes partent, la récente reste.
+        TEST_RETENTION_DAYS.with(|value| value.set(Some(60)));
+        let archived = cycle(&[("N3.pcap-one.pcapng", one.join("N3.pcapng"))]);
+        TEST_RETENTION_DAYS.with(|value| value.set(None));
+        assert_eq!(pdu(&archived).len(), 1);
+        assert_eq!(&archived.capture_order[..3], &before.capture_order[..], "les captures archivées restent inscrites");
+        // Restauration : l'archive revient en tête des fragments.
+        let segments: Vec<PathBuf> = fs::read_dir(base.join("archive")).unwrap().flatten().map(|entry| entry.path()).collect();
+        manager.restore_from_archive_segment(&segments[0]).unwrap();
+        let restored: LiveDataset =
+            serde_json::from_slice(&fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap();
+        assert!(restored.event_shards[0].path.starts_with("event-shards/shard-restored-"));
+        // Ordre de LECTURE après restauration : la troisième capture
+        // importée est lue avant la deuxième.
+        let reading_order: Vec<String> = {
+            let mut seen = Vec::new();
+            for shard in &restored.event_shards {
+                for line in fs::read_to_string(base.join("dataset").join(&shard.path)).unwrap().lines() {
+                    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    let id = value["capture_id"].as_str().unwrap().to_owned();
+                    if import_order.contains(&id) && !seen.contains(&id) {
+                        seen.push(id);
+                    }
+                }
+            }
+            seen
+        };
+        assert_eq!(reading_order, vec![import_order[0].clone(), import_order[2].clone(), import_order[1].clone()], "le cas est bien celui visé");
+        // Le rang, lui, n'a pas bougé ; les sessions et leurs ids non plus.
+        assert_eq!(restored.capture_order, archived.capture_order);
+        assert_eq!(&restored.capture_order[..3], &before.capture_order[..]);
+        assert_eq!(pdu(&restored), pdu(&before));
+        assert!(restored.superseded_session_ids.is_empty());
     }
 }

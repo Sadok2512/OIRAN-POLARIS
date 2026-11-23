@@ -1976,6 +1976,7 @@ mod tests {
             probe_type: None,
             physical_link: None,
             timestamp_source: None,
+            capture_rank: 0,
         }
     }
 

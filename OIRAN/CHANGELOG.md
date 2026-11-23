@@ -1,5 +1,75 @@
 # Changelog
 
+## oiran-api 2.21.152, session-engine 0.5.31, live-probe 0.6.37, correlation-engine 0.6.14 — 2026-11-23 — sessions coupées à la rotation : ordre canonique par rang d'import des captures
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.151 @ `7ccf7cb` (branche `fix/oiran-2.21.152-capture-rank-order`). Ordre du cœur #9 7087455119 ; audit #9 7087307029 ; preuve #9 7086975345 ; relevé lab #9 7087420291 (3 contextes touchés à coup sûr, 24 indéterminés, sur environ 230).
+
+### Le défaut
+
+L'ordre canonique était `(capture_id, n° de paquet, rang dans le paquet)`, et le `capture_id` d'un segment de capture est l'empreinte de son fichier. Entre deux segments de rotation, l'ordre des empreintes est un hasard : un contexte UE à cheval sur deux segments était parcouru à l'envers une fois sur deux. Le moteur créait alors un contexte sans `InitialUEMessage` à partir du segment récent, puis en ouvrait un autre avec le segment ancien : la session était rattachée à un contexte amputé, sous un autre id, parfois dédoublée.
+
+### Correctif
+
+- **Ordre canonique** : `(rang de la capture, capture_id, n° de paquet, rang dans le paquet)` (`session_engine::canonical_sort_key`, donc ses seize appelants). Le rang n'est jamais écrit dans un event : `EventRecord.capture_rank`, hors JSONL, posé par `apply_capture_ranks`. Sans rang attribué, l'ordre est exactement celui d'avant.
+- **Rang d'une capture** : les captures sont rangées **par point de capture, puis par ordre d'import**. L'ordre d'import est **inscrit au manifeste** (`capture_order`, une entrée par capture, avec son point de capture) et **persistant** : une capture y est ajoutée au cycle où elle apparaît — à la suite, dans l'ordre de première apparition à la lecture des fragments — et n'en bouge plus ni n'en sort, même archivée. Au premier cycle (aucune liste au manifeste précédent), toute la liste vient de la première apparition.
+- **Ids** : sous le nouvel ordre, un contexte UE nouveau prend un id intrinsèque, `hash(triplet | ancre)`, l'ancre étant l'`event_id` de son premier event ; le compteur `generation` ne sert plus à nommer. Un contexte dont l'ancre figure dans la table `published_context_anchors` (manifeste) **garde son id**, donc son pseudonyme UE et l'id de ses sessions. La table est remplie depuis la découverte du manifeste précédent au premier cycle, puis reportée.
+- **`correlation-engine`** : le choix de l'event source de l'arête « pseudonymes ambigus » suit le même ordre (même défaut).
+- **Reprise des call flows (2.21.143)** : au cycle où l'ordre des captures change (premier cycle sous 2.21.152, garde posée ou coupée), rien n'est repris ; tous les call flows sont reconstruits. Un cycle au coût plein, une fois.
+- Périmètre : **le jeu continu seulement**. Les captures à la demande ne changent pas.
+
+### Écart déclaré par rapport à la décision du cœur
+
+La décision était « rang = ordre de première apparition du `capture_id` ». J'ai rangé **par point de capture d'abord, par première apparition ensuite**. Raison, mesurée : avec la première apparition seule, l'ordre entre deux plans (N2, N3, N4) dépendait du découpage des imports en cycles, et le test existant `three_incremental_cycles_append_three_immutable_shards` échouait (un fragment contre trois fragments : mêmes events, ordre différent dans le call flow). Avec le point de capture en tête, ce test passe **sans être modifié**. Entre deux captures d'un même point — le cas du défaut — c'est bien l'ordre d'import qui décide, et lui seul.
+
+### Ce qui change pour l'utilisateur, à dire avant de déployer
+
+- **L'ordre des events d'un call flow 5G entre plans change** : il suivait l'ordre des empreintes des captures, il suit maintenant l'ordre des points de capture (N2, puis N3, puis N4…). `build_callflow` garde l'ordre canonique tel quel. Si l'écran trie lui-même par le temps, rien ne se voit ; **je n'ai pas lu p900** (hors de ce dépôt de travail).
+- **Sessions déjà publiées mal découpées** : au premier cycle, le contexte est recollé. La session entière apparaît — sous l'id qu'elle aurait eu si elle n'avait pas été coupée, ou sous un id nouveau. **L'ancien id reste publié**, avec son call flow d'origine (le report des sessions du manifeste précédent existait déjà et n'est pas touché) : une session coupée apparaît donc **deux fois**, l'ancienne amputée et la nouvelle entière. Le manifeste inscrit l'ancien id dans `superseded_session_ids`, avec l'id qui le remplace. Retirer les anciennes est une décision à part.
+
+### Journal
+
+`CAPTURE_RANK_ORDER`, une ligne par cycle, garde coupée comprise : `enabled`, `applied`, `captures`, `captures_newly_ranked`, `events_without_rank`, contextes avant / après / retirés / créés, contextes gardant un id publié, contextes à id intrinsèque, sessions avant / après, `session_ids_not_rediscovered`, `session_ids_superseded`, `sessions_left_dataset` (rétention), `session_ids_created`, `superseded_session_ids_total`. `CALLFLOW_REUSE` gagne `capture_order_changed`.
+
+### Garde
+
+`OIRAN_CAPTURE_RANK_ORDER=0` : publication d'avant 2.21.152 — ordre des empreintes, ids par `generation`, aucun des trois champs nouveaux au manifeste. Revenir en arrière après un cycle sous 2.21.152 laisse en place les ids intrinsèques déjà publiés (report), et la découverte reprend l'ancien nommage pour le reste.
+
+### Outil de comparaison, lecture seule
+
+`dataset-order-compare <copie du manifeste> <dossier du jeu> <dossier de travail hors du jeu>` (binaire de `live-probe`) : recalcule la découverte « avant » (et dit si elle reproduit celle du manifeste) puis « après », et affiche les nombres et les ids opaques gardés, non redécouverts, créés. Il ne lit que les events NGAP et NAS 5G, n'écrit qu'un fichier temporaire dans le dossier de travail, qu'il retire.
+
+### Tests
+
+- `a_ue_context_across_two_segments_does_not_depend_on_their_hashes_2_21_152` (session-engine) — la sonde, permanente : six points de coupe, empreinte du second segment rangée après puis avant ; résultat identique au jeu non coupé. Le même test affirme que **sans rang** l'ordre inversé coupe le contexte.
+- `capture_order_is_first_appearance_even_inside_one_fragment_2_21_152` — deux segments dans un même fragment.
+- `a_published_context_keeps_its_id_pseudonym_and_session_ids_2_21_152` — la table d'ancres ; sans elle les ids diffèrent.
+- `a_ue_context_across_two_rotation_files_is_whole_whatever_their_hashes_2_21_152` (live-probe) — de bout en bout, avec le fichier pcapng N2 du jeu certifié coupé en deux **vrais** fichiers, importés en deux cycles puis en un seul ; les deux ordres d'empreinte sont couverts ; garde coupée, le défaut est constaté.
+- `published_ids_and_pseudonyms_survive_the_switch_to_capture_rank_order_2_21_152` — trois cycles sous l'ancien ordre, deux sous le nouveau : ids de contexte, pseudonymes UE et ids de session inchangés ; garde coupée, le manifeste ne porte aucun champ nouveau.
+- `a_context_published_split_is_rejoined_and_retired_ids_are_recorded_2_21_152` — sessions déjà publiées mal découpées : recollées, ancien id toujours servi, remplacement inscrit.
+- `published_ids_survive_retention_then_restore_under_capture_rank_order_2_21_152` — rétention puis restauration : ids retrouvés, liste d'import inchangée.
+- `a_capture_keeps_its_import_rank_when_restore_changes_the_reading_order_2_21_152` — une capture ancienne importée tard, archivée puis restaurée, est **lue** avant une capture importée avant elle ; son rang ne bouge pas. C'est ce test qui a fait choisir le rang inscrit plutôt que le rang recalculé : avec « première apparition » seule, l'ordre des deux captures s'inversait à la restauration.
+- `ambiguous_pseudonym_edge_starts_at_the_first_imported_capture_0_6_14` (correlation-engine).
+
+### Lu, et laissé tel quel
+
+- `apps/api/src/lib.rs:8736` (`/packets`) : ordre de **liste** et de pagination par `capture_id` ; aucune décision n'en dépend. Non modifié.
+- `apps/api/src/lib.rs:12463` : fonction de référence d'un test.
+- `apps/api/src/identity_vault.rs:165` : ordre de rangement des observations ; l'index rend toutes les positions ; aucune décision n'en dépend.
+- `apps/api/src/lib.rs:627` : redécouverte au chargement du jeu de démonstration embarqué (une capture par plan) ; non concerné.
+- `decoder-sbi`, `dataset-registry`, `live-probe/src/lib.rs:5867` et `:6035` : tris à l'intérieur d'un même fichier.
+
+### OUVERT
+
+- **`apps/api/src/live_trace.rs:4599`** : le rejeu d'une trace live trie par `(capture_id, n° de paquet, id)`. Une trace à cheval sur deux `capture_id` est rejouée dans l'ordre des empreintes. Même famille de défaut, **non corrigée** : je ne sais pas dire, sans le lire plus avant, quel `capture_id` porte un event live d'un segment en cours d'écriture.
+- **Premier cycle sous 2.21.152** : la liste d'import est amorcée par la première apparition dans les fragments tels qu'ils sont. Dans un fragment retenu par la rétention, cet ordre est celui des fragments d'origine (la rétention concatène puis filtre ligne à ligne, sans trier ; constaté par test). Dans un fragment écrit par une ancienne version, il peut être celui des empreintes : non mesuré.
+- La liste `capture_order` ne fait que s'allonger : une entrée de l'ordre de 100 octets par capture.
+- **Le monolithe du 11/11** : ses captures prennent leur rang dans l'ordre où il les contient. S'il a été écrit trié par empreinte, les sessions mal découpées qu'il contient le restent. Non mesuré.
+- **LTE** : `discover_lte_sessions` passe par le même ordre et en profite, mais l'id d'un UE LTE contient le `capture_id` : une session LTE à cheval sur deux segments reste deux sessions. Non traité, non sondé.
+- **Découverte S1AP et arêtes SBI à cheval** : aucun test dédié.
+- **p900** : non lu.
+- La table `published_context_anchors` vit dans le manifeste : un jeu republié sans manifeste précédent perd les ids historiques.
+- Les dossiers temporaires des tests ne sont pas retirés (comportement existant de `temporary_root`).
+
 ## oiran-api 2.21.151, session-engine 0.5.30 — 2026-11-22 — passe des représentants : le plafond borne la mémoire réellement allouée
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.150 @ `44ddb5b` (branche `fix/oiran-2.21.151-run-cap-real-bytes`). Relecture indépendante d'ANR1 (#10 7087035661) : **FAIL sur 2.21.150**.

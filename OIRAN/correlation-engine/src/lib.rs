@@ -796,8 +796,14 @@ fn append_lte_bridge(
             .flat_map(|event| event.identifier_values("subscriber_pseudonym"))
             .collect::<std::collections::BTreeSet<_>>();
         if right_pseudonyms.len() > 1 {
+            // 0.6.14 (POLARIS 2.21.152) — le rang d'import de la capture
+            // passe devant son empreinte, comme dans
+            // `session_engine::canonical_sort_key` : entre deux segments de
+            // rotation, « le premier event » ne dépend plus du hasard des
+            // empreintes. Sans rang attribué (0), l'ordre est celui d'avant.
             let canonical = |a: &&EventRecord, b: &&EventRecord| {
-                (a.capture_id.as_str(), a.packet_number(), a.event_id.as_str()).cmp(&(
+                (a.capture_rank, a.capture_id.as_str(), a.packet_number(), a.event_id.as_str()).cmp(&(
+                    b.capture_rank,
                     b.capture_id.as_str(),
                     b.packet_number(),
                     b.event_id.as_str(),
@@ -1569,6 +1575,7 @@ mod tests {
             probe_type: None,
             physical_link: None,
             timestamp_source: None,
+            capture_rank: 0,
         }
     }
     fn manifest() -> ScenarioManifest {
@@ -4167,5 +4174,31 @@ Content-Length: 0\r\n\
             "deux établissements : ambigu, aucune arête"
         );
         assert_eq!(count(&[sip, pfcp("p4", "PFCP Session Modification Request", 5)]), 1);
+    }
+    /// 0.6.14 (POLARIS 2.21.152) — l'arête « pseudonymes ambigus » part du
+    /// premier event dans l'ordre d'IMPORT des captures, pas dans l'ordre
+    /// de leurs empreintes. Avant : l'event du segment récent, dont
+    /// l'empreinte se range en premier, était pris pour source.
+    #[test]
+    fn ambiguous_pseudonym_edge_starts_at_the_first_imported_capture_0_6_14() {
+        let mut old_segment = e("evt-old", "S1-MME", "S1AP", "InitialUEMessage", 7, &[("subscriber_pseudonym", "psn-a")], json!([]));
+        old_segment.capture_id = "sha256:ffff-ancien".into();
+        let mut new_segment = e("evt-new", "S1-MME", "S1AP", "UplinkNASTransport", 2, &[("subscriber_pseudonym", "psn-a")], json!([]));
+        new_segment.capture_id = "sha256:0000-recent".into();
+        let right_a = e("evt-s11-a", "S11", "GTPv2-C", "CreateSessionRequest", 1, &[("subscriber_pseudonym", "psn-a")], json!([]));
+        let right_b = e("evt-s11-b", "S11", "GTPv2-C", "CreateSessionRequest", 2, &[("subscriber_pseudonym", "psn-b")], json!([]));
+        let source_of = |left: &[&EventRecord]| {
+            let mut edges = Vec::new();
+            append_lte_bridge(&mut edges, left, &[&right_a, &right_b], "S1-MME", "S11", &["subscriber_pseudonym"], "s1mme-s11-exact-or-open");
+            assert_eq!(edges.len(), 1);
+            edges[0].source_event_id.clone()
+        };
+        // Sans rang (avant 2.21.152) : l'empreinte décide, le segment récent passe devant.
+        assert_eq!(source_of(&[&old_segment, &new_segment]), "evt-new");
+        // Avec le rang d'import : le segment ancien est le premier.
+        old_segment.capture_rank = 1;
+        new_segment.capture_rank = 2;
+        assert_eq!(source_of(&[&old_segment, &new_segment]), "evt-old");
+        assert_eq!(source_of(&[&new_segment, &old_segment]), "evt-old", "indépendant de l'ordre du tableau");
     }
 }
