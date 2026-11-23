@@ -1154,8 +1154,13 @@ pub struct LiveDataset {
     pub decode_reports: BTreeMap<String, DecodeReport>,
     pub checksums: BTreeMap<String, String>,
     pub state: String,
-    #[serde(default)]
-    pub discovery: Option<session_engine::DiscoveryResult>,
+    /// 2.21.154 (ordre cœur #9 7097032838) — PARTAGÉE (`Arc`) : `datasets()`
+    /// clone chaque jeu sous le verrou de la table des jeux ; avant, ce
+    /// clone copiait la découverte entière (dont tous les identifiants
+    /// d'events hors session), et toutes les routes attendaient derrière.
+    /// Le manifeste sur disque est sérialisé à l'identique.
+    #[serde(default, with = "shared_discovery")]
+    pub discovery: Option<std::sync::Arc<session_engine::DiscoveryResult>>,
     #[serde(default)]
     pub capture_started_epoch_ms: Option<u64>,
     #[serde(default)]
@@ -1194,6 +1199,22 @@ pub struct LiveDataset {
     /// Absent d'un manifeste antérieur : tout est alors reconstruit.
     #[serde(default)]
     pub callflow_reuse_keys: BTreeMap<String, String>,
+}
+
+/// 2.21.154 — (dé)sérialisation de la découverte partagée : même JSON
+/// qu'un `Option<DiscoveryResult>`.
+mod shared_discovery {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use session_engine::DiscoveryResult;
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(value: &Option<Arc<DiscoveryResult>>, serializer: S) -> Result<S::Ok, S::Error> {
+        value.as_deref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Arc<DiscoveryResult>>, D::Error> {
+        Ok(Option::<DiscoveryResult>::deserialize(deserializer)?.map(Arc::new))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2641,6 +2662,17 @@ impl CaptureManager {
             .collect()
     }
 
+    /// 2.21.154 (ordre cœur #9 7097032838) — l'identifiant du jeu qui
+    /// publie `session_id`, cherché sous le verrou SANS cloner aucun jeu.
+    pub fn dataset_id_for_session(&self, session_id: &str) -> Option<String> {
+        self.datasets
+            .lock()
+            .unwrap()
+            .values()
+            .find(|dataset| dataset.session_ids.iter().any(|id| id == session_id))
+            .map(|dataset| dataset.dataset_id.clone())
+    }
+
     pub fn dataset(&self, id: &str) -> Option<LiveDataset> {
         self.datasets
             .lock()
@@ -3067,7 +3099,7 @@ impl CaptureManager {
             decode_reports: source_dataset.decode_reports.clone(),
             checksums,
             state: "PARTIAL".into(),
-            discovery: Some(discovery),
+            discovery: Some(std::sync::Arc::new(discovery)),
             capture_started_epoch_ms: None,
             last_packet_epoch_ms: None,
             fresh_packet_count: 0,
@@ -8234,7 +8266,7 @@ impl CaptureManager {
             decode_reports: reports,
             checksums,
             state: dataset_state.to_string(),
-            discovery: Some(discovery),
+            discovery: Some(std::sync::Arc::new(discovery)),
             capture_started_epoch_ms,
             last_packet_epoch_ms,
             fresh_packet_count,
@@ -23831,5 +23863,74 @@ Content-Length: 0\r\n\
         assert!((17..42).contains(&bytes), "les octets des deux générations non référencées : {bytes}");
         // Rien n'a été modifié.
         assert_eq!(fs::read_dir(&generations).unwrap().count(), 4);
+    }
+    /// 2.21.154 — jeu continu à la taille du lab : 310 sessions et
+    /// `background` identifiants d'events hors session dans la découverte.
+    /// Construit par désérialisation (le chemin du manifeste), pour que le
+    /// même code de test se rejoue sur une version antérieure.
+    fn lab_sized_dataset_2_21_154(background: usize) -> LiveDataset {
+        let session_ids: Vec<String> = (0..310).map(|i| format!("5g-session-bench{i:011}")).collect();
+        serde_json::from_value(serde_json::json!({
+            "dataset_id": CONTINUOUS_DATASET_ID, "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous-lab-import/dataset", "event_count": 1_810_461,
+            "session_ids": session_ids, "decode_reports": {}, "checksums": {}, "state": "PUBLISHED",
+            "discovery": {
+                "ue_contexts": [], "pfcp_sessions": [], "gtpu_tunnels": [], "procedures": [],
+                "pdu_sessions": session_ids.iter().map(|id| serde_json::json!({
+                    "session_id": id, "ue_context_id": "uectx-bench", "pdu_session_id": "1", "dnn": null, "snssai": null,
+                    "state": "ESTABLISHED", "establishment_timestamp_ns": 0, "release_timestamp_ns": null,
+                    "interfaces": ["N2"], "correlation_status": "CORRELATED", "event_ids": []
+                })).collect::<Vec<_>>(),
+                "background_event_ids": (0..background).map(|i| format!("evt-{i:016x}")).collect::<Vec<_>>(),
+                "unmatched_event_ids": [], "duplicate_observations": [], "event_accounting": {}
+            },
+            "capture_started_epoch_ms": null, "last_packet_epoch_ms": null, "fresh_packet_count": 0,
+            "active_ue_ips": [], "active_pdu_contexts": []
+        }))
+        .unwrap()
+    }
+
+    /// 2.21.154 (ordre cœur #9 7097032838) — le temps passé sous le verrou
+    /// de la table des jeux par `datasets()` ne dépend plus de la taille de
+    /// la découverte. Jeu de la taille du lab : 700 000 identifiants hors
+    /// session, 310 sessions. Avant : la découverte entière était clonée
+    /// sous le verrou à chaque appel.
+    #[test]
+    fn listing_datasets_holds_the_lock_for_a_bounded_time_on_a_lab_sized_dataset_2_21_154() {
+        let root = temporary_root("lock-bound-2-21-154");
+        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let dataset = lab_sized_dataset_2_21_154(700_000);
+        manager.datasets.lock().unwrap().insert(dataset.dataset_id.clone(), dataset);
+        let mut slowest = std::time::Duration::ZERO;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let listed = manager.datasets();
+            slowest = slowest.max(started.elapsed());
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].discovery.as_ref().unwrap().background_event_ids.len(), 700_000);
+        }
+        let started = std::time::Instant::now();
+        assert!(manager.dataset_id_for_session("5g-session-bench00000000155").is_some());
+        let lookup = started.elapsed();
+        println!("LOCK_BOUND datasets_max_ms={} lookup_us={}", slowest.as_millis(), lookup.as_micros());
+        const BOUND: std::time::Duration = std::time::Duration::from_millis(50);
+        assert!(slowest <= BOUND, "datasets() a tenu le verrou {} ms > {} ms", slowest.as_millis(), BOUND.as_millis());
+        assert!(lookup <= BOUND);
+    }
+
+    /// 2.21.154 — la découverte partagée se sérialise exactement comme avant.
+    #[test]
+    fn shared_discovery_serializes_like_the_plain_one_2_21_154() {
+        let dataset = lab_sized_dataset_2_21_154(3);
+        let value = serde_json::to_value(&dataset).unwrap();
+        let plain = serde_json::to_value(dataset.discovery.as_deref().unwrap()).unwrap();
+        assert_eq!(value["discovery"], plain);
+        let back: LiveDataset = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), value);
+        let mut none = value;
+        none["discovery"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<LiveDataset>(none.clone()).unwrap().discovery.is_none());
+        none.as_object_mut().unwrap().remove("discovery");
+        assert!(serde_json::from_value::<LiveDataset>(none).unwrap().discovery.is_none(), "champ absent : défaut");
     }
 }

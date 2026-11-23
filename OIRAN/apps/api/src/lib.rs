@@ -1472,25 +1472,16 @@ fn spawn_compact_index_workers(
 }
 
 fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
+    // 2.21.154 (ordre cœur #9 7097032838) — avant : `datasets()` clonait
+    // tous les jeux sous le verrou de la table des jeux pour y chercher
+    // l'identifiant. Le jeu est désormais trouvé sous le verrou sans aucun
+    // clone ; le call flow est lu ensuite, hors du verrou.
+    let dataset_id = state.inner.capture_manager.dataset_id_for_session(id)?;
     state
         .inner
         .capture_manager
-        .datasets()
-        .into_iter()
-        .find_map(|dataset| {
-            dataset
-                .session_ids
-                .iter()
-                .any(|session_id| session_id == id)
-                .then(|| {
-                    state
-                        .inner
-                        .capture_manager
-                        .callflow(&dataset.dataset_id, id)
-                        .map(|flow| (dataset.dataset_id, flow))
-                })
-                .flatten()
-        })
+        .callflow(&dataset_id, id)
+        .map(|flow| (dataset_id, flow))
 }
 
 /// 2.21.13 — calcul des compteurs de `/health` (lourd : relit les

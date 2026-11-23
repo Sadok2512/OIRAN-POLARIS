@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.154, live-probe 0.6.39 — 2026-11-23 — détail d'une session sans attente pendant une publication ; IMEISV masqué servi sous son nom
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.151 @ `7ccf7cb` (branche `fix/oiran-2.21.154-trace-isolation`). Trois sujets, trois commits, une version (décision du cœur #9 7098608248). live-probe passe de 0.6.36 à **0.6.39** : 0.6.37 est prise par 2.21.152 (refusée) et 0.6.38 par 2.21.153 (annulée).
+
+FAIL de la recette de clôture, point 7 : Sadok voit le détail d'une session expirer à 30 s, par intermittence. Ordres du cœur #9 7097032838 et 7097237993 ; audits #9 7096603566 et 7097078822.
+
+**Ce qui n'est PAS prouvé, pour les sujets 1 et 2** : que la contention mesurée ci-dessous explique les **30 s** vues par Sadok. ANR2 mesure au lab 1,7 à 3,3 s pendant une publication (#10 7097135855), et 3,1 s au pire pour six routes en parallèle (#10 7097547656). Le pire cas mesuré ici, **19 s** pour `/sessions/:id` seule pendant une publication simulée, montre que 30 s sont à portée de cette contention. Ce n'est pas une preuve. **Inféré, non mesuré au lab.**
+
+Mesures des sujets 1 et 2 : tests du lot, build de test non optimisé, jeu de la taille du lab (310 sessions, 700 000 identifiants d'events hors session). « Avant » est rejoué sur le code de 2.21.151 dans un arbre séparé.
+
+### Sujet 1 — la découverte d'un jeu devient une référence partagée
+
+**Lu** : `CaptureManager::datasets()` clone chaque `LiveDataset` **pendant qu'il tient le verrou de la table des jeux**, découverte comprise, avec tous les identifiants d'events hors session. La publication ne tient ce verrou qu'un instant ; ce qui l'occupe longtemps, ce sont les appels à `datasets()` : 16 dans l'API, plus `live_flow_for`, qui sert les routes de détail d'une session.
+
+**Correctif** :
+- La découverte devient une référence partagée (`Arc`) dans `LiveDataset`. Cloner un jeu ne copie plus que le pointeur. Le manifeste se sérialise **à l'identique**.
+- Les 17 appelants de `datasets()` en profitent sans changement de leur code. Aucun ne garde de copie profonde de la découverte : aucun ne la modifie ni ne la consomme par valeur (lu ; le compilateur l'aurait refusé).
+- `live_flow_for` ne clone plus aucun jeu : il cherche sous le verrou quel jeu publie la session (`dataset_id_for_session`), puis lit le call flow hors du verrou.
+- Restent clonées sous le verrou, petites : `session_ids`, `event_shards`, `checksums`, `decode_reports`, `callflow_reuse_keys` (quelques centaines d'entrées au lab).
+
+| | Avant | Après |
+|---|---|---|
+| Temps sous le verrou, un appel à `datasets()` | 181 ms | 0 ms |
+
+Tests :
+- `listing_datasets_holds_the_lock_for_a_bounded_time_on_a_lab_sized_dataset_2_21_154` (live-probe) : borne de 50 ms. Avant : 181 ms, **échec**.
+- `shared_discovery_serializes_like_the_plain_one_2_21_154` (live-probe) : même JSON, découverte absente ou nulle comprise.
+
 ## oiran-api 2.21.151, session-engine 0.5.30 — 2026-11-22 — passe des représentants : le plafond borne la mémoire réellement allouée
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.150 @ `44ddb5b` (branche `fix/oiran-2.21.151-run-cap-real-bytes`). Relecture indépendante d'ANR1 (#10 7087035661) : **FAIL sur 2.21.150**.
