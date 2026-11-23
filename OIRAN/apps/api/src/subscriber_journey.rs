@@ -76,7 +76,13 @@ pub struct SubscriberRecord {
 #[derive(Clone, Debug)]
 struct SessionNode {
     session: JourneySession,
+    /// Identités d'abonné de la session. Après `resolve` : les
+    /// représentants de leurs groupes d'alias.
     subscribers: BTreeSet<String>,
+    /// 2.21.155 — jetons d'abonné portés ENSEMBLE par un même message hors
+    /// SIP : des alias du même abonné (IMSI et MSISDN d'une réponse
+    /// Diameter, SUCI et SUPI d'un échange).
+    aliases: Vec<BTreeSet<String>>,
     assignments: BTreeMap<String, Vec<CanonicalRef>>,
     presentations: BTreeMap<String, Vec<CanonicalRef>>,
 }
@@ -85,6 +91,13 @@ struct SessionNode {
 pub struct JourneyIndex {
     nodes: BTreeMap<String, SessionNode>,
     sessions_by_subscriber: BTreeMap<String, BTreeSet<String>>,
+    /// 2.21.155 — jeton d'abonné → représentant de son groupe d'alias.
+    alias_of: BTreeMap<String, String>,
+    /// 2.21.155 — sessions qui portent les identités de plusieurs abonnés
+    /// distincts : rangées sous aucun, et comptées.
+    ambiguous_sessions: usize,
+    /// 2.21.155 — groupes d'alias de plus d'un jeton (réunions faites).
+    alias_groups_with_several_tokens: usize,
 }
 
 fn values_named(value: &Value, names: &[&str], out: &mut BTreeSet<String>) {
@@ -174,15 +187,33 @@ impl JourneyIndexBuilder {
                 procedures: flow.procedures.iter().map(|p| p.name.clone()).collect(),
             },
             subscribers: BTreeSet::new(),
+            aliases: Vec::new(),
             assignments: BTreeMap::new(),
             presentations: BTreeMap::new(),
         };
+        // 2.21.154 / 2.21.155 — jetons qui ne désignent pas un abonné :
+        // l'IMEISV masqué (équipement) et la 5G-S-TMSI (identité
+        // temporaire), quand leur IE NGAP est encore dans le call flow.
+        // Ceux d'un call flow compacté arrivent déjà renommés par la
+        // lecture (`CaptureManager::callflow`).
+        let mut excluded = callflow_schema::masked_imeisv_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree));
+        excluded.extend(callflow_schema::s_tmsi_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree)));
         for event in &flow.events {
-            values_named(
-                &event.decoded_ie_tree,
-                SUBSCRIBER_NAMES,
-                &mut node.subscribers,
-            );
+            // 2.21.155 (ordre cœur #9 7102937368) — un message SIP porte
+            // l'identité du PAIR (`From` de l'appelant, dans la session de
+            // l'appelé aussi) : il n'apporte aucune identité à la session.
+            // Avant : la session de B, appelé par A, comptait A parmi ses
+            // abonnés, et l'entrée de A listait la session de B.
+            if event.protocol == "SIP" {
+                continue;
+            }
+            let mut in_event = BTreeSet::new();
+            values_named(&event.decoded_ie_tree, SUBSCRIBER_NAMES, &mut in_event);
+            in_event.retain(|token| !excluded.contains(token));
+            if in_event.len() > 1 {
+                node.aliases.push(in_event.clone());
+            }
+            node.subscribers.extend(in_event);
             let mut temporary = BTreeSet::new();
             values_named(&event.decoded_ie_tree, TEMPORARY_NAMES, &mut temporary);
             let reference = event_ref(flow, event);
@@ -200,13 +231,6 @@ impl JourneyIndexBuilder {
                 }
             }
         }
-        // 2.21.154 (décision du cœur #9 7099347809) — un IMEISV masqué
-        // (IE NGAP 34, émis sous le nom `subscriber_pseudonym`) désigne un
-        // équipement commun à tous les terminaux d'un même modèle, jamais
-        // un abonné. Avant : deux UE qui ne partageaient que ce jeton
-        // formaient un seul « abonné » et un seul parcours.
-        let equipment = callflow_schema::masked_imeisv_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree));
-        node.subscribers.retain(|token| !equipment.contains(token));
         self.nodes.insert(flow.session_id.clone(), node);
     }
 
@@ -214,6 +238,9 @@ impl JourneyIndexBuilder {
         let mut index = JourneyIndex {
             nodes: self.nodes,
             sessions_by_subscriber: BTreeMap::new(),
+            alias_of: BTreeMap::new(),
+            ambiguous_sessions: 0,
+            alias_groups_with_several_tokens: 0,
         };
         index.resolve();
         index
@@ -234,12 +261,61 @@ impl JourneyIndex {
     }
 
     fn resolve(&mut self) {
-        for (session_id, node) in &self.nodes {
-            for pseudo in &node.subscribers {
-                self.sessions_by_subscriber
-                    .entry(pseudo.clone())
-                    .or_default()
-                    .insert(session_id.clone());
+        // 2.21.155 — groupes d'alias : les jetons portés ensemble par un
+        // même message hors SIP désignent le même abonné. Le représentant
+        // d'un groupe est son plus petit jeton.
+        let mut parent: BTreeMap<String, String> = BTreeMap::new();
+        fn find(parent: &mut BTreeMap<String, String>, token: &str) -> String {
+            let mut root = token.to_owned();
+            while let Some(next) = parent.get(&root).filter(|next| **next != root).cloned() {
+                root = next;
+            }
+            parent.insert(token.to_owned(), root.clone());
+            root
+        }
+        for node in self.nodes.values() {
+            for token in &node.subscribers {
+                parent.entry(token.clone()).or_insert_with(|| token.clone());
+            }
+        }
+        for node in self.nodes.values() {
+            for group in &node.aliases {
+                let mut tokens = group.iter();
+                let Some(first) = tokens.next() else { continue };
+                for other in tokens {
+                    let (a, b) = (find(&mut parent, first), find(&mut parent, other));
+                    if a != b {
+                        let (low, high) = if a < b { (a, b) } else { (b, a) };
+                        parent.insert(high, low);
+                    }
+                }
+            }
+        }
+        let tokens: Vec<String> = parent.keys().cloned().collect();
+        let mut group_sizes: BTreeMap<String, usize> = BTreeMap::new();
+        for token in tokens {
+            let root = find(&mut parent, &token);
+            *group_sizes.entry(root.clone()).or_default() += 1;
+            self.alias_of.insert(token, root);
+        }
+        self.alias_groups_with_several_tokens = group_sizes.values().filter(|size| **size > 1).count();
+        // Une session appartient à un abonné si toutes ses identités sont
+        // des alias de ce seul abonné ; sinon elle est ambiguë : rangée
+        // sous aucun, et comptée (2.21.155, ordre cœur #9 7102937368).
+        for (session_id, node) in self.nodes.iter_mut() {
+            let representatives: BTreeSet<String> = node
+                .subscribers
+                .iter()
+                .map(|token| self.alias_of.get(token).cloned().unwrap_or_else(|| token.clone()))
+                .collect();
+            node.subscribers = representatives;
+            match node.subscribers.len() {
+                0 => {}
+                1 => {
+                    let only = node.subscribers.iter().next().expect("one").clone();
+                    self.sessions_by_subscriber.entry(only).or_default().insert(session_id.clone());
+                }
+                _ => self.ambiguous_sessions += 1,
             }
         }
 
@@ -306,6 +382,22 @@ impl JourneyIndex {
             .collect()
     }
 
+    /// 2.21.155 — sessions portant les identités de plusieurs abonnés
+    /// distincts, rangées sous aucun.
+    pub fn ambiguous_sessions(&self) -> usize {
+        self.ambiguous_sessions
+    }
+
+    /// 2.21.155 — groupes d'alias de plus d'un jeton.
+    pub fn alias_groups_with_several_tokens(&self) -> usize {
+        self.alias_groups_with_several_tokens
+    }
+
+    /// 2.21.155 — représentant du groupe d'alias d'un jeton d'abonné.
+    fn canonical<'a>(&'a self, subscriber: &'a str) -> &'a str {
+        self.alias_of.get(subscriber).map(String::as_str).unwrap_or(subscriber)
+    }
+
     pub fn subscriber_for_session(&self, session_id: &str) -> Option<&str> {
         let mut matches = self
             .sessions_by_subscriber
@@ -317,6 +409,7 @@ impl JourneyIndex {
     }
 
     pub fn sessions(&self, subscriber: &str) -> Vec<JourneySession> {
+        let subscriber = self.canonical(subscriber);
         let mut sessions = self
             .sessions_by_subscriber
             .get(subscriber)
@@ -347,6 +440,7 @@ impl JourneyIndex {
     }
 
     pub fn links(&self, subscriber: &str) -> Vec<JourneyLink> {
+        let subscriber = self.canonical(subscriber);
         self.sessions(subscriber)
             .windows(2)
             .map(|pair| {
@@ -393,7 +487,7 @@ impl JourneyIndex {
     }
 
     pub fn tmsi(&self, subscriber: &str) -> Vec<TmsiRecord> {
-        let ids = self.sessions_by_subscriber.get(subscriber);
+        let ids = self.sessions_by_subscriber.get(self.canonical(subscriber));
         let mut grouped: BTreeMap<String, (Vec<CanonicalRef>, Vec<CanonicalRef>)> = BTreeMap::new();
         for node in ids
             .into_iter()
@@ -703,5 +797,175 @@ mod masked_imeisv_journey_tests_2_21_154 {
         assert_eq!(index.subscriber_for_session("5g-session-ue-b"), Some(imsi_b));
         assert_eq!(index.sessions(imsi_a).len(), 1);
         assert_eq!(index.subscribers().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod journey_identity_tests_2_21_155 {
+    use super::*;
+
+    const IMSI_A: &str = "psn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const IMSI_B: &str = "psn-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const MSISDN_A: &str = "psn-cccccccccccccccccccccccccccccccc";
+    const TMSI: &str = "psn-dddddddddddddddddddddddddddddddd";
+
+    fn template() -> CallFlow {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().join("OIRAN_5G_E2E_CALLFLOW.json");
+        let mut flow: CallFlow = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Array(items) => {
+                    items.retain(|item| !item.to_string().contains("psn-"));
+                    items.iter_mut().for_each(strip)
+                }
+                Value::Object(map) => map.values_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        for event in &mut flow.events {
+            strip(&mut event.decoded_ie_tree);
+        }
+        flow
+    }
+
+    /// Un call flow dont les events portent, dans l'ordre, les arbres donnés
+    /// (protocole, arbre) ; les autres events n'ont aucune identité.
+    fn flow(session: &str, trees: &[(&str, Value)]) -> CallFlow {
+        let mut flow = template();
+        flow.session_id = session.into();
+        for (event, (protocol, tree)) in flow.events.iter_mut().zip(trees) {
+            event.protocol = (*protocol).into();
+            event.decoded_ie_tree = tree.clone();
+        }
+        flow
+    }
+
+    fn id(name: &str, value: &str) -> Value {
+        serde_json::json!({"name": name, "value": value, "source": "session_identifiers"})
+    }
+
+    /// 2.21.155 (ordre cœur #9 7102937368, FAIL C d'ANR2 #10 7102867871) —
+    /// test 1 : B est appelé par A ; la session IMS de B porte, sur ses
+    /// messages SIP, le `From` de A. Avant : la session de B comptait A parmi
+    /// ses abonnés, l'entrée de A listait la session de B, et la session de B
+    /// n'était pas décorée (deux « abonnés »).
+    #[test]
+    fn a_sip_call_does_not_put_the_callee_session_under_the_caller_2_21_155() {
+        let a = flow("5g-session-ue-a", &[("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_A)]))]);
+        let b = flow(
+            "5g-session-ue-b",
+            &[
+                ("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_B)])),
+                ("SIP", serde_json::json!([id("subscriber_pseudonym", IMSI_A)])),
+            ],
+        );
+        let index = JourneyIndex::from_flows([&a, &b]);
+        assert_eq!(index.sessions(IMSI_A).iter().map(|s| s.session_id.as_str()).collect::<Vec<_>>(), vec!["5g-session-ue-a"]);
+        assert_eq!(index.subscriber_for_session("5g-session-ue-b"), Some(IMSI_B), "la session de B est à B, et décorée");
+        assert_eq!(index.ambiguous_sessions(), 0);
+    }
+
+    /// Test 2 : deux UE dont la 5G-S-TMSI (IE NGAP 26) a la même valeur, et
+    /// aucune autre identité visible. Avant : un seul « abonné », deux
+    /// sessions. Après : la TMSI n'est pas un abonné.
+    #[test]
+    fn a_reassigned_5g_s_tmsi_does_not_make_two_ues_one_subscriber_2_21_155() {
+        let tree = || serde_json::json!([
+            {"id": 26, "name": "identity_pseudonym", "value": format!("subscriber_pseudonym={TMSI}")},
+            id("subscriber_pseudonym", TMSI)
+        ]);
+        let a = flow("5g-session-ue-a", &[("NGAP", tree())]);
+        let b = flow("5g-session-ue-b", &[("NGAP", tree())]);
+        let index = JourneyIndex::from_flows([&a, &b]);
+        assert!(index.subscribers().is_empty(), "{:?}", index.subscribers().iter().map(|r| &r.subscriber_pseudonym).collect::<Vec<_>>());
+        assert!(index.sessions(TMSI).is_empty());
+    }
+
+    /// Test 3 : une session qui porte, sur deux messages distincts, les
+    /// IMSI de deux abonnés : ambiguë, rangée sous aucun, et comptée.
+    #[test]
+    fn a_session_carrying_two_subscribers_is_ambiguous_and_counted_2_21_155() {
+        let mixed = flow(
+            "5g-session-mixte",
+            &[
+                ("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_A)])),
+                ("NAS-5GMM", serde_json::json!([id("subscriber_pseudonym", IMSI_B)])),
+            ],
+        );
+        let a = flow("5g-session-ue-a", &[("NGAP", serde_json::json!([id("subscriber_pseudonym", IMSI_A)]))]);
+        let index = JourneyIndex::from_flows([&mixed, &a]);
+        assert_eq!(index.ambiguous_sessions(), 1);
+        assert_eq!(index.subscriber_for_session("5g-session-mixte"), None);
+        assert_eq!(index.sessions(IMSI_A).len(), 1, "l'entrée de A ne compte pas la session ambiguë");
+        assert!(index.sessions(IMSI_B).is_empty());
+    }
+
+    /// Test 5 : IMSI et MSISDN d'un même abonné, portés ensemble par un
+    /// message Diameter, sont des alias. Une autre session ne porte que le
+    /// MSISDN. Une seule entrée, deux sessions, toutes deux décorées. Avant :
+    /// deux entrées, et la première session sans décoration.
+    #[test]
+    fn imsi_and_msisdn_carried_together_are_one_subscriber_2_21_155() {
+        let attach = flow(
+            "lte-session-1",
+            &[("DIAMETER", serde_json::json!([id("subscriber_pseudonym", IMSI_A), id("subscriber_pseudonym", MSISDN_A)]))],
+        );
+        let later = flow("lte-session-2", &[("DIAMETER", serde_json::json!([id("subscriber_pseudonym", MSISDN_A)]))]);
+        let index = JourneyIndex::from_flows([&attach, &later]);
+        assert_eq!(index.subscribers().len(), 1);
+        let key = index.subscriber_for_session("lte-session-1").expect("décorée");
+        assert_eq!(index.subscriber_for_session("lte-session-2"), Some(key));
+        assert_eq!(index.sessions(IMSI_A).len(), 2, "chercher par l'IMSI");
+        assert_eq!(index.sessions(MSISDN_A).len(), 2, "ou par le MSISDN");
+        assert_eq!(index.ambiguous_sessions(), 0);
+        assert_eq!(index.alias_groups_with_several_tokens(), 1);
+    }
+
+    /// Test 4 : non-régression sur la capture du banc lab à cinq abonnés,
+    /// call flows construits comme la publication : cinq abonnés distincts,
+    /// chaque session rattachée à un seul, aucune session ambiguë.
+    #[test]
+    fn five_subscribers_stay_five_distinct_subscribers_2_21_155() {
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut jsonl = String::new();
+        for interface in ["N2", "N4", "SBI"] {
+            let config = oiran_decode::DecodeConfig {
+                input: capture.clone(),
+                capture_id: format!("sha256:{}", event_schema::sha256_hex(interface.as_bytes())),
+                interface: interface.into(),
+                endpoints: std::collections::HashMap::new(),
+                stable_source_file: "multi-imsi.pcap".into(),
+            };
+            let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                jsonl.push_str(&event.to_json());
+                jsonl.push('\n');
+                Ok(())
+            });
+        }
+        let mut events = session_engine::load_jsonl(std::io::Cursor::new(jsonl)).unwrap();
+        let discovery = session_engine::discover_sessions(&mut events);
+        assert_eq!(discovery.pdu_sessions.len(), 5);
+        let flows: Vec<CallFlow> = discovery
+            .pdu_sessions
+            .iter()
+            .map(|session| {
+                let context = discovery.ue_contexts.iter().find(|c| c.context_id == session.ue_context_id);
+                let wanted: BTreeSet<&String> = session.event_ids.iter().chain(context.into_iter().flat_map(|c| c.event_ids.iter())).collect();
+                let selected = events.iter().filter(|e| wanted.contains(&e.event_id)).cloned().collect();
+                let mut reconstruction = session_engine::reconstruct(selected, session_engine::ReconstructionHints::default());
+                reconstruction.session_id = session.session_id.clone();
+                callflow_schema::build_callflow(&reconstruction, Vec::new())
+            })
+            .collect();
+        let index = JourneyIndex::from_flows(flows.iter());
+        assert_eq!(index.ambiguous_sessions(), 0);
+        assert_eq!(index.subscribers().len(), 5, "cinq abonnés distincts");
+        let owners: BTreeSet<&str> = flows.iter().filter_map(|f| index.subscriber_for_session(&f.session_id)).collect();
+        assert_eq!(owners.len(), 5, "chaque session à son propre abonné");
+        for record in index.subscribers() {
+            assert_eq!(record.session_count, 1);
+        }
     }
 }

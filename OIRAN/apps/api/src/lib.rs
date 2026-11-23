@@ -4896,7 +4896,13 @@ async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuer
             let search = search.to_ascii_lowercase();
             rows.retain(|row| row.to_string().to_ascii_lowercase().contains(&search));
         }
-        paginated(rows, &query)
+        let mut page = paginated(rows, &query);
+        // 2.21.155 (ordre cœur #9 7102937368) — sessions qui portent les
+        // identités de plusieurs abonnés distincts : rangées sous aucune
+        // entrée, et comptées ici au lieu d'être silencieuses.
+        page.0["meta"]["ambiguous_sessions"] = json!(index.ambiguous_sessions());
+        page.0["meta"]["alias_groups_with_several_tokens"] = json!(index.alias_groups_with_several_tokens());
+        page
     })
     .await
     .unwrap_or_else(|_| Json(json!({"error": "subscribers handler panicked"})))

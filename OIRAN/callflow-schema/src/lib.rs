@@ -85,14 +85,36 @@ pub const MASKED_IMEISV_PSEUDONYM: &str = "masked_imeisv_pseudonym";
 /// 1.5.2 — identifiant NGAP de l'IE *Masked IMEISV* (TS 38.413 §9.3.1.54).
 const NGAP_MASKED_IMEISV_IE: u64 = 34;
 
+/// 1.5.3 (POLARIS 2.21.155) — nom sous lequel une 5G-S-TMSI est servie.
+/// Le décodeur NGAP émet l'IE 26 (*5G-S-TMSI*) sous la forme
+/// `subscriber_pseudonym=psn-…` et la promeut en identifiant de session
+/// `subscriber_pseudonym`. C'est une identité TEMPORAIRE, que l'AMF
+/// réattribue : servie sous un nom d'abonné, une même valeur reliait des
+/// UE différents dans le parcours abonné. Le parcours sait traiter
+/// `s_tmsi_pseudonym` comme une identité temporaire.
+pub const S_TMSI_PSEUDONYM: &str = "s_tmsi_pseudonym";
+
+/// 1.5.3 — identifiant NGAP de l'IE *5G-S-TMSI* (TS 38.413 §9.3.3.20).
+const NGAP_5G_S_TMSI_IE: u64 = 26;
+
+/// 1.5.3 — jetons de 5G-S-TMSI portés par des arbres d'IE : valeurs
+/// `psn-…` de toute IE d'identifiant 26. Lecture seule.
+pub fn s_tmsi_tokens<'a>(trees: impl IntoIterator<Item = &'a Value>) -> BTreeSet<String> {
+    ngap_ie_tokens(trees, NGAP_5G_S_TMSI_IE)
+}
+
 /// 1.5.2 — jetons d'IMEISV masqué portés par des arbres d'IE : valeurs
 /// `psn-…` de toute IE d'identifiant 34. Lecture seule.
 pub fn masked_imeisv_tokens<'a>(trees: impl IntoIterator<Item = &'a Value>) -> BTreeSet<String> {
-    fn walk(value: &Value, out: &mut BTreeSet<String>) {
+    ngap_ie_tokens(trees, NGAP_MASKED_IMEISV_IE)
+}
+
+fn ngap_ie_tokens<'a>(trees: impl IntoIterator<Item = &'a Value>, ie_id: u64) -> BTreeSet<String> {
+    fn walk(value: &Value, ie_id: u64, out: &mut BTreeSet<String>) {
         match value {
-            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            Value::Array(items) => items.iter().for_each(|item| walk(item, ie_id, out)),
             Value::Object(map) => {
-                if map.get("id").and_then(Value::as_u64) == Some(NGAP_MASKED_IMEISV_IE) {
+                if map.get("id").and_then(Value::as_u64) == Some(ie_id) {
                     if let Some(text) = map.get("value").and_then(Value::as_str) {
                         for field in text.split(',') {
                             let candidate = field.split_once('=').map(|(_, value)| value).unwrap_or(field).trim();
@@ -102,14 +124,14 @@ pub fn masked_imeisv_tokens<'a>(trees: impl IntoIterator<Item = &'a Value>) -> B
                         }
                     }
                 }
-                map.values().for_each(|item| walk(item, out));
+                map.values().for_each(|item| walk(item, ie_id, out));
             }
             _ => {}
         }
     }
     let mut out = BTreeSet::new();
     for tree in trees {
-        walk(tree, &mut out);
+        walk(tree, ie_id, &mut out);
     }
     out
 }
@@ -121,6 +143,11 @@ pub fn masked_imeisv_tokens<'a>(trees: impl IntoIterator<Item = &'a Value>) -> B
 /// renommées. Les autres valeurs, et les vrais pseudonymes d'abonné, ne
 /// changent pas. Correction à la lecture : rien de stocké n'est réécrit.
 pub fn relabel_masked_imeisv(value: &mut Value, tokens: &BTreeSet<String>) -> usize {
+    relabel_subscriber_tokens(value, tokens, MASKED_IMEISV_PSEUDONYM)
+}
+
+/// 1.5.3 — même renommage que `relabel_masked_imeisv`, vers `name`.
+pub fn relabel_subscriber_tokens(value: &mut Value, tokens: &BTreeSet<String>, name: &str) -> usize {
     if tokens.is_empty() {
         return 0;
     }
@@ -131,22 +158,22 @@ pub fn relabel_masked_imeisv(value: &mut Value, tokens: &BTreeSet<String>) -> us
             for token in tokens {
                 let from = format!("subscriber_pseudonym={token}");
                 if text.contains(&from) {
-                    *text = text.replace(&from, &format!("{MASKED_IMEISV_PSEUDONYM}={token}"));
+                    *text = text.replace(&from, &format!("{name}={token}"));
                     renamed += 1;
                 }
             }
             renamed
         }
-        Value::Array(items) => items.iter_mut().map(|item| relabel_masked_imeisv(item, tokens)).sum(),
+        Value::Array(items) => items.iter_mut().map(|item| relabel_subscriber_tokens(item, tokens, name)).sum(),
         Value::Object(map) => {
             let mut renamed = 0;
             let is_imeisv = map.get("name").and_then(Value::as_str) == Some("subscriber_pseudonym")
                 && map.get("value").and_then(Value::as_str).is_some_and(|token| tokens.contains(token));
             if is_imeisv {
-                map.insert("name".into(), Value::from(MASKED_IMEISV_PSEUDONYM));
+                map.insert("name".into(), Value::from(name));
                 renamed += 1;
             }
-            renamed + map.values_mut().map(|item| relabel_masked_imeisv(item, tokens)).sum::<usize>()
+            renamed + map.values_mut().map(|item| relabel_subscriber_tokens(item, tokens, name)).sum::<usize>()
         }
         _ => 0,
     }
@@ -158,9 +185,13 @@ pub fn relabel_masked_imeisv(value: &mut Value, tokens: &BTreeSet<String>) -> us
 /// parent présent dans le même call flow).
 pub fn relabel_masked_imeisv_in_flow(flow: &mut CallFlow) -> usize {
     let tokens = masked_imeisv_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree));
+    let temporary = s_tmsi_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree));
     flow.events
         .iter_mut()
-        .map(|event| relabel_masked_imeisv(&mut event.decoded_ie_tree, &tokens))
+        .map(|event| {
+            relabel_masked_imeisv(&mut event.decoded_ie_tree, &tokens)
+                + relabel_subscriber_tokens(&mut event.decoded_ie_tree, &temporary, S_TMSI_PSEUDONYM)
+        })
         .sum()
 }
 
@@ -1245,5 +1276,28 @@ mod masked_imeisv_tests_1_5_2 {
         let none = masked_imeisv_tokens([&alone]);
         assert!(none.is_empty());
         assert_eq!(relabel_masked_imeisv(&mut alone, &none), 0);
+    }
+}
+
+#[cfg(test)]
+mod s_tmsi_tests_1_5_3 {
+    use super::*;
+
+    #[test]
+    fn the_5g_s_tmsi_is_relabelled_as_a_temporary_identity_1_5_3() {
+        let tmsi = "psn-11111111111111111111111111111111";
+        let imsi = "psn-22222222222222222222222222222222";
+        let mut ngap = serde_json::json!([
+            {"id": 26, "name": "identity_pseudonym", "value": format!("subscriber_pseudonym={tmsi}")},
+            {"name": "subscriber_pseudonym", "value": tmsi, "source": "session_identifiers"},
+            {"name": "subscriber_pseudonym", "value": imsi, "source": "session_identifiers"}
+        ]);
+        let tokens = s_tmsi_tokens([&ngap]);
+        assert_eq!(tokens, BTreeSet::from([tmsi.to_owned()]));
+        assert!(masked_imeisv_tokens([&ngap]).is_empty(), "l'IE 26 n'est pas un IMEISV");
+        assert_eq!(relabel_subscriber_tokens(&mut ngap, &tokens, S_TMSI_PSEUDONYM), 2);
+        assert_eq!(ngap[1]["name"], S_TMSI_PSEUDONYM);
+        assert_eq!(ngap[2]["name"], "subscriber_pseudonym", "le vrai pseudonyme d'abonné ne change pas");
+        assert_eq!(ngap[0]["value"], format!("{S_TMSI_PSEUDONYM}={tmsi}"));
     }
 }

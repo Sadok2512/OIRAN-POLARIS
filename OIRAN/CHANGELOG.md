@@ -1,5 +1,54 @@
 # Changelog
 
+## oiran-api 2.21.155, live-probe 0.6.40, session-engine 0.5.33, callflow-schema 1.5.3 — 2026-11-23 — un abonné n'est plus servi avec les sessions d'un autre
+
+Upgrade **patch** sans déploiement, au-dessus de 2.21.154 @ `0fe302e` (en prod), branche `fix/oiran-2.21.155-journey-identities`. Deux sujets. Ordre du cœur #9 7102937368. Audit #9 7102975186, corrigé par 7102995729.
+
+### Sujet 1 — parcours abonné : un jeton partagé ne réunit plus deux abonnés
+
+FAIL de la recette C (ANR2) : deux entrées de `/subscribers` mêlent de vrais abonnés distincts (107 sessions avec 2 identités, 95 avec 3), et leur jeton commun n'est pas l'IMEISV masqué.
+
+**Lu**, producteurs d'un `subscriber_pseudonym` commun à plusieurs abonnés :
+- **SIP** (`decoder-sip:503-512`, `:666-673`) : le jeton est fait des chiffres du `From`, donc de l'**appelant**, y compris dans la session de l'appelé.
+- **NGAP IE 26, 5G-S-TMSI** (`decoder-ngap:194-199`) : une identité **temporaire**, que l'AMF réattribue.
+
+**Inféré** : lequel des deux a produit les deux entrées du lab. Le correctif couvre les deux ; le fait demandé à ANR2 dira lequel.
+
+**Lu**, pourquoi rien ne le signalait : `observe` rangeait dans les abonnés d'une session toutes les valeurs `subscriber_pseudonym` qu'elle portait, et `resolve` l'inscrivait sous chacune. L'entrée de l'appelant listait donc la session de l'appelé, et cette session n'était décorée nulle part.
+
+**Correctif**, à la lecture, sans réécrire de données stockées :
+- Un message **SIP** n'apporte aucune identité à sa session.
+- La **5G-S-TMSI** est servie sous `s_tmsi_pseudonym`, identité temporaire que le parcours sait déjà traiter. Ses jetons sont relevés avant compaction par la passe des représentants (`collect_s_tmsi_tokens`), rangés au manifeste (`LiveDataset.s_tmsi_tokens`), puis renommés quand un call flow ou une page est servi. C'est le même chemin que l'IMEISV masqué en 2.21.154.
+- **Alias** : des jetons portés ensemble par un même message hors SIP désignent le même abonné. Par exemple l'IMSI et le MSISDN d'une réponse Diameter, ou le SUCI et le SUPI d'un échange. Ils sont réunis en une seule entrée, désignée par le plus petit jeton ; on retrouve l'entrée en cherchant par l'un ou l'autre.
+- **Règle de sûreté** : une session n'est rangée sous un abonné que si toutes ses identités sont des alias de ce seul abonné. Sinon elle est **ambiguë** : elle n'est rangée sous aucune entrée et elle est comptée.
+- `/subscribers` expose `meta.ambiguous_sessions` et `meta.alias_groups_with_several_tokens`.
+
+**Changement visible** : un abonné LTE qui apparaissait deux fois, une fois par son IMSI et une fois par son MSISDN, n'apparaît plus qu'une fois, et ses sessions sont décorées.
+
+**Risque déclaré** : un message hors SIP qui porterait deux abonnés différents les réunirait. Je n'en connais aucun. Ce cas est compté par `alias_groups_with_several_tokens`, et le test 4 le garde sur la capture à cinq abonnés.
+
+**OUVERT** :
+- La trace live n'est pas modifiée pour la 5G-S-TMSI.
+- Les données déjà publiées ne portent pas encore `s_tmsi_tokens` au manifeste. Leurs call flows compactés n'ont plus l'IE 26, donc leur TMSI n'est renommée qu'à la publication suivante (même mécanisme que l'IMEISV en 2.21.154). Pour ces données, l'exclusion du SIP et la règle de sûreté s'appliquent dès la lecture, sans attendre.
+
+Tests (`apps/api`, `subscriber_journey`) ; les quatre premiers sont rejoués sur `0fe302e` dans un arbre séparé, patch `~/oiran-polaris-archives/2.21.155-preuve-echec-avant-sur-0fe302e.patch` :
+
+| Test | Sur `0fe302e` | Sur 2.21.155 |
+|---|---|---|
+| `a_sip_call_does_not_put_the_callee_session_under_the_caller_2_21_155` | échoue : l'entrée de A a 2 sessions, `[a, b]` | passe |
+| `a_reassigned_5g_s_tmsi_does_not_make_two_ues_one_subscriber_2_21_155` | échoue : un « abonné » | passe |
+| `a_session_carrying_two_subscribers_is_ambiguous_and_counted_2_21_155` | échoue : l'entrée de A a 2 sessions | passe |
+| `imsi_and_msisdn_carried_together_are_one_subscriber_2_21_155` | échoue : 2 entrées | passe |
+| `five_subscribers_stay_five_distinct_subscribers_2_21_155` (non-régression, `multi-imsi.pcap`) | passe | passe |
+
+Le test `the_5g_s_tmsi_is_relabelled_as_a_temporary_identity_1_5_3` vérifie dans `callflow-schema` que seule la TMSI est renommée, et que le vrai pseudonyme d'abonné reste tel quel.
+
+### Sujet 2 — rétention sans archive, sur option
+
+`OIRAN_DATASET_RETENTION_ARCHIVE=0` : la rétention retire du jeu les captures hors fenêtre **sans les copier** dans `archive/`. Le cycle est journalisé `CONTINUOUS_CAPTURE_RETENTION_WITHOUT_ARCHIVE`, avec les comptes retenus et écartés. Sans l'option, ou avec une autre valeur, le comportement est celui d'avant : un segment est écrit. Il n'y a pas d'expiration des segments existants : ils restent à la main d'ANR2, sur liste figée.
+
+Test : `retention_without_archive_discards_stale_captures_and_writes_no_segment_2_21_155` (live-probe) vérifie les deux cas, avec et sans option.
+
 ## oiran-api 2.21.154, live-probe 0.6.39, session-engine 0.5.32, callflow-schema 1.5.2 — 2026-11-23 — détail d'une session sans attente pendant une publication ; l'IMEISV masqué n'est plus un abonné
 
 Upgrade **patch** sans déploiement, au-dessus de 2.21.151 @ `7ccf7cb` (branche `fix/oiran-2.21.154-trace-isolation`). Trois sujets, trois commits, une version (décision du cœur #9 7098608248). live-probe passe de 0.6.36 à **0.6.39** et session-engine de 0.5.30 à **0.5.32** : 0.6.37 et 0.5.31 sont prises par 2.21.152 (refusée), 0.6.38 par 2.21.153 (annulée).

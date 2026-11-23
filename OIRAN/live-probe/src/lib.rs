@@ -1206,6 +1206,11 @@ pub struct LiveDataset {
     /// modèle : la lecture ne les sert jamais sous `subscriber_pseudonym`.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub masked_imeisv_tokens: BTreeSet<String>,
+    /// 2.21.155 (ordre cœur #9 7102937368) — jetons de 5G-S-TMSI (IE NGAP
+    /// 26), relevés comme ceux de l'IMEISV. Identités TEMPORAIRES, que
+    /// l'AMF réattribue : la lecture les sert sous `s_tmsi_pseudonym`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub s_tmsi_tokens: BTreeSet<String>,
 }
 
 /// 2.21.154 — (dé)sérialisation de la découverte partagée : même JSON
@@ -2682,11 +2687,16 @@ impl CaptureManager {
 
     /// 2.21.154 — jetons d'IMEISV masqué connus pour un jeu (manifeste).
     pub fn masked_imeisv_tokens(&self, dataset_id: &str) -> BTreeSet<String> {
+        self.equipment_and_temporary_tokens(dataset_id).0
+    }
+
+    /// 2.21.155 — jetons d'IMEISV masqué et de 5G-S-TMSI connus pour un jeu.
+    pub fn equipment_and_temporary_tokens(&self, dataset_id: &str) -> (BTreeSet<String>, BTreeSet<String>) {
         self.datasets
             .lock()
             .unwrap()
             .get(dataset_id)
-            .map(|dataset| dataset.masked_imeisv_tokens.clone())
+            .map(|dataset| (dataset.masked_imeisv_tokens.clone(), dataset.s_tmsi_tokens.clone()))
             .unwrap_or_default()
     }
 
@@ -2723,10 +2733,13 @@ impl CaptureManager {
         // 2.21.154 — l'IMEISV masqué est servi sous son nom d'équipement,
         // pas sous `subscriber_pseudonym` (correction à la lecture) : jetons
         // relevés par la publication, plus ceux d'une IE 34 encore présente.
-        let mut tokens = self.masked_imeisv_tokens(dataset_id);
+        let (mut tokens, mut temporary) = self.equipment_and_temporary_tokens(dataset_id);
         tokens.extend(callflow_schema::masked_imeisv_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree)));
+        temporary.extend(callflow_schema::s_tmsi_tokens(flow.events.iter().map(|event| &event.decoded_ie_tree)));
         for event in &mut flow.events {
             callflow_schema::relabel_masked_imeisv(&mut event.decoded_ie_tree, &tokens);
+            // 2.21.155 — la 5G-S-TMSI sous son nom d'identité temporaire.
+            callflow_schema::relabel_subscriber_tokens(&mut event.decoded_ie_tree, &temporary, callflow_schema::S_TMSI_PSEUDONYM);
         }
         Some(flow)
     }
@@ -2834,11 +2847,15 @@ impl CaptureManager {
         // 2.21.154 — même correction à la lecture que `callflow`, avec les
         // jetons d'IMEISV masqué trouvés dans les events de la page.
         if let Some(events) = page.get_mut("events") {
-            let mut tokens = self.masked_imeisv_tokens(dataset_id);
+            let (mut tokens, mut temporary) = self.equipment_and_temporary_tokens(dataset_id);
             tokens.extend(callflow_schema::masked_imeisv_tokens(
                 events.as_array().into_iter().flatten().map(|event| &event["decoded_ie_tree"]),
             ));
+            temporary.extend(callflow_schema::s_tmsi_tokens(
+                events.as_array().into_iter().flatten().map(|event| &event["decoded_ie_tree"]),
+            ));
             callflow_schema::relabel_masked_imeisv(events, &tokens);
+            callflow_schema::relabel_subscriber_tokens(events, &temporary, callflow_schema::S_TMSI_PSEUDONYM);
         }
         Ok(Some(page))
     }
@@ -3148,6 +3165,7 @@ impl CaptureManager {
             callflows_path: None,
             callflow_reuse_keys: BTreeMap::new(),
             masked_imeisv_tokens: BTreeSet::new(),
+            s_tmsi_tokens: BTreeSet::new(),
         };
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
@@ -7599,6 +7617,7 @@ impl CaptureManager {
         advise_files_no_longer_needed(&event_paths);
         let event_count = index.source_event_count;
         let masked_imeisv_tokens = index.masked_imeisv_tokens;
+        let s_tmsi_tokens = index.s_tmsi_tokens;
         let mut events = index.events;
         // The legacy BTreeMap kept keys, tree nodes and freed allocation pages
         // resident through phase 07. Runs are gone at this point; return those
@@ -8317,6 +8336,7 @@ impl CaptureManager {
             callflows_path: None,
             callflow_reuse_keys,
             masked_imeisv_tokens,
+            s_tmsi_tokens,
         };
         trace_publication_rss(
             publication_started_epoch_ms,
@@ -11103,6 +11123,24 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RETENTION_ARCHIVE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// 2.21.155 — `OIRAN_DATASET_RETENTION_ARCHIVE=0` : la rétention retire les
+/// captures hors fenêtre sans les copier dans `archive/`. Absente ou toute
+/// autre valeur : l'archive est écrite (comportement d'avant).
+fn retention_archive_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_RETENTION_ARCHIVE.with(|value| value.get()) {
+        return enabled;
+    }
+    std::env::var("OIRAN_DATASET_RETENTION_ARCHIVE").map_or(true, |value| value.trim() != "0")
+}
+
 fn retention_cutoff_epoch_s() -> Option<u64> {
     let days = retention_days()?;
     let now = SystemTime::now()
@@ -11194,6 +11232,30 @@ fn archive_stale_captures(
     let segment_events = segment_dir.join("events.jsonl");
     let segment_manifest = segment_dir.join("manifest.json");
     let hot_tmp = events_path.with_extension("jsonl.hot-tmp");
+    // 2.21.155 (ordre cœur #9 7102937368, décision de Sadok 7102170772) —
+    // rétention SANS archive, sur option : les captures hors fenêtre sortent
+    // du jeu sans copie. Par défaut (option absente), l'archive est écrite
+    // comme avant.
+    if !retention_archive_enabled() {
+        let (discarded, retained, _) = archive_split_stream(events_path, None, &hot_tmp, &stale).map_err(|error| {
+            let _ = fs::remove_file(&hot_tmp);
+            error
+        })?;
+        fs::rename(&hot_tmp, events_path)
+            .map_err(|error| format!("CONTINUOUS_ARCHIVE_COMMIT_FAILED: {error}"))?;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_CAPTURE_RETENTION_WITHOUT_ARCHIVE",
+                "cutoff_epoch_s": cutoff,
+                "retention_days": retention_days(),
+                "capture_count": stale.len(),
+                "event_count_discarded": discarded,
+                "event_count_retained": retained,
+            })
+        );
+        return Ok(());
+    }
     // Create archive dir. Any IO failure here means "fail-closed":
     // the hot view is untouched by construction (we haven't written
     // anything yet).
@@ -11205,7 +11267,7 @@ fn archive_stale_captures(
     // above the rename step, we wipe the half-written archive and
     // the hot tmp, and the published jsonl stays byte-identical to
     // what it was on entry.
-    let outcome = archive_split_stream(events_path, &segment_events, &hot_tmp, &stale);
+    let outcome = archive_split_stream(events_path, Some(&segment_events), &hot_tmp, &stale);
     let (archived_count, retained_count, archive_sha256) = match outcome {
         Ok(result) => result,
         Err(error) => {
@@ -11276,18 +11338,24 @@ fn archive_stale_captures(
     Ok(())
 }
 
+/// 2.21.155 — `segment_events` à `None` : les events hors fenêtre ne sont
+/// écrits nulle part (rétention sans archive, `OIRAN_DATASET_RETENTION_ARCHIVE=0`).
 fn archive_split_stream(
     events_path: &Path,
-    segment_events: &Path,
+    segment_events: Option<&Path>,
     hot_tmp: &Path,
     stale: &BTreeSet<String>,
 ) -> Result<(u64, u64, String), String> {
     let hot_file = fs::File::create(hot_tmp)
         .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: hot: {error}"))?;
     let mut hot_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, hot_file);
-    let archive_file = fs::File::create(segment_events)
-        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment: {error}"))?;
-    let mut archive_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, archive_file);
+    let mut archive_writer = match segment_events {
+        Some(path) => Some(BufWriter::with_capacity(
+            STREAM_CHUNK_BYTES,
+            fs::File::create(path).map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment: {error}"))?,
+        )),
+        None => None,
+    };
     let mut archive_hash = Sha256Hasher::new();
     let reader = BufReader::with_capacity(
         STREAM_CHUNK_BYTES,
@@ -11309,12 +11377,14 @@ fn archive_split_stream(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         if stale.contains(cid) {
-            archive_writer
-                .write_all(line.as_bytes())
-                .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: body: {error}"))?;
-            archive_writer
-                .write_all(b"\n")
-                .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: newline: {error}"))?;
+            if let Some(archive_writer) = archive_writer.as_mut() {
+                archive_writer
+                    .write_all(line.as_bytes())
+                    .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: body: {error}"))?;
+                archive_writer
+                    .write_all(b"\n")
+                    .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: newline: {error}"))?;
+            }
             archive_hash.update(line.as_bytes());
             archive_hash.update(b"\n");
             archived = archived.saturating_add(1);
@@ -11338,13 +11408,15 @@ fn archive_split_stream(
         .get_ref()
         .sync_all()
         .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: hot sync: {error}"))?;
-    archive_writer
-        .flush()
-        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment flush: {error}"))?;
-    archive_writer
-        .get_ref()
-        .sync_all()
-        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment sync: {error}"))?;
+    if let Some(mut archive_writer) = archive_writer {
+        archive_writer
+            .flush()
+            .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment flush: {error}"))?;
+        archive_writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment sync: {error}"))?;
+    }
     Ok((archived, retained, archive_hash.finish_hex()))
 }
 
@@ -16626,6 +16698,7 @@ mod tests {
                 callflows_path: None,
                 callflow_reuse_keys: BTreeMap::new(),
             masked_imeisv_tokens: BTreeSet::new(),
+            s_tmsi_tokens: BTreeSet::new(),
             },
         );
         manager.jobs.lock().unwrap().insert(
@@ -18757,6 +18830,7 @@ Content-Length: 0\r\n\
             callflows_path: None,
             callflow_reuse_keys: BTreeMap::new(),
             masked_imeisv_tokens: BTreeSet::new(),
+            s_tmsi_tokens: BTreeSet::new(),
         };
         fs::write(source.join("dataset/oiran_events.jsonl"), b"").unwrap();
         fs::write(
@@ -24045,5 +24119,32 @@ Content-Length: 0\r\n\
         }
         // Rien de stocké n'est réécrit.
         assert!(stored_subscribers.is_superset(&served_imeisv));
+    }
+    /// 2.21.155 (ordre cœur #9 7102937368) — rétention sans archive, sur
+    /// option : les captures hors fenêtre sortent du jeu, aucun segment
+    /// n'est écrit sous `archive/`. Option absente : l'archive est écrite,
+    /// comme avant.
+    #[test]
+    fn retention_without_archive_discards_stale_captures_and_writes_no_segment_2_21_155() {
+        let base = temporary_root("retention-without-archive");
+        fs::create_dir_all(&base).unwrap();
+        let events_path = base.join("oiran_events.jsonl");
+        let lines = [
+            restore_test_line("evt-stale-1", "sha256:stale", 10),
+            restore_test_line("evt-fresh-1", "sha256:fresh", 10_000),
+        ];
+        write_jsonl(&events_path, &lines);
+        let archive_root = base.join("archive");
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(Some(false)));
+        let result = archive_stale_captures(&events_path, &archive_root, 5000);
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(None));
+        result.unwrap();
+        assert!(!archive_root.exists(), "aucun segment d'archive");
+        let kept = fs::read_to_string(&events_path).unwrap();
+        assert!(kept.contains("evt-fresh-1") && !kept.contains("evt-stale-1"), "seule la capture récente reste");
+        // Option absente : comportement d'avant.
+        write_jsonl(&events_path, &lines);
+        archive_stale_captures(&events_path, &archive_root, 5000).unwrap();
+        assert_eq!(fs::read_dir(&archive_root).unwrap().count(), 1, "un segment d'archive");
     }
 }
