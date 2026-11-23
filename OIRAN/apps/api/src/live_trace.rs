@@ -338,26 +338,28 @@ fn seed_from_ring(
             continue;
         };
         // 2.21.130 — seuls les segments les plus récents du plan sont
-        // relus (noms du ring croissants avec le temps), et eux seuls
-        // sont interrogés : la session d'un abonné tient dans les
-        // derniers segments, pas dans le ring entier.
-        let mut names: Vec<std::path::PathBuf> = entries
+        // relus, et eux seuls sont interrogés : la session d'un abonné
+        // tient dans les derniers segments, pas dans le ring entier.
+        // 2.21.158 (garde ANR1 `ring_segment_numbering_restart_selects_newest_files_2_21_157`,
+        // ordre cœur #9 7111464637) — « les plus récents » se décide par
+        // DATE DE MODIFICATION du fichier, puis par nom à date égale. Avant :
+        // par nom ; après un redémarrage de sonde, la numérotation repart de
+        // 1 et les noms les plus élevés étaient les plus ANCIENS segments.
+        // Un segment dont la date est illisible passe pour le plus ancien.
+        let mut files: Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>)> = entries
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("pcapng"))
-            .collect();
-        names.sort();
-        if names.len() > SEED_MAX_SEGMENTS_PER_INTERFACE {
-            report.truncated = true;
-            names.drain(..names.len() - SEED_MAX_SEGMENTS_PER_INTERFACE);
-        }
-        let files: Vec<_> = names
-            .into_iter()
             .filter_map(|path| {
                 let meta = path.metadata().ok()?;
                 Some((path, meta.len(), meta.modified().ok()))
             })
             .collect();
+        files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+        if files.len() > SEED_MAX_SEGMENTS_PER_INTERFACE {
+            report.truncated = true;
+            files.drain(..files.len() - SEED_MAX_SEGMENTS_PER_INTERFACE);
+        }
         let (selected, truncated) = select_seed_files(files, SEED_MAX_BYTES_PER_INTERFACE);
         report.truncated |= truncated;
         for (path, size) in selected {
@@ -5571,6 +5573,70 @@ mod tests {
         assert!(served["messages"].as_u64().unwrap() > 0, "{served}");
         assert_eq!(served["live_events_since_open"].as_u64().unwrap(), live.len() as u64, "{served}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // 2.21.158 — garde d'ANR1 repris TEL QUEL de `test/anr1-ring-seed-guards`
+    // @ `202c77a` (#10 7111105810), avec ses deux fonctions d'appui ; permanent.
+    fn empty_pcap_2_21_157() -> Vec<u8> {
+        // PCAP classique, Ethernet, sans paquet. Le suffixe reste `.pcapng`
+        // comme dans le ring : le loader choisit le format par le magic.
+        vec![
+            0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0xff,
+            0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    fn seed_ring_root_2_21_157(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "oiran-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Après redémarrage, dumpcap peut repartir à 1 alors que les anciens
+    /// noms élevés existent encore. Les trois derniers doivent être choisis
+    /// par fraîcheur disque, pas par le numéro lexical du segment.
+    #[test]
+    fn ring_segment_numbering_restart_selects_newest_files_2_21_157() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let old = fs::read(source).unwrap();
+        let recent = empty_pcap_2_21_157();
+        let root = seed_ring_root_2_21_157("seed-renumbered-ring");
+        let n2 = root.join("n2");
+        fs::create_dir_all(&n2).unwrap();
+        for segment in 97..=99 {
+            fs::write(n2.join(format!("n2_{segment:05}.pcapng")), &old).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for segment in 1..=3 {
+            fs::write(n2.join(format!("n2_{segment:05}.pcapng")), &recent).unwrap();
+        }
+        let old_mtime = fs::metadata(n2.join("n2_00099.pcapng"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let recent_mtime = fs::metadata(n2.join("n2_00003.pcapng"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(recent_mtime > old_mtime, "précondition : 1..3 sont les plus récents");
+
+        let registry = trace_on("psn-renumbering-guard");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        assert!(registry.begin_seed());
+        let report = seed_from_ring(&root, &key, &registry);
+        registry.finish_seed(&report);
+        assert_eq!(report.files, 3);
+        assert_eq!(
+            report.bytes,
+            3 * recent.len() as u64,
+            "DÉFAUT : le tri par nom a relu 97..99 (anciens) au lieu de 1..3 (récents après redémarrage)"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

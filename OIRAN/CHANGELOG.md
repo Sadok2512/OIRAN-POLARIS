@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.158 — 2026-11-23 — amorçage de trace : les « 3 derniers segments » se choisissent par date de fichier
+
+Upgrade **patch**, sans déploiement. Base `23d613d` (2.21.157, PASS d'ANR1 #10 7111397052), branche `fix/oiran-2.21.158-seed-segments-by-mtime`.
+- Ordre du cœur : #9 7111464637 (voie B, lots inversés).
+- Garde d'ANR1 : `test/anr1-ring-seed-guards` @ `202c77a`.
+
+**Défaut** (garde d'ANR1) : `seed_from_ring` gardait, par plan, les 3 segments aux noms les plus élevés. Après un redémarrage de sonde, la numérotation repart de 1, et ce choix relisait les 3 segments **les plus anciens** encore présents.
+
+**Correctif** : pour chaque plan, les `*.pcapng` sont triés par **date de modification du fichier**, puis par nom à date égale. Les 3 plus récents sont gardés. Un segment dont la date est illisible passe pour le plus ancien. Le plafond de 64 Mio par plan (`select_seed_files`) est inchangé : il triait déjà par date.
+
+**Effet de bord, déclaré** :
+- À ring constant, l'ensemble relu ne change que si l'ordre des noms et l'ordre des dates divergent :
+  - après un redémarrage qui renumérote : c'est le cas corrigé ;
+  - si un segment a été réécrit ou recopié après coup ;
+  - si l'horloge du système a reculé.
+- Quand noms et dates croissent ensemble, cas nominal d'un ring dumpcap, l'ensemble relu est identique à celui d'avant.
+- **Une trace déjà ouverte n'est pas affectée** : l'amorçage n'a lieu qu'une fois, à la première passe du lecteur après la création (`needs_seed`), et une réouverture identique réutilise la trace sans la ré-amorcer. Les traces vivent en mémoire : après le déploiement, seules les traces ouvertes ensuite passent par la nouvelle sélection.
+
+**OUVERT, hors de ce lot** : le lecteur live (`reader_pass`) désigne lui aussi le segment « le plus récent » et le « précédent » **par nom** (`paths.sort()`, puis `last_idx`). Après un redémarrage qui renumérote, il suivrait un ancien segment comme segment courant. Ce lot n'y touche pas.
+
+Test : `ring_segment_numbering_restart_selects_newest_files_2_21_157`, garde d'ANR1 repris **tel quel**, avec ses deux fonctions d'appui, octet pour octet identiques à `202c77a`. Il est permanent.
+
+| | Sur `23d613d` (arbre séparé) | Sur 2.21.158 |
+|---|---|---|
+| octets relus | **18 540** : les segments 97 à 99, anciens. **Échoue** | **72** : les segments 1 à 3, récents. Passe |
+
+Patch de la preuve : `~/oiran-polaris-archives/2.21.158-preuve-echec-avant-sur-23d613d.patch`.
+
 ## oiran-api 2.21.157 — 2026-11-23 — trace live : un « 0 message » devient lisible
 
 Upgrade **patch**, sans déploiement. Base `e99d95c` (2.21.156, en prod), branche `fix/oiran-2.21.157-trace-seed-observability`.
