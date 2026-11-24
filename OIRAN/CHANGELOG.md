@@ -1,5 +1,41 @@
 # Changelog
 
+## oiran-api 2.21.167 — 2026-11-24 — panneau UE Info : exposer ce qui est déjà décodé
+
+Ordre cœur #9 7135745591 (lot 2 sur 3), audit #9 7135657542. Base : `9c8979c` (2.21.165, en production). Lot indépendant de 2.21.166 ; la fusion des trois lots est demandée par le cœur.
+
+### Exposé, sans aucun décodage neuf
+- **`ue_info.ue_context`** (trace live) : un contexte UE appris de **tout** event rattaché, amorçage compris, à partir des IE **déjà décodées**.
+  - **PLMN, NR cell id, TAC** : depuis l'IE `UserLocationInformation` (NGAP IE 121).
+  - **5QI** : clés `…five_qi…` des listes de flux QoS.
+  - **QFI** : clé `qfi`, NGAP ou PFCP (IE 124).
+  - **Sessions PDU** : `pdu_session_id` des listes `PDUSessionResourceSetupList*`, avec les états `SETUP_REQUESTED`, `ACTIVE` et `RELEASED`.
+- **Chaque champ** porte `value` (ou `values`), `source` (l'IE ou le message) et `event_id` (la preuve). En l'absence de valeur, il porte `value: null` **et** une `reason`. Jamais un « non disponible » nu.
+- **Identité gNB** : toujours `null`, avec la raison `carried_by_ng_setup_a_node_message_not_attached_to_a_subscriber_trace`. Le gNB ID n'est porté que par `NGSetup`, un message de nœud.
+- **`ue_info`** repart aussi quand le contexte change. Avant, seul un changement des pseudonymes le déclenchait.
+
+### État UE et fin de procédure
+- **`registration`, `rm_state`, `cm_state`**, dérivés des messages NGAP en clair :
+  - `InitialUEMessage` donne `IN_PROGRESS` et `CM-CONNECTED` ;
+  - **`InitialContextSetupResponse`** donne `REGISTERED`, `RM-REGISTERED` et `CM-CONNECTED` ;
+  - `UEContextReleaseComplete` donne `CM-IDLE` ;
+  - `Deregistration Accept` donne `DEREGISTERED`, `RM-DEREGISTERED`, `CM-IDLE`, et les sessions passent à `RELEASED`.
+  - La source de chaque état est publiée. Un enregistrement neuf remet le contexte à zéro, comme l'état technique.
+- **Phase terminale** : `procedure` n'était émis **qu'en phase `update`**, d'où le « Registration : en cours » éternel. Désormais, une phase **`complete`** est émise une fois, pour `Registration` (sur l'`InitialContextSetupResponse`) et pour `PDU Session Establishment` (sur le `PDUSessionResourceSetupResponse`).
+
+### L'identité saisie, sous l'interrupteur
+`POLARIS_IDENTITIES_IN_CLEAR`, même nom et même sémantique que Control 0.36.31 (décision #9 7135266817).
+- **À `1`** : la trace par IMSI, SUPI ou MSISDN rend ses chiffres canoniques (`LiveTrace.identity_in_clear`, et `ue_info.identity`).
+- **Absente ou `0`** : aucun champ, et la sérialisation reste celle de 2.21.98.
+
+### « non observé » sur un échec : ce qui permet déjà de distinguer, en attendant 2.21.168
+- Sur **`/sessions/:id/identities`**, un échec est **HTTP 503** avec `error.code = "HEAVY_WORK_IN_PROGRESS"` et `Retry-After`, alors qu'une absence est **HTTP 200** avec des champs vides. **p900 doit lire le statut HTTP** et afficher « lecture indisponible, réessai » sur un 503, jamais « non observé ».
+- Sur la **liste** `/sessions`, `identities: null` ne distingue rien aujourd'hui : c'est ce que **2.21.168** apporte (`meta.hydration`, `identities_status`).
+
+### Gardes
+- `ue_info_carries_the_ue_context_from_already_decoded_ies_2_21_167` : capture N2 réelle du dépôt. PLMN `001-01`, NR cell id et TAC depuis la ULI ; `REGISTERED` sur l'`InitialContextSetupResponse` ; 5QI ; session PDU `ACTIVE` ; identité gNB nulle **avec** sa raison ; aucun champ vide sans raison ; phases `complete` pour `Registration` et `PDU Session Establishment` ; pas d'identité saisie interrupteur fermé.
+- `typed_identity_follows_the_identities_switch_2_21_167`.
+
 ## Fusion déployable oiran-api 2.21.165 — 2026-11-24 — ordre cœur #9 7131640379
 
 Une seule mise en production, sur `8640a0d` (fusion 2.21.163, en production), réunit : 2.21.164 reportée sur `8640a0d` (`/health` véridique ; delta relu PASS par ANR1 sur `452406e`, #10 7129528652) et 2.21.165 (`/sessions` lit `commit_seq` une fois par requête). Versions finales : oiran-api 2.21.165, live-probe 0.6.42. Le détail de chaque lot suit.

@@ -33,6 +33,12 @@ const MAX_REMEMBERED_EXPIRED_TRACES: usize = 64;
 pub(crate) struct LiveTrace {
     trace_id: String,
     key_type: String,
+    /// 2.21.167 (ordre cœur #9 7135745591, décision Sadok 7135266817) —
+    /// la valeur saisie (chiffres canoniques) d'une trace par IMSI, SUPI ou
+    /// MSISDN, rendue SEULEMENT sous `POLARIS_IDENTITIES_IN_CLEAR=1`. Absente
+    /// sinon : la sérialisation reste celle de 2.21.98.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_in_clear: Option<String>,
     subscriber_pseudonyms: Vec<String>,
     interfaces: Vec<String>,
     created_at: u64,
@@ -793,6 +799,177 @@ impl TraceState {
     }
 }
 
+/// 2.21.167 (ordre cœur #9 7135745591, lot 2/3) — interrupteur des
+/// identités côté Analyzer, même nom et même sémantique que Control
+/// (décision #9 7135266817) : `POLARIS_IDENTITIES_IN_CLEAR=1` ouvre, tout le
+/// reste ferme. Lu une fois par processus.
+pub(crate) fn identities_in_clear() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("POLARIS_IDENTITIES_IN_CLEAR").ok().as_deref().map(str::trim) == Some("1")
+    })
+}
+
+/// 2.21.167 — valeur saisie rendue au panneau : chiffres canoniques d'une
+/// trace par IMSI, SUPI ou MSISDN, et seulement interrupteur ouvert.
+fn typed_identity_in_clear(key_type: &str, value: &str, clear: bool) -> Option<String> {
+    if !clear || !matches!(key_type, "imsi" | "supi" | "msisdn") {
+        return None;
+    }
+    canonical_digits(value)
+}
+
+/// Une valeur du panneau et sa preuve (event qui l'a portée).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Proven {
+    value: String,
+    event_id: String,
+    source: &'static str,
+}
+
+/// 2.21.167 — contexte UE du panneau UE Info, construit UNIQUEMENT depuis
+/// des IE déjà décodées (aucun décodage neuf) et des noms de messages NGAP
+/// en clair. Chaque champ est publié avec sa preuve, ou avec la raison de
+/// son absence — jamais un « non disponible » nu.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct UeContext {
+    plmn: Option<Proven>,
+    nr_cell_id: Option<Proven>,
+    tac: Option<Proven>,
+    five_qi: BTreeMap<String, Proven>,
+    qfi: BTreeMap<String, Proven>,
+    registration: Option<Proven>,
+    rm_state: Option<Proven>,
+    cm_state: Option<Proven>,
+    pdu_sessions: BTreeMap<String, Proven>,
+    /// Procédures terminées depuis la dernière émission (phase `complete`).
+    pending_completions: Vec<(&'static str, String)>,
+}
+
+/// `clé=valeur` d'une valeur d'IE décodée (`a=1,b=2`).
+fn ie_pairs(value: &str) -> impl Iterator<Item = (&str, &str)> {
+    value.split(',').filter_map(|pair| pair.split_once('='))
+}
+
+impl UeContext {
+    fn set(slot: &mut Option<Proven>, value: &str, event_id: &str, source: &'static str) -> bool {
+        let next = Proven { value: value.to_string(), event_id: event_id.to_string(), source };
+        if slot.as_ref().map(|p| &p.value) == Some(&next.value) {
+            return false;
+        }
+        *slot = Some(next);
+        true
+    }
+
+    /// Apprend d'un event rattaché à la trace. Rend `true` si le contexte a
+    /// changé.
+    fn observe(&mut self, event: &event_schema::NormalizedEvent) -> bool {
+        let before = self.clone();
+        let id = event.event_id.as_str();
+        for ie in &event.information_elements {
+            let Some(value) = ie.value.as_deref() else { continue };
+            if ie.name == "UserLocationInformation" {
+                for (key, v) in ie_pairs(value) {
+                    match key {
+                        "plmn" => { Self::set(&mut self.plmn, v, id, "UserLocationInformation"); }
+                        "nr_cell_id" => { Self::set(&mut self.nr_cell_id, v, id, "UserLocationInformation"); }
+                        "tac" => { Self::set(&mut self.tac, v, id, "UserLocationInformation"); }
+                        _ => {}
+                    }
+                }
+            }
+            let pdu_state = match ie.name.as_str() {
+                "PDUSessionResourceSetupListSUReq" | "PDUSessionResourceSetupListCxtReq" => Some("SETUP_REQUESTED"),
+                "PDUSessionResourceSetupListSURes" | "PDUSessionResourceSetupListCxtRes" => Some("ACTIVE"),
+                "PDUSessionResourceReleasedListRelRes" | "PDUSessionResourceListCxtRelCpl" => Some("RELEASED"),
+                _ => None,
+            };
+            for (key, v) in ie_pairs(value) {
+                if key.contains("five_qi") && v.parse::<u16>().is_ok() {
+                    self.five_qi.entry(v.to_string()).or_insert(Proven { value: v.to_string(), event_id: id.to_string(), source: "QosFlowSetupRequestItem" });
+                } else if key == "qfi" && v.parse::<u8>().is_ok() {
+                    let source = if event.protocol.as_str() == "PFCP" { "PFCP QFI" } else { "NGAP QoS flow" };
+                    self.qfi.entry(v.to_string()).or_insert(Proven { value: v.to_string(), event_id: id.to_string(), source });
+                } else if key == "pdu_session_id" {
+                    if let Some(state) = pdu_state {
+                        let current = self.pdu_sessions.get(v).map(|p| p.value.as_str());
+                        // Une session active ne redescend pas à « demandée ».
+                        if !(state == "SETUP_REQUESTED" && current == Some("ACTIVE")) {
+                            self.pdu_sessions.insert(v.to_string(), Proven { value: state.into(), event_id: id.to_string(), source: "NGAP PDU session list" });
+                        }
+                    }
+                }
+            }
+        }
+        match compact_name(&event.message_name).as_str() {
+            "initialuemessage" => {
+                Self::set(&mut self.cm_state, "CM-CONNECTED", id, "InitialUEMessage");
+                if self.registration.as_ref().map(|p| p.value.as_str()) != Some("REGISTERED") {
+                    Self::set(&mut self.registration, "IN_PROGRESS", id, "InitialUEMessage");
+                }
+            }
+            "initialcontextsetupresponse" => {
+                let was_registered = self.registration.as_ref().map(|p| p.value.as_str()) == Some("REGISTERED");
+                Self::set(&mut self.registration, "REGISTERED", id, "InitialContextSetupResponse");
+                Self::set(&mut self.rm_state, "RM-REGISTERED", id, "InitialContextSetupResponse");
+                Self::set(&mut self.cm_state, "CM-CONNECTED", id, "InitialContextSetupResponse");
+                if !was_registered {
+                    self.pending_completions.push(("Registration", id.to_string()));
+                }
+            }
+            "uecontextreleasecomplete" => {
+                Self::set(&mut self.cm_state, "CM-IDLE", id, "UEContextReleaseComplete");
+            }
+            "pdusessionresourcesetupresponse" => {
+                self.pending_completions.push(("PDU Session Establishment", id.to_string()));
+            }
+            name if name.ends_with("deregistrationaccept") => {
+                Self::set(&mut self.registration, "DEREGISTERED", id, "Deregistration Accept");
+                Self::set(&mut self.rm_state, "RM-DEREGISTERED", id, "Deregistration Accept");
+                Self::set(&mut self.cm_state, "CM-IDLE", id, "Deregistration Accept");
+                for session in self.pdu_sessions.values_mut() {
+                    session.value = "RELEASED".into();
+                }
+            }
+            _ => {}
+        }
+        *self != before
+    }
+
+    /// Charge utile `ue_context` : chaque champ porte sa valeur et sa preuve,
+    /// ou `value: null` et la raison de l'absence.
+    fn payload(&self) -> Value {
+        let one = |slot: &Option<Proven>, reason: &str| match slot {
+            Some(p) => json!({"value": p.value, "source": p.source, "event_id": p.event_id}),
+            None => json!({"value": null, "reason": reason}),
+        };
+        let many = |map: &BTreeMap<String, Proven>, reason: &str| {
+            if map.is_empty() {
+                json!({"values": [], "reason": reason})
+            } else {
+                json!({"values": map.values().map(|p| json!({"value": p.value, "source": p.source, "event_id": p.event_id})).collect::<Vec<_>>()})
+            }
+        };
+        let not_yet = "not_observed_in_this_trace_yet";
+        json!({
+            "plmn": one(&self.plmn, "no_user_location_information_attached_yet"),
+            "nr_cell_id": one(&self.nr_cell_id, "no_user_location_information_attached_yet"),
+            "tac": one(&self.tac, "no_user_location_information_attached_yet"),
+            "gnb_id": {"value": null, "reason": "carried_by_ng_setup_a_node_message_not_attached_to_a_subscriber_trace"},
+            "five_qi": many(&self.five_qi, "no_qos_flow_setup_attached_yet"),
+            "qfi": many(&self.qfi, "no_qos_flow_attached_yet"),
+            "registration": one(&self.registration, not_yet),
+            "rm_state": one(&self.rm_state, not_yet),
+            "cm_state": one(&self.cm_state, not_yet),
+            "pdu_sessions": if self.pdu_sessions.is_empty() {
+                json!({"values": [], "reason": "no_pdu_session_resource_list_attached_yet"})
+            } else {
+                json!({"values": self.pdu_sessions.iter().map(|(id, p)| json!({"pdu_session_id": id, "state": p.value, "source": p.source, "event_id": p.event_id})).collect::<Vec<_>>()})
+            },
+        })
+    }
+}
+
 struct TraceState {
     trace: LiveTrace,
     /// 2.21.139 — empreinte de la demande d'ouverture (type de clé,
@@ -828,6 +1005,9 @@ struct TraceState {
     /// `None` initialement et après fin de session ⇒ le premier
     /// `ue_info` est toujours émis.
     last_ue_info_signature: Option<Vec<String>>,
+    /// 2.21.167 — contexte UE du panneau, appris des events rattachés
+    /// (amorçage compris) depuis les IE déjà décodées.
+    ue_context: UeContext,
     throughput_second: u64,
     ul_bytes: u64,
     dl_bytes: u64,
@@ -2639,12 +2819,18 @@ impl LiveTraceRegistry {
             // les sessions, et n'est pas concerné.
             if !forced && match_pseudo && is_fresh_registration(&event.message_name) {
                 forget_technical_state(state);
+                // 2.21.167 — un enregistrement neuf repart de zéro, comme
+                // l'état technique : le contexte d'avant est périmé.
+                state.ue_context = UeContext::default();
                 if !seed_only {
                     state.trace.fresh_registrations =
                         state.trace.fresh_registrations.saturating_add(1);
                 }
             }
             attached_here += 1;
+            // 2.21.167 — le contexte UE apprend de tout event rattaché,
+            // amorçage compris ; l'émission reste réservée au direct.
+            state.ue_context.observe(event);
             if forced {
                 state.trace.parents_attached_after_child =
                     state.trace.parents_attached_after_child.saturating_add(1);
@@ -3375,8 +3561,23 @@ impl LiveTraceRegistry {
             // qu'on renvoyait le set entier à chaque message. La 2.21.98
             // avait déjà réduit le CONTENU de `keys` (pseudonymes seuls) ;
             // 2.21.103 réduit la FRÉQUENCE à « sur changement effectif ».
+            // 2.21.167 — procédures terminées : phase `complete`, émise une
+            // fois. Avant, seule la phase `update` existait.
+            for (procedure, completed_by) in std::mem::take(&mut state.ue_context.pending_completions) {
+                state.next_id += 1;
+                let done = BufferedEvent {
+                    id: state.next_id,
+                    kind: "procedure".into(),
+                    payload: json!({"procedure": procedure, "phase": "complete", "event_id": completed_by, "capture_id": event.capture_id}),
+                };
+                state.buffer(done.clone());
+                let _ = state.tx.send(done);
+            }
             let mut sorted_keys: Vec<String> = state.exposed_keys.iter().cloned().collect();
             sorted_keys.sort();
+            // 2.21.167 — `ue_info` repart aussi quand le contexte UE change.
+            let ue_context = state.ue_context.payload();
+            sorted_keys.push(format!("ue_context:{ue_context}"));
             let should_emit_ue_info = state.last_ue_info_signature.as_ref() != Some(&sorted_keys);
             if should_emit_ue_info {
                 state.last_ue_info_signature = Some(sorted_keys);
@@ -3389,7 +3590,14 @@ impl LiveTraceRegistry {
                     // chiffres canoniques de la saisie et les IE values non
                     // pseudonymisées restent dans `match_keys` (interne
                     // non-Serialize, `MatchKeys`), donc ne peuvent fuiter.
-                    payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.exposed_keys,"capture_id":event.capture_id,"packet_number":packet}),
+                    payload: {
+                        let mut info = json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.exposed_keys,"capture_id":event.capture_id,"packet_number":packet,"ue_context":ue_context});
+                        // 2.21.167 — la valeur saisie, seulement interrupteur ouvert.
+                        if let Some(identity) = &state.trace.identity_in_clear {
+                            info["identity"] = json!({"key_type": state.trace.key_type, "value": identity});
+                        }
+                        info
+                    },
                 };
                 state.buffer(info.clone());
                 let _ = state.tx.send(info);
@@ -4505,9 +4713,11 @@ pub(crate) async fn create(
         );
     }
     let (tx, _) = broadcast::channel(MAX_EVENTS);
+    let identity_in_clear = typed_identity_in_clear(&input.key_type, &input.value, identities_in_clear());
     let trace = LiveTrace {
         trace_id: trace_id.clone(),
         key_type: input.key_type,
+        identity_in_clear,
         subscriber_pseudonyms: pseudonyms.clone(),
         interfaces: input.interfaces,
         created_at: now,
@@ -4555,6 +4765,7 @@ pub(crate) async fn create(
             match_keys: initial_match_keys,
             exposed_keys: HashSet::new(),
             last_ue_info_signature: None,
+            ue_context: UeContext::default(),
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
@@ -5091,6 +5302,7 @@ mod tests {
             trace: LiveTrace {
                 trace_id: "t".into(),
                 key_type: "pseudonym".into(),
+                identity_in_clear: None,
                 subscriber_pseudonyms: pseudos,
                 interfaces: vec![],
                 created_at: 0,
@@ -5131,6 +5343,7 @@ mod tests {
             match_keys: initial_match_keys.into_iter().collect(),
             exposed_keys: HashSet::new(),
             last_ue_info_signature: None,
+            ue_context: UeContext::default(),
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
@@ -12686,5 +12899,101 @@ mod tests {
             newest_consumed > 0 && observed > 0,
             "DÉFAUT : le lecteur a suivi le segment 99 par nom et ignoré le segment 3, plus récent"
         );
+    }
+
+    /// 2.21.167 (ordre cœur #9 7135745591, lot 2/3) — le panneau UE Info
+    /// sur la capture N2 réelle du dépôt : le dernier `ue_info` porte un
+    /// `ue_context` alimenté par les IE déjà décodées (PLMN, NR cell id, TAC
+    /// de la ULI ; 5QI ; session PDU), l'état d'enregistrement passe à
+    /// REGISTERED sur l'`InitialContextSetupResponse`, et les procédures
+    /// terminées sont émises en phase `complete`. Tout champ vide porte sa
+    /// raison. Avant 2.21.167 : ni `ue_context`, ni phase `complete`.
+    #[test]
+    fn ue_info_carries_the_ue_context_from_already_decoded_ies_2_21_167() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N2"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events.sort_by_key(|event| event.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        let pseudonym = events
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let r = trace_on(&pseudonym);
+        for event in &events {
+            r.route_normalized(event);
+        }
+        let traces = r.traces.lock().unwrap();
+        let state = &traces["t"];
+        let info = state
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.kind == "ue_info")
+            .expect("au moins un ue_info");
+        let context = &info.payload["ue_context"];
+        for field in ["plmn", "nr_cell_id", "tac"] {
+            assert!(context[field]["value"].is_string(), "{field} : {context}");
+            assert_eq!(context[field]["source"], "UserLocationInformation", "{field}");
+        }
+        assert_eq!(context["plmn"]["value"], "001-01", "{context}");
+        assert_eq!(context["registration"]["value"], "REGISTERED", "{context}");
+        assert_eq!(context["registration"]["source"], "InitialContextSetupResponse");
+        assert_eq!(context["rm_state"]["value"], "RM-REGISTERED");
+        assert_eq!(context["cm_state"]["value"], "CM-CONNECTED");
+        assert!(!context["five_qi"]["values"].as_array().unwrap().is_empty(), "5QI : {context}");
+        let sessions = context["pdu_sessions"]["values"].as_array().unwrap();
+        assert!(sessions.iter().any(|s| s["state"] == "ACTIVE"), "PDU : {context}");
+        // Identité gNB : pas dans une trace d'abonné, et le panneau le dit.
+        assert!(context["gnb_id"]["value"].is_null());
+        assert!(context["gnb_id"]["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        // Aucun champ nul sans sa raison.
+        for (name, field) in context.as_object().unwrap() {
+            let empty = field.get("value").is_some_and(Value::is_null)
+                || field.get("values").and_then(Value::as_array).is_some_and(|v| v.is_empty());
+            if empty {
+                assert!(field["reason"].as_str().is_some_and(|r| !r.is_empty()), "{name} vide sans raison");
+            }
+        }
+        // Les procédures terminées, en phase `complete`.
+        let completed: Vec<&str> = state
+            .events
+            .iter()
+            .filter(|e| e.kind == "procedure" && e.payload["phase"] == "complete")
+            .filter_map(|e| e.payload["procedure"].as_str())
+            .collect();
+        assert!(completed.contains(&"Registration"), "{completed:?}");
+        assert!(completed.contains(&"PDU Session Establishment"), "{completed:?}");
+        // Interrupteur fermé (tests) : aucune identité saisie exposée.
+        assert!(info.payload.get("identity").is_none());
+    }
+
+    /// 2.21.167 — l'identité saisie suit `POLARIS_IDENTITIES_IN_CLEAR` : rien
+    /// interrupteur fermé, les chiffres canoniques ouvert, et seulement pour
+    /// une trace par IMSI, SUPI ou MSISDN.
+    #[test]
+    fn typed_identity_follows_the_identities_switch_2_21_167() {
+        assert_eq!(typed_identity_in_clear("imsi", "imsi-001010000000201", false), None);
+        assert_eq!(
+            typed_identity_in_clear("imsi", "imsi-001010000000201", true).as_deref(),
+            Some("001010000000201")
+        );
+        assert_eq!(
+            typed_identity_in_clear("imsi", "001 01 0000000201", true).as_deref(),
+            Some("001010000000201")
+        );
+        assert_eq!(typed_identity_in_clear("pseudonym", "psn-0123", true), None);
+        assert_eq!(typed_identity_in_clear("ip", "10.45.0.2", true), None);
+        // Fermé, la trace sérialisée n'a pas le champ.
+        let state = state(u64::MAX, false, vec![]);
+        let serialized = serde_json::to_value(&state.trace).unwrap();
+        assert!(serialized.get("identity_in_clear").is_none(), "{serialized}");
     }
 }
