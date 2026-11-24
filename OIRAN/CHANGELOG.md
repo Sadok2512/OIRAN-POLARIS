@@ -10,9 +10,10 @@ Ordre cœur #9 7138374225 (priorité 3), refus ANR1 #10 7137693482 de 2.21.168. 
 - **Borne trop courte** : 30 s aurait tué à tort une session de 7 messages mesurée à 54,1 s par ANR2 (#10 7137873871). La durée suit la taille du fichier de capture, pas celle de la session.
 
 ### Corrigé
-- **Le statut porte la signature de sa source** : `len:mtime` du fichier callflow d'un jeu publié (un `statx`), ou `static` pour le jeu de référence. Chaque `complete`, `deferred` ou `unavailable` enregistre la source sur laquelle il a été établi.
-- **Sur les listes** (`identities_status`), un `complete` dont la source a changé est publié **`deferred` / `source_changed`**. Une reprise est mise en file **même si la voûte n'est pas vide**. La reprise réhydrate (le cache est manqué si de nouveaux paquets sont arrivés) et rétablit `complete` pour la nouvelle source.
+- **Un `complete` porte l'empreinte de l'état qui l'a établi** : la source du callflow (`len:mtime` du fichier d'un jeu publié, un `statx` ; `static` pour le jeu de référence) **et** la signature de l'entrée de cache d'identités (en mémoire). Aucune lecture du callflow sur les listes.
+- **Sur les listes** (`identities_status`), un `complete` dont la source **ou** la signature de cache a changé est publié **`deferred` / `source_changed`**. Une reprise est mise en file **même si la voûte n'est pas vide**. La reprise réhydrate (le cache est manqué si de nouveaux paquets sont arrivés) et rétablit `complete` pour la nouvelle source.
 - **`unavailable` pour les trois raisons** (`tshark_timeout`, `tshark_unavailable`, `tshark_dissection_failed`) : la raison est gardée dans la table, et la même sortie s'applique (nouvelle signature, ou 15 minutes).
+- **Le fil de reprise attend 250 ms avant chaque retrait** : des demandes rapprochées sont regroupées, et une reprise programmée reste visible en file le temps d'être prise. Avant, elle était retirée dès le démarrage du fil, ce que le garde ANR1 observe par `queued() >= 1`. **Déclaré** : cette assertion reste sensible au minutage, avec une marge de 250 ms ; elle passe 12 fois sur 12.
 - **Borne `tshark` par défaut : 300 s** (`OIRAN_IDENTITY_TSHARK_TIMEOUT_S`, toujours configurable). Depuis 2.21.168, la reprise s'efface en environ 50 ms devant une publication en attente : la borne ne protège plus la publication, elle sert seulement de garde-fou contre un `tshark` pathologique.
 
 ### Gardes, rouges sur `5b98f64`

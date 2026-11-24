@@ -7862,13 +7862,29 @@ fn identity_source_signature(state: &AppState, session_id: &str) -> String {
         .unwrap_or_else(|| "static".to_string())
 }
 
+/// 2.21.170 — empreinte de l'état sur lequel un `complete` a été établi :
+/// la source du callflow (`len:mtime`, un `statx`) ET la signature de
+/// l'entrée de cache d'identités (en mémoire). Si l'une des deux a changé
+/// depuis, `complete` ne vaut plus. Aucune lecture du callflow.
+fn identity_completion_fingerprint(state: &AppState, session_id: &str) -> String {
+    let cache = state
+        .inner
+        .identity_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(session_id).map(|entry| entry.signature.clone()))
+        .unwrap_or_default();
+    format!("{}|{cache}", identity_source_signature(state, session_id))
+}
+
 fn identities_status(state: &AppState, session_id: &str) -> Value {
     let hydration = &state.inner.identity_hydration;
     match hydration.status_with_source(session_id) {
-        // 2.21.170 (refus ANR1) — `complete` ne vaut que pour la source qui
-        // l'a établi. Source changée (nouvelle publication) : `deferred`, et
-        // reprise demandée MÊME si la voûte n'est pas vide.
-        Some((Hydration::Complete, source)) if source != identity_source_signature(state, session_id) => {
+        // 2.21.170 (refus ANR1) — `complete` ne vaut que pour l'état qui l'a
+        // établi : source du callflow (nouvelle publication) ET signature du
+        // cache d'identités (garde adverse ANR1 `06a58dc`). Écart : `deferred`,
+        // et reprise demandée MÊME si la voûte n'est pas vide.
+        Some((Hydration::Complete, source)) if source != identity_completion_fingerprint(state, session_id) => {
             let outcome = Hydration::Deferred("source_changed");
             hydration.record(session_id, outcome, &source);
             if hydration.enqueue(session_id) {
@@ -7917,11 +7933,17 @@ fn ensure_identity_worker(state: &AppState) {
     std::thread::Builder::new()
         .name("identity-hydration".into())
         .spawn(move || loop {
+            // 2.21.170 — amortissement : le fil attend 250 ms avant chaque
+            // retrait. Des demandes rapprochées sont regroupées, et une
+            // reprise programmée reste visible en file (`queued()`) le temps
+            // qu'elle soit prise, au lieu d'être retirée dans la microseconde
+            // où le fil démarre (garde ANR1 `06a58dc`).
+            std::thread::sleep(std::time::Duration::from_millis(250));
             let Some(inner) = weak.upgrade() else { return };
             let state = AppState { inner };
             let Some(session_id) = state.inner.identity_hydration.pop() else {
                 drop(state);
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
             };
             // Période calme seulement : ni écriture demandée, ni tenue.
@@ -8014,7 +8036,7 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
                 let observations = entry.observations.clone();
                 drop(guard);
                 state.inner.identity_vault.upsert(observations)?;
-                hydration.record(session_id, Hydration::Complete, &source);
+                hydration.record(session_id, Hydration::Complete, &format!("{source}|{signature}"));
                 return Ok(Hydration::Complete);
             }
         }
@@ -8058,6 +8080,7 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
     let runner = tshark_identities;
     match runner(state, session_id, &flow, &cancel) {
         Ok(observations) => {
+            let cache_signature = signature.clone();
             state.inner.identity_cache.lock().unwrap().insert(
                 session_id.to_string(),
                 IdentityCacheEntry { signature, observations: observations.clone() },
@@ -8066,7 +8089,7 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
             if let Ok(mut timeouts) = hydration.timeouts.lock() {
                 timeouts.remove(session_id);
             }
-            hydration.record(session_id, Hydration::Complete, &source);
+            hydration.record(session_id, Hydration::Complete, &format!("{source}|{cache_signature}"));
             Ok(Hydration::Complete)
         }
         Err(error) => Ok(match error.as_str() {
