@@ -1,5 +1,33 @@
 # Changelog
 
+## oiran-api 2.21.163, live-probe 0.6.42 — 2026-11-24 — l'archive de rétention sort du budget d'import
+
+Upgrade **patch**, sans déploiement. Base `f419573` (2.21.158, en prod), indépendante de 2.21.159 à 2.21.162. Branche `fix/oiran-2.21.163-archive-out-of-import-budget`. Ordre du cœur : #9 7126590830. Audit : #9 7117606449.
+
+**Défaut** (prouvé au lab, #10 7125027532 et 7125603696) : `work_bytes(base)` compte, comme travail « en vol », tout répertoire sous la base d'import qui n'est pas exclu. Or la rétention écrit son archive dans `<base>/archive/`. Le 23/11, dès 13:33, `archive/` (3 552 764 747 octets) dépassait à lui seul `max_owned_bytes - 64 Mio` (1 073 741 824 octets). Chaque segment candidat déclenchait alors `CONTINUOUS_SEGMENT_PENDING_BACKPRESSURE`, aucune publication n'aboutissait, et `/sessions/filter` répondait 503. Après la suppression autorisée de 07:28, la rétention a recréé un `archive/` dès 07:29 : le défaut était déjà en train de revenir. C'est la même erreur de catégorie que `.dataset.rollback.*` en 2.11.3.
+
+**Correctif** : `archive` rejoint la liste d'exclusion de `work_bytes`, à côté de `dataset`, `.dataset-next`, `.dataset-previous`, `.dataset-gc-*` et `.dataset[-.]rollback.*`.
+
+**Inventaire de ce que `work_bytes` voit sous la base** (lu dans le code ; comparé au relevé du lab) :
+
+| Entrée | Rôle | Compté ? |
+|---|---|---|
+| `pcap/` | ring importé | seuls les `.importing` en cours (2.9.8) |
+| `dataset/`, `.dataset-next`, `.dataset-previous`, `.dataset-gc-*`, `.dataset[-.]rollback.*` | publié, échange, ramassage, retour arrière | non |
+| `archive/` | dépôt de rétention | **non, depuis ce lot** |
+| fichiers posés à la racine : `import_state.json`, son `.prev` (lien physique, compté deux fois par `metadata.len()`), `import_state.json.pre-recover`, `.publication.lock`, temporaires `.import_state.json.*.tmp` | état de l'import | **oui, laissés comptés** |
+
+Le reste, au lab : `staging_bytes` (3 566 176 902) moins `archive/` (3 552 764 747) = **13 412 155 octets**. **Inféré** : ce sont les fichiers d'état. `import_state.json` grandit à chaque segment importé, car `state.segments` n'est plus élagué depuis 2.8.4. Je les laisse comptés : ce sont des écritures de l'import lui-même. **OUVERT** : leur croissance est à mesurer (`ls -la` de la base) avant de décider s'ils doivent sortir du budget, ou si `state.segments` doit être borné.
+
+**Effet, déclaré** : le budget d'import ne protège plus contre un `archive/` qui remplirait le disque. Ce n'est pas son rôle : c'est celui de la politique disque (`DISK_SAFETY_POLICY`), de la rétention et de l'expiration des segments d'archive (lot 2.21.164).
+
+Tests, rejoués sur `f419573` dans un arbre séparé (patch `~/oiran-polaris-archives/2.21.163-preuve-echec-avant-sur-f419573.patch`) :
+
+| Test | Sur `f419573` | Sur 2.21.163 |
+|---|---|---|
+| `a_retention_archive_larger_than_the_budget_does_not_block_publication_2_21_163` : `archive/` de 512 Mio, budget de 128 Mio, segment N2 réel, vrai `start_continuous_import` | **échoue** : aucun segment publié avant l'échéance de 30 s | passe : segment publié, manifeste écrit, pas de `BACKPRESSURE_LIMIT` |
+| `only_the_archive_leaves_the_import_budget_2_21_163` : `archive/` petit puis grand, puis un autre répertoire de 2 Gio | **échoue** : `archive/` compté (4 096 octets) | passe : `archive/` n'est jamais compté, l'autre répertoire l'est toujours et déclenche encore la contre-pression |
+
 ## oiran-api 2.21.158 — 2026-11-23 — amorçage de trace : les « 3 derniers segments » se choisissent par date de fichier
 
 Upgrade **patch**, sans déploiement. Base `23d613d` (2.21.157, PASS d'ANR1 #10 7111397052), branche `fix/oiran-2.21.158-seed-segments-by-mtime`.
