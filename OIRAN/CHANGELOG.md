@@ -1,5 +1,25 @@
 # Changelog
 
+## oiran-api 2.21.173 — 2026-11-24 — flow, source et cache d'une même génération avant tout `Complete`
+
+Ordre cœur #9 7143568156, refus ANR1 #10 7143535580 de 2.21.172. Base : `3d22d00` (2.21.172).
+
+### Défaut (entrelacement d'ANR1, confirmé au code de `3d22d00`)
+`hydrate_identities` clonait le flow G (`session_flow`), puis calculait la source, éventuellement déjà G+1 si une publication avait terminé entre-temps, et la signature de cache sur le flow G. Si le cache tenait G, le chemin rapide enregistrait `Complete` sous « source G+1 | cache G » et retournait **avant** toute garde de publication. `identity_completion_fingerprint` relit la signature de l'entrée de cache : il reconstruisait exactement ce mélange, le jugeait valide, et aucune reprise n'était programmée. Le chemin lent avait le même trou, puisque la source y est calculée avant la garde.
+
+### Corrigé : revalidation tardive
+- **La source est lue avant le clonage du flow.**
+- **Elle est relue juste avant d'enregistrer `Complete`**, dans les deux chemins (`record_complete_if_source_unchanged`). Égale : `Complete` sous « source | signature de cache ». Changée : pas de `Complete`, `deferred` / `source_changed`, et reprise programmée.
+- **Pourquoi « égale » suffit** : le `commit_seq` mémorisé (live-probe 0.6.45) change à chaque entrée au registre et ne décroît pas. Une source égale avant le clonage et avant l'enregistrement exclut donc toute publication entre les deux.
+- **Pourquoi pas la garde avant `session_flow`** : elle aurait allongé la section tenue pendant la lecture du flow et le chemin rapide, au risque de ramener les reports et les délais fermés en 2.21.168. La revalidation ne tient rien et ne lit rien sur disque : `commit_seq` vient de la mémoire, et `len:mtime` est un `statx`.
+
+### Garde à barrières, rouge sur `3d22d00`
+- `a_publication_between_flow_clone_and_source_cannot_record_complete_2_21_173`. Un point d'arrêt de test, `cfg(test)`, est placé juste après `session_flow`. Deux `std::sync::Barrier` y synchronisent un fil qui publie G+1 **entre le clonage du flow et la suite** : un event de plus dans le callflow, `commit_seq` 7 → 8, entrée au registre par `upsert_dataset`. Le garde vérifie que le point d'arrêt a bien été traversé et que G+1 change le flow.
+- **Exigé** : pas de `Complete`, la liste en `deferred`, puis `complete` seulement quand le cache porte la signature du flow G+1.
+- **Rouge sur `3d22d00`** : `pas de Complete sur « source G+1 | cache G »`, `left: Complete right: Complete`.
+
+Preuve rejouable : branche `proof/oiran-2.21.173-guards-on-3d22d00` (`ea3372a`). Elle n'ajoute que le garde et le point d'arrêt.
+
 ## oiran-api 2.21.172 / live-probe 0.6.45 — 2026-11-24 — la signature des identités porte le commit logique, lu en mémoire
 
 Ordre cœur #9 7142465934, refus ANR1 #10 7142383874 de 2.21.170. Base : `5dbd3af` (2.21.170).
