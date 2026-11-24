@@ -16016,6 +16016,44 @@ mod tests {
         assert!(TIMEOUT_RUNNER_CALLS_2_21_168.load(std::sync::atomic::Ordering::SeqCst) > calls, "relancé après le délai");
     }
 
+    /// Garde adverse ANR1 : `complete` appartient à une signature précise.
+    /// Si le cache ne correspond plus au callflow courant, une liste doit
+    /// annoncer `deferred` et programmer une reprise, même si la voûte est
+    /// déjà non vide.
+    #[test]
+    fn list_invalidates_complete_identity_status_when_callflow_signature_changes_anr1_red() {
+        let state = operator_state();
+        *state.inner.identity_hydration.runner_override.lock().unwrap() =
+            Some(fake_identity_runner_2_21_168);
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        assert_eq!(hydrate_identities(&state, &session_id).unwrap(), Hydration::Complete);
+
+        // Simule une publication qui a changé la signature depuis la dernière
+        // hydratation sans vider les observations cumulatives de la voûte.
+        state
+            .inner
+            .identity_cache
+            .lock()
+            .unwrap()
+            .get_mut(&session_id)
+            .expect("entrée de cache complète")
+            .signature = "signature-before-new-publication".into();
+
+        let page = sessions_blocking(&state, &ListQuery::default());
+        let row = page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == session_id)
+            .expect("session présente dans la liste");
+        assert_eq!(
+            row["identities_status"]["status"],
+            "deferred",
+            "la liste ne doit pas annoncer complete sous une signature périmée"
+        );
+        assert!(state.inner.identity_hydration.queued() >= 1, "la reprise doit être programmée");
+    }
+
     /// 2.21.168 — `tshark` borné et annulable : tué au dépassement, tué dès
     /// qu'une publication demande l'écriture ; une sortie normale passe.
     #[test]
