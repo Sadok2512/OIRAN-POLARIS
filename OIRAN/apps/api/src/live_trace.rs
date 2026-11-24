@@ -13143,4 +13143,53 @@ mod tests {
         assert_eq!(session["event_id"], deregistration.event_id.as_str(), "{payload}");
         assert_eq!(session["source"], "Deregistration Accept", "{payload}");
     }
+
+    /// Garde adverse ANR1 : rejouer un message déjà émis ne doit pas
+    /// réarmer sa phase terminale. Le dédoublonnage doit précéder toute
+    /// mutation de `ue_context`.
+    #[test]
+    fn duplicate_pdu_response_does_not_rearm_terminal_phase_anr1_red() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N2"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events.sort_by_key(|event| event.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        let pseudonym = events
+            .iter()
+            .flat_map(|event| event.session_identifiers.iter())
+            .find(|identifier| identifier.name == "subscriber_pseudonym")
+            .map(|identifier| identifier.value.clone())
+            .unwrap();
+        let terminal = events
+            .iter()
+            .position(|event| compact_name(&event.message_name) == "pdusessionresourcesetupresponse")
+            .expect("réponse terminale PDU dans la capture");
+        let registry = trace_on(&pseudonym);
+        for event in &events[..=terminal] {
+            registry.route_normalized(event);
+        }
+        {
+            let traces = registry.traces.lock().unwrap();
+            let state = &traces["t"];
+            let completed = state.events.iter().filter(|event| {
+                event.kind == "procedure"
+                    && event.payload["phase"] == "complete"
+                    && event.payload["procedure"] == "PDU Session Establishment"
+            }).count();
+            assert_eq!(completed, 1, "précondition : une seule terminaison après le premier passage");
+        }
+
+        // Même clé de dédoublonnage : aucun état ne doit être réarmé.
+        registry.route_normalized(&events[terminal]);
+        let traces = registry.traces.lock().unwrap();
+        assert!(
+            traces["t"].ue_context.pending_completions.is_empty(),
+            "un doublon rejeté a réarmé une phase terminale qui ressortira au prochain message"
+        );
+    }
 }
