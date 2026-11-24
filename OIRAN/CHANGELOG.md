@@ -1,5 +1,24 @@
 # Changelog
 
+## oiran-api 2.21.178 / live-probe 0.6.48 — 2026-11-24 — fusion de 2.21.166 dans le train : la production n'est plus en arrière du candidat
+
+Ordre cœur #9 7147700904. **Fusion** (`git merge --no-ff 4cad449`) sur la tête du train `86f9b93` (2.21.177), **sans rebase** : les verdicts d'ANR1 sur 2.21.167 → 2.21.177 restent valides commit par commit. Montée : patch sur les deux composants.
+
+### Défaut
+Le train 2.21.167 → 2.21.177 est parti de `9c8979c`, pas de `4cad449` (2.21.166, alors en production). Déployer 2.21.173 a retiré 2.21.166 de la production : le lecteur live est repassé à `endpoints: HashMap::new()`, et la table par défaut de live-probe ne portait plus aucune adresse SBI. Mesure d'ANR2 (#10 7147620106) : 0 message servi sur 2.21.173, contre 33 sur 2.21.166.
+
+### Rétabli (résolu par la fusion elle-même ; les conflits ne portaient que sur les versions et le CHANGELOG)
+- `ring_decode_config` (`apps/api/src/live_trace.rs`) passe à nouveau `live_probe::endpoint_map()`.
+- live-probe porte à nouveau `endpoint_map`, `default_endpoint_map`, `parse_endpoint_map`, `OIRAN_ENDPOINT_MAP_FILE` et les neuf adresses SBI `10.77.20.10`-`19`.
+- `read_time_patch` garde un participant déjà nommé (`known_participant`).
+- Le CHANGELOG garde les deux historiques, 2.21.166 compris.
+
+### Garde d'ascendance
+- `the_live_reader_never_decodes_with_an_empty_endpoint_table_2_21_178` : la configuration de décodage du lecteur live porte une table **non vide**, avec les adresses du lab plan par plan (AMF, gNB, SMF, UPF, NRF, AUSF, BSF), et c'est **la même** que celle de l'import continu. **Rouge sur `86f9b93`.**
+- Les gardes de 2.21.166 (`2_21_166`, API et live-probe) repassent dans les gates.
+
+Preuve rejouable : branche `proof/oiran-2.21.178-guards-on-86f9b93`.
+
 ## oiran-api 2.21.177 — 2026-11-24 — le G-PDU d'un autre abonné ne se rattache plus par l'adresse du pair ; l'amorçage ne dit plus `ok` sur un index en retard
 
 Ordre cœur #9 7146569811, refus ANR1 #10 7146440592 de 2.21.176. Base : `da9502b` (2.21.176). Seul `oiran-api` change. Le volet B de 2.21.176 (interrogation ciblée du jeu publié) est conservé tel quel.
@@ -227,6 +246,31 @@ Un défaut de cache de `/identities` exigeait `heavy_memory_try_enter()` sans at
 - **Remplacé** : le test 2.21.26 `cold_identities_answer_503_while_continuous_publication_holds_memory_gate`, dont l'invariant (503) est ce que ce lot retire. Le principe de 2.21.26 tient : aucun `tshark` pendant une publication.
 
 Patch : `~/oiran-polaris-archives/2.21.168-preuve-echec-avant-sur-9c8979c.patch`.
+## oiran-api 2.21.166, live-probe 0.6.43 — 2026-11-24 — la trace live nomme les participants ; la table d'adresses s'ouvre au SBI et à la configuration
+
+Ordre cœur #9 7135745591 (lot 1 sur 3). Base : `9c8979c` (2.21.165, en production).
+
+### Défaut
+La trace live décodait le ring avec une table d'adresses **vide** (`live_trace.rs`, amorçage et `ring_decode_config` : `endpoints: HashMap::new()`). Seule l'inférence par port SCTP nommait quelque chose (N2, S1-MME). SBI, PFCP N4 et GTP-U arrivaient sans fonction réseau aux deux bouts, y compris le N4, dont les adresses figuraient dans la table. La table elle-même, codée en dur, ignorait le SBI. Enfin, le patch à la lecture **écrasait** un participant connu par « Unknown endpoint ».
+
+### Corrigé
+- **La trace live** (amorçage et lecteur) décode avec `live_probe::endpoint_map()`, la même table que l'import continu.
+- **La table** reçoit les neuf adresses SBI mesurées au lab par ANR2 (#10 7135362409) : NRF `10.77.20.10`, AMF `.11`, SMF `.12`, AUSF `.14`, UDM `.15`, UDR `.16`, PCF `.17`, NSSF `.18`, BSF `.19`. Le lab n'a pas de SCP. Les 13 valeurs d'avant restent les mêmes.
+- **Configurable** : `OIRAN_ENDPOINT_MAP_FILE` désigne un fichier `adresse fonction` (une paire par ligne, `=` ou blanc, `#` pour commenter). Ses entrées s'ajoutent aux valeurs par défaut ou les remplacent. Le fichier est lu une fois par processus. Un fichier illisible (`ENDPOINT_MAP_FILE_UNREADABLE`, retour aux valeurs par défaut) ou des lignes invalides (`ENDPOINT_MAP_LOADED … rejected_lines`) sont journalisés, jamais ignorés en silence.
+- **Le patch à la lecture** (`read_time_patch::patch_one`) ne remplace plus un participant nommé par « Unknown endpoint ». Il nomme, ou corrige un nom par un autre nom, mais n'efface jamais.
+
+### Effet sur les données existantes
+- Le patch agit à la lecture : les events SBI **déjà stockés** sont nommés par la nouvelle table dès qu'ils sont relus (`/events`, `/callflow`, le détail).
+- Les events publiés à partir de maintenant portent la fonction réseau dès l'ingestion.
+
+### Gardes, rouges sur `9c8979c` sauf le garde de non-régression
+- `live_ring_decoding_names_the_n4_peers_with_the_endpoint_table_2_21_166` : capture N4 réelle du dépôt, SMF et UPF aux deux bouts. **Rouge avant.**
+- `a_named_participant_survives_the_read_time_patch_2_21_166` : `AMF` et `UDM` survivent au patch sans table. **Rouge avant** (`Unknown endpoint`).
+- `endpoint_map_names_the_lab_sbi_functions_2_21_166` : les neuf adresses SBI, plus N4 et N2. **Rouge avant.**
+- `a_ring_without_table_still_names_n2_by_its_sctp_port_2_21_166` : sans table, le N2 reste nommé par le port. Vert avant et après (non-régression).
+- `endpoint_map_file_parsing_keeps_valid_pairs_and_counts_rejects_2_21_166` : analyse du fichier. Fonction nouvelle, donc pas de « rouge avant » possible.
+
+Patch : `~/oiran-polaris-archives/2.21.166-preuve-echec-avant-sur-9c8979c.patch`.
 
 ## Fusion déployable oiran-api 2.21.165 — 2026-11-24 — ordre cœur #9 7131640379
 
