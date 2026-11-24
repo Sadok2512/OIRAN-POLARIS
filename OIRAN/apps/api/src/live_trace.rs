@@ -12687,4 +12687,77 @@ mod tests {
             "DÉFAUT : le lecteur a suivi le segment 99 par nom et ignoré le segment 3, plus récent"
         );
     }
+    /// 2.21.167 (ordre cœur #9 7135745591, lot 2/3) — le panneau UE Info
+    /// sur la capture N2 réelle du dépôt : le dernier `ue_info` porte un
+    /// `ue_context` alimenté par les IE déjà décodées (PLMN, NR cell id, TAC
+    /// de la ULI ; 5QI ; session PDU), l'état d'enregistrement passe à
+    /// REGISTERED sur l'`InitialContextSetupResponse`, et les procédures
+    /// terminées sont émises en phase `complete`. Tout champ vide porte sa
+    /// raison. Avant 2.21.167 : ni `ue_context`, ni phase `complete`.
+    #[test]
+    fn ue_info_carries_the_ue_context_from_already_decoded_ies_2_21_167() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N2"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events.sort_by_key(|event| event.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        let pseudonym = events
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let r = trace_on(&pseudonym);
+        for event in &events {
+            r.route_normalized(event);
+        }
+        let traces = r.traces.lock().unwrap();
+        let state = &traces["t"];
+        let info = state
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.kind == "ue_info")
+            .expect("au moins un ue_info");
+        let context = &info.payload["ue_context"];
+        for field in ["plmn", "nr_cell_id", "tac"] {
+            assert!(context[field]["value"].is_string(), "{field} : {context}");
+            assert_eq!(context[field]["source"], "UserLocationInformation", "{field}");
+        }
+        assert_eq!(context["plmn"]["value"], "001-01", "{context}");
+        assert_eq!(context["registration"]["value"], "REGISTERED", "{context}");
+        assert_eq!(context["registration"]["source"], "InitialContextSetupResponse");
+        assert_eq!(context["rm_state"]["value"], "RM-REGISTERED");
+        assert_eq!(context["cm_state"]["value"], "CM-CONNECTED");
+        assert!(!context["five_qi"]["values"].as_array().unwrap().is_empty(), "5QI : {context}");
+        let sessions = context["pdu_sessions"]["values"].as_array().unwrap();
+        assert!(sessions.iter().any(|s| s["state"] == "ACTIVE"), "PDU : {context}");
+        // Identité gNB : pas dans une trace d'abonné, et le panneau le dit.
+        assert!(context["gnb_id"]["value"].is_null());
+        assert!(context["gnb_id"]["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        // Aucun champ nul sans sa raison.
+        for (name, field) in context.as_object().unwrap() {
+            let empty = field.get("value").is_some_and(Value::is_null)
+                || field.get("values").and_then(Value::as_array).is_some_and(|v| v.is_empty());
+            if empty {
+                assert!(field["reason"].as_str().is_some_and(|r| !r.is_empty()), "{name} vide sans raison");
+            }
+        }
+        // Les procédures terminées, en phase `complete`.
+        let completed: Vec<&str> = state
+            .events
+            .iter()
+            .filter(|e| e.kind == "procedure" && e.payload["phase"] == "complete")
+            .filter_map(|e| e.payload["procedure"].as_str())
+            .collect();
+        assert!(completed.contains(&"Registration"), "{completed:?}");
+        assert!(completed.contains(&"PDU Session Establishment"), "{completed:?}");
+        // Interrupteur fermé (tests) : aucune identité saisie exposée.
+        assert!(info.payload.get("identity").is_none());
+    }
 }
