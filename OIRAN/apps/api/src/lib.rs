@@ -228,6 +228,9 @@ struct Inner {
     /// des packet_references du callflow). Évite de relancer tshark
     /// 210 s sur le chemin de requête.
     identity_cache: std::sync::Mutex<BTreeMap<String, IdentityCacheEntry>>,
+    /// 2.21.168 — reprise d'hydratation d'identités (file bornée, un seul
+    /// fil, statuts par session). Par état, jamais process-wide.
+    identity_hydration: IdentityHydration,
     #[cfg(test)]
     filter_summary_resolutions: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -839,6 +842,7 @@ impl AppState {
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
+                identity_hydration: IdentityHydration::default(),
                 #[cfg(test)]
                 filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -951,6 +955,7 @@ impl AppState {
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
+                identity_hydration: IdentityHydration::default(),
                 #[cfg(test)]
                 filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -5302,6 +5307,8 @@ fn cached_live_list_row_with(
             fill_missing_identities(&mut identities, &events_identities);
         }
         object.insert("identities".into(), identities);
+        // 2.21.168 — l'état de lecture des identités, pour ne jamais lire un vide comme « non observé ».
+        object.insert("identities_status".into(), identities_status(state, session_id));
     }
     Some(summary)
 }
@@ -5430,6 +5437,8 @@ fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
                 let mut identities = identity_summary_for_session(state, &flow.session_id);
                 merge_sbi_identities(&mut identities, &flow.events);
                 object.insert("identities".into(), identities);
+                // 2.21.168 — l'état de lecture des identités, pour ne jamais lire un vide comme « non observé ».
+                object.insert("identities_status".into(), identities_status(state, &flow.session_id));
             }
             (flow.session_id.clone(), summary)
         })
@@ -5657,6 +5666,8 @@ fn insert_list_identities(
     }
     if let Some(object) = summary.as_object_mut() {
         object.insert("identities".into(), identities);
+        // 2.21.168 — l'état de lecture des identités, pour ne jamais lire un vide comme « non observé ».
+        object.insert("identities_status".into(), identities_status(state, session_id));
     }
 }
 
@@ -6023,6 +6034,8 @@ fn sessions_filter_blocking(
                 fill_missing_identities(&mut identities, events_identities);
             }
             object.insert("identities".into(), identities);
+            // 2.21.168 — l'état de lecture des identités, pour ne jamais lire un vide comme « non observé ».
+            object.insert("identities_status".into(), identities_status(&state, session_id));
         }
         Some(summary)
     };
@@ -7483,6 +7496,7 @@ fn tshark_identities(
     state: &AppState,
     session_id: &str,
     flow: &CallFlow,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<IdentityObservation>, String> {
     let mut by_file = BTreeMap::<PathBuf, BTreeMap<u64, PacketIdentityEvidence>>::new();
     for event in flow.events.iter().take(4096) {
@@ -7544,11 +7558,12 @@ fn tshark_identities(
             "-E",
             "aggregator=,",
         ]);
-        let result = command.output().map_err(|_| "TSHARK_UNAVAILABLE")?;
-        if !result.status.success() {
-            return Err("TSHARK_DISSECTION_FAILED".into());
-        }
-        let stdout = String::from_utf8(result.stdout).map_err(|_| "TSHARK_OUTPUT_INVALID")?;
+        // 2.21.168 — borné (`OIRAN_IDENTITY_TSHARK_TIMEOUT_S`) et annulé dès
+        // qu'une publication demande l'écriture : la publication n'attend
+        // jamais derrière une hydratation. Avant : `command.output()`, sans
+        // délai maximal, la lecture du verrou tenue tout du long.
+        let stdout = run_bounded(command, identity_tshark_timeout(), cancel)?;
+        let stdout = String::from_utf8(stdout).map_err(|_| "TSHARK_OUTPUT_INVALID")?;
         for line in stdout.lines() {
             let columns = line.split('\t').collect::<Vec<_>>();
             let packet_number = columns.first().and_then(|value| value.parse::<u64>().ok());
@@ -7707,46 +7722,253 @@ fn tshark_identities(
     Ok(observations)
 }
 
-/// 2.15.3 — background identity hydration for the session list: at most
-/// two tshark dissections at a time, each session attempted once per
-/// process (failures are not retried in a loop).
-static IDENTITY_HYDRATION_SEEN: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-static IDENTITY_HYDRATION_RUNNING: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-const IDENTITY_HYDRATION_MAX: usize = 2;
-
-fn schedule_identity_hydration(state: &AppState, session_id: &str) {
-    use std::sync::atomic::Ordering;
-    let Ok(mut seen) = IDENTITY_HYDRATION_SEEN.lock() else {
-        return;
-    };
-    if seen.contains(session_id) {
-        return;
-    }
-    if IDENTITY_HYDRATION_RUNNING.fetch_add(1, Ordering::SeqCst) >= IDENTITY_HYDRATION_MAX {
-        IDENTITY_HYDRATION_RUNNING.fetch_sub(1, Ordering::SeqCst);
-        return; // retried on a later list request
-    }
-    seen.insert(session_id.to_owned());
-    drop(seen);
-    let state = state.clone();
-    let session_id = session_id.to_owned();
-    std::thread::spawn(move || {
-        let _ = hydrate_identities(&state, &session_id);
-        IDENTITY_HYDRATION_RUNNING.fetch_sub(1, Ordering::SeqCst);
-    });
+/// 2.21.168 (ordre cœur #9 7135991210, conditions #9 7136123546) — état
+/// d'hydratation d'une lecture d'identités. Les identités d'une session sont
+/// CUMULATIVES (`IdentityVault::upsert` n'ajoute que du nouveau) : servir ce
+/// que la voûte sait n'est jamais faux, seulement parfois incomplet, et ce
+/// champ le dit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hydration {
+    /// La voûte reflète le callflow courant.
+    Complete,
+    /// Lecture servie avec ce que la voûte sait ; une reprise est en file
+    /// (ou la file est pleine : reprise au prochain appel).
+    Deferred(&'static str),
+    /// Hydratation impossible pour l'instant, avec sa raison.
+    Unavailable(&'static str),
 }
 
-fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> {
+impl Hydration {
+    fn as_json(self) -> Value {
+        match self {
+            Hydration::Complete => json!({"status": "complete"}),
+            Hydration::Deferred(reason) => json!({"status": "deferred", "reason": reason}),
+            Hydration::Unavailable(reason) => json!({"status": "unavailable", "reason": reason}),
+        }
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            Hydration::Complete => "complete",
+            Hydration::Deferred(_) => "deferred",
+            Hydration::Unavailable(_) => "unavailable",
+        }
+    }
+}
+
+/// 2.21.168 — capacité de la file de reprise : au-delà, on refuse d'empiler
+/// et la session sera reprise au prochain appel. Un lab à 205 sessions
+/// vivantes ne crée donc jamais 205 reprises en attente.
+const IDENTITY_RETRY_QUEUE_MAX: usize = 32;
+/// 2.21.168 — dépassements consécutifs de la borne `tshark` avant
+/// `unavailable` (raison `tshark_timeout`).
+const IDENTITY_TSHARK_TIMEOUTS_BEFORE_UNAVAILABLE: u32 = 2;
+/// 2.21.168 — sortie d'`unavailable` : un changement de signature du
+/// callflow (nouveaux paquets) OU ce délai écoulé.
+const IDENTITY_UNAVAILABLE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// 2.21.168 — borne de `tshark` pour l'hydratation, en secondes :
+/// `OIRAN_IDENTITY_TSHARK_TIMEOUT_S` (1..=3600), 30 par défaut. PROVISOIRE :
+/// un seul point connu (210 s froid sur la session de référence lab) ; la
+/// distribution réelle relevée par ANR2 (#10 7136132105) fixera la valeur.
+fn identity_tshark_timeout() -> std::time::Duration {
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let seconds = std::env::var("OIRAN_IDENTITY_TSHARK_TIMEOUT_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| (1..=3600).contains(value))
+            .unwrap_or(30);
+        std::time::Duration::from_secs(seconds)
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct IdentityHydration {
+    queue: std::sync::Mutex<std::collections::VecDeque<String>>,
+    status: std::sync::Mutex<HashMap<String, Hydration>>,
+    /// Sessions `unavailable` : (signature du callflow, instant).
+    unavailable: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    timeouts: std::sync::Mutex<HashMap<String, u32>>,
+    worker: std::sync::OnceLock<()>,
+    /// Compteurs exposés aux tests et au diagnostic.
+    queue_refused: std::sync::atomic::AtomicU64,
+    cancelled_for_publication: std::sync::atomic::AtomicU64,
+    tshark_timeouts: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    runner_override: std::sync::Mutex<Option<IdentityRunner>>,
+}
+
+#[cfg(test)]
+type IdentityRunner =
+    fn(&AppState, &str, &CallFlow, &dyn Fn() -> bool) -> Result<Vec<IdentityObservation>, String>;
+
+impl IdentityHydration {
+    fn record(&self, session_id: &str, hydration: Hydration) {
+        if let Ok(mut status) = self.status.lock() {
+            status.insert(session_id.to_string(), hydration);
+        }
+    }
+
+    fn status_of(&self, session_id: &str) -> Option<Hydration> {
+        self.status.lock().ok().and_then(|status| status.get(session_id).copied())
+    }
+
+    /// Met la session en file si elle n'y est pas déjà. `false` : file
+    /// pleine, rien n'est empilé.
+    fn enqueue(&self, session_id: &str) -> bool {
+        let Ok(mut queue) = self.queue.lock() else { return false };
+        if queue.iter().any(|queued| queued == session_id) {
+            return true;
+        }
+        if queue.len() >= IDENTITY_RETRY_QUEUE_MAX {
+            self.queue_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        queue.push_back(session_id.to_string());
+        true
+    }
+
+    fn pop(&self) -> Option<String> {
+        self.queue.lock().ok().and_then(|mut queue| queue.pop_front())
+    }
+
+    pub(crate) fn queued(&self) -> usize {
+        self.queue.lock().map(|queue| queue.len()).unwrap_or(0)
+    }
+}
+
+/// 2.21.168 — statut à publier à côté d'`identities` sur les listes.
+fn identities_status(state: &AppState, session_id: &str) -> Value {
+    match state.inner.identity_hydration.status_of(session_id) {
+        Some(hydration) => hydration.as_json(),
+        // Jamais tentée : la ligne vient de demander une reprise.
+        None => json!({"status": "deferred", "reason": "hydration_requested"}),
+    }
+}
+
+/// 2.15.3 / 2.21.168 — hydratation de fond demandée par les listes. Avant
+/// 2.21.168, la session était marquée « vue » AVANT l'essai et l'échec jeté :
+/// un premier essai refusé pendant une publication n'était jamais retenté.
+/// Désormais, seule une hydratation `complete` clôt la session ; sinon elle
+/// passe par la même file bornée que la route.
+fn schedule_identity_hydration(state: &AppState, session_id: &str) {
+    if matches!(
+        state.inner.identity_hydration.status_of(session_id),
+        Some(Hydration::Complete)
+    ) {
+        return;
+    }
+    if state.inner.identity_hydration.enqueue(session_id) {
+        if state.inner.identity_hydration.status_of(session_id).is_none() {
+            state
+                .inner
+                .identity_hydration
+                .record(session_id, Hydration::Deferred("hydration_requested"));
+        }
+        ensure_identity_worker(state);
+    }
+}
+
+/// 2.21.168 — UN SEUL fil de reprise par état, qui ne prend la lecture du
+/// verrou mémoire qu'entre deux publications (jamais de lecture bloquante,
+/// jamais devant une écriture demandée) et s'efface devant une publication.
+fn ensure_identity_worker(state: &AppState) {
+    let hydration = &state.inner.identity_hydration;
+    if hydration.worker.set(()).is_err() {
+        return;
+    }
+    let weak = Arc::downgrade(&state.inner);
+    std::thread::Builder::new()
+        .name("identity-hydration".into())
+        .spawn(move || loop {
+            let Some(inner) = weak.upgrade() else { return };
+            let state = AppState { inner };
+            let Some(session_id) = state.inner.identity_hydration.pop() else {
+                drop(state);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            };
+            // Période calme seulement : ni écriture demandée, ni tenue.
+            while state.inner.capture_manager.heavy_memory_write_requested()
+                || state.inner.capture_manager.heavy_memory_try_enter().is_none()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            IDENTITY_HYDRATION_RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let outcome = hydrate_identities(&state, &session_id);
+            IDENTITY_HYDRATION_RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if matches!(outcome, Ok(Hydration::Deferred(_))) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        })
+        .ok();
+}
+
+/// 2.21.168 — compteur gardé pour `/metrics` (hydratations en cours).
+static IDENTITY_HYDRATION_RUNNING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 2.21.168 — lance une commande et la tue si elle dépasse `timeout` ou si
+/// `cancel()` devient vrai (publication demandée). La sortie standard est lue
+/// en parallèle (pas d'interblocage de tube).
+fn run_bounded(
+    mut command: Command,
+    timeout: std::time::Duration,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| "TSHARK_UNAVAILABLE".to_string())?;
+    let mut stdout = child.stdout.take().ok_or("TSHARK_OUTPUT_INVALID")?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        buffer
+    });
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = reader.join().unwrap_or_default();
+                return if status.success() {
+                    Ok(output)
+                } else {
+                    Err("TSHARK_DISSECTION_FAILED".into())
+                };
+            }
+            Ok(None) => {}
+            Err(_) => return Err("TSHARK_DISSECTION_FAILED".into()),
+        }
+        let reason = if cancel() {
+            Some("TSHARK_CANCELLED_FOR_PUBLICATION")
+        } else if started.elapsed() >= timeout {
+            Some("TSHARK_TIMEOUT")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(reason.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 2.21.168 — hydratation d'une session. Rend son état ; l'erreur ne sert
+/// plus qu'à `SESSION_NOT_FOUND`. Jamais de 503 : la route sert toujours ce
+/// que la voûte sait, avec `meta.hydration`.
+fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, String> {
     let Some(flow) = session_flow(state, session_id) else {
         return Err("SESSION_NOT_FOUND".into());
     };
-    // 2.21.15 (reprise #9 6941147984) — cache par signature de callflow
-    // pour éviter de relancer tshark à chaque `/identities`. Un `tshark`
-    // froid sur session réf = 210 s ; après fix : miss paye le prix une
-    // fois, hit sert en < 10 ms.
+    let hydration = &state.inner.identity_hydration;
+    // 2.21.15 — cache par signature de callflow.
     let signature = identity_cache_signature(&flow);
     {
         let guard = state.inner.identity_cache.lock().unwrap();
@@ -7754,27 +7976,101 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> 
             if entry.signature == signature {
                 let observations = entry.observations.clone();
                 drop(guard);
-                return state.inner.identity_vault.upsert(observations);
+                state.inner.identity_vault.upsert(observations)?;
+                hydration.record(session_id, Hydration::Complete);
+                return Ok(Hydration::Complete);
             }
         }
     }
-    // 2.21.26 (FAIL lab 2.21.22 : OOM 4,0 G) — le chemin froid (tshark) ne
-    // tourne jamais pendant la publication continue ; réponse 503 explicite.
-    let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
-        return Err("HEAVY_WORK_IN_PROGRESS".into());
-    };
-    let observations = tshark_identities(state, session_id, &flow)?;
-    {
-        let mut guard = state.inner.identity_cache.lock().unwrap();
-        guard.insert(
-            session_id.to_string(),
-            IdentityCacheEntry {
-                signature,
-                observations: observations.clone(),
-            },
-        );
+    // Sortie d'`unavailable` : nouvelle signature, ou délai écoulé.
+    if let Ok(mut unavailable) = hydration.unavailable.lock() {
+        if let Some((marked_signature, at)) = unavailable.get(session_id) {
+            if *marked_signature == signature && at.elapsed() < IDENTITY_UNAVAILABLE_RETRY_AFTER {
+                let outcome = Hydration::Unavailable("tshark_timeout");
+                hydration.record(session_id, outcome);
+                return Ok(outcome);
+            }
+            unavailable.remove(session_id);
+            if let Ok(mut timeouts) = hydration.timeouts.lock() {
+                timeouts.remove(session_id);
+            }
+        }
     }
-    state.inner.identity_vault.upsert(observations)
+    let defer = |reason: &'static str| -> Hydration {
+        let outcome = if hydration.enqueue(session_id) {
+            ensure_identity_worker(state);
+            Hydration::Deferred(reason)
+        } else {
+            Hydration::Deferred("retry_queue_full")
+        };
+        hydration.record(session_id, outcome);
+        outcome
+    };
+    // 2.21.26 — jamais de `tshark` pendant une publication ; 2.21.168 — ni
+    // quand une publication attend l'écriture.
+    if state.inner.capture_manager.heavy_memory_write_requested() {
+        return Ok(defer("publication_in_progress"));
+    }
+    let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
+        return Ok(defer("publication_in_progress"));
+    };
+    let cancel = || state.inner.capture_manager.heavy_memory_write_requested();
+    #[cfg(test)]
+    let runner = hydration.runner_override.lock().unwrap().unwrap_or(tshark_identities);
+    #[cfg(not(test))]
+    let runner = tshark_identities;
+    match runner(state, session_id, &flow, &cancel) {
+        Ok(observations) => {
+            state.inner.identity_cache.lock().unwrap().insert(
+                session_id.to_string(),
+                IdentityCacheEntry { signature, observations: observations.clone() },
+            );
+            state.inner.identity_vault.upsert(observations)?;
+            if let Ok(mut timeouts) = hydration.timeouts.lock() {
+                timeouts.remove(session_id);
+            }
+            hydration.record(session_id, Hydration::Complete);
+            Ok(Hydration::Complete)
+        }
+        Err(error) => Ok(match error.as_str() {
+            "TSHARK_CANCELLED_FOR_PUBLICATION" => {
+                hydration.cancelled_for_publication.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                defer("publication_in_progress")
+            }
+            "TSHARK_TIMEOUT" => {
+                hydration.tshark_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let count = hydration
+                    .timeouts
+                    .lock()
+                    .map(|mut timeouts| {
+                        let entry = timeouts.entry(session_id.to_string()).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    })
+                    .unwrap_or(1);
+                if count >= IDENTITY_TSHARK_TIMEOUTS_BEFORE_UNAVAILABLE {
+                    if let Ok(mut unavailable) = hydration.unavailable.lock() {
+                        unavailable.insert(session_id.to_string(), (signature, std::time::Instant::now()));
+                    }
+                    let outcome = Hydration::Unavailable("tshark_timeout");
+                    hydration.record(session_id, outcome);
+                    outcome
+                } else {
+                    defer("tshark_timeout_retrying")
+                }
+            }
+            "TSHARK_UNAVAILABLE" => {
+                let outcome = Hydration::Unavailable("tshark_unavailable");
+                hydration.record(session_id, outcome);
+                outcome
+            }
+            _ => {
+                let outcome = Hydration::Unavailable("tshark_dissection_failed");
+                hydration.record(session_id, outcome);
+                outcome
+            }
+        }),
+    }
 }
 
 /// 2.21.15 — signature d'un `CallFlow` pour invalidation cache
@@ -8095,56 +8391,45 @@ async fn session_identities(
         hydrate_identities(&state_for_hydrate, &id_for_hydrate)
     })
     .await;
-    let hydrate_result = match hydrate_result {
-        Ok(result) => result,
-        Err(error) => {
+    // 2.21.168 (ordre cœur #9 7135991210) — plus de 503 : la route sert
+    // TOUJOURS ce que la voûte sait, avec `meta.hydration` (`complete`,
+    // `deferred` + raison, `unavailable` + raison). Avant, un défaut de cache
+    // pendant une publication rendait 503 HEAVY_WORK_IN_PROGRESS.
+    let hydration = match hydrate_result {
+        Ok(Ok(hydration)) => hydration,
+        Ok(Err(error)) if error == "SESSION_NOT_FOUND" => {
+            return api_error(StatusCode::NOT_FOUND, &error, "unknown session id")
+        }
+        Ok(Err(_)) | Err(_) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "IDENTITY_VAULT_FAILED",
-                &format!("identity hydrate panicked: {error}"),
+                "identity evidence could not be loaded",
             )
         }
     };
-    if let Err(error) = hydrate_result {
-        return match error.as_str() {
-            "SESSION_NOT_FOUND" => api_error(StatusCode::NOT_FOUND, &error, "unknown session id"),
-            "TSHARK_UNAVAILABLE" => api_error(
-                StatusCode::NOT_IMPLEMENTED,
-                &error,
-                "packet dissector unavailable",
-            ),
-            "HEAVY_WORK_IN_PROGRESS" => {
-                let mut response = api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &error,
-                    "continuous publication in progress, retry later",
-                );
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
-                response
-            }
-            _ => api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "IDENTITY_VAULT_FAILED",
-                "identity evidence could not be loaded",
-            ),
-        };
-    }
     match state.inner.identity_vault.for_session(&id) {
         Ok(observations) => {
-            // 2.18.4 (ANR1 #10) — fournir les events de la session à
-            // `identity_bundle` pour que MSISDN / IMEI / IMEISV
-            // observés dans les events SBI du call flow soient
-            // exposés quand le vault ne les porte pas. Vault
-            // prioritaire ; si `session_flow` ne retrouve pas la
-            // session (edge case), on tombe sur le bundle vault-only
-            // comme avant 2.18.4.
+            // 2.18.4 (ANR1 #10) — events de la session pour les identités SBI.
             let events_owned: Vec<callflow_schema::CallFlowEvent> =
                 session_flow(&state, &id)
                     .map(|flow| flow.events)
                     .unwrap_or_default();
-            operator_envelope(identity_bundle(observations, &events_owned))
+            let mut response = Json(json!({
+                "data": identity_bundle(observations, &events_owned),
+                "meta": {
+                    "api_version": API_VERSION,
+                    "identity_access": "operator",
+                    "hydration": hydration.as_json(),
+                }
+            }))
+            .into_response();
+            if matches!(hydration, Hydration::Deferred(_)) {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("10"));
+            }
+            response
         }
         Err(_) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -15495,13 +15780,33 @@ mod tests {
         assert_eq!(second["data"]["session_count"], count);
     }
 
-    /// 2.21.26 (FAIL lab 2.21.22 : OOM) — pendant un travail lourd (publication
-    /// continue), le chemin froid `/identities` répond 503 + Retry-After au
-    /// lieu de matérialiser en parallèle ; libéré, la route refonctionne.
+    /// 2.21.168 (ordre cœur #9 7135991210) — REMPLACE le test 2.21.26
+    /// `cold_identities_answer_503_while_continuous_publication_holds_memory_gate`,
+    /// dont l'invariant (503 pendant une publication) est exactement ce que ce
+    /// lot retire. Pendant une publication, un défaut de cache rend 200 avec ce
+    /// que la voûte sait et `meta.hydration = deferred` ; jamais 503. Le
+    /// chemin froid ne tourne toujours pas pendant la publication (2.21.26).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cold_identities_answer_503_while_continuous_publication_holds_memory_gate() {
+    async fn cold_identities_are_deferred_not_503_during_publication_2_21_168() {
         let state = operator_state();
         let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        // La voûte connaît déjà l'IMSI de la session (hydratation passée).
+        state
+            .inner
+            .identity_vault
+            .upsert(vec![IdentityObservation {
+                session_id: session_id.clone(),
+                subscriber_pseudonym: Some("psn-known".into()),
+                kind: "imsi".into(),
+                value: "001010000000201".into(),
+                value_type: Some("IMSI".into()),
+                role: "presented".into(),
+                event_id: "evt-known".into(),
+                capture_id: "sha256:known".into(),
+                packet_number: 1,
+                cleartext: None,
+            }])
+            .unwrap();
         let app = router(state.clone(), None);
         let request = |uri: String| {
             Request::builder()
@@ -15511,16 +15816,209 @@ mod tests {
                 .unwrap()
         };
         let uri = format!("/api/v1/sessions/{session_id}/identities");
+        let _publication = state.inner.capture_manager.heavy_memory_enter();
+        let busy = app.clone().oneshot(request(uri.clone())).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::OK);
+        assert_eq!(busy.headers()[header::RETRY_AFTER], "10");
+        let body = json_body(busy).await;
+        assert_eq!(body["meta"]["hydration"]["status"], "deferred", "{body}");
+        assert_eq!(body["meta"]["hydration"]["reason"], "publication_in_progress");
+        assert_eq!(body["data"]["imsi"], "001010000000201", "ce que la voûte sait est servi");
+    }
+
+    /// 2.21.168 — une session jamais vue, voûte vide, pendant une
+    /// publication : champs vides ET `deferred`. Un vide ne se fait jamais
+    /// passer pour une observation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_vault_during_publication_is_deferred_never_a_silent_empty_2_21_168() {
+        let state = operator_state();
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        let app = router(state.clone(), None);
+        let _publication = state.inner.capture_manager.heavy_memory_enter();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{session_id}/identities"))
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body["data"]["imsi"].is_null(), "{body}");
+        assert_eq!(body["meta"]["hydration"]["status"], "deferred", "{body}");
+    }
+
+    fn fake_identity_runner_2_21_168(
+        _state: &AppState,
+        session_id: &str,
+        _flow: &CallFlow,
+        _cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<IdentityObservation>, String> {
+        FAKE_RUNNER_CALLS_2_21_168.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![IdentityObservation {
+            session_id: session_id.to_string(),
+            subscriber_pseudonym: Some("psn-fake".into()),
+            kind: "imsi".into(),
+            value: "001010000000777".into(),
+            value_type: Some("IMSI".into()),
+            role: "presented".into(),
+            event_id: "evt-fake".into(),
+            capture_id: "sha256:fake".into(),
+            packet_number: 1,
+            cleartext: None,
+        }])
+    }
+    static FAKE_RUNNER_CALLS_2_21_168: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn timeout_identity_runner_2_21_168(
+        _state: &AppState,
+        _session_id: &str,
+        _flow: &CallFlow,
+        _cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<IdentityObservation>, String> {
+        TIMEOUT_RUNNER_CALLS_2_21_168.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err("TSHARK_TIMEOUT".into())
+    }
+    static TIMEOUT_RUNNER_CALLS_2_21_168: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// 2.21.168 — la reprise remplit le cache après la publication, sur UN
+    /// seul fil, et l'appel suivant rend `complete`. La liste ne marque plus
+    /// une session « vue » avant succès : son statut passe de `deferred` à
+    /// `complete`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_retry_fills_the_cache_after_publication_and_the_next_call_is_complete_2_21_168() {
+        let state = operator_state();
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(fake_identity_runner_2_21_168);
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
         {
             let _publication = state.inner.capture_manager.heavy_memory_enter();
-            let busy = app.clone().oneshot(request(uri.clone())).await.unwrap();
-            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
-            let body = json_body(busy).await;
-            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+            let first = hydrate_identities(&state, &session_id).unwrap();
+            assert_eq!(first, Hydration::Deferred("publication_in_progress"));
+            // Le fil de reprise a pu déjà retirer la session de la file : il
+            // attend alors la période calme sans hydrater (vérifié ci-dessous).
+            assert!(state.inner.identity_hydration.queued() <= 1);
+            // Pendant la publication, le fil de reprise n'hydrate pas.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            assert_eq!(
+                state.inner.identity_hydration.status_of(&session_id),
+                Some(Hydration::Deferred("publication_in_progress"))
+            );
         }
-        let free = app.oneshot(request(uri)).await.unwrap();
-        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.inner.identity_hydration.status_of(&session_id) != Some(Hydration::Complete) {
+            assert!(std::time::Instant::now() < deadline, "la reprise n'a pas abouti");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(hydrate_identities(&state, &session_id).unwrap(), Hydration::Complete);
+        let observations = state.inner.identity_vault.for_session(&session_id).unwrap();
+        assert!(observations.iter().any(|o| o.value == "001010000000777"));
+        assert_eq!(identities_status(&state, &session_id)["status"], "complete");
+    }
+
+    /// 2.21.168 — la file de reprise est bornée : pleine, on refuse
+    /// d'empiler (compté), et la lecture le dit (`retry_queue_full`).
+    #[test]
+    fn the_retry_queue_is_bounded_and_refuses_when_full_2_21_168() {
+        let state = operator_state();
+        for index in 0..(IDENTITY_RETRY_QUEUE_MAX + 8) {
+            state.inner.identity_hydration.enqueue(&format!("session-{index}"));
+        }
+        assert_eq!(state.inner.identity_hydration.queued(), IDENTITY_RETRY_QUEUE_MAX);
+        assert_eq!(
+            state.inner.identity_hydration.queue_refused.load(std::sync::atomic::Ordering::Relaxed),
+            8
+        );
+        // Une session déjà en file n'est pas comptée deux fois.
+        assert!(state.inner.identity_hydration.enqueue("session-0"));
+        assert_eq!(state.inner.identity_hydration.queued(), IDENTITY_RETRY_QUEUE_MAX);
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        let _publication = state.inner.capture_manager.heavy_memory_enter();
+        assert_eq!(
+            hydrate_identities(&state, &session_id).unwrap(),
+            Hydration::Deferred("retry_queue_full")
+        );
+        assert_eq!(state.inner.identity_hydration.queued(), IDENTITY_RETRY_QUEUE_MAX);
+    }
+
+    /// 2.21.168 — deux dépassements de la borne `tshark` : `unavailable`
+    /// (`tshark_timeout`), sans relancer `tshark` à chaque appel. Sortie :
+    /// délai écoulé (ou nouvelle signature du callflow).
+    #[test]
+    fn two_tshark_timeouts_make_the_session_unavailable_until_it_may_be_retried_2_21_168() {
+        let state = operator_state();
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(timeout_identity_runner_2_21_168);
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        let before = TIMEOUT_RUNNER_CALLS_2_21_168.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(hydrate_identities(&state, &session_id).unwrap(), Hydration::Deferred("tshark_timeout_retrying"));
+        // Le fil de reprise peut avoir déjà retenté : on vide la file.
+        while state.inner.identity_hydration.pop().is_some() {}
+        let second = hydrate_identities(&state, &session_id).unwrap();
+        let outcome = if second == Hydration::Unavailable("tshark_timeout") {
+            second
+        } else {
+            hydrate_identities(&state, &session_id).unwrap()
+        };
+        assert_eq!(outcome, Hydration::Unavailable("tshark_timeout"));
+        let calls = TIMEOUT_RUNNER_CALLS_2_21_168.load(std::sync::atomic::Ordering::SeqCst);
+        // Unavailable : plus de `tshark` pour la même signature.
+        assert_eq!(hydrate_identities(&state, &session_id).unwrap(), Hydration::Unavailable("tshark_timeout"));
+        assert_eq!(TIMEOUT_RUNNER_CALLS_2_21_168.load(std::sync::atomic::Ordering::SeqCst), calls);
+        assert!(calls - before >= 2);
+        // Délai écoulé : la session redevient hydratable.
+        {
+            let mut unavailable = state.inner.identity_hydration.unavailable.lock().unwrap();
+            let entry = unavailable.get_mut(&session_id).unwrap();
+            entry.1 = std::time::Instant::now() - IDENTITY_UNAVAILABLE_RETRY_AFTER - std::time::Duration::from_secs(1);
+        }
+        let _ = hydrate_identities(&state, &session_id).unwrap();
+        assert!(TIMEOUT_RUNNER_CALLS_2_21_168.load(std::sync::atomic::Ordering::SeqCst) > calls, "relancé après le délai");
+    }
+
+    /// 2.21.168 — `tshark` borné et annulable : tué au dépassement, tué dès
+    /// qu'une publication demande l'écriture ; une sortie normale passe.
+    #[test]
+    fn run_bounded_kills_on_timeout_and_on_publication_request_2_21_168() {
+        let started = std::time::Instant::now();
+        let mut slow = Command::new("sleep");
+        slow.arg("5");
+        assert_eq!(
+            run_bounded(slow, std::time::Duration::from_millis(200), &|| false).unwrap_err(),
+            "TSHARK_TIMEOUT"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let mut slow = Command::new("sleep");
+        slow.arg("5");
+        assert_eq!(
+            run_bounded(slow, std::time::Duration::from_secs(30), &|| true).unwrap_err(),
+            "TSHARK_CANCELLED_FOR_PUBLICATION"
+        );
+        let mut quick = Command::new("printf");
+        quick.arg("ok");
+        assert_eq!(run_bounded(quick, std::time::Duration::from_secs(5), &|| false).unwrap(), b"ok");
+    }
+
+    /// 2.21.168 — une publication qui ATTEND l'écriture est visible pendant
+    /// qu'un lecteur tient le verrou : c'est ce qui fait s'effacer la reprise.
+    #[test]
+    fn a_waiting_publication_is_visible_to_a_reader_2_21_168() {
+        let state = operator_state();
+        let manager = state.inner.capture_manager.clone();
+        assert!(!manager.heavy_memory_write_requested());
+        let read = state.inner.capture_manager.heavy_memory_try_enter().unwrap();
+        let writer = std::thread::spawn(move || {
+            let _write = manager.heavy_memory_enter();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.inner.capture_manager.heavy_memory_write_requested() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(read);
+        writer.join().unwrap();
+        assert!(!state.inner.capture_manager.heavy_memory_write_requested());
     }
 
     /// 2.21.85 (CLAUDE1, ordre #9 7015585561) — inversé par rapport à

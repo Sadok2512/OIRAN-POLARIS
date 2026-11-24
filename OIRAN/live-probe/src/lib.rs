@@ -1789,6 +1789,12 @@ pub struct CaptureManager {
     /// mutuellement → 503 parasite, FAIL gate ANR2 2.21.26). La publication
     /// le prend en bloquant ; l'API le prend en `try` (503 si occupé).
     heavy_memory_gate: Arc<std::sync::RwLock<()>>,
+    /// 0.6.44 (OIRAN 2.21.168, ordre cœur #9 7136123546) — nombre de prises
+    /// d'écriture (publications) en attente ou en cours d'acquisition. Le
+    /// `RwLock` standard ne dit pas qu'un écrivain attend : ce compteur le
+    /// dit, pour qu'un travail de lecture long (reprise d'hydratation
+    /// `tshark`) s'efface devant une publication au lieu de la retarder.
+    heavy_memory_write_requests: Arc<std::sync::atomic::AtomicUsize>,
     /// 0.6.20 — callback API exécuté après l'upsert atomique d'un dataset
     /// publié. Il préchauffe les index dépendants avant l'annonce de fin de
     /// cycle et n'est jamais appelé sous le mutex `datasets`.
@@ -2078,9 +2084,23 @@ impl CaptureManager {
     /// 0.6.8 — entrée bloquante (publication continue).
     /// 0.6.11 — `RwLock` : la publication prend l'écriture (exclusive).
     pub fn heavy_memory_enter(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
-        self.heavy_memory_gate
+        use std::sync::atomic::Ordering;
+        // 0.6.44 — la demande est visible AVANT l'attente : un lecteur long
+        // qui la voit s'arrête et libère la lecture.
+        self.heavy_memory_write_requests.fetch_add(1, Ordering::SeqCst);
+        let guard = self
+            .heavy_memory_gate
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.heavy_memory_write_requests.fetch_sub(1, Ordering::SeqCst);
+        guard
+    }
+
+    /// 0.6.44 — une publication attend (ou acquiert) l'écriture.
+    pub fn heavy_memory_write_requested(&self) -> bool {
+        self.heavy_memory_write_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
     }
 
     /// 0.6.8 — entrée non bloquante (requêtes API) : `None` = travail lourd en cours.
@@ -2281,6 +2301,7 @@ impl CaptureManager {
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(std::sync::RwLock::new(())),
+            heavy_memory_write_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dataset_publish_observer: Arc::new(Mutex::new(None)),
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
             vtap_publication_triggers: Arc::new(Mutex::new(BTreeSet::new())),

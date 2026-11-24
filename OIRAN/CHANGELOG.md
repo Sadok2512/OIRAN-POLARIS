@@ -1,5 +1,46 @@
 # Changelog
 
+## oiran-api 2.21.168, live-probe 0.6.44 — 2026-11-24 — `/sessions/:id/identities` ne rend plus 503 : la voûte servie, l'hydratation reprise
+
+Ordres cœur #9 7135991210 (GO option b) et 7136123546 (conditions), audit #9 7135501393. Base : `9c8979c` (2.21.165, en production). Lot 3 sur 3, indépendant de 2.21.166 et 2.21.167.
+
+### Défaut
+Un défaut de cache de `/identities` exigeait `heavy_memory_try_enter()` sans attente. Pendant toute publication continue, la réponse était donc **503 `HEAVY_WORK_IN_PROGRESS`**. Une session vivante change de signature à chaque publication, et le 503 revenait à chaque cycle. L'hydratation de fond des listes marquait la session « vue » **avant** l'essai et jetait l'échec : un premier refus ne se rattrapait jamais. `tshark` tournait **sans délai maximal**, la lecture du verrou tenue tout du long.
+
+### Corrigé
+- **Jamais de 503.** La route sert **toujours** ce que la voûte sait : les identités sont cumulatives, ce n'est jamais faux, seulement parfois incomplet. **`meta.hydration`** figure sur toutes les réponses :
+  - `{"status":"complete"}` ;
+  - `{"status":"deferred","reason":…}` (`publication_in_progress`, `retry_queue_full`, `tshark_timeout_retrying`), avec `Retry-After: 10` ;
+  - `{"status":"unavailable","reason":…}` (`tshark_timeout`, `tshark_unavailable`, `tshark_dissection_failed`).
+
+  Restent : 404 pour une session inconnue, et 500 si la voûte est illisible.
+- **Les listes** publient **`identities_status`** (même forme) à côté d'`identities`, sur les quatre sites. Un vide ne se fait plus passer pour « non observé ».
+- **Une seule file de reprise par état**, **bornée à 32 sessions** (`IDENTITY_RETRY_QUEUE_MAX`). Pleine, elle refuse d'empiler (compté dans `queue_refused`) et la session sera reprise au prochain appel (`retry_queue_full`). Une session déjà en file n'est pas empilée deux fois.
+- **Un seul fil de reprise** par état, démarré à la première mise en file. Il ne commence qu'en **période calme** : aucune écriture demandée (nouveau `CaptureManager::heavy_memory_write_requested`, live-probe 0.6.44) et la lecture obtenue par `try_read`. **Jamais de lecture bloquante.**
+- **La reprise s'efface devant la publication.** `tshark` est lancé par `run_bounded`, qui le **tue** dès qu'une publication demande l'écriture (`TSHARK_CANCELLED_FOR_PUBLICATION`) ; la session est remise en file. Le `RwLock` standard ne signale pas un écrivain en attente : `heavy_memory_enter` incrémente donc un compteur **avant** d'attendre l'écriture, et le décrémente une fois l'écriture obtenue.
+- **`tshark` est borné** : `OIRAN_IDENTITY_TSHARK_TIMEOUT_S` (de 1 à 3600), **30 s par défaut**. **Ce défaut est PROVISOIRE et fondé sur un seul point** : 210 s à froid sur la session de référence du lab. La distribution relevée par ANR2 (#10 7136132105) fixera la valeur, sans toucher au code.
+- **`unavailable` après deux dépassements consécutifs**, avec la raison `tshark_timeout`. `tshark` n'est plus relancé pour la même signature. **Sortie** : une nouvelle signature du callflow (nouveaux paquets), ou **15 minutes** écoulées. Un pic de charge ne condamne donc aucune session.
+- **Les listes** passent par la même file. Seule une hydratation `complete` clôt une session ; un refus est repris.
+
+### Ce que la reprise tient au pire, et pendant combien de temps
+- **Pour la publication** : la reprise tient la **lecture** du verrou mémoire au plus **la borne `tshark`** (30 s par défaut). Mais elle la **rend en au plus environ 50 ms** (période de scrutation de `run_bounded`, plus le `kill`) dès qu'une publication demande l'écriture. **La publication n'attend donc jamais plus d'environ 50 ms derrière une hydratation**, au lieu d'une durée non bornée (210 s connues) auparavant.
+- **Pour la session** : au plus deux passes de 30 s avant `unavailable`, puis rien pendant 15 minutes, sauf si de nouveaux paquets arrivent.
+- Le chemin direct (une requête qui tombe en période calme) utilise le même `run_bounded` : même borne, même effacement.
+
+### Gardes
+- **Rouges sur `9c8979c`** :
+  - `cold_identities_are_deferred_not_503_during_publication_2_21_168` : 200 avec `deferred` et l'IMSI connu servi ; avant, **503** ;
+  - `empty_vault_during_publication_is_deferred_never_a_silent_empty_2_21_168` : 200 avec des champs vides **et** `deferred` ; avant, **503**.
+- **Fonctions nouvelles** (pas de « rouge avant » possible) :
+  - `the_retry_fills_the_cache_after_publication_and_the_next_call_is_complete_2_21_168` : aucune hydratation pendant la publication, la reprise aboutit après, l'appel suivant est `complete`, et `identities_status` vaut `complete` ;
+  - `the_retry_queue_is_bounded_and_refuses_when_full_2_21_168` : 40 mises en file donnent 32 sessions en file et 8 refus ; plein, `retry_queue_full` ;
+  - `two_tshark_timeouts_make_the_session_unavailable_until_it_may_be_retried_2_21_168` : `unavailable` sans relance ; relance après le délai ;
+  - `run_bounded_kills_on_timeout_and_on_publication_request_2_21_168` ;
+  - `a_waiting_publication_is_visible_to_a_reader_2_21_168`.
+- **Remplacé** : le test 2.21.26 `cold_identities_answer_503_while_continuous_publication_holds_memory_gate`, dont l'invariant (503) est ce que ce lot retire. Le principe de 2.21.26 tient : aucun `tshark` pendant une publication.
+
+Patch : `~/oiran-polaris-archives/2.21.168-preuve-echec-avant-sur-9c8979c.patch`.
+
 ## Fusion déployable oiran-api 2.21.165 — 2026-11-24 — ordre cœur #9 7131640379
 
 Une seule mise en production, sur `8640a0d` (fusion 2.21.163, en production), réunit : 2.21.164 reportée sur `8640a0d` (`/health` véridique ; delta relu PASS par ANR1 sur `452406e`, #10 7129528652) et 2.21.165 (`/sessions` lit `commit_seq` une fois par requête). Versions finales : oiran-api 2.21.165, live-probe 0.6.42. Le détail de chaque lot suit.
