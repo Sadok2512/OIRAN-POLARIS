@@ -16000,6 +16000,79 @@ mod tests {
         assert_eq!(run_bounded(quick, std::time::Duration::from_secs(5), &|| false).unwrap(), b"ok");
     }
 
+    /// 2.21.170 (refus ANR1 #10 7137693482) — la séquence adverse d'ANR1 :
+    /// hydratation complète → voûte non vide → la source du callflow change
+    /// (nouvelle publication) → la liste ne doit PLUS annoncer `complete` :
+    /// `deferred` / `source_changed` immédiatement, reprise, puis `complete`.
+    /// Avant 2.21.170 : `complete` restait affiché sur une voûte périmée.
+    #[test]
+    fn a_complete_status_does_not_survive_a_source_change_2_21_170() {
+        let (state, capture_root, _commit_seq) =
+            continuous_sessions_fixture_2_21_165("identities-source-change-2-21-170", 1);
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(fake_identity_runner_2_21_168);
+        let session_id = "5g-session-seq00000000000";
+        assert_eq!(hydrate_identities(&state, session_id).unwrap(), Hydration::Complete);
+        assert_eq!(identities_status(&state, session_id)["status"], "complete");
+        assert!(!state.inner.identity_vault.for_session(session_id).unwrap().is_empty(), "voûte non vide");
+        // Nouvelle publication : le fichier du callflow change.
+        let callflow = capture_root
+            .join(live_probe::CONTINUOUS_CAPTURE_ID)
+            .join("dataset/callflows")
+            .join(format!("{session_id}.json"));
+        let mut content = std::fs::read(&callflow).unwrap();
+        content.extend_from_slice(b"\n");
+        std::fs::write(&callflow, content).unwrap();
+        let after_change = identities_status(&state, session_id);
+        assert_eq!(after_change["status"], "deferred", "{after_change}");
+        assert_eq!(after_change["reason"], "source_changed", "{after_change}");
+        // La reprise rétablit `complete` pour la nouvelle source.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while identities_status(&state, session_id)["status"] != "complete" {
+            assert!(std::time::Instant::now() < deadline, "la reprise n'a pas abouti");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::fs::remove_dir_all(capture_root).ok();
+    }
+
+    fn unavailable_identity_runner_2_21_170(
+        _state: &AppState,
+        _session_id: &str,
+        _flow: &CallFlow,
+        _cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<IdentityObservation>, String> {
+        UNAVAILABLE_RUNNER_CALLS_2_21_170.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err("TSHARK_UNAVAILABLE".into())
+    }
+    static UNAVAILABLE_RUNNER_CALLS_2_21_170: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// 2.21.170 (écart secondaire ANR1) — `tshark_unavailable` ne relance pas
+    /// `tshark` à l'appel suivant pour la même signature.
+    #[test]
+    fn tshark_unavailable_is_not_retried_for_the_same_signature_2_21_170() {
+        let state = operator_state();
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(unavailable_identity_runner_2_21_170);
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        let first = hydrate_identities(&state, &session_id).unwrap();
+        assert!(matches!(first, Hydration::Unavailable(_)), "{first:?}");
+        let calls = UNAVAILABLE_RUNNER_CALLS_2_21_170.load(std::sync::atomic::Ordering::SeqCst);
+        let second = hydrate_identities(&state, &session_id).unwrap();
+        assert!(matches!(second, Hydration::Unavailable(_)), "{second:?}");
+        assert_eq!(
+            UNAVAILABLE_RUNNER_CALLS_2_21_170.load(std::sync::atomic::Ordering::SeqCst),
+            calls,
+            "pas de nouvelle tentative pour la même signature"
+        );
+    }
+
+    /// 2.21.170 (ordre cœur #9 7138374225) — borne `tshark` par défaut :
+    /// 300 s (la mesure ANR2 a 54,1 s pour 7 messages ; 30 s aurait tué la
+    /// session à tort).
+    #[test]
+    fn the_default_tshark_bound_is_300_seconds_2_21_170() {
+        assert!(std::env::var_os("OIRAN_IDENTITY_TSHARK_TIMEOUT_S").is_none());
+        assert_eq!(identity_tshark_timeout(), std::time::Duration::from_secs(300));
+    }
+
     /// 2.21.168 — une publication qui ATTEND l'écriture est visible pendant
     /// qu'un lecteur tient le verrou : c'est ce qui fait s'effacer la reprise.
     #[test]
