@@ -9118,6 +9118,77 @@ mod tests {
         assert_eq!(trace.gpdu_attached, 1, "no_match={}", trace.gpdu_rejected_no_match);
     }
 
+    /// 2.21.177 — un G-PDU construit à partir d'un G-PDU réel : extrémités
+    /// du tunnel, TEID et adresses internes posés par le garde.
+    fn gpdu_2_21_177(
+        base: &event_schema::NormalizedEvent,
+        tunnel: (&str, &str, &str),
+        inner: (&str, &str),
+        event_id: &str,
+    ) -> event_schema::NormalizedEvent {
+        let mut event = base.clone();
+        event.event_id = event_id.into();
+        event.source_endpoint.address = tunnel.0.into();
+        event.destination_endpoint.address = tunnel.1.into();
+        for id in event.session_identifiers.iter_mut() {
+            match id.name.as_str() {
+                "teid" => id.value = tunnel.2.into(),
+                "inner_source_ip" => id.value = inner.0.into(),
+                "inner_destination_ip" => id.value = inner.1.into(),
+                _ => {}
+            }
+        }
+        event.session_identifiers.retain(|id| id.name != "ue_ip");
+        if let Some(reference) = event.packet_references.first_mut() {
+            reference.packet_number += event_id.len() as u64 * 1_000;
+        }
+        event
+    }
+
+    /// 2.21.177 (refus ANR1 #10 7146440592, ordre cœur #9 7146569811) — DEUX
+    /// abonnés suivis, DEUX tunnels. Un paquet UE-B → UE-A passe d'abord par
+    /// le tunnel MONTANT de B (vers l'UPF), puis par le tunnel DESCENDANT de A
+    /// (vers le gNB de A). Les TEID sont inconnus des deux traces : seul le
+    /// chemin par l'IP de l'UE peut rattacher. Exigé : B rattache le premier,
+    /// A le second, chacun UNE fois. Le tunnel de B ne s'attache jamais à A
+    /// par l'adresse du pair, et le paquet n'est pas compté deux fois. Avant
+    /// 2.21.177 (deux adresses internes candidates) : A et B rattachaient
+    /// les deux passages.
+    #[test]
+    fn a_peer_address_never_attaches_another_subscribers_tunnel_2_21_177() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let base = decode_reference_capture_2_21_176("N3.pcapng", "N3", &key)
+            .into_iter()
+            .find(|e| e.protocol.as_str() == "GTP-U" && e.session_identifiers.iter().any(|id| id.name == "inner_source_ip"))
+            .expect("un G-PDU réel");
+        let (upf, gnb_a, gnb_b) = ("10.77.22.13", "10.77.22.20", "10.77.22.21");
+        let (ip_a, ip_b) = ("10.45.0.2", "10.45.0.3");
+        let r = LiveTraceRegistry::new();
+        for (id, pseudonym, ip, core_teid, gnb, radio_teid) in
+            [("a", "psn-ue-a-2-21-177", ip_a, "0x0000a001", gnb_a, "0x0000a002"), ("b", "psn-ue-b-2-21-177", ip_b, "0x0000b001", gnb_b, "0x0000b002")]
+        {
+            let mut trace = state(u64::MAX, false, vec![pseudonym.into()]);
+            trace.trace.trace_id = id.into();
+            trace.core_tunnel_endpoints.insert((upf.into(), core_teid.into()));
+            trace.tunnel_endpoints.insert((upf.into(), core_teid.into()));
+            trace.tunnel_endpoints.insert((gnb.into(), radio_teid.into()));
+            trace.ue_ip_keys.insert(event_schema::pseudonym_ip_text(&key, ip).unwrap(), HashSet::new());
+            r.traces.lock().unwrap().insert(id.into(), trace);
+        }
+        // B → A sur le tunnel montant de B (TEID inconnu des deux traces).
+        let uplink_b = gpdu_2_21_177(&base, (gnb_b, upf, "0x0000b0ff"), (ip_b, ip_a), "evt-uplink-b-2-21-177");
+        // Le même paquet livré sur le tunnel descendant de A.
+        let downlink_a = gpdu_2_21_177(&base, (upf, gnb_a, "0x0000a0ff"), (ip_b, ip_a), "evt-downlink-a-2-21-177");
+        route_live(&r, &uplink_b, &key);
+        route_live(&r, &downlink_a, &key);
+        let traces = r.traces.lock().unwrap();
+        let (a, b) = (&traces["a"].trace, &traces["b"].trace);
+        assert_eq!(a.gpdu_seen, 2);
+        assert_eq!(b.gpdu_seen, 2);
+        assert_eq!(b.gpdu_attached, 1, "B : seulement son tunnel montant (no_match={})", b.gpdu_rejected_no_match);
+        assert_eq!(a.gpdu_attached, 1, "A : seulement son tunnel descendant (no_match={})", a.gpdu_rejected_no_match);
+    }
+
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
         let bytes = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
