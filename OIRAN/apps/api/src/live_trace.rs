@@ -12996,4 +12996,94 @@ mod tests {
         let serialized = serde_json::to_value(&state.trace).unwrap();
         assert!(serialized.get("identity_in_clear").is_none(), "{serialized}");
     }
+    /// 2.21.169 (refus ANR1 #10 7137693482) — un message DOUBLONNÉ ne mute
+    /// plus le contexte UE. Sur la capture N2 réelle : le
+    /// `PDUSessionResourceSetupResponse` re-servi ne produit pas de seconde
+    /// phase `complete`, et le `Registration Request` re-servi ne remet pas
+    /// le contexte à zéro. Avant : seconde phase `complete` et contexte effacé.
+    #[test]
+    fn duplicate_messages_do_not_mutate_the_ue_context_2_21_169() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N2"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events.sort_by_key(|event| event.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        let pseudonym = events
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let r = trace_on(&pseudonym);
+        for event in &events {
+            r.route_normalized(event);
+        }
+        let setup_response = events
+            .iter()
+            .find(|e| e.message_name == "PDUSessionResourceSetupResponse")
+            .cloned()
+            .unwrap();
+        let registration_request = events
+            .iter()
+            .find(|e| e.message_name.ends_with("Registration Request"))
+            .cloned()
+            .unwrap();
+        // Doublons, puis un message distinct qui déclenche l'émission.
+        r.route_normalized(&setup_response);
+        r.route_normalized(&registration_request);
+        let mut distinct = events
+            .iter()
+            .find(|e| e.message_name == "InitialContextSetupResponse")
+            .cloned()
+            .unwrap();
+        distinct.event_id = format!("{}-distinct", distinct.event_id);
+        if let Some(reference) = distinct.packet_references.first_mut() {
+            reference.packet_number += 1_000;
+        }
+        r.route_normalized(&distinct);
+        let traces = r.traces.lock().unwrap();
+        let state = &traces["t"];
+        let pdu_completions = state
+            .events
+            .iter()
+            .filter(|e| e.kind == "procedure" && e.payload["phase"] == "complete")
+            .filter(|e| e.payload["procedure"] == "PDU Session Establishment")
+            .count();
+        assert_eq!(pdu_completions, 1, "une seule phase complete pour la session PDU");
+        let context = state.ue_context.payload();
+        assert_eq!(context["registration"]["value"], "REGISTERED", "doublon sans remise à zéro : {context}");
+        assert!(context["plmn"]["value"].is_string(), "{context}");
+        assert!(context["pdu_sessions"]["values"].as_array().is_some_and(|v| !v.is_empty()), "{context}");
+    }
+
+    /// 2.21.169 (refus ANR1) — sur `Deregistration Accept`, la session PDU
+    /// passée à RELEASED porte la preuve de l'event de désinscription, pas
+    /// celle de l'ancien établissement.
+    #[test]
+    fn a_released_session_carries_the_proof_of_the_releasing_event_2_21_169() {
+        use event_schema::{Direction, Protocol};
+        let mut context = UeContext::default();
+        let setup = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupResponse",
+            10,
+            Direction::Unknown,
+            vec![],
+            vec![("PDUSessionResourceSetupListSURes", "nested_list_sha256=x,pdu_session_id=1")],
+        );
+        let deregistration = mk_event("N2", Protocol::Nas5gs, "Deregistration Accept", 20, Direction::Unknown, vec![], vec![]);
+        context.observe(&setup);
+        context.observe(&deregistration);
+        let payload = context.payload();
+        let session = &payload["pdu_sessions"]["values"][0];
+        assert_eq!(session["state"], "RELEASED", "{payload}");
+        assert_eq!(session["event_id"], deregistration.event_id.as_str(), "{payload}");
+        assert_eq!(session["source"], "Deregistration Accept", "{payload}");
+    }
 }
