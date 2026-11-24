@@ -4203,6 +4203,28 @@ fn trace_request_fingerprint(
     event_schema::pseudonym(key, "live-trace-request", &input)
 }
 
+/// 2.21.160 — pseudonyme d'abonné dérivé d'une saisie, pour les seuls
+/// types de clé dont le domaine de pseudonymisation est celui des
+/// décodeurs : `imsi`. `None` pour tout autre type (MSISDN, IMEI, TMSI :
+/// domaines distincts, une dérivation n'y correspondrait à rien), et si la
+/// saisie ne porte pas de chiffres.
+fn derived_subscriber_pseudonym(state: &AppState, key_type: &str, value: &str) -> Option<String> {
+    if key_type != "imsi" {
+        return None;
+    }
+    // 2.21.161 (REFUS ANR1 #10 7117296485) — les chiffres CANONIQUES de la
+    // saisie, ceux que la route promet déjà (`canonical_digits` : préfixes
+    // retirés, séparateurs ignorés), puis la fonction des décodeurs sur ces
+    // chiffres. En 2.21.160, la saisie brute passait à
+    // `pseudonym_subscriber_text`, qui s'arrête au premier caractère non
+    // numérique : une saisie avec séparateurs donnait un autre pseudonyme.
+    let digits = canonical_digits(value)?;
+    Some(event_schema::pseudonym_subscriber_digits(
+        state.inner.capture_manager.pseudonym_key().as_ref(),
+        digits.as_bytes(),
+    ))
+}
+
 fn allowed_key(value: &str) -> bool {
     matches!(
         value,
@@ -4268,8 +4290,31 @@ pub(crate) async fn create(
             .identity_vault
             .pseudonyms_for_value(input.value.trim())
         {
-            Ok(v) if !v.is_empty() => (v, false),
-            Ok(_) => (Vec::new(), true),
+            Ok(v) => {
+                // 2.21.160 (ordre cœur #9 7116694153, audit #9 7116428144) —
+                // pour une clé IMSI, le pseudonyme est DÉRIVÉ de la saisie
+                // en plus de ceux de la voûte : même fonction
+                // (`pseudonym_subscriber_text`), même domaine (`subscriber`,
+                // unifié depuis 2.9.9) et MÊME CLÉ (celle du
+                // `capture_manager`) que la voûte (`lib.rs`,
+                // `tshark_identities`) et que les décodeurs. 2.21.90 avait
+                // retiré ce repli pour tous les types de clé ; il dérivait
+                // alors avec la clé par défaut du disque, pas celle des
+                // décodeurs. Depuis, une trace IMSI dont l'IMSI était
+                // inconnu de la voûte ne rattachait rien. MSISDN, IMEI et
+                // TMSI ont d'autres domaines : rien n'y est dérivé.
+                let mut pseudonyms = v;
+                if let Some(derived) = derived_subscriber_pseudonym(&state, &input.key_type, input.value.trim()) {
+                    if !pseudonyms.contains(&derived) {
+                        pseudonyms.push(derived);
+                    }
+                }
+                // Une trace qui a au moins un pseudonyme a une cible : elle
+                // n'est pas « armée » (en attente d'un premier rattachement
+                // par les seuls chiffres en clair), comme avec la voûte.
+                let armed = pseudonyms.is_empty();
+                (pseudonyms, armed)
+            }
             Err(_) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
