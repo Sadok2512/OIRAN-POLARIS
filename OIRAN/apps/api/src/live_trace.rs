@@ -12687,4 +12687,55 @@ mod tests {
             "DÉFAUT : le lecteur a suivi le segment 99 par nom et ignoré le segment 3, plus récent"
         );
     }
+    /// 2.21.166 (ordre cœur #9 7135745591) — la trace live décode avec la
+    /// table d'adresses : sur la capture N4 réelle du dépôt (10.77.23.12 ↔
+    /// 10.77.23.13), les deux bouts du PFCP sont SMF et UPF. Avant 2.21.166
+    /// (`endpoints: HashMap::new()`), ils restaient sans fonction réseau.
+    #[test]
+    fn live_ring_decoding_names_the_n4_peers_with_the_endpoint_table_2_21_166() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N4.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N4"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let pfcp: Vec<_> = events.iter().filter(|e| e.protocol.as_str() == "PFCP").collect();
+        assert!(!pfcp.is_empty(), "la capture N4 porte du PFCP");
+        for event in pfcp {
+            let names = [
+                event.source_endpoint.network_function.as_deref(),
+                event.destination_endpoint.network_function.as_deref(),
+            ];
+            assert!(names.contains(&Some("SMF")) && names.contains(&Some("UPF")), "{names:?}");
+        }
+    }
+
+    /// 2.21.166 — sans table, le N2 reste nommé par son port SCTP (38412) :
+    /// la table complète l'inférence par port, elle ne la remplace pas.
+    #[test]
+    fn a_ring_without_table_still_names_n2_by_its_sctp_port_2_21_166() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut config = ring_decode_config(&source, "N2");
+        config.endpoints = HashMap::new();
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let ngap: Vec<_> = events.iter().filter(|e| e.protocol.as_str() == "NGAP").collect();
+        assert!(!ngap.is_empty());
+        for event in ngap {
+            let names = [
+                event.source_endpoint.network_function.as_deref(),
+                event.destination_endpoint.network_function.as_deref(),
+            ];
+            assert!(names.contains(&Some("AMF")) && names.contains(&Some("gNB")), "{names:?}");
+        }
+    }
 }

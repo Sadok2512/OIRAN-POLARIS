@@ -24280,4 +24280,27 @@ Content-Length: 0\r\n\
         );
         fs::remove_dir_all(base).ok();
     }
+    /// 2.21.166 (ordre cœur #9 7135745591) — les neuf adresses SBI relevées
+    /// par ANR2 (#10 7135362409) sont dans la table, à côté des valeurs
+    /// d'avant, et un fichier de surcharge s'analyse sans silence.
+    #[test]
+    fn endpoint_map_names_the_lab_sbi_functions_2_21_166() {
+        let map = endpoint_map();
+        for (address, function) in [
+            ("10.77.20.10", "NRF"),
+            ("10.77.20.11", "AMF"),
+            ("10.77.20.12", "SMF"),
+            ("10.77.20.14", "AUSF"),
+            ("10.77.20.15", "UDM"),
+            ("10.77.20.16", "UDR"),
+            ("10.77.20.17", "PCF"),
+            ("10.77.20.18", "NSSF"),
+            ("10.77.20.19", "BSF"),
+            ("10.77.23.12", "SMF"),
+            ("10.77.23.13", "UPF"),
+            ("10.77.21.11", "AMF"),
+        ] {
+            assert_eq!(map.get(address).map(String::as_str), Some(function), "{address}");
+        }
+    }
 }
