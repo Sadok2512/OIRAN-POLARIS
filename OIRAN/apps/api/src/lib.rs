@@ -19004,6 +19004,76 @@ mod tests {
         assert_eq!(builds(), steady + 3, "aucune reconstruction de plus une fois la nouvelle signature en cache");
         fs::remove_dir_all(capture_root).ok();
     }
+    /// 2.21.168 (ordre cœur #9 7135991210) — REMPLACE le test 2.21.26
+    /// `cold_identities_answer_503_while_continuous_publication_holds_memory_gate`,
+    /// dont l'invariant (503 pendant une publication) est exactement ce que ce
+    /// lot retire. Pendant une publication, un défaut de cache rend 200 avec ce
+    /// que la voûte sait et `meta.hydration = deferred` ; jamais 503. Le
+    /// chemin froid ne tourne toujours pas pendant la publication (2.21.26).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_identities_are_deferred_not_503_during_publication_2_21_168() {
+        let state = operator_state();
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        // La voûte connaît déjà l'IMSI de la session (hydratation passée).
+        state
+            .inner
+            .identity_vault
+            .upsert(vec![IdentityObservation {
+                session_id: session_id.clone(),
+                subscriber_pseudonym: Some("psn-known".into()),
+                kind: "imsi".into(),
+                value: "001010000000201".into(),
+                value_type: Some("IMSI".into()),
+                role: "presented".into(),
+                event_id: "evt-known".into(),
+                capture_id: "sha256:known".into(),
+                packet_number: 1,
+                cleartext: None,
+            }])
+            .unwrap();
+        let app = router(state.clone(), None);
+        let request = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let uri = format!("/api/v1/sessions/{session_id}/identities");
+        let _publication = state.inner.capture_manager.heavy_memory_enter();
+        let busy = app.clone().oneshot(request(uri.clone())).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::OK);
+        assert_eq!(busy.headers()[header::RETRY_AFTER], "10");
+        let body = json_body(busy).await;
+        assert_eq!(body["meta"]["hydration"]["status"], "deferred", "{body}");
+        assert_eq!(body["meta"]["hydration"]["reason"], "publication_in_progress");
+        assert_eq!(body["data"]["imsi"], "001010000000201", "ce que la voûte sait est servi");
+    }
+
+    /// 2.21.168 — une session jamais vue, voûte vide, pendant une
+    /// publication : champs vides ET `deferred`. Un vide ne se fait jamais
+    /// passer pour une observation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_vault_during_publication_is_deferred_never_a_silent_empty_2_21_168() {
+        let state = operator_state();
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        let app = router(state.clone(), None);
+        let _publication = state.inner.capture_manager.heavy_memory_enter();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{session_id}/identities"))
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body["data"]["imsi"].is_null(), "{body}");
+        assert_eq!(body["meta"]["hydration"]["status"], "deferred", "{body}");
+    }
 }
 
 #[cfg(test)]
