@@ -1,5 +1,26 @@
 # Changelog
 
+## oiran-api 2.21.170 — 2026-11-24 — un statut `complete` ne survit plus à un changement de source ; borne `tshark` à 300 s
+
+Ordre cœur #9 7138374225 (priorité 3), refus ANR1 #10 7137693482 de 2.21.168. Base : `5b98f64` (2.21.168).
+
+### Défauts
+- **`complete` pouvait mentir sur les listes.** Le statut d'hydratation ne portait pas de signature : après une hydratation complète, une publication qui ajoutait des paquets laissait la liste servir l'ancienne voûte en annonçant encore `complete`. De plus, `schedule_identity_hydration` n'était appelé que si `identities` était `null` : aucune reprise n'était demandée.
+- **Écart secondaire** : `tshark_unavailable` et `tshark_dissection_failed` n'entraient pas dans la table `unavailable`, et l'appel suivant relançait aussitôt `tshark` pour la même signature.
+- **Borne trop courte** : 30 s aurait tué à tort une session de 7 messages mesurée à 54,1 s par ANR2 (#10 7137873871). La durée suit la taille du fichier de capture, pas celle de la session.
+
+### Corrigé
+- **Le statut porte la signature de sa source** : `len:mtime` du fichier callflow d'un jeu publié (un `statx`), ou `static` pour le jeu de référence. Chaque `complete`, `deferred` ou `unavailable` enregistre la source sur laquelle il a été établi.
+- **Sur les listes** (`identities_status`), un `complete` dont la source a changé est publié **`deferred` / `source_changed`**. Une reprise est mise en file **même si la voûte n'est pas vide**. La reprise réhydrate (le cache est manqué si de nouveaux paquets sont arrivés) et rétablit `complete` pour la nouvelle source.
+- **`unavailable` pour les trois raisons** (`tshark_timeout`, `tshark_unavailable`, `tshark_dissection_failed`) : la raison est gardée dans la table, et la même sortie s'applique (nouvelle signature, ou 15 minutes).
+- **Borne `tshark` par défaut : 300 s** (`OIRAN_IDENTITY_TSHARK_TIMEOUT_S`, toujours configurable). Depuis 2.21.168, la reprise s'efface en environ 50 ms devant une publication en attente : la borne ne protège plus la publication, elle sert seulement de garde-fou contre un `tshark` pathologique.
+
+### Gardes, rouges sur `5b98f64`
+- `a_complete_status_does_not_survive_a_source_change_2_21_170`, sur un vrai jeu continu (fixture 2.21.165) : `complete`, puis le fichier callflow réécrit, donne **immédiatement** `deferred` / `source_changed`, puis `complete` après la reprise.
+- `tshark_unavailable_is_not_retried_for_the_same_signature_2_21_170`.
+- `the_default_tshark_bound_is_300_seconds_2_21_170`.
+- Le **garde adverse d'ANR1** `list_invalidates_complete_identity_status_when_callflow_signature_changes_anr1_red` (branche `test/anr1-221168-stale-identity-status-red`, `06a58dc`) est repris **tel quel**.
+
 ## oiran-api 2.21.168, live-probe 0.6.44 — 2026-11-24 — `/sessions/:id/identities` ne rend plus 503 : la voûte servie, l'hydratation reprise
 
 Ordres cœur #9 7135991210 (GO option b) et 7136123546 (conditions), audit #9 7135501393. Base : `9c8979c` (2.21.165, en production). Lot 3 sur 3, indépendant de 2.21.166 et 2.21.167.

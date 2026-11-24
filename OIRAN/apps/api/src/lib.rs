@@ -7768,9 +7768,13 @@ const IDENTITY_TSHARK_TIMEOUTS_BEFORE_UNAVAILABLE: u32 = 2;
 const IDENTITY_UNAVAILABLE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// 2.21.168 — borne de `tshark` pour l'hydratation, en secondes :
-/// `OIRAN_IDENTITY_TSHARK_TIMEOUT_S` (1..=3600), 30 par défaut. PROVISOIRE :
-/// un seul point connu (210 s froid sur la session de référence lab) ; la
-/// distribution réelle relevée par ANR2 (#10 7136132105) fixera la valeur.
+/// `OIRAN_IDENTITY_TSHARK_TIMEOUT_S` (1..=3600).
+/// 2.21.170 (ordre cœur #9 7138374225) — 300 par défaut, et non plus 30.
+/// Mesure ANR2 (#10 7137873871) : la durée suit la taille du FICHIER de
+/// capture, pas celle de la session (7 messages → 54,1 s). Depuis que la
+/// reprise s'efface en ~50 ms devant une publication en attente, la borne ne
+/// protège plus la publication : c'est un garde-fou contre un `tshark`
+/// pathologique, donc large.
 fn identity_tshark_timeout() -> std::time::Duration {
     static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
@@ -7778,7 +7782,7 @@ fn identity_tshark_timeout() -> std::time::Duration {
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|value| (1..=3600).contains(value))
-            .unwrap_or(30);
+            .unwrap_or(300);
         std::time::Duration::from_secs(seconds)
     })
 }
@@ -7786,9 +7790,12 @@ fn identity_tshark_timeout() -> std::time::Duration {
 #[derive(Default)]
 pub(crate) struct IdentityHydration {
     queue: std::sync::Mutex<std::collections::VecDeque<String>>,
-    status: std::sync::Mutex<HashMap<String, Hydration>>,
-    /// Sessions `unavailable` : (signature du callflow, instant).
-    unavailable: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// 2.21.170 (refus ANR1 #10 7137693482) — le statut porte la signature de
+    /// la SOURCE (fichier callflow `len:mtime`) au moment où il a été établi.
+    /// Un `complete` dont la source a changé n'est plus publié comme tel.
+    status: std::sync::Mutex<HashMap<String, (Hydration, String)>>,
+    /// Sessions `unavailable` : (signature du callflow, instant, raison).
+    unavailable: std::sync::Mutex<HashMap<String, (String, std::time::Instant, &'static str)>>,
     timeouts: std::sync::Mutex<HashMap<String, u32>>,
     worker: std::sync::OnceLock<()>,
     /// Compteurs exposés aux tests et au diagnostic.
@@ -7804,14 +7811,18 @@ type IdentityRunner =
     fn(&AppState, &str, &CallFlow, &dyn Fn() -> bool) -> Result<Vec<IdentityObservation>, String>;
 
 impl IdentityHydration {
-    fn record(&self, session_id: &str, hydration: Hydration) {
+    fn record(&self, session_id: &str, hydration: Hydration, source: &str) {
         if let Ok(mut status) = self.status.lock() {
-            status.insert(session_id.to_string(), hydration);
+            status.insert(session_id.to_string(), (hydration, source.to_string()));
         }
     }
 
     fn status_of(&self, session_id: &str) -> Option<Hydration> {
-        self.status.lock().ok().and_then(|status| status.get(session_id).copied())
+        self.status.lock().ok().and_then(|status| status.get(session_id).map(|(h, _)| *h))
+    }
+
+    fn status_with_source(&self, session_id: &str) -> Option<(Hydration, String)> {
+        self.status.lock().ok().and_then(|status| status.get(session_id).cloned())
     }
 
     /// Met la session en file si elle n'y est pas déjà. `false` : file
@@ -7839,9 +7850,33 @@ impl IdentityHydration {
 }
 
 /// 2.21.168 — statut à publier à côté d'`identities` sur les listes.
+/// 2.21.170 — signature peu coûteuse de la source des identités d'une
+/// session : `len:mtime` du fichier callflow d'un jeu publié (un `statx`),
+/// `static` pour une session du jeu de référence (immuable).
+fn identity_source_signature(state: &AppState, session_id: &str) -> String {
+    let manager = &state.inner.capture_manager;
+    manager
+        .dataset_id_for_session(session_id)
+        .and_then(|dataset_id| manager.callflow_file_signature(&dataset_id, session_id))
+        .map(|(len, mtime)| format!("{len}:{mtime}"))
+        .unwrap_or_else(|| "static".to_string())
+}
+
 fn identities_status(state: &AppState, session_id: &str) -> Value {
-    match state.inner.identity_hydration.status_of(session_id) {
-        Some(hydration) => hydration.as_json(),
+    let hydration = &state.inner.identity_hydration;
+    match hydration.status_with_source(session_id) {
+        // 2.21.170 (refus ANR1) — `complete` ne vaut que pour la source qui
+        // l'a établi. Source changée (nouvelle publication) : `deferred`, et
+        // reprise demandée MÊME si la voûte n'est pas vide.
+        Some((Hydration::Complete, source)) if source != identity_source_signature(state, session_id) => {
+            let outcome = Hydration::Deferred("source_changed");
+            hydration.record(session_id, outcome, &source);
+            if hydration.enqueue(session_id) {
+                ensure_identity_worker(state);
+            }
+            outcome.as_json()
+        }
+        Some((hydration, _)) => hydration.as_json(),
         // Jamais tentée : la ligne vient de demander une reprise.
         None => json!({"status": "deferred", "reason": "hydration_requested"}),
     }
@@ -7864,7 +7899,7 @@ fn schedule_identity_hydration(state: &AppState, session_id: &str) {
             state
                 .inner
                 .identity_hydration
-                .record(session_id, Hydration::Deferred("hydration_requested"));
+                .record(session_id, Hydration::Deferred("hydration_requested"), &identity_source_signature(state, session_id));
         }
         ensure_identity_worker(state);
     }
@@ -7968,6 +8003,8 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
         return Err("SESSION_NOT_FOUND".into());
     };
     let hydration = &state.inner.identity_hydration;
+    // 2.21.170 — la source à laquelle le statut sera attaché.
+    let source = identity_source_signature(state, session_id);
     // 2.21.15 — cache par signature de callflow.
     let signature = identity_cache_signature(&flow);
     {
@@ -7977,17 +8014,17 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
                 let observations = entry.observations.clone();
                 drop(guard);
                 state.inner.identity_vault.upsert(observations)?;
-                hydration.record(session_id, Hydration::Complete);
+                hydration.record(session_id, Hydration::Complete, &source);
                 return Ok(Hydration::Complete);
             }
         }
     }
     // Sortie d'`unavailable` : nouvelle signature, ou délai écoulé.
     if let Ok(mut unavailable) = hydration.unavailable.lock() {
-        if let Some((marked_signature, at)) = unavailable.get(session_id) {
+        if let Some((marked_signature, at, reason)) = unavailable.get(session_id) {
             if *marked_signature == signature && at.elapsed() < IDENTITY_UNAVAILABLE_RETRY_AFTER {
-                let outcome = Hydration::Unavailable("tshark_timeout");
-                hydration.record(session_id, outcome);
+                let outcome = Hydration::Unavailable(reason);
+                hydration.record(session_id, outcome, &source);
                 return Ok(outcome);
             }
             unavailable.remove(session_id);
@@ -8003,7 +8040,7 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
         } else {
             Hydration::Deferred("retry_queue_full")
         };
-        hydration.record(session_id, outcome);
+        hydration.record(session_id, outcome, &source);
         outcome
     };
     // 2.21.26 — jamais de `tshark` pendant une publication ; 2.21.168 — ni
@@ -8029,7 +8066,7 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
             if let Ok(mut timeouts) = hydration.timeouts.lock() {
                 timeouts.remove(session_id);
             }
-            hydration.record(session_id, Hydration::Complete);
+            hydration.record(session_id, Hydration::Complete, &source);
             Ok(Hydration::Complete)
         }
         Err(error) => Ok(match error.as_str() {
@@ -8050,23 +8087,25 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, S
                     .unwrap_or(1);
                 if count >= IDENTITY_TSHARK_TIMEOUTS_BEFORE_UNAVAILABLE {
                     if let Ok(mut unavailable) = hydration.unavailable.lock() {
-                        unavailable.insert(session_id.to_string(), (signature, std::time::Instant::now()));
+                        unavailable.insert(session_id.to_string(), (signature.clone(), std::time::Instant::now(), "tshark_timeout"));
                     }
                     let outcome = Hydration::Unavailable("tshark_timeout");
-                    hydration.record(session_id, outcome);
+                    hydration.record(session_id, outcome, &source);
                     outcome
                 } else {
                     defer("tshark_timeout_retrying")
                 }
             }
-            "TSHARK_UNAVAILABLE" => {
-                let outcome = Hydration::Unavailable("tshark_unavailable");
-                hydration.record(session_id, outcome);
-                outcome
-            }
-            _ => {
-                let outcome = Hydration::Unavailable("tshark_dissection_failed");
-                hydration.record(session_id, outcome);
+            // 2.21.170 (écart secondaire ANR1) — ces deux états entrent aussi
+            // dans la table `unavailable` : plus de relance immédiate pour la
+            // même signature ; même sortie (nouvelle signature ou délai).
+            other => {
+                let reason = if other == "TSHARK_UNAVAILABLE" { "tshark_unavailable" } else { "tshark_dissection_failed" };
+                if let Ok(mut unavailable) = hydration.unavailable.lock() {
+                    unavailable.insert(session_id.to_string(), (signature.clone(), std::time::Instant::now(), reason));
+                }
+                let outcome = Hydration::Unavailable(reason);
+                hydration.record(session_id, outcome, &source);
                 outcome
             }
         }),
@@ -15998,6 +16037,79 @@ mod tests {
         let mut quick = Command::new("printf");
         quick.arg("ok");
         assert_eq!(run_bounded(quick, std::time::Duration::from_secs(5), &|| false).unwrap(), b"ok");
+    }
+
+    /// 2.21.170 (refus ANR1 #10 7137693482) — la séquence adverse d'ANR1 :
+    /// hydratation complète → voûte non vide → la source du callflow change
+    /// (nouvelle publication) → la liste ne doit PLUS annoncer `complete` :
+    /// `deferred` / `source_changed` immédiatement, reprise, puis `complete`.
+    /// Avant 2.21.170 : `complete` restait affiché sur une voûte périmée.
+    #[test]
+    fn a_complete_status_does_not_survive_a_source_change_2_21_170() {
+        let (state, capture_root, _commit_seq) =
+            continuous_sessions_fixture_2_21_165("identities-source-change-2-21-170", 1);
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(fake_identity_runner_2_21_168);
+        let session_id = "5g-session-seq00000000000";
+        assert_eq!(hydrate_identities(&state, session_id).unwrap(), Hydration::Complete);
+        assert_eq!(identities_status(&state, session_id)["status"], "complete");
+        assert!(!state.inner.identity_vault.for_session(session_id).unwrap().is_empty(), "voûte non vide");
+        // Nouvelle publication : le fichier du callflow change.
+        let callflow = capture_root
+            .join(live_probe::CONTINUOUS_CAPTURE_ID)
+            .join("dataset/callflows")
+            .join(format!("{session_id}.json"));
+        let mut content = std::fs::read(&callflow).unwrap();
+        content.extend_from_slice(b"\n");
+        std::fs::write(&callflow, content).unwrap();
+        let after_change = identities_status(&state, session_id);
+        assert_eq!(after_change["status"], "deferred", "{after_change}");
+        assert_eq!(after_change["reason"], "source_changed", "{after_change}");
+        // La reprise rétablit `complete` pour la nouvelle source.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while identities_status(&state, session_id)["status"] != "complete" {
+            assert!(std::time::Instant::now() < deadline, "la reprise n'a pas abouti");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::fs::remove_dir_all(capture_root).ok();
+    }
+
+    fn unavailable_identity_runner_2_21_170(
+        _state: &AppState,
+        _session_id: &str,
+        _flow: &CallFlow,
+        _cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<IdentityObservation>, String> {
+        UNAVAILABLE_RUNNER_CALLS_2_21_170.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err("TSHARK_UNAVAILABLE".into())
+    }
+    static UNAVAILABLE_RUNNER_CALLS_2_21_170: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// 2.21.170 (écart secondaire ANR1) — `tshark_unavailable` ne relance pas
+    /// `tshark` à l'appel suivant pour la même signature.
+    #[test]
+    fn tshark_unavailable_is_not_retried_for_the_same_signature_2_21_170() {
+        let state = operator_state();
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(unavailable_identity_runner_2_21_170);
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        let first = hydrate_identities(&state, &session_id).unwrap();
+        assert!(matches!(first, Hydration::Unavailable(_)), "{first:?}");
+        let calls = UNAVAILABLE_RUNNER_CALLS_2_21_170.load(std::sync::atomic::Ordering::SeqCst);
+        let second = hydrate_identities(&state, &session_id).unwrap();
+        assert!(matches!(second, Hydration::Unavailable(_)), "{second:?}");
+        assert_eq!(
+            UNAVAILABLE_RUNNER_CALLS_2_21_170.load(std::sync::atomic::Ordering::SeqCst),
+            calls,
+            "pas de nouvelle tentative pour la même signature"
+        );
+    }
+
+    /// 2.21.170 (ordre cœur #9 7138374225) — borne `tshark` par défaut :
+    /// 300 s (la mesure ANR2 a 54,1 s pour 7 messages ; 30 s aurait tué la
+    /// session à tort).
+    #[test]
+    fn the_default_tshark_bound_is_300_seconds_2_21_170() {
+        assert!(std::env::var_os("OIRAN_IDENTITY_TSHARK_TIMEOUT_S").is_none());
+        assert_eq!(identity_tshark_timeout(), std::time::Duration::from_secs(300));
     }
 
     /// 2.21.168 — une publication qui ATTEND l'écriture est visible pendant
