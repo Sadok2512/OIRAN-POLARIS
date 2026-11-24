@@ -1,5 +1,30 @@
 # Changelog
 
+## oiran-api 2.21.175 / live-probe 0.6.47 — 2026-11-24 — le porteur d'un répertoire de test survit à tout ce qui l'utilise
+
+Ordre cœur #9 7144888102, refus ANR1 #10 7144715047 de 2.21.174. Base : `4044030`. **Tests uniquement**, sous `cfg(test)`. Montée : patch sur les deux composants.
+
+### Défaut
+Quatre tests liaient leur porteur dans un bloc-expression : `let manager = { let tmp = temporary_root(..); CaptureManager::…(tmp.to_path_buf(), …) }.unwrap();`. Le porteur mourait **avant** le manager, qui gardait le `PathBuf`. Dans `stop_enforces_exact_owner_and_is_idempotent_after_completion`, `update` → `persist_job` → `create_dir_all` recréait ensuite la racine, et rien ne la supprimait. Les gardes 0.6.46 ne couvraient que le propriétaire lexical simple.
+
+### Corrigé
+- **Les quatre porteurs** (`interfaces`, `validation`, `locked`, `ownership`) sont liés dans la portée du test (`let root = temporary_root(..)`), et le manager est construit depuis `root.to_path_buf()`. Déclaré après le porteur, le manager est détruit avant lui.
+- **`ArchivedLabShapedDataset`** : le champ `_root` passe en **dernier**. Rust détruit les champs dans l'ordre de déclaration : le porteur meurt donc après le manager.
+
+### Inventaire des durées de vie : les 143 appels
+136 sont liés directement dans le corps de leur fonction. 7 sont imbriqués :
+- les **4 blocs-expressions** ci-dessus, corrigés ;
+- les **2 gardes 0.6.46**, volontairement en bloc : rien n'y survit au porteur ;
+- la **fermeture SIP** de `continuous_import_decodes_n6_sip_as_ims_2_21_107`, où porteur et manager sont locaux à la fermeture, et le manager est détruit en premier.
+
+Les utilitaires qui ne sont pas des tests : `run_reuse_cycles_2_21_143` n'en sort que des données, et le porteur y est déclaré avant le manager. `archived_lab_shaped_dataset_2_21_146` rend son porteur dans la structure, désormais en dernier champ.
+
+### Garde de durée de vie, rouge sur `4044030`
+`a_manager_never_outlives_its_temporary_root_0_6_47` : un journal **par fil** des racines créées par `temporary_root` (`thread_local`, `cfg(test)`). Le garde exécute, sur son propre fil, les quatre tests concernés. L'un d'eux fait persister un job **après** la construction du manager. Ensuite, aucune des quatre racines créées ne doit exister. **Rouge sur `4044030`** : `racines survivant à leur test : [".../oiran-live-probe-ownership-…"]`. Branche `proof/live-probe-0.6.47-guards-on-4044030`.
+
+### OUVERT, séparément
+Les résidus **asynchrones** restent ouverts : des fils d'import encore vivants recréent une racine après la fin de leur test. Ils ne sont pas traités dans ce lot. Leur correction toucherait le comportement de production de `stop`.
+
 ## oiran-api 2.21.174 / live-probe 0.6.46 — 2026-11-24 — les répertoires temporaires des tests se suppriment eux-mêmes, même en cas de panique
 
 Ordre cœur #9 7143938762 et 7144069142, audit #9 7143903772. Base : `99f9797` (2.21.173). **Tests uniquement** : aucun code de production modifié. Montée de version : patch sur les deux composants.

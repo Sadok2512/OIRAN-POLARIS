@@ -14271,6 +14271,14 @@ mod tests {
 
     static TEMP_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    thread_local! {
+        /// 0.6.47 — journal, PAR FIL, des racines créées par `temporary_root`.
+        /// Chaque test tourne sur son propre fil : un garde qui appelle des
+        /// tests sur son fil sait exactement quelles racines ils ont créées.
+        static TEMP_ROOTS_CREATED_ON_THIS_THREAD: std::cell::RefCell<Vec<PathBuf>> =
+            std::cell::RefCell::new(Vec::new());
+    }
+
     fn temporary_root(name: &str) -> TempRoot {
         let sequence = TEMP_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -14279,7 +14287,30 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
+        TEMP_ROOTS_CREATED_ON_THIS_THREAD.with(|created| created.borrow_mut().push(root.clone()));
         TempRoot(root)
+    }
+
+    /// 0.6.47 (refus ANR1 #10 7144715047, ordre cœur #9 7144888102) — garde de
+    /// DURÉE DE VIE. Il exécute, sur son propre fil, les quatre tests dont le
+    /// porteur vivait dans un bloc-expression, dont
+    /// `stop_enforces_exact_owner_and_is_idempotent_after_completion`, qui fait
+    /// PERSISTER un job (`update` → `persist_job` → `create_dir_all`) APRÈS la
+    /// construction du manager. Une fois ces tests finis, et donc toutes leurs
+    /// valeurs détruites, aucune des racines qu'ils ont créées ne doit
+    /// exister. En 0.6.46, `ownership` était recréée après la mort de son
+    /// porteur et restait sur le disque.
+    #[test]
+    fn a_manager_never_outlives_its_temporary_root_0_6_47() {
+        TEMP_ROOTS_CREATED_ON_THIS_THREAD.with(|created| created.borrow_mut().clear());
+        stop_enforces_exact_owner_and_is_idempotent_after_completion();
+        real_interface_discovery_is_allowlisted();
+        validation_rejects_custom_device_filter_and_unbounded_values();
+        execution_is_fail_closed_until_deployment_enables_it();
+        let created = TEMP_ROOTS_CREATED_ON_THIS_THREAD.with(|created| created.borrow().clone());
+        assert_eq!(created.len(), 4, "précondition : les quatre tests ont créé leur racine : {created:?}");
+        let survivors: Vec<_> = created.iter().filter(|path| path.exists()).collect();
+        assert!(survivors.is_empty(), "racines survivant à leur test : {survivors:?}");
     }
 
     /// 0.6.46 — le garde du garde : un test qui PANIQUE ne laisse pas son
@@ -18372,7 +18403,16 @@ Content-Length: 0\r\n\
         // 2.9.2 (#9 comment 6710853974): the registry now returns
         // every decoder-backed plane (11 interfaces, N6 excluded —
         // see `interface_specs_covers_every_decoder_backed_plane`).
-        let manager = { let tmp = temporary_root("interfaces"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        // 0.6.47 (refus ANR1 #10 7144715047) — le porteur vit dans la portée
+        // du test, pas dans un bloc : sinon il mourait avant le manager, qui
+        // recréait ensuite la racine (`persist_job`) sans que rien ne la nettoie.
+        let root = temporary_root("interfaces");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
         let interfaces = manager.interfaces();
         // 2.11.0 (devmat) : 12 interfaces (11 core planes + IMS).
         assert_eq!(interfaces.len(), 12);
@@ -18394,7 +18434,16 @@ Content-Length: 0\r\n\
 
     #[test]
     fn validation_rejects_custom_device_filter_and_unbounded_values() {
-        let manager = { let tmp = temporary_root("validation"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        // 0.6.47 (refus ANR1 #10 7144715047) — le porteur vit dans la portée
+        // du test, pas dans un bloc : sinon il mourait avant le manager, qui
+        // recréait ensuite la racine (`persist_job`) sans que rien ne la nettoie.
+        let root = temporary_root("validation");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
         let mut request = CaptureRequest::default();
         request.interfaces = vec!["eth0".into()];
         request.duration_seconds = 901;
@@ -18466,7 +18515,16 @@ Content-Length: 0\r\n\
 
     #[test]
     fn execution_is_fail_closed_until_deployment_enables_it() {
-        let manager = { let tmp = temporary_root("locked"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        // 0.6.47 (refus ANR1 #10 7144715047) — le porteur vit dans la portée
+        // du test, pas dans un bloc : sinon il mourait avant le manager, qui
+        // recréait ensuite la racine (`persist_job`) sans que rien ne la nettoie.
+        let root = temporary_root("locked");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
         assert!(manager
             .start(CaptureRequest::default(), "operator")
             .is_err());
@@ -18475,7 +18533,16 @@ Content-Length: 0\r\n\
 
     #[test]
     fn stop_enforces_exact_owner_and_is_idempotent_after_completion() {
-        let manager = { let tmp = temporary_root("ownership"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        // 0.6.47 (refus ANR1 #10 7144715047) — le porteur vit dans la portée
+        // du test, pas dans un bloc : sinon il mourait avant le manager, qui
+        // recréait ensuite la racine (`persist_job`) sans que rien ne la nettoie.
+        let root = temporary_root("ownership");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
         let id = "live-owned-0001".to_string();
         let job = CaptureJob {
             capture_id: id.clone(),
@@ -23548,9 +23615,6 @@ Content-Length: 0\r\n\
     /// (un autre UE, octobre), puis la rétention un cycle, puis un cycle
     /// de plus sans rétention.
     struct ArchivedLabShapedDataset {
-        /// 0.6.46 — garde le répertoire temporaire vivant aussi longtemps
-        /// que le jeu rendu ; il est supprimé quand le test le lâche.
-        _root: TempRoot,
         manager: CaptureManager,
         base: PathBuf,
         segment: PathBuf,
@@ -23562,6 +23626,10 @@ Content-Length: 0\r\n\
         flows_before: BTreeMap<String, String>,
         events_before: usize,
         old_events: usize,
+        /// 0.6.46 — garde le répertoire temporaire vivant aussi longtemps
+        /// que le jeu rendu. 0.6.47 — DERNIER champ : Rust détruit les champs
+        /// dans l'ordre de déclaration, donc le porteur meurt après le manager.
+        _root: TempRoot,
     }
 
     fn flow_shas_2_21_146(dataset_dir: &Path) -> BTreeMap<String, String> {
