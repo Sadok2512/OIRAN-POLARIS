@@ -8033,10 +8033,168 @@ fn run_bounded(
 /// 2.21.168 — hydratation d'une session. Rend son état ; l'erreur ne sert
 /// plus qu'à `SESSION_NOT_FOUND`. Jamais de 503 : la route sert toujours ce
 /// que la voûte sait, avec `meta.hydration`.
+#[cfg(test)]
+thread_local! {
+    /// 2.21.173 — point d'arrêt de test entre le clonage du flow et la suite
+    /// de l'hydratation : un garde à barrières y publie une génération
+    /// nouvelle pour FORCER la course décrite par ANR1 (#10 7143535580).
+    static HYDRATE_AFTER_FLOW_CLONE_2_21_173: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 2.21.173 (refus ANR1 #10 7143535580, ordre cœur #9 7143568156) —
+/// `Complete` n'est enregistré que si la source n'a pas bougé depuis AVANT
+/// le clonage du flow. `source_before` est lue avant `session_flow` ; elle
+/// est relue ici, juste avant l'enregistrement. Le `commit_seq` mémorisé
+/// est monotone et change à chaque entrée au registre : une source égale
+/// avant et après exclut toute publication entre les deux. Sinon : pas de
+/// `Complete`, `deferred` / `source_changed`, et reprise programmée.
+fn record_complete_if_source_unchanged(
+    state: &AppState,
+    session_id: &str,
+    source_before: &str,
+    cache_signature: &str,
+) -> Hydration {
+    let hydration = &state.inner.identity_hydration;
+    if identity_source_signature(state, session_id) != source_before {
+        let outcome = Hydration::Deferred("source_changed");
+        hydration.record(session_id, outcome, source_before);
+        if hydration.enqueue(session_id) {
+            ensure_identity_worker(state);
+        }
+        return outcome;
+    }
+    hydration.record(session_id, Hydration::Complete, &format!("{source_before}|{cache_signature}"));
+    Hydration::Complete
+}
+
+fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, String> {
+    let hydration = &state.inner.identity_hydration;
+    // 2.21.170 — la source à laquelle le statut sera attaché.
+    // 2.21.173 — lue AVANT le clonage du flow (et revalidée avant
+    // `Complete`), pour que flow, source et cache soient d'une même génération.
+    let source = identity_source_signature(state, session_id);
+    let Some(flow) = session_flow(state, session_id) else {
+        return Err("SESSION_NOT_FOUND".into());
+    };
+    #[cfg(test)]
+    if let Some(hook) = HYDRATE_AFTER_FLOW_CLONE_2_21_173.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    // 2.21.15 — cache par signature de callflow.
+    let signature = identity_cache_signature(&flow);
+    {
+        let guard = state.inner.identity_cache.lock().unwrap();
+        if let Some(entry) = guard.get(session_id) {
+            if entry.signature == signature {
+                let observations = entry.observations.clone();
+                drop(guard);
+                state.inner.identity_vault.upsert(observations)?;
+                return Ok(record_complete_if_source_unchanged(state, session_id, &source, &signature));
+            }
+        }
+    }
+    // Sortie d'`unavailable` : nouvelle signature, ou délai écoulé.
+    if let Ok(mut unavailable) = hydration.unavailable.lock() {
+        if let Some((marked_signature, at, reason)) = unavailable.get(session_id) {
+            if *marked_signature == signature && at.elapsed() < IDENTITY_UNAVAILABLE_RETRY_AFTER {
+                let outcome = Hydration::Unavailable(reason);
+                hydration.record(session_id, outcome, &source);
+                return Ok(outcome);
+            }
+            unavailable.remove(session_id);
+            if let Ok(mut timeouts) = hydration.timeouts.lock() {
+                timeouts.remove(session_id);
+            }
+        }
+    }
+    let defer = |reason: &'static str| -> Hydration {
+        let outcome = if hydration.enqueue(session_id) {
+            ensure_identity_worker(state);
+            Hydration::Deferred(reason)
+        } else {
+            Hydration::Deferred("retry_queue_full")
+        };
+        hydration.record(session_id, outcome, &source);
+        outcome
+    };
+    // 2.21.26 — jamais de `tshark` pendant une publication ; 2.21.168 — ni
+    // quand une publication attend l'écriture.
+    if state.inner.capture_manager.heavy_memory_write_requested() {
+        return Ok(defer("publication_in_progress"));
+    }
+    let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
+        return Ok(defer("publication_in_progress"));
+    };
+    let cancel = || state.inner.capture_manager.heavy_memory_write_requested();
+    #[cfg(test)]
+    let runner = hydration.runner_override.lock().unwrap().unwrap_or(tshark_identities);
+    #[cfg(not(test))]
+    let runner = tshark_identities;
+    match runner(state, session_id, &flow, &cancel) {
+        Ok(observations) => {
+            let cache_signature = signature.clone();
+            state.inner.identity_cache.lock().unwrap().insert(
+                session_id.to_string(),
+                IdentityCacheEntry { signature, observations: observations.clone() },
+            );
+            state.inner.identity_vault.upsert(observations)?;
+            if let Ok(mut timeouts) = hydration.timeouts.lock() {
+                timeouts.remove(session_id);
+            }
+            Ok(record_complete_if_source_unchanged(state, session_id, &source, &cache_signature))
+        }
+        Err(error) => Ok(match error.as_str() {
+            "TSHARK_CANCELLED_FOR_PUBLICATION" => {
+                hydration.cancelled_for_publication.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                defer("publication_in_progress")
+            }
+            "TSHARK_TIMEOUT" => {
+                hydration.tshark_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let count = hydration
+                    .timeouts
+                    .lock()
+                    .map(|mut timeouts| {
+                        let entry = timeouts.entry(session_id.to_string()).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    })
+                    .unwrap_or(1);
+                if count >= IDENTITY_TSHARK_TIMEOUTS_BEFORE_UNAVAILABLE {
+                    if let Ok(mut unavailable) = hydration.unavailable.lock() {
+                        unavailable.insert(session_id.to_string(), (signature.clone(), std::time::Instant::now(), "tshark_timeout"));
+                    }
+                    let outcome = Hydration::Unavailable("tshark_timeout");
+                    hydration.record(session_id, outcome, &source);
+                    outcome
+                } else {
+                    defer("tshark_timeout_retrying")
+                }
+            }
+            // 2.21.170 (écart secondaire ANR1) — ces deux états entrent aussi
+            // dans la table `unavailable` : plus de relance immédiate pour la
+            // même signature ; même sortie (nouvelle signature ou délai).
+            other => {
+                let reason = if other == "TSHARK_UNAVAILABLE" { "tshark_unavailable" } else { "tshark_dissection_failed" };
+                if let Ok(mut unavailable) = hydration.unavailable.lock() {
+                    unavailable.insert(session_id.to_string(), (signature.clone(), std::time::Instant::now(), reason));
+                }
+                let outcome = Hydration::Unavailable(reason);
+                hydration.record(session_id, outcome, &source);
+                outcome
+            }
+        }),
+    }
+}
+
 fn hydrate_identities(state: &AppState, session_id: &str) -> Result<Hydration, String> {
     let Some(flow) = session_flow(state, session_id) else {
         return Err("SESSION_NOT_FOUND".into());
     };
+    #[cfg(test)]
+    if let Some(hook) = HYDRATE_AFTER_FLOW_CLONE_2_21_173.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let hydration = &state.inner.identity_hydration;
     // 2.21.170 — la source à laquelle le statut sera attaché.
     let source = identity_source_signature(state, session_id);
@@ -16177,6 +16335,78 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "la reprise n'a pas abouti");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        fs::remove_dir_all(capture_root).ok();
+    }
+
+    /// 2.21.173 (refus ANR1 #10 7143535580) — garde À BARRIÈRES : la course
+    /// d'ANR1 est forcée, pas contournée. Hydratation complète sur G, puis
+    /// seconde hydratation dont le flow G est cloné ; ENTRE ce clonage et la
+    /// suite, un autre fil publie G+1 (un event de plus dans le callflow,
+    /// `commit_seq` 7 → 8, entrée au registre par `upsert_dataset`). Le cache
+    /// tient G : avant 2.21.173, le chemin rapide enregistrait `Complete` sous
+    /// « source G+1 | cache G », jugé valide ensuite, sans reprise. Exigé : pas
+    /// de `Complete` sur ce mélange — `deferred` tout de suite, puis `complete`
+    /// seulement quand le cache porte la signature du flow G+1.
+    #[test]
+    fn a_publication_between_flow_clone_and_source_cannot_record_complete_2_21_173() {
+        use std::sync::{Arc, Barrier};
+        let (state, capture_root, commit_seq_path) =
+            continuous_sessions_fixture_2_21_165("identities-barrier-race-2-21-173", 1);
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(fake_identity_runner_2_21_168);
+        let session_id = "5g-session-seq00000000000";
+        let base = capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID);
+        let callflow = base.join("dataset/callflows").join(format!("{session_id}.json"));
+        assert_eq!(hydrate_identities(&state, session_id).unwrap(), Hydration::Complete);
+        let signature_g = identity_cache_signature(&session_flow(&state, session_id).unwrap());
+
+        let flow_cloned = Arc::new(Barrier::new(2));
+        let published = Arc::new(Barrier::new(2));
+        let publisher = {
+            let (flow_cloned, published) = (flow_cloned.clone(), published.clone());
+            let (state, base, callflow, commit_seq_path) =
+                (state.clone(), base.clone(), callflow.clone(), commit_seq_path.clone());
+            std::thread::spawn(move || {
+                flow_cloned.wait();
+                // Publication G+1 : un event de plus, un nouveau commit logique.
+                let mut flow: Value = serde_json::from_slice(&fs::read(&callflow).unwrap()).unwrap();
+                let events = flow["events"].as_array_mut().unwrap();
+                let mut added = events[0].clone();
+                added["event_id"] = Value::from("evt-published-g-plus-1-2-21-173");
+                events.push(added);
+                fs::write(&callflow, serde_json::to_vec(&flow).unwrap()).unwrap();
+                fs::write(&commit_seq_path, b"8\n").unwrap();
+                state.inner.capture_manager.recover_continuous_dataset_from_disk(&base).expect("publication G+1");
+                published.wait();
+            })
+        };
+        {
+            let (flow_cloned, published) = (flow_cloned.clone(), published.clone());
+            HYDRATE_AFTER_FLOW_CLONE_2_21_173.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    flow_cloned.wait();
+                    published.wait();
+                }));
+            });
+        }
+        let raced = hydrate_identities(&state, session_id).unwrap();
+        publisher.join().unwrap();
+        assert!(
+            HYDRATE_AFTER_FLOW_CLONE_2_21_173.with(|hook| hook.borrow().is_none()),
+            "le point d'arrêt a bien été traversé : la course a eu lieu"
+        );
+        let signature_g1 = identity_cache_signature(&session_flow(&state, session_id).unwrap());
+        assert_ne!(signature_g, signature_g1, "précondition : G+1 change le flow");
+        assert_ne!(raced, Hydration::Complete, "pas de Complete sur « source G+1 | cache G »");
+        let listed = identities_status(&state, session_id);
+        assert_eq!(listed["status"], "deferred", "{listed}");
+        // La reprise rétablit `complete`, et seulement avec le cache de G+1.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while identities_status(&state, session_id)["status"] != "complete" {
+            assert!(std::time::Instant::now() < deadline, "la reprise n'a pas abouti");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let cached = state.inner.identity_cache.lock().unwrap().get(session_id).map(|entry| entry.signature.clone());
+        assert_eq!(cached.as_deref(), Some(signature_g1.as_str()), "complete porte le cache de G+1");
         fs::remove_dir_all(capture_root).ok();
     }
 
