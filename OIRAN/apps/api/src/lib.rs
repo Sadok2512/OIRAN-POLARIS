@@ -16134,6 +16134,39 @@ mod tests {
         std::fs::remove_dir_all(capture_root).ok();
     }
 
+    /// 2.21.172 (refus ANR1 #10 7142383874) — contre-exemple d'ANR1 :
+    /// republication où SEUL le commit logique change (même taille, même
+    /// mtime du callflow). La liste ne doit plus annoncer `complete` :
+    /// `deferred` / `source_changed` immédiatement, puis `complete` après
+    /// la reprise. Avant : `complete` restait affiché, aucune reprise.
+    #[test]
+    fn a_complete_status_does_not_survive_a_commit_only_republication_2_21_172() {
+        let (state, capture_root, commit_seq_path) =
+            continuous_sessions_fixture_2_21_165("identities-commit-only-2-21-172", 1);
+        *state.inner.identity_hydration.runner_override.lock().unwrap() = Some(fake_identity_runner_2_21_168);
+        let session_id = "5g-session-seq00000000000";
+        let base = capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID);
+        let callflow = base.join("dataset/callflows").join(format!("{session_id}.json"));
+        let file_before = fs::metadata(&callflow).map(|m| (m.len(), m.modified().unwrap())).unwrap();
+        assert_eq!(hydrate_identities(&state, session_id).unwrap(), Hydration::Complete);
+        assert_eq!(identities_status(&state, session_id)["status"], "complete");
+        // Republication : nouveau commit logique, callflow intouché, entrée
+        // au registre par le chemin réel (`upsert_dataset`).
+        fs::write(&commit_seq_path, b"8\n").unwrap();
+        state.inner.capture_manager.recover_continuous_dataset_from_disk(&base).expect("republication");
+        let file_after = fs::metadata(&callflow).map(|m| (m.len(), m.modified().unwrap())).unwrap();
+        assert_eq!(file_after, file_before, "précondition : même taille et même mtime");
+        let after = identities_status(&state, session_id);
+        assert_eq!(after["status"], "deferred", "{after}");
+        assert_eq!(after["reason"], "source_changed", "{after}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while identities_status(&state, session_id)["status"] != "complete" {
+            assert!(std::time::Instant::now() < deadline, "la reprise n'a pas abouti");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        fs::remove_dir_all(capture_root).ok();
+    }
+
     fn unavailable_identity_runner_2_21_170(
         _state: &AppState,
         _session_id: &str,
