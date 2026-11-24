@@ -1764,7 +1764,90 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
         })
         .unwrap_or_else(|_| json!({"total": 0}));
     data["sessions_filter_generation_swap_accepted_with_mismatch"] = swap_accepted_with_mismatch;
+    // 2.21.164 (ordre cœur #9 7127905530, point 1) — `/health` a répondu
+    // `healthy` pendant huit heures (23/11 13:33 → 24/11 07:28) alors
+    // qu'aucune publication n'aboutissait et que `/sessions/filter`
+    // répondait 503. On EXPOSE l'état réel du pipeline sans toucher à
+    // `status` : p900 et d'éventuelles sondes le lisent, le seuil d'un
+    // `degraded` se décidera avec Sadok. Lectures en mémoire seulement
+    // (mutex `jobs` le temps d'un clonage, `generation_slot` en lecture) :
+    // aucun accès disque, aucun calcul de `journey_signature`.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    data["continuous_import"] = continuous_import_health(&state, now_ms);
+    data["sessions_filter_generation"] = sessions_filter_generation_health(&state, now_ms);
     ok(data)
+}
+
+/// 2.21.164 — état du job d'import continu tel que la boucle l'écrit à
+/// chaque cycle (`pending_segments`, `closed_not_ingested_segments`,
+/// `owned_bytes_percent` sont mis à jour AVANT le contrôle de
+/// contre-pression, donc aussi pendant un blocage) et à chaque
+/// publication aboutie (`last_ingested_epoch_ms`, posé juste après
+/// `manifest-swap-complete` et persisté dans `job.json`).
+fn continuous_import_health(state: &AppState, now_ms: u64) -> Value {
+    let Some(job) = state
+        .inner
+        .capture_manager
+        .get(live_probe::CONTINUOUS_CAPTURE_ID)
+    else {
+        return json!({"present": false});
+    };
+    let blocked = job.state == live_probe::CaptureState::Blocked;
+    let last_publication_epoch_ms = job.metrics.last_ingested_epoch_ms;
+    json!({
+        "present": true,
+        "state": job.state,
+        "blocked": blocked,
+        "error": job.error,
+        "stop_reason": job.stop_reason,
+        "last_publication_epoch_ms": last_publication_epoch_ms,
+        "last_publication_age_ms": last_publication_epoch_ms.map(|at| now_ms.saturating_sub(at)),
+        "pending_segments": job.metrics.pending_segments,
+        "closed_not_ingested_segments": job.metrics.closed_not_ingested_segments,
+        "open_segments": job.metrics.open_segments,
+        "owned_bytes_percent": job.metrics.owned_bytes_percent,
+        "queue_occupancy_percent": job.metrics.queue_occupancy_percent,
+    })
+}
+
+/// 2.21.164 — la génération que `/sessions/filter` sert. `ready=false`
+/// avec `enforced=true` est exactement l'état où la route répond 503
+/// `SESSION_FILTER_CACHE_WARMING`.
+fn sessions_filter_generation_health(state: &AppState, now_ms: u64) -> Value {
+    let enforced = state
+        .inner
+        .session_filter_cache_readiness
+        .lock()
+        .map(|readiness| readiness.enforced)
+        .unwrap_or(false);
+    let generation: Option<Arc<FilterGeneration>> = state
+        .inner
+        .generation_slot
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    match generation {
+        Some(generation) => json!({
+            "enforced": enforced,
+            "ready": true,
+            "generation": generation.generation,
+            "commit_seq": generation.commit_seq,
+            "ready_since_ms": generation.ready_since_ms,
+            "age_ms": generation.stale_since_ms(now_ms),
+            "session_count": generation.session_count,
+        }),
+        None => json!({
+            "enforced": enforced,
+            "ready": false,
+            "generation": null,
+            "ready_since_ms": null,
+            "age_ms": null,
+            "session_count": 0,
+        }),
+    }
 }
 
 async fn version(State(state): State<AppState>) -> Json<Value> {
@@ -18483,6 +18566,168 @@ mod tests {
             events_out.len(),
             "chaque event a sa propre clé après backfill"
         );
+    }
+
+    /// 2.21.164 — prépare un vrai import continu sur un segment N2 réel, avec
+    /// une API en mode production (import continu actif, préchauffage installé
+    /// avant le démarrage : `enforced=true`, amorçage différé).
+    fn health_2_21_164_state(label: &str, inflight_bytes: u64) -> (AppState, PathBuf, PathBuf) {
+        use live_probe::{ContinuousImportConfig, CONTINUOUS_CAPTURE_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let capture_root = temporary_directory(&format!("{label}-root"));
+        let source = temporary_directory(&format!("{label}-source"));
+        fs::create_dir_all(source.join("N2")).unwrap();
+        fs::copy(
+            workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng"),
+            source.join("N2/segment-0001.pcapng"),
+        )
+        .unwrap();
+        let mut closures = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(source.join("capture-rotation.jsonl"))
+            .unwrap();
+        writeln!(
+            closures,
+            r#"{{"timestamp":"2026-11-06T00:00:00Z","interface":"br-oiran-n2","plane":"n2","exit_code":0,"packets_captured":0,"packets_dropped":0}}"#
+        )
+        .unwrap();
+        drop(closures);
+        if inflight_bytes > 0 {
+            // Un répertoire de travail en vol plus gros que le budget : la
+            // contre-pression réelle du worker (reste comptée après 2.21.163).
+            let inflight = capture_root.join(CONTINUOUS_CAPTURE_ID).join("staging-inflight");
+            fs::create_dir_all(&inflight).unwrap();
+            fs::File::create(inflight.join("blob")).unwrap().set_len(inflight_bytes).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let manager = CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            capture_root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        let mut config = test_config(workspace, label);
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        config.continuous_import_enabled = true;
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+        install_session_filter_cache_prewarm(&state);
+        state
+            .inner
+            .capture_manager
+            .start_continuous_import(ContinuousImportConfig {
+                scan_interval: std::time::Duration::from_millis(200),
+                stable_age: std::time::Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 8,
+                ..ContinuousImportConfig::bounded(source.clone())
+            })
+            .unwrap();
+        (state, capture_root, source)
+    }
+
+    fn wait_2_21_164(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "condition non atteinte en 60 s");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// 2.21.164 (ordre cœur #9 7127905530) — l'incident du 23/11 : import
+    /// bloqué par la contre-pression, aucune publication, aucune génération
+    /// READY, et `/health` disait seulement `healthy`. Le blocage et
+    /// l'absence de génération doivent apparaître ; `status` ne bouge pas.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_shows_a_blocked_import_and_no_ready_generation_2_21_164() {
+        use live_probe::CONTINUOUS_CAPTURE_ID;
+        let (state, capture_root, source) = health_2_21_164_state("health-blocked-2-21-164", 512 * 1024 * 1024);
+        let manager_state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_2_21_164(|| {
+                manager_state
+                    .inner
+                    .capture_manager
+                    .get(CONTINUOUS_CAPTURE_ID)
+                    .is_some_and(|job| job.error.as_deref() == Some("CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT"))
+            })
+        })
+        .await
+        .unwrap();
+        let response = router(state.clone(), None).oneshot(req("/api/v1/health", false)).await.unwrap();
+        let body = json_body(response).await;
+        state.inner.capture_manager.stop(CONTINUOUS_CAPTURE_ID, "operator").ok();
+        let data = &body["data"];
+        assert_eq!(data["status"], "healthy", "status inchangé dans ce lot");
+        let import = &data["continuous_import"];
+        assert_eq!(import["present"], true, "{import}");
+        assert_eq!(import["state"], "BLOCKED", "{import}");
+        assert_eq!(import["blocked"], true, "{import}");
+        assert_eq!(import["error"], "CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT", "{import}");
+        assert_eq!(import["stop_reason"], "BOUNDED_STORAGE_FULL", "{import}");
+        assert!(import["last_publication_epoch_ms"].is_null(), "aucune publication : {import}");
+        assert!(import["last_publication_age_ms"].is_null(), "{import}");
+        assert!(import["pending_segments"].as_u64().unwrap_or(0) >= 1, "segment en attente : {import}");
+        let generation = &data["sessions_filter_generation"];
+        assert_eq!(generation["enforced"], true, "{generation}");
+        assert_eq!(generation["ready"], false, "{generation}");
+        assert!(generation["age_ms"].is_null(), "{generation}");
+        // Le 503 que l'opérateur voyait, pour la même raison.
+        let filter = router(state.clone(), None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/filter")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"limit": 100}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filter.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json_body(filter).await["error"]["code"], "SESSION_FILTER_CACHE_WARMING");
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(capture_root).ok();
+    }
+
+    /// 2.21.164 — le cas sain : une publication aboutie et la génération
+    /// READY qu'elle a préchauffée apparaissent avec leur âge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_shows_the_last_publication_and_the_ready_generation_2_21_164() {
+        use live_probe::CONTINUOUS_CAPTURE_ID;
+        let (state, capture_root, source) = health_2_21_164_state("health-ready-2-21-164", 0);
+        let waiting = state.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_2_21_164(|| {
+                waiting.inner.generation_slot.read().map(|slot| slot.is_some()).unwrap_or(false)
+                    && waiting
+                        .inner
+                        .capture_manager
+                        .get(CONTINUOUS_CAPTURE_ID)
+                        .is_some_and(|job| job.metrics.last_ingested_epoch_ms.is_some())
+            })
+        })
+        .await
+        .unwrap();
+        let response = router(state.clone(), None).oneshot(req("/api/v1/health", false)).await.unwrap();
+        let body = json_body(response).await;
+        state.inner.capture_manager.stop(CONTINUOUS_CAPTURE_ID, "operator").ok();
+        let data = &body["data"];
+        assert_eq!(data["status"], "healthy");
+        let import = &data["continuous_import"];
+        assert_eq!(import["blocked"], false, "{import}");
+        assert!(import["error"].is_null(), "{import}");
+        assert!(import["last_publication_epoch_ms"].as_u64().is_some(), "{import}");
+        assert!(import["last_publication_age_ms"].as_u64().is_some_and(|age| age < 60_000), "{import}");
+        let generation = &data["sessions_filter_generation"];
+        assert_eq!(generation["ready"], true, "{generation}");
+        assert!(generation["generation"].as_u64().is_some_and(|n| n >= 1), "{generation}");
+        assert!(generation["age_ms"].as_u64().is_some_and(|age| age < 60_000), "{generation}");
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(capture_root).ok();
     }
 }
 

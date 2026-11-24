@@ -1,5 +1,25 @@
 # Changelog
 
+## oiran-api 2.21.164 — 2026-11-24 — `/health` dit la vérité sur le pipeline, sans changer `status`
+
+**Base : la fusion déployée `8640a0d` (oiran-api 2.21.163, live-probe 0.6.42).** Ordre cœur #9 7131598395. La première écriture (`452406e`) reposait sur `f419573` : la poser aurait retiré les lots 2.21.159 à 2.21.163 de la production. ANR1 l'avait relue PASS et en avait refusé le déploiement direct (#10 7129528652). Le code de `/health` et les gardes sont repris tels quels, par `cherry-pick`.
+
+Ordre cœur #9 7127905530, point 1 ; proposition #9 7117606449, point 5. Du 23/11 13:33 au 24/11 07:28, `/health` a répondu `healthy` alors qu'aucune publication n'aboutissait (contre-pression : `archive/` comptée dans `work_bytes`) et que `/sessions/filter` répondait 503 `SESSION_FILTER_CACHE_WARMING`.
+
+### Ajouté à la réponse de `/health`
+- `continuous_import` : `present`, `state` (`CAPTURING`, `BLOCKED`, …), `blocked`, `error` (ex. `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`), `stop_reason` (ex. `BOUNDED_STORAGE_FULL`), `last_publication_epoch_ms` et `last_publication_age_ms` (dernière publication aboutie : `last_ingested_epoch_ms`, posé juste après `manifest-swap-complete` et persisté dans `job.json`), `pending_segments`, `closed_not_ingested_segments`, `open_segments`, `owned_bytes_percent`, `queue_occupancy_percent`. Les compteurs d'attente sont écrits à chaque cycle **avant** le contrôle de contre-pression, donc aussi pendant un blocage. `{"present": false}` sans import continu.
+- `sessions_filter_generation` : `enforced`, `ready`, `generation`, `commit_seq`, `ready_since_ms`, `age_ms`, `session_count`. `enforced=true` avec `ready=false` est exactement l'état où `/sessions/filter` répond 503.
+
+Lectures en mémoire seulement : mutex `jobs` le temps d'un clonage, `generation_slot` en lecture. Aucun accès disque, aucun `journey_signature`.
+
+### Ce qui ne change pas
+`status` reste `"healthy"` : p900 et d'éventuelles sondes le lisent ; le seuil d'un `degraded` se décide avec Sadok. Un garde le vérifie.
+
+### Gardes
+`health_shows_a_blocked_import_and_no_ready_generation_2_21_164` : vrai import continu, vraie contre-pression (répertoire de travail en vol de 512 Mio pour un budget de 128 Mio, compté aussi après 2.21.163), API en mode production (préchauffage installé, amorçage différé). `/health` montre `BLOCKED`, l'erreur, la raison, aucune publication, des segments en attente, `enforced=true` et `ready=false` ; `/sessions/filter` répond bien 503 au même moment ; `status` vaut `healthy`.
+`health_shows_the_last_publication_and_the_ready_generation_2_21_164` : publication réelle et préchauffage par l'observateur ; `/health` montre l'âge de la dernière publication et la génération READY avec son âge.
+Les deux échouent sur `f419573` (champs absents) ; patch : `~/oiran-polaris-archives/2.21.164-preuve-echec-avant-sur-f419573.patch`.
+
 ## Fusion déployable oiran-api 2.21.163 — 2026-11-24 — ordre cœur #9 7126979628
 
 Une seule mise en production, sur `f419573` (2.21.158, en prod), réunit dans cet ordre : 2.21.160 + 2.21.161 (cible de trace par clé IMSI, PASS #10 7125071572), 2.21.159 + gardes ANR1 `9cb2ca7` + 2.21.162 (amorçage en ordre canonique, lecteur live par date ; PASS #10 7117533448 et 7126789251), puis 2.21.163 (`archive/` hors budget d'import, PASS #10 7128001213). Versions finales : oiran-api 2.21.163, live-probe 0.6.42. Le détail de chaque lot suit, version décroissante.
