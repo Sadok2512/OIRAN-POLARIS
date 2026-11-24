@@ -1,5 +1,25 @@
 # Changelog
 
+## oiran-api 2.21.171 — 2026-11-24 — un enregistrement re-servi ne mute plus rien dans la trace
+
+Ordre cœur #9 7142465934, refus ANR1 #10 7142383874 de 2.21.169. Base : `feafb47` (2.21.169).
+
+### Défaut
+2.21.169 gardait le contexte UE contre un doublon, mais pas le reste. Un `Registration Request` re-servi passait encore, **avant** le dédoublonnage, par `forget_technical_state`. Celui-ci efface identifiants UE, tunnels, SEID, IP UE et références d'events. Le doublon incrémentait aussi `fresh_registrations`. Le garde repris ne regardait que `ue_context.payload()`.
+
+### Corrigé
+- **Tout le bloc « enregistrement neuf » est sauté** pour un message déjà observé, avec la même clé `(capture_id, paquet, event_id)` que le dédoublonnage : pas d'oubli de l'état technique, pas de remise à zéro du contexte, pas de compteur.
+
+### Garde élargi, rouge sur `feafb47`
+- `replaying_every_message_mutates_nothing_but_the_duplicate_counter_2_21_171`, sur la capture N2 réelle : après un premier passage, **chaque** message est rejoué à l'identique. Après **chaque** rejeu, l'instantané est comparé à celui d'avant. Il contient :
+  - l'état technique complet (identifiants UE, contextes SM, tunnels, SEID, IP UE, clés de rattachement) ;
+  - le contexte UE ;
+  - **tous** les compteurs de la trace.
+- **Exclus, et déclarés** : les compteurs d'**entrée**, qui comptent ce qui arrive (doublons compris), pas l'état de la trace : `duplicates_dropped`, `live_events_since_open`, et par flux `seen`, `attached`, ainsi que les mesures de retard horodatées.
+- **Rouge sur `feafb47`** : le rejeu de `initialUEMessage · Registration Request` change `ue_ids`, `tunnel_teids`, `seids`, `match_keys`, `session_tunnels` et `fresh_registrations`.
+
+Preuve rejouable : branche `proof/oiran-2.21.171-guards-on-feafb47`.
+
 ## oiran-api 2.21.169 — 2026-11-24 — contexte UE : un doublon ne mute plus rien ; la libération porte sa propre preuve
 
 Ordre cœur #9 7138374225 (priorité 2), refus ANR1 #10 7137693482 de 2.21.167. Base : `2cf1b4d` (2.21.167).
