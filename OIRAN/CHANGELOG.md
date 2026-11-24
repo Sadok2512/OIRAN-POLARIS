@@ -1,5 +1,45 @@
 # Changelog
 
+## oiran-api 2.21.176 — 2026-11-24 — la trace live rattache le N3 d'un abonné dont la session précède le ring : amorçage sur le jeu publié, IP de l'UE comme clé de G-PDU
+
+Ordres cœur #9 7145234285, 7145423680, 7145721924 ; audit #9 7145300842 et 7145472269. Base : `aed583b` (2.21.175). Seul `oiran-api` est touché ; `event-schema`, `decoder-gtpu` et le format stocké sont inchangés.
+
+### Défaut (mesuré par ANR2, #10 7144987452)
+2 420 G-PDU décodés, 0 rattaché, `rejected_no_match` += 2 420. Deux causes, établies au code :
+- **(a)** l'IP de l'UE n'était pas une clé pour un G-PDU : `match_ue_ip` était réservé au SIP et au PFCP ;
+- **(b)** les clés d'un G-PDU (couples adresse/TEID, `ue_ip_keys`) ne s'apprenaient que de la signalisation de l'abonné présente dans les 3 derniers segments du ring. Une UE enregistrée avant était structurellement inobservable sur N3.
+
+### Volet A — l'IP de l'UE devient une clé de G-PDU (voie ii)
+- `match_ue_ip` couvre désormais le G-PDU.
+- **La comparaison porte sur un pseudonyme calculé À LA VOLÉE, pas sur une valeur stockée.** `decoder-gtpu` pose les adresses internes en clair (`ue_ip`, ou à défaut `inner_source_ip` / `inner_destination_ip`). `route_live` les pseudonymise avec la clé du lecteur (`event_schema::pseudonym_ip_text`), sur une **copie** de l'event, sous le nom `gpdu_ue_ip_candidate`. Ces candidats servent à la comparaison seulement : ils ne sont jamais appris, et les valeurs d'origine restent intactes. **Le jeu publié n'a pas changé.**
+- Les deux adresses internes sont candidates, parce que `ue_ip` n'est posé que si le décodeur a déduit la direction. Sur la capture de référence N3, aucun G-PDU ne porte `ue_ip`.
+
+### Volet B — l'amorçage interroge le jeu publié, de façon ciblée
+- Le registre des traces reçoit de l'API un **résolveur** (`published_seed_resolver`, posé au démarrage du lecteur, référence faible vers l'état). Aucun client vers Control.
+- `resolve_published_seed` :
+  1. pseudonyme → sessions par le `JourneyIndex` **déjà en cache**, jamais reconstruit (sinon `journey_index_not_built`) ;
+  2. les **8** sessions les plus récentes (`PUBLISHED_SEED_MAX_SESSIONS`), en ordre `(capture d'ancrage, premier paquet, session)` ;
+  3. leurs events **bruts** par `event_id`, via l'index compact (lecture à un décalage, `compact_index_building` si l'index n'est pas prêt) ;
+  4. au plus **4 096** events (`PUBLISHED_SEED_MAX_EVENTS`).
+
+  Rien n'est lu si une publication attend l'écriture (`publication_in_progress`). La garde lourde n'est jamais prise.
+- Les events publiés sont relus par `normalized_event_from_json`, lecteur inverse exact de `NormalizedEvent::to_json`, puis rejoués **avant** le ring (rang 0), dans l'ordre canonique `(capture_id, seq)`. Le ring reste relu comme avant.
+- **Le rendu de la trace dit ce qui a été fait** : `seed.published` (`consulted`, `reason`, `sessions_found`, `sessions_used`, `events`, `bounded`, `max_sessions`, `max_events`) et `seed.published_state` (`not_consulted` / `consulted` / `bounded`). **`seed.truncated` ne parle plus que du ring.**
+
+### Gardes
+- `gpdus_attach_through_the_published_dataset_without_n2_in_the_ring_2_21_176` : ring = **N3 réel seul**. Les liens viennent du jeu publié construit sur N2+N4 (résolveur de test qui rend ces events). `gpdu_attached > 0` exigé, aucun fichier de signalisation relu. **Rouge sur `aed583b`.**
+- `a_gpdu_attaches_by_its_ue_ip_alone_2_21_176` : un G-PDU réel dont le TEID est inconnu se rattache par l'IP de l'UE seule. **Rouge sur `aed583b`.**
+- `the_resolver_reads_the_subscriber_links_from_a_published_n2_n4_dataset_2_21_176` : le **vrai** résolveur sur un jeu **réellement publié** (import continu de N2 et N4). Sans index en cache, il rend `journey_index_not_built`. Avec l'index, il rend `consulted`, `ok`, au moins une session, le NGAP et le PFCP porteur de l'IE 93, dans les bornes.
+- `published_events_read_back_exactly_2_21_176` : aller-retour `to_json` → lecteur, **identique champ pour champ** sur les 64 events réels de N2, N3 et N4.
+- `the_seed_reports_what_it_did_with_the_published_dataset_2_21_176` : `seed.published`, les bornes et `published_state` sont rendus.
+
+Preuve rejouable : branche `proof/oiran-2.21.176-guards-on-aed583b`.
+
+### OUVERT
+- **G-PDU en clair dans le jeu publié** (asymétrie avec le PFCP) : lot séparé, non traité ici.
+- **Clé du lecteur** : le lecteur charge la clé du chemin par défaut. La voie (ii) suppose que c'est celle des décodeurs de l'import. En production, c'est attesté par le N2 live qui se rattache à une trace IMSI dérivée avec la clé du `capture_manager` (#10 7145653563). Ce n'est pas vérifié au code.
+- **43 108 G-PDU absents de l'agrégat** : voir le rapport. La cause n'est pas établie au contenu.
+
 ## oiran-api 2.21.175 / live-probe 0.6.47 — 2026-11-24 — le porteur d'un répertoire de test survit à tout ce qui l'utilise
 
 Ordre cœur #9 7144888102, refus ANR1 #10 7144715047 de 2.21.174. Base : `4044030`. **Tests uniquement**, sous `cfg(test)`. Montée : patch sur les deux composants.

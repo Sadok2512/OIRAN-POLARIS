@@ -211,7 +211,52 @@ pub(crate) struct SeedStats {
     /// ils passent en tête du tri (rang absent < rang présent).
     #[serde(default)]
     rank_source_missing: u64,
+    /// 2.21.176 (ordre cœur #9 7145423680 / 7145721924) — l'amorçage
+    /// interroge aussi le JEU PUBLIÉ, de façon ciblée, sur les pseudonymes de
+    /// la trace. `truncated` ci-dessus ne parle que du ring ; l'état du jeu
+    /// publié est ici, avec ses bornes.
+    #[serde(default)]
+    published: PublishedSeedStats,
+    /// 2.21.176 (ordre cœur #9 7145721924) — `truncated` ne parle QUE du
+    /// ring. L'état du jeu publié, en clair : `not_consulted`, `consulted`
+    /// (toutes les sessions et tous les events retenus), `bounded` (une
+    /// borne a coupé la résolution).
+    #[serde(default)]
+    published_state: &'static str,
 }
+
+/// 2.21.176 — bilan de l'interrogation du jeu publié par l'amorçage.
+#[derive(Clone, Default, Serialize, Debug, PartialEq)]
+pub(crate) struct PublishedSeedStats {
+    /// Le jeu publié a-t-il été interrogé ?
+    pub(crate) consulted: bool,
+    /// Pourquoi pas, ou `"ok"`.
+    pub(crate) reason: &'static str,
+    /// Sessions de l'abonné connues du jeu publié, et retenues (les plus
+    /// récentes, dans la borne).
+    pub(crate) sessions_found: u64,
+    pub(crate) sessions_used: u64,
+    /// Events rejoués depuis le jeu publié.
+    pub(crate) events: u64,
+    /// `true` si une borne a coupé la résolution (sessions ou events).
+    pub(crate) bounded: bool,
+    /// Bornes appliquées, rendues telles quelles.
+    pub(crate) max_sessions: u64,
+    pub(crate) max_events: u64,
+}
+
+/// 2.21.176 — résultat d'un résolveur de jeu publié : events bruts de
+/// l'abonné, en ordre canonique, et bilan.
+pub(crate) struct PublishedSeed {
+    pub(crate) events: Vec<event_schema::NormalizedEvent>,
+    pub(crate) stats: PublishedSeedStats,
+}
+
+/// 2.21.176 — fourni par l'API : interroge le jeu publié sur des
+/// pseudonymes d'abonné. Aucun accès à Control : seulement les données de
+/// la sonde.
+pub(crate) type PublishedResolver =
+    std::sync::Arc<dyn Fn(&[String]) -> PublishedSeed + Send + Sync>;
 
 /// 2.21.105 — interfaces de signalisation relues à l'ouverture d'une
 /// trace, dans l'ordre de dépendance : N2/S1-MME portent l'identité
@@ -289,6 +334,213 @@ fn ring_directory(interface: &str) -> String {
     }
 }
 
+/// 2.21.176 — lecteur inverse EXACT de `NormalizedEvent::to_json` (champs,
+/// noms et encodages de `event-schema` 1.6.0), pour rejouer à l'amorçage les
+/// events bruts du jeu publié. `None` si un champ obligatoire manque ou si
+/// une valeur d'énumération est inconnue : un event mal relu n'est jamais
+/// « deviné ». `schema_version` est rendu comme la constante courante (le
+/// champ est `&'static str`). Garde d'aller-retour sur les captures réelles :
+/// `published_events_read_back_exactly_2_21_176`.
+pub(crate) fn normalized_event_from_json(v: &Value) -> Option<event_schema::NormalizedEvent> {
+    use event_schema::*;
+    fn s(v: &Value, k: &str) -> Option<String> {
+        v.get(k)?.as_str().map(str::to_owned)
+    }
+    fn os(v: &Value, k: &str) -> Option<String> {
+        v.get(k).and_then(Value::as_str).map(str::to_owned)
+    }
+    fn u(v: &Value, k: &str) -> Option<u64> {
+        v.get(k)?.as_u64()
+    }
+    fn ou(v: &Value, k: &str) -> Option<u64> {
+        v.get(k).and_then(Value::as_u64)
+    }
+    fn decode_status(text: &str) -> Option<DecodeStatus> {
+        [DecodeStatus::Decoded, DecodeStatus::Partial, DecodeStatus::Unsupported, DecodeStatus::Malformed, DecodeStatus::EncryptedOrProtected]
+            .into_iter()
+            .find(|status| status.as_str() == text)
+    }
+    let protocol_text = s(v, "protocol")?;
+    let protocol = [
+        Protocol::Ngap, Protocol::S1ap, Protocol::Nas5gs, Protocol::Nas5gmm, Protocol::Nas5gsm,
+        Protocol::NasEpsMm, Protocol::NasEpsSm, Protocol::Gtpv2c, Protocol::Diameter, Protocol::Pfcp,
+        Protocol::Gtpu, Protocol::Sctp, Protocol::SbiHttp2, Protocol::Sip, Protocol::Rtp, Protocol::Rtcp,
+        Protocol::Unknown,
+    ]
+    .into_iter()
+    .find(|protocol| protocol.as_str() == protocol_text)?;
+    let direction_text = s(v, "direction")?;
+    let direction = [
+        Direction::RanToCore, Direction::CoreToRan, Direction::SmfToUpf, Direction::UpfToSmf,
+        Direction::Uplink, Direction::Downlink, Direction::Unknown, Direction::SbiRequest, Direction::SbiResponse,
+    ]
+    .into_iter()
+    .find(|direction| direction.as_str() == direction_text)?;
+    let endpoint = |value: &Value| -> Option<Endpoint> {
+        Some(Endpoint {
+            address: s(value, "address")?,
+            port: value.get("port").and_then(Value::as_u64).map(|port| port as u16),
+            network_function: os(value, "network_function"),
+        })
+    };
+    let timestamp = v.get("timestamp")?;
+    let mut packet_references = Vec::new();
+    for p in v.get("packet_references")?.as_array()? {
+        packet_references.push(PacketReference {
+            source_file: s(p, "source_file")?,
+            source_sha256: os(p, "source_sha256"),
+            packet_number: u(p, "packet_number")?,
+            byte_offset: u(p, "byte_offset")?,
+            interface_id: u(p, "interface_id")? as u32,
+            link_type: ou(p, "link_type").map(|n| n as u32),
+            sll2_protocol_type: ou(p, "sll2_protocol_type").map(|n| n as u16),
+            sll2_reserved: ou(p, "sll2_reserved").map(|n| n as u16),
+            sll2_interface_index: ou(p, "sll2_interface_index").map(|n| n as u32),
+            sll2_arphrd_type: ou(p, "sll2_arphrd_type").map(|n| n as u16),
+            sll2_packet_type: ou(p, "sll2_packet_type").map(|n| n as u8),
+            sll2_address_length: ou(p, "sll2_address_length").map(|n| n as u8),
+            sll2_address: os(p, "sll2_address"),
+            captured_length: u(p, "captured_length")? as u32,
+            original_length: u(p, "original_length")? as u32,
+        });
+    }
+    let mut session_identifiers = Vec::new();
+    for id in v.get("session_identifiers")?.as_array()? {
+        session_identifiers.push(NamedValue {
+            name: s(id, "name")?,
+            value: s(id, "value")?,
+            pseudonymized: id.get("pseudonymized")?.as_bool()?,
+        });
+    }
+    let mut information_elements = Vec::new();
+    for ie in v.get("information_elements")?.as_array()? {
+        information_elements.push(InformationElement {
+            id: ou(ie, "id").map(|n| n as u16),
+            name: s(ie, "name")?,
+            length: u(ie, "length")? as u32,
+            value: os(ie, "value"),
+            raw_sha256: os(ie, "raw_sha256"),
+            status: decode_status(&s(ie, "status")?)?,
+        });
+    }
+    let mut evidence_references = Vec::new();
+    for e in v.get("evidence_references").and_then(Value::as_array).into_iter().flatten() {
+        let state_text = s(e, "state")?;
+        let state = [EvidenceState::Exact, EvidenceState::Strong, EvidenceState::Possible, EvidenceState::Unknown]
+            .into_iter()
+            .find(|state| state.as_str() == state_text)?;
+        evidence_references.push(EvidenceReference { state, kind: s(e, "kind")?, reference: s(e, "reference")? });
+    }
+    let sbi = match v.get("sbi") {
+        Some(Value::Object(_)) => {
+            let b = v.get("sbi")?;
+            Some(SbiMetadata {
+                tcp_connection_id: s(b, "tcp_connection_id")?,
+                http2_stream_id: u(b, "http2_stream_id")? as u32,
+                service: os(b, "service"),
+                operation: os(b, "operation"),
+                http_method: os(b, "http_method"),
+                request_uri: os(b, "request_uri"),
+                http_status: ou(b, "http_status").map(|n| n as u16),
+                consumer_nf: os(b, "consumer_nf"),
+                producer_nf: os(b, "producer_nf"),
+                scp_transit: b.get("scp_transit")?.as_bool()?,
+                transaction_duration_ns: ou(b, "transaction_duration_ns"),
+            })
+        }
+        _ => None,
+    };
+    Some(NormalizedEvent {
+        event_id: s(v, "event_id")?,
+        stable_event_key: os(v, "stable_event_key").unwrap_or_default(),
+        parent_event_id: os(v, "parent_event_id"),
+        probe_id: s(v, "probe_id")?,
+        capture_point_id: s(v, "capture_point_id")?,
+        capture_id: s(v, "capture_id")?,
+        packet_references,
+        timestamp: ExactTimestamp {
+            seconds: timestamp.get("seconds")?.as_i64()?,
+            nanoseconds: u(timestamp, "nanoseconds")? as u32,
+            raw_ticks: u(timestamp, "raw_ticks")?,
+            resolution_base: u(timestamp, "resolution_base")? as u8,
+            resolution_exponent: u(timestamp, "resolution_exponent")? as u8,
+        },
+        interface: s(v, "interface")?,
+        protocol,
+        message_name: s(v, "message_name")?,
+        message_type: u(v, "message_type")? as u32,
+        procedure_code: ou(v, "procedure_code").map(|n| n as u32),
+        procedure: os(v, "procedure"),
+        security_state: os(v, "security_state"),
+        source_byte_offset: ou(v, "source_byte_offset").map(|n| n as u32),
+        source_endpoint: endpoint(v.get("source_endpoint")?)?,
+        destination_endpoint: endpoint(v.get("destination_endpoint")?)?,
+        direction,
+        session_identifiers,
+        information_elements,
+        decoder_name: s(v, "decoder_name")?,
+        decoder_version: s(v, "decoder_version")?,
+        schema_version: NormalizedEvent::SCHEMA_VERSION,
+        decoding_status: decode_status(&s(v, "decoding_status")?)?,
+        errors: v
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|errors| errors.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default(),
+        raw_payload_reference: s(v, "raw_payload_reference")?,
+        evidence_references,
+        sbi,
+    })
+}
+
+/// 2.21.176 (voie ii, arbitrage cœur #9 7145721924) — route un event du
+/// lecteur live. Pour un G-PDU, `decoder-gtpu` pose `ue_ip` EN CLAIR
+/// (`pseudonymized: false`) alors que les clés de la trace (`ue_ip_keys`,
+/// apprises du PFCP IE 93 et du NAS) sont des PSEUDONYMES : la valeur est
+/// pseudonymisée ici, avec la clé du lecteur (celle des décodeurs), sur une
+/// COPIE de l'event. La comparaison porte donc sur un pseudonyme calculé à la
+/// volée ; le jeu stocké et le format des events ne changent pas.
+/// 2.21.176 — nom des candidats « IP de l'UE » d'un G-PDU, posés sur la
+/// copie routée par `route_live`. Servent à la comparaison seulement.
+const GPDU_UE_IP_CANDIDATE: &str = "gpdu_ue_ip_candidate";
+
+pub(crate) fn route_live(
+    traces: &LiveTraceRegistry,
+    event: &event_schema::NormalizedEvent,
+    key: &event_schema::PseudonymKey,
+) {
+    if event.protocol.as_str() != "GTP-U" {
+        traces.route_normalized(event);
+        return;
+    }
+    // `ue_ip` n'est posé par le décodeur que si la direction a pu être
+    // déduite ; les deux adresses internes le sont toujours. L'une d'elles
+    // est celle de l'UE : chacune devient un CANDIDAT de comparaison, sous un
+    // nom propre — jamais appris, jamais `ue_ip`, les valeurs d'origine
+    // restent intactes.
+    let candidates: Vec<String> = event
+        .session_identifiers
+        .iter()
+        .filter(|id| {
+            !id.pseudonymized && matches!(id.name.as_str(), "ue_ip" | "inner_source_ip" | "inner_destination_ip")
+        })
+        .filter_map(|id| event_schema::pseudonym_ip_text(key, &id.value))
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    if candidates.is_empty() {
+        traces.route_normalized(event);
+        return;
+    }
+    let mut event = event.clone();
+    event.session_identifiers.extend(candidates.into_iter().map(|value| event_schema::NamedValue {
+        name: GPDU_UE_IP_CANDIDATE.into(),
+        value,
+        pseudonymized: true,
+    }));
+    traces.route_normalized(&event);
+}
+
 /// 2.21.105 — choisit les fichiers du ring à relire pour l'amorçage :
 /// les plus récents d'abord tant que le plafond tient, rendus du plus
 /// ancien au plus récent (l'apprentissage suit l'ordre chronologique).
@@ -328,6 +580,8 @@ pub(crate) struct SeedReport {
     rank_source_created: u64,
     rank_source_name: u64,
     rank_source_missing: u64,
+    /// 2.21.176 — interrogation du jeu publié.
+    published: PublishedSeedStats,
 }
 
 /// 2.21.105 (ordre #9 7048974175) — relit le ring de signalisation et
@@ -437,6 +691,12 @@ fn seed_from_ring(
             report.bytes = report.bytes.saturating_add(size);
         }
     }
+    // 2.21.176 — le jeu publié de l'abonné, interrogé de façon ciblée. Ses
+    // events sont plus anciens que le ring : rang 0, donc rejoués d'abord,
+    // puis en ordre canonique `(capture_id, seq)` comme le reste.
+    let published = registry.published_for_seeding();
+    report.published = published.stats;
+    history.extend(published.events.into_iter().map(|event| (Some(0u128), event)));
     // 2.21.157 — compté ici, écarté comme avant par `route_event_with`.
     report.node_messages_skipped = history.iter().filter(|(_, event)| is_pfcp_node_event(event)).count() as u64;
     learn_ranked_history(registry, history);
@@ -1444,6 +1704,11 @@ fn ue_ip_pseudonyms(event: &event_schema::NormalizedEvent) -> Vec<String> {
         _ => {}
     }
     for id in &event.session_identifiers {
+        // 2.21.176 — candidats d'un G-PDU (copie routée par `route_live`).
+        if id.name == GPDU_UE_IP_CANDIDATE && id.pseudonymized && event.protocol.as_str() == "GTP-U" {
+            out.push(id.value.clone());
+            continue;
+        }
         if id.name == "ue_ip" && id.pseudonymized {
             out.push(id.value.clone());
         }
@@ -1591,6 +1856,8 @@ pub(crate) struct LiveTraceRegistry {
     /// 2.21.134 — même tampon, propre à l'amorçage : jamais mêlé au live,
     /// vidé à chaque début et fin d'amorçage.
     seed_rejected_pfcp: Mutex<VecDeque<event_schema::NormalizedEvent>>,
+    /// 2.21.176 — résolveur du jeu publié, posé par l'API.
+    published_resolver: Mutex<Option<PublishedResolver>>,
 }
 
 impl LiveTraceRegistry {
@@ -1611,7 +1878,46 @@ impl LiveTraceRegistry {
             recent_rejected: Mutex::new(VecDeque::new()),
             recent_rejected_pfcp: Mutex::new(VecDeque::new()),
             seed_rejected_pfcp: Mutex::new(VecDeque::new()),
+            published_resolver: Mutex::new(None),
         }
+    }
+
+    /// 2.21.176 — pose le résolveur du jeu publié (une fois, par l'API).
+    pub(crate) fn set_published_resolver(&self, resolver: PublishedResolver) {
+        *self.published_resolver.lock().unwrap() = Some(resolver);
+    }
+
+    /// 2.21.176 — pseudonymes d'abonné des traces EN AMORÇAGE.
+    fn seeding_pseudonyms(&self) -> Vec<String> {
+        let traces = self.traces.lock().unwrap();
+        let mut out: Vec<String> = traces
+            .values()
+            .filter(|state| state.seeding)
+            .flat_map(|state| state.trace.subscriber_pseudonyms.iter().cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// 2.21.176 — interroge le jeu publié pour l'amorçage en cours. Sans
+    /// résolveur, ou sans pseudonyme : non consulté, raison rendue.
+    fn published_for_seeding(&self) -> PublishedSeed {
+        let resolver = self.published_resolver.lock().unwrap().clone();
+        let Some(resolver) = resolver else {
+            return PublishedSeed {
+                events: Vec::new(),
+                stats: PublishedSeedStats { reason: "no_resolver", ..Default::default() },
+            };
+        };
+        let pseudonyms = self.seeding_pseudonyms();
+        if pseudonyms.is_empty() {
+            return PublishedSeed {
+                events: Vec::new(),
+                stats: PublishedSeedStats { reason: "no_subscriber_pseudonym", ..Default::default() },
+            };
+        }
+        resolver(&pseudonyms)
     }
     pub(crate) fn audit(&self, entry: Value) {
         let mut audit = self.audit.lock().unwrap();
@@ -1705,6 +2011,14 @@ impl LiveTraceRegistry {
                 state.trace.seed.rank_source_created = report.rank_source_created;
                 state.trace.seed.rank_source_name = report.rank_source_name;
                 state.trace.seed.rank_source_missing = report.rank_source_missing;
+                state.trace.seed.published = report.published.clone();
+                state.trace.seed.published_state = if !report.published.consulted {
+                    "not_consulted"
+                } else if report.published.bounded {
+                    "bounded"
+                } else {
+                    "consulted"
+                };
             }
         }
     }
@@ -2367,7 +2681,12 @@ impl LiveTraceRegistry {
             // l'UE de l'abonné. SIP : adresse du paquet ou du SDP (couvre
             // REGISTER et tout message sans SDP, avec des URI qui ne sont
             // ni IMSI ni MSISDN). PFCP : IE 93.
-            let match_ue_ip = (is_sip || is_pfcp)
+            // 2.21.176 (arbitrage cœur #9 7145423680 / 7145721924, voie ii) —
+            // le G-PDU aussi : l'IP de l'UE survit au handover et au
+            // rétablissement, le couple (adresse, TEID) non. Sa valeur est
+            // pseudonymisée À LA VOLÉE par le lecteur (`route_live`), jamais
+            // dans le jeu stocké.
+            let match_ue_ip = (is_sip || is_pfcp || is_gpdu_data)
                 && ev_ue_ip_pseudonyms
                     .iter()
                     .any(|ip| state.ue_ip_keys.contains_key(ip));
@@ -3997,7 +4316,7 @@ pub(crate) fn reader_pass(
                 if !is_newest && sessions.contains_key(path) {
                     let config = ring_decode_config(path, interface);
                     for event in close_reader_session(sessions, &config) {
-                        traces.route_normalized(&event);
+                        route_live(traces, &event, key);
                     }
                 } else if sessions.contains_key(path) {
                     // 2.21.131 — segment courant inchangé : les derniers
@@ -4099,7 +4418,7 @@ pub(crate) fn reader_pass(
                 if incremental
                     || file_state_entry.route_once_for_live_trace(&event.event_id)
                 {
-                    traces.route_normalized(event);
+                    route_live(traces, event, key);
                 }
                 // 2.21.137 (ordre #9 7061820250) — même règle que pour les
                 // traces (2.21.135) : rien d'antérieur au démarrage du
@@ -4130,7 +4449,7 @@ pub(crate) fn reader_pass(
             }
             if incremental && !is_newest {
                 for event in close_reader_session(sessions, &config) {
-                    traces.route_normalized(&event);
+                    route_live(traces, &event, key);
                 }
             } else if incremental {
                 snapshot_rtp_flows_if_due(sessions, path, &config, interface, now, traces, &mut pass_io);
@@ -4155,6 +4474,8 @@ pub(crate) fn reader_pass(
 }
 
 pub(crate) fn start_reader(state: AppState) {
+    // 2.21.176 — l'amorçage interroge aussi le jeu publié (volet B).
+    state.inner.live_traces.set_published_resolver(crate::published_seed_resolver(&state));
     if state
         .inner
         .live_traces
@@ -8647,6 +8968,154 @@ mod tests {
             "chaque event écarté est compté une fois"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 2.21.176 — décode une capture réelle du jeu de référence.
+    fn decode_reference_capture_2_21_176(
+        file: &str,
+        interface: &str,
+        key: &event_schema::PseudonymKey,
+    ) -> Vec<event_schema::NormalizedEvent> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1")
+            .join(file);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&path, interface), key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events
+    }
+
+    /// 2.21.176 — le lecteur inverse est EXACT : chaque event réel des
+    /// captures N2, N3 et N4, sérialisé par `to_json` puis relu, est
+    /// identique champ pour champ. C'est ce qui permet de rejouer à
+    /// l'amorçage les events bruts du jeu publié sans rien perdre.
+    #[test]
+    fn published_events_read_back_exactly_2_21_176() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut total = 0usize;
+        for (file, interface) in [("N2.pcapng", "N2"), ("N3.pcapng", "N3"), ("N4.pcapng", "N4")] {
+            for event in decode_reference_capture_2_21_176(file, interface, &key) {
+                let value: Value = serde_json::from_str(&event.to_json()).unwrap();
+                let back = normalized_event_from_json(&value)
+                    .unwrap_or_else(|| panic!("relecture impossible : {} {}", event.protocol.as_str(), event.message_name));
+                assert_eq!(back, event, "{file} : {}", event.message_name);
+                total += 1;
+            }
+        }
+        assert!(total >= 60, "précondition : les events réels des trois captures ont été relus ({total})");
+    }
+
+    /// 2.21.176 (ordres cœur #9 7145423680 / 7145721924) — LE cas mesuré par
+    /// ANR2 : une UE dont la session est ANTÉRIEURE à la fenêtre du ring. Le
+    /// ring ne contient QUE du N3 réel (aucun N2, aucun N4) ; les liens de
+    /// l'abonné — tunnels du N2, F-TEID et IP de l'UE du PFCP — ne peuvent
+    /// venir que du JEU PUBLIÉ construit sur N2+N4, rendu par le résolveur.
+    /// Exigé : des G-PDU rattachés à la trace. Avant 2.21.176 : 0 rattaché,
+    /// tous en `rejected_no_match`.
+    #[test]
+    fn gpdus_attach_through_the_published_dataset_without_n2_in_the_ring_2_21_176() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut published = decode_reference_capture_2_21_176("N2.pcapng", "N2", &key);
+        published.extend(decode_reference_capture_2_21_176("N4.pcapng", "N4", &key));
+        let pseudonym = published
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .expect("pseudonyme d'abonné dans le N2 publié");
+        let r = trace_on(&pseudonym);
+        let published_for_resolver = published.clone();
+        r.set_published_resolver(std::sync::Arc::new(move |_pseudonyms: &[String]| PublishedSeed {
+            events: published_for_resolver.clone(),
+            stats: PublishedSeedStats {
+                consulted: true,
+                reason: "ok",
+                events: published_for_resolver.len() as u64,
+                ..Default::default()
+            },
+        }));
+        // Ring : N3 seulement.
+        let (dir, bytes) = n3_ring_file("published-seed-2-21-176");
+        let root = dir.parent().unwrap().join("ring");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(ring_directory("N3"))).unwrap();
+        fs::write(root.join(ring_directory("N3")).join("n3_00001.pcapng"), &bytes).unwrap();
+        assert!(!root.join(ring_directory("N2")).exists(), "précondition : aucun N2 dans le ring");
+        let mut states = HashMap::new();
+        let mut sessions = HashMap::new();
+        let mut dirs = HashMap::new();
+        let mut hooks = CountingHooks::default();
+        reader_pass(&root, &key, &r, &mut states, &mut sessions, &mut dirs, true, false, std::time::Instant::now(), &mut hooks);
+        let traces = r.traces.lock().unwrap();
+        let trace = &traces["t"].trace;
+        assert!(trace.gpdu_seen > 0, "précondition : le N3 réel a été lu ({})", trace.gpdu_seen);
+        assert!(
+            trace.gpdu_attached > 0,
+            "aucun G-PDU rattaché : seen={} no_match={} endpoint_mismatch={}",
+            trace.gpdu_seen,
+            trace.gpdu_rejected_no_match,
+            trace.gpdu_rejected_endpoint_mismatch
+        );
+        assert_eq!(trace.seed.files, 0, "rien n'est venu du ring de signalisation");
+        drop(traces);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// 2.21.176 — la trace DIT ce que l'amorçage a fait du jeu publié :
+    /// consulté, nombre d'events, et l'état à trois valeurs à côté de
+    /// `truncated` (ring seulement).
+    #[test]
+    fn the_seed_reports_what_it_did_with_the_published_dataset_2_21_176() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let published = decode_reference_capture_2_21_176("N2.pcapng", "N2", &key);
+        let r = trace_on("psn-seed-state-2-21-176");
+        let count = published.len() as u64;
+        r.set_published_resolver(std::sync::Arc::new(move |_pseudonyms: &[String]| PublishedSeed {
+            events: published.clone(),
+            stats: PublishedSeedStats { consulted: true, reason: "ok", events: count, bounded: true, max_sessions: 8, max_events: 4096, ..Default::default() },
+        }));
+        let root = std::env::temp_dir().join(format!("oiran-seed-state-2-21-176-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut hooks = CountingHooks::default();
+        reader_pass(&root, &key, &r, &mut HashMap::new(), &mut HashMap::new(), &mut HashMap::new(), true, false, std::time::Instant::now(), &mut hooks);
+        let traces = r.traces.lock().unwrap();
+        let seed = serde_json::to_value(&traces["t"].trace.seed).unwrap();
+        assert_eq!(seed["published"]["consulted"], true, "{seed}");
+        assert_eq!(seed["published"]["events"], count, "{seed}");
+        assert_eq!(seed["published"]["max_sessions"], 8, "{seed}");
+        assert_eq!(seed["published"]["max_events"], 4096, "{seed}");
+        assert_eq!(seed["published_state"], "bounded", "{seed}");
+        assert!(seed.get("truncated").is_some(), "truncated reste, pour le ring : {seed}");
+        drop(traces);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 2.21.176 (volet A) — un G-PDU dont le TEID est INCONNU de la trace se
+    /// rattache par la seule IP de l'UE. Le décodeur la pose en clair ; le
+    /// lecteur la pseudonymise à la volée (`route_live`) avec sa clé, puis
+    /// la compare à `ue_ip_keys`. Avant : `match_ue_ip` excluait le GTP-U.
+    #[test]
+    fn a_gpdu_attaches_by_its_ue_ip_alone_2_21_176() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let gpdu = decode_reference_capture_2_21_176("N3.pcapng", "N3", &key)
+            .into_iter()
+            .find(|e| e.protocol.as_str() == "GTP-U" && e.session_identifiers.iter().any(|id| id.name == "inner_source_ip"))
+            .expect("un G-PDU réel avec ses adresses internes");
+        // L'UE est l'une des deux adresses internes : la source, pour ce garde.
+        let clear = gpdu.session_identifiers.iter().find(|id| id.name == "inner_source_ip").unwrap().value.clone();
+        let pseudonym = event_schema::pseudonym_ip_text(&key, &clear).unwrap();
+        let r = trace_on("psn-ue-ip-only-2-21-176");
+        r.traces.lock().unwrap().get_mut("t").unwrap().ue_ip_keys.insert(pseudonym, HashSet::new());
+        route_live(&r, &gpdu, &key);
+        let traces = r.traces.lock().unwrap();
+        let trace = &traces["t"].trace;
+        assert_eq!(trace.gpdu_seen, 1);
+        assert_eq!(trace.gpdu_attached, 1, "no_match={}", trace.gpdu_rejected_no_match);
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {

@@ -1301,6 +1301,121 @@ fn oiran_endpoint_map() -> HashMap<String, String> {
 ///   `read_time_patch.status = "index_building"` sur la réponse.
 /// - `NotApplicable` : items vide ou aucun event_id cherchable ;
 ///   le handler NE MARQUE PAS la réponse.
+/// 2.21.176 (ordre cœur #9 7145423680 / 7145721924, volet B) — bornes de
+/// l'interrogation du jeu publié par l'amorçage d'une trace. Rendues telles
+/// quelles dans `seed.published` de la trace.
+pub(crate) const PUBLISHED_SEED_MAX_SESSIONS: usize = 8;
+pub(crate) const PUBLISHED_SEED_MAX_EVENTS: usize = 4096;
+
+/// 2.21.176 — résolveur posé sur le registre des traces : interroge le jeu
+/// publié sur les pseudonymes d'abonné. Garde une référence FAIBLE vers
+/// l'état (pas de cycle `Inner` → registre → résolveur → `Inner`).
+pub(crate) fn published_seed_resolver(state: &AppState) -> live_trace::PublishedResolver {
+    let weak = std::sync::Arc::downgrade(&state.inner);
+    std::sync::Arc::new(move |pseudonyms: &[String]| match weak.upgrade() {
+        Some(inner) => resolve_published_seed(&AppState { inner }, pseudonyms),
+        None => live_trace::PublishedSeed {
+            events: Vec::new(),
+            stats: live_trace::PublishedSeedStats { reason: "state_dropped", ..Default::default() },
+        },
+    })
+}
+
+/// 2.21.176 — résolution CIBLÉE, jamais un balayage :
+/// 1. pseudonyme → sessions par le `JourneyIndex` DÉJÀ en cache (jamais
+///    reconstruit ici : un index absent rend `journey_index_not_built`) ;
+/// 2. les `PUBLISHED_SEED_MAX_SESSIONS` sessions les plus récentes, dans
+///    l'ordre canonique `(capture_id d'ancrage, premier paquet, session)` ;
+/// 3. pour chacune, son call flow (un fichier), puis ses events BRUTS par
+///    `event_id` via l'index compact du jeu (lecture à un décalage) ;
+/// 4. au plus `PUBLISHED_SEED_MAX_EVENTS` events en tout.
+/// Rien n'est lu si une publication attend l'écriture : la garde lourde
+/// n'est jamais prise.
+fn resolve_published_seed(state: &AppState, pseudonyms: &[String]) -> live_trace::PublishedSeed {
+    let mut stats = live_trace::PublishedSeedStats {
+        max_sessions: PUBLISHED_SEED_MAX_SESSIONS as u64,
+        max_events: PUBLISHED_SEED_MAX_EVENTS as u64,
+        ..Default::default()
+    };
+    let mut events = Vec::new();
+    if state.inner.capture_manager.heavy_memory_write_requested() {
+        stats.reason = "publication_in_progress";
+        return live_trace::PublishedSeed { events, stats };
+    }
+    let journey = state
+        .inner
+        .journey_index_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().map(|(_, index)| index.clone()));
+    let Some(journey) = journey else {
+        stats.reason = "journey_index_not_built";
+        return live_trace::PublishedSeed { events, stats };
+    };
+    let mut sessions: Vec<subscriber_journey::JourneySession> =
+        pseudonyms.iter().flat_map(|pseudonym| journey.sessions(pseudonym)).collect();
+    sessions.sort_by(|a, b| {
+        (a.anchor_capture_id.as_str(), a.first_packet_number, a.session_id.as_str())
+            .cmp(&(b.anchor_capture_id.as_str(), b.first_packet_number, b.session_id.as_str()))
+    });
+    sessions.dedup_by(|a, b| a.session_id == b.session_id);
+    stats.consulted = true;
+    stats.sessions_found = sessions.len() as u64;
+    if sessions.len() > PUBLISHED_SEED_MAX_SESSIONS {
+        stats.bounded = true;
+        sessions.drain(..sessions.len() - PUBLISHED_SEED_MAX_SESSIONS);
+    }
+    let mut reason = "ok";
+    for session in &sessions {
+        if events.len() >= PUBLISHED_SEED_MAX_EVENTS {
+            stats.bounded = true;
+            break;
+        }
+        // Sessions des jeux publiés seulement (continu, dérivé) ; le jeu de
+        // référence statique n'est pas relu ici.
+        let Some((dataset_id, flow)) = live_flow_for(state, &session.session_id) else {
+            continue;
+        };
+        let Some(root) = state.inner.capture_manager.dataset_root(&dataset_id) else {
+            continue;
+        };
+        let bundle = state.inner.compact_index_registry.ensure_tracking(&root);
+        spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
+        if !bundle.all_ready() {
+            reason = "compact_index_building";
+            continue;
+        }
+        let room = PUBLISHED_SEED_MAX_EVENTS - events.len();
+        let mut ids: Vec<String> = flow.events.iter().map(|event| event.event_id.clone()).collect();
+        if ids.len() > room {
+            stats.bounded = true;
+            ids.truncate(room);
+        }
+        let wanted: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        let scoped = read_time_patch::scoped_index_from_compact(
+            &bundle,
+            &wanted,
+            &state.inner.read_time_patch_counters,
+        );
+        for id in &ids {
+            if let Some(event) = scoped.get(id).and_then(live_trace::normalized_event_from_json) {
+                events.push(event);
+            }
+        }
+        stats.sessions_used += 1;
+    }
+    events.sort_by(|a, b| {
+        let seq = |event: &event_schema::NormalizedEvent| {
+            event.packet_references.first().map(|p| p.packet_number).unwrap_or(u64::MAX)
+        };
+        a.capture_id.cmp(&b.capture_id).then_with(|| seq(a).cmp(&seq(b)))
+    });
+    events.dedup_by(|a, b| a.event_id == b.event_id);
+    stats.events = events.len() as u64;
+    stats.reason = reason;
+    live_trace::PublishedSeed { events, stats }
+}
+
 fn apply_read_time_patch(
     state: &AppState,
     items: &mut Vec<Value>,
@@ -19534,6 +19649,114 @@ mod tests {
             })
             .unwrap();
         (state, capture_root, source)
+    }
+
+    /// 2.21.176 (volet B) — le VRAI résolveur de l'API sur un jeu RÉELLEMENT
+    /// publié : import continu des captures N2 et N4 du jeu de référence,
+    /// index de parcours construit, puis `resolve_published_seed` sur le
+    /// pseudonyme de l'abonné. Il doit rendre ses events — dont le PFCP qui
+    /// porte l'IP de l'UE (IE 93) — par l'index compact, dans ses bornes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_resolver_reads_the_subscriber_links_from_a_published_n2_n4_dataset_2_21_176() {
+        use live_probe::{ContinuousImportConfig, CONTINUOUS_CAPTURE_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let label = "published-seed-resolver-2-21-176";
+        let capture_root = temporary_directory(&format!("{label}-root"));
+        let source = temporary_directory(&format!("{label}-source"));
+        let mut closures = fs::OpenOptions::new().create(true).append(true).open(source.join("capture-rotation.jsonl")).unwrap();
+        for plane in ["N2", "N4"] {
+            fs::create_dir_all(source.join(plane)).unwrap();
+            fs::copy(
+                workspace.join(format!("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/{plane}.pcapng")),
+                source.join(format!("{plane}/segment-0001.pcapng")),
+            )
+            .unwrap();
+            let lower = plane.to_ascii_lowercase();
+            writeln!(
+                closures,
+                r#"{{"timestamp":"2026-11-06T00:00:00Z","interface":"br-oiran-{lower}","plane":"{lower}","exit_code":0,"packets_captured":0,"packets_dropped":0}}"#
+            )
+            .unwrap();
+        }
+        drop(closures);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let manager = CaptureManager::with_pseudonym_key_path(capture_root.clone(), false, capture_root.join(".oiran-pseudonym.key")).unwrap();
+        let mut config = test_config(workspace, label);
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        config.continuous_import_enabled = true;
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+        state
+            .inner
+            .capture_manager
+            .start_continuous_import(ContinuousImportConfig {
+                scan_interval: std::time::Duration::from_millis(200),
+                stable_age: std::time::Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 8,
+                ..ContinuousImportConfig::bounded(source.clone())
+            })
+            .unwrap();
+        let waiting = state.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_2_21_164(|| {
+                waiting
+                    .inner
+                    .capture_manager
+                    .datasets()
+                    .iter()
+                    .any(|dataset| !dataset.session_ids.is_empty())
+                    && waiting
+                        .inner
+                        .capture_manager
+                        .get(CONTINUOUS_CAPTURE_ID)
+                        .is_some_and(|job| job.metrics.pending_segments == 0 && job.metrics.last_ingested_epoch_ms.is_some())
+            })
+        })
+        .await
+        .unwrap();
+        state.inner.capture_manager.stop(CONTINUOUS_CAPTURE_ID, "operator").ok();
+        // Sans index de parcours en cache : non consulté, jamais reconstruit ici.
+        let cold = resolve_published_seed(&state, &["psn-anything".to_string()]);
+        assert!(!cold.stats.consulted, "{:?}", cold.stats);
+        assert_eq!(cold.stats.reason, "journey_index_not_built");
+        let journey = cached_journey_index(&state);
+        let subscriber = journey
+            .subscribers()
+            .into_iter()
+            .find(|record| record.session_count > 0)
+            .expect("un abonné dans le jeu publié")
+            .subscriber_pseudonym;
+        let resolving = state.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let resolved = resolve_published_seed(&resolving, &[subscriber.clone()]);
+                if resolved.stats.reason != "compact_index_building" || std::time::Instant::now() > deadline {
+                    return resolved;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+        .await
+        .unwrap();
+        let stats = &resolved.stats;
+        assert!(stats.consulted, "{stats:?}");
+        assert_eq!(stats.reason, "ok", "{stats:?}");
+        assert!(stats.sessions_found >= 1 && stats.sessions_used >= 1, "{stats:?}");
+        assert!(stats.sessions_used as usize <= PUBLISHED_SEED_MAX_SESSIONS);
+        assert!(stats.events > 0 && resolved.events.len() as u64 == stats.events, "{stats:?}");
+        assert!(resolved.events.len() <= PUBLISHED_SEED_MAX_EVENTS);
+        assert!(
+            resolved.events.iter().any(|event| event.protocol.as_str() == "PFCP"
+                && event.information_elements.iter().any(|ie| ie.id == Some(93))),
+            "le PFCP publié qui porte l'IP de l'UE (IE 93) est rendu"
+        );
+        assert!(resolved.events.iter().any(|event| event.protocol.as_str() == "NGAP"), "le N2 publié est rendu");
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(capture_root).ok();
     }
 
     fn wait_2_21_164(mut done: impl FnMut() -> bool) {
