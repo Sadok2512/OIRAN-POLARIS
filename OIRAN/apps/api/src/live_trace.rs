@@ -13118,6 +13118,106 @@ mod tests {
         assert!(context["pdu_sessions"]["values"].as_array().is_some_and(|v| !v.is_empty()), "{context}");
     }
 
+    /// 2.21.171 — instantané de TOUT ce qu'un message peut muter dans une
+    /// trace : état technique (identifiants UE, tunnels, SEID, IP UE, clés de
+    /// rattachement), contexte UE, et tous les compteurs de la trace sauf
+    /// `duplicates_dropped` (le seul qui DOIT bouger sur un doublon).
+    fn trace_snapshot_2_21_171(state: &TraceState) -> Value {
+        fn sorted<T: std::fmt::Debug>(items: impl IntoIterator<Item = T>) -> Vec<String> {
+            let mut out: Vec<String> = items.into_iter().map(|item| format!("{item:?}")).collect();
+            out.sort();
+            out
+        }
+        let mut trace = serde_json::to_value(&state.trace).unwrap();
+        // Exclus, et déclarés : les compteurs d'ENTRÉE, qui comptent ce qui
+        // arrive (doublons compris) et non l'état de la trace —
+        // `duplicates_dropped`, `live_events_since_open`, et par flux
+        // `seen`, `attached` (messages qui correspondent à l'abonné, avant
+        // dédoublonnage) et les mesures de retard horodatées.
+        if let Some(object) = trace.as_object_mut() {
+            object.remove("duplicates_dropped");
+            object.remove("live_events_since_open");
+            if let Some(feed) = object.get_mut("feed").and_then(Value::as_object_mut) {
+                for counters in feed.values_mut().filter_map(Value::as_object_mut) {
+                    for field in ["seen", "attached", "last_event_lag_ms", "last_event_timestamp_ns", "last_event_timestamp_s", "max_event_lag_ms"] {
+                        counters.remove(field);
+                    }
+                }
+            }
+        }
+        json!({
+            "ue_ids": sorted(&state.ue_ids),
+            "sm_context_sessions": sorted(&state.sm_context_sessions),
+            "tunnel_teids": sorted(&state.tunnel_teids),
+            "tunnel_endpoints": sorted(&state.tunnel_endpoints),
+            "session_tunnels": sorted(state.session_tunnels.iter().map(|(k, v)| (k, sorted(v)))),
+            "core_tunnel_endpoints": sorted(&state.core_tunnel_endpoints),
+            "seid_tunnels": sorted(state.seid_tunnels.iter().map(|(k, v)| (k, sorted(v)))),
+            "seids": sorted(&state.seids),
+            "seid_endpoints": sorted(&state.seid_endpoints),
+            "ue_ips": sorted(&state.ue_ips),
+            "ue_ip_keys": sorted(state.ue_ip_keys.iter().map(|(k, v)| (k, sorted(v)))),
+            "match_keys": sorted(state.match_keys.iter()),
+            "ue_context": state.ue_context.payload(),
+            "trace": trace,
+        })
+    }
+
+    /// 2.21.171 (refus ANR1 #10 7142383874, ordre cœur #9 7142465934) — le
+    /// rejeu EXACT de chaque message déjà rattaché ne mute rien : ni l'état
+    /// technique (un `Registration Request` re-servi passait par
+    /// `forget_technical_state` avant le dédoublonnage), ni le contexte UE,
+    /// ni aucun compteur (`fresh_registrations` avançait). Seul
+    /// `duplicates_dropped` progresse, d'autant de messages.
+    #[test]
+    fn replaying_every_message_mutates_nothing_but_the_duplicate_counter_2_21_171() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N2"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events.sort_by_key(|event| event.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        assert!(
+            events.iter().any(|e| e.message_name.ends_with("Registration Request")),
+            "précondition : la capture contient un Registration Request"
+        );
+        let pseudonym = events
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let r = trace_on(&pseudonym);
+        for event in &events {
+            r.route_normalized(event);
+        }
+        let (before, dropped_before, fresh_before) = {
+            let traces = r.traces.lock().unwrap();
+            let state = &traces["t"];
+            (trace_snapshot_2_21_171(state), state.trace.duplicates_dropped, state.trace.fresh_registrations)
+        };
+        assert!(fresh_before >= 1, "précondition : l'enregistrement neuf a été compté");
+        assert!(
+            before["ue_ids"].as_array().is_some_and(|ids| !ids.is_empty()),
+            "précondition : un état technique à effacer : {before}"
+        );
+        // Rejeu exact, message par message, en vérifiant après CHACUN.
+        for event in &events {
+            r.route_normalized(event);
+            let traces = r.traces.lock().unwrap();
+            let after = trace_snapshot_2_21_171(&traces["t"]);
+            assert_eq!(after, before, "le rejeu de « {} » a muté la trace", event.message_name);
+        }
+        let traces = r.traces.lock().unwrap();
+        let state = &traces["t"];
+        assert!(state.trace.duplicates_dropped > dropped_before, "les doublons sont comptés comme tels");
+        assert_eq!(state.trace.fresh_registrations, fresh_before);
+    }
+
     /// 2.21.169 (refus ANR1) — sur `Deregistration Accept`, la session PDU
     /// passée à RELEASED porte la preuve de l'event de désinscription, pas
     /// celle de l'ancien établissement.
