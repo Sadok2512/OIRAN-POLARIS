@@ -13574,7 +13574,54 @@ fn count_pcap_records_bytes(bytes: &[u8]) -> u64 {
     count
 }
 
+/// 2.21.166 (ordre cœur #9 7135745591) — table adresse → fonction réseau,
+/// partagée par l'import continu, la trace live (amorçage et lecteur) et le
+/// patch à la lecture. Valeurs par défaut : celles du lab, dont les neuf
+/// adresses SBI relevées par ANR2 (#10 7135362409). Surcharge sans
+/// recompilation : `OIRAN_ENDPOINT_MAP_FILE` désigne un fichier « adresse
+/// fonction » (une paire par ligne, `#` pour un commentaire) dont les
+/// entrées s'ajoutent aux valeurs par défaut ou les remplacent. Lue une
+/// fois par processus ; un fichier illisible ou une ligne invalide est
+/// journalisé et ignoré, jamais silencieux.
 pub fn endpoint_map() -> HashMap<String, String> {
+    static MAP: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = default_endpoint_map();
+        if let Some(path) = std::env::var_os("OIRAN_ENDPOINT_MAP_FILE") {
+            match fs::read_to_string(&path) {
+                Ok(text) => {
+                    let (entries, rejected_lines) = parse_endpoint_map(&text);
+                    let loaded = entries.len();
+                    map.extend(entries);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "ENDPOINT_MAP_LOADED",
+                            "path": std::path::Path::new(&path).display().to_string(),
+                            "entries_loaded": loaded,
+                            "rejected_lines": rejected_lines,
+                            "entries_total": map.len(),
+                        })
+                    );
+                }
+                Err(error) => eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "ENDPOINT_MAP_FILE_UNREADABLE",
+                        "path": std::path::Path::new(&path).display().to_string(),
+                        "error": error.to_string(),
+                        "fallback": "default_endpoint_map",
+                    })
+                ),
+            }
+        }
+        map
+    })
+    .clone()
+}
+
+/// 2.21.166 — valeurs par défaut de la table : plan 10.77.x du lab.
+pub fn default_endpoint_map() -> HashMap<String, String> {
     [
         ("10.77.21.20", "gNB"),
         ("10.77.21.11", "AMF"),
@@ -13589,10 +13636,52 @@ pub fn endpoint_map() -> HashMap<String, String> {
         ("10.77.12.10", "MME"),
         ("10.77.12.12", "SGW-C"),
         ("10.77.12.14", "PGW-C"),
+        // 2.21.166 — SBI, relevé ANR2 #10 7135362409 (config Open5GS montée
+        // et segment SBI du 24/11). Pas de SCP sur ce lab.
+        ("10.77.20.10", "NRF"),
+        ("10.77.20.11", "AMF"),
+        ("10.77.20.12", "SMF"),
+        ("10.77.20.14", "AUSF"),
+        ("10.77.20.15", "UDM"),
+        ("10.77.20.16", "UDR"),
+        ("10.77.20.17", "PCF"),
+        ("10.77.20.18", "NSSF"),
+        ("10.77.20.19", "BSF"),
     ]
     .into_iter()
     .map(|(address, function)| (address.into(), function.into()))
     .collect()
+}
+
+/// 2.21.166 — analyse d'un fichier de table : `adresse fonction` par ligne
+/// (séparateur blanc ou `=`), `#` commente la fin de ligne. Une adresse
+/// doit être une IPv4 ou IPv6 valide, une fonction 1 à 32 caractères
+/// `[A-Za-z0-9-]`. Rend les paires valides et le nombre de lignes rejetées.
+pub fn parse_endpoint_map(text: &str) -> (Vec<(String, String)>, usize) {
+    let mut entries = Vec::new();
+    let mut rejected = 0usize;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line
+            .split(|c: char| c.is_whitespace() || c == '=')
+            .filter(|part| !part.is_empty());
+        let (Some(address), Some(function), None) = (parts.next(), parts.next(), parts.next()) else {
+            rejected += 1;
+            continue;
+        };
+        let address_ok = address.parse::<std::net::IpAddr>().is_ok();
+        let function_ok = (1..=32).contains(&function.len())
+            && function.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if address_ok && function_ok {
+            entries.push((address.to_string(), function.to_string()));
+        } else {
+            rejected += 1;
+        }
+    }
+    (entries, rejected)
 }
 
 fn epoch_ms() -> u64 {
@@ -24279,5 +24368,45 @@ Content-Length: 0\r\n\
             "et il déclenche toujours la contre-pression"
         );
         fs::remove_dir_all(base).ok();
+    }
+
+    /// 2.21.166 (ordre cœur #9 7135745591) — les neuf adresses SBI relevées
+    /// par ANR2 (#10 7135362409) sont dans la table, à côté des valeurs
+    /// d'avant, et un fichier de surcharge s'analyse sans silence.
+    #[test]
+    fn endpoint_map_names_the_lab_sbi_functions_2_21_166() {
+        let map = endpoint_map();
+        for (address, function) in [
+            ("10.77.20.10", "NRF"),
+            ("10.77.20.11", "AMF"),
+            ("10.77.20.12", "SMF"),
+            ("10.77.20.14", "AUSF"),
+            ("10.77.20.15", "UDM"),
+            ("10.77.20.16", "UDR"),
+            ("10.77.20.17", "PCF"),
+            ("10.77.20.18", "NSSF"),
+            ("10.77.20.19", "BSF"),
+            ("10.77.23.12", "SMF"),
+            ("10.77.23.13", "UPF"),
+            ("10.77.21.11", "AMF"),
+        ] {
+            assert_eq!(map.get(address).map(String::as_str), Some(function), "{address}");
+        }
+    }
+
+    #[test]
+    fn endpoint_map_file_parsing_keeps_valid_pairs_and_counts_rejects_2_21_166() {
+        let (entries, rejected) = parse_endpoint_map(
+            "# lab\n10.77.20.10 NRF\n10.77.20.20=SCP   # commentaire\n\n2001:db8::1 UPF\nnot-an-ip AMF\n10.0.0.1\n10.0.0.2 AMF extra\n10.0.0.3 bad/name\n",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                ("10.77.20.10".to_string(), "NRF".to_string()),
+                ("10.77.20.20".to_string(), "SCP".to_string()),
+                ("2001:db8::1".to_string(), "UPF".to_string()),
+            ]
+        );
+        assert_eq!(rejected, 4);
     }
 }

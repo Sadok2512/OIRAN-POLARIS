@@ -713,13 +713,28 @@ fn patch_one(
     // Publier les nouvelles valeurs si elles diffèrent (idempotent).
     let mut patched_fields: Vec<&'static str> = Vec::new();
 
+    // 2.21.166 (ordre cœur #9 7135745591, piège relevé dans l'audit #9
+    // 7134885713) — un participant déjà nommé (à la publication, ou par la
+    // trace live) n'est plus remplacé par « Unknown endpoint » quand l'event
+    // brut ne sait pas mieux. Le patch ne fait que nommer ou corriger un nom
+    // par un autre nom, jamais effacer.
+    let known_participant = |field: &str| -> Option<String> {
+        event
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != "Unknown endpoint")
+            .map(str::to_string)
+    };
     let new_source = source
         .network_function
         .clone()
+        .or_else(|| known_participant("source_participant"))
         .unwrap_or_else(|| "Unknown endpoint".to_string());
     let new_destination = destination
         .network_function
         .clone()
+        .or_else(|| known_participant("destination_participant"))
         .unwrap_or_else(|| "Unknown endpoint".to_string());
 
     let event_object = match event.as_object_mut() {
@@ -3057,6 +3072,43 @@ mod tests {
         }
         assert!(events[1]["message_name"].as_str().unwrap().starts_with("UnsupportedSbiOperation"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.21.166 (ordre cœur #9 7135745591) — un participant nommé à la
+    /// publication SURVIT au patch à la lecture quand l'event brut ne sait
+    /// pas mieux (adresses absentes de la table, pas de fonction réseau).
+    /// Avant 2.21.166 il était remplacé par « Unknown endpoint ».
+    #[test]
+    fn a_named_participant_survives_the_read_time_patch_2_21_166() {
+        let raw = |event_id: &str| {
+            json!({
+                "event_id": event_id,
+                "interface": "SBI",
+                "protocol": "SBI",
+                "message_name": "POST /nudm-sdm/v2",
+                "source_endpoint": {"address": "192.0.2.10", "port": 7777},
+                "destination_endpoint": {"address": "192.0.2.11", "port": 7777},
+            })
+        };
+        let mut by_event_id = HashMap::new();
+        by_event_id.insert("evt-named".to_string(), raw("evt-named"));
+        by_event_id.insert("evt-unknown".to_string(), raw("evt-unknown"));
+        let index = RawEventIndex::from_map(by_event_id);
+        let mut events = vec![
+            json!({"event_id": "evt-named", "interface": "SBI", "protocol": "SBI",
+                   "message_name": "POST /nudm-sdm/v2",
+                   "source_participant": "AMF", "destination_participant": "UDM"}),
+            json!({"event_id": "evt-unknown", "interface": "SBI", "protocol": "SBI",
+                   "message_name": "POST /nudm-sdm/v2",
+                   "source_participant": "Unknown endpoint", "destination_participant": ""}),
+        ];
+        let counters = Arc::new(PatchCounters::new());
+        patch_flow_events(&mut events, &index, &HashMap::new(), &counters);
+        assert_eq!(events[0]["source_participant"], "AMF", "{}", events[0]);
+        assert_eq!(events[0]["destination_participant"], "UDM", "{}", events[0]);
+        // Sans nom connu nulle part, « Unknown endpoint » reste, comptable.
+        assert_eq!(events[1]["source_participant"], "Unknown endpoint");
+        assert_eq!(events[1]["destination_participant"], "Unknown endpoint");
     }
 }
 
