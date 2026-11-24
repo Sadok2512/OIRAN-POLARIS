@@ -844,6 +844,22 @@ pub(crate) struct UeContext {
     pdu_sessions: BTreeMap<String, Proven>,
     /// Procédures terminées depuis la dernière émission (phase `complete`).
     pending_completions: Vec<(&'static str, String)>,
+    /// 2.21.169 (refus ANR1 #10 7137693482) — messages déjà observés, par la
+    /// MÊME clé que le dédoublonnage des messages `(capture_id, paquet,
+    /// event_id)`. Un doublon ne mute plus le contexte (ni phase `complete`
+    /// répétée, ni remise à zéro), en direct comme à l'amorçage. Borné.
+    observed: std::collections::HashSet<(String, u64, String)>,
+    observed_order: std::collections::VecDeque<(String, u64, String)>,
+}
+
+/// 2.21.169 — borne de l'ensemble des messages observés par le contexte UE.
+const UE_CONTEXT_OBSERVED_MAX: usize = 16_384;
+
+/// 2.21.169 — la clé de dédoublonnage d'un message, identique à celle de
+/// `state.seen` (`(capture_id, numéro de paquet, event_id)`).
+fn message_dedupe_key(event: &event_schema::NormalizedEvent) -> (String, u64, String) {
+    let packet = event.packet_references.first().map(|p| p.packet_number).unwrap_or(0);
+    (event.capture_id.clone(), packet, event.event_id.clone())
 }
 
 /// `clé=valeur` d'une valeur d'IE décodée (`a=1,b=2`).
@@ -861,9 +877,25 @@ impl UeContext {
         true
     }
 
-    /// Apprend d'un event rattaché à la trace. Rend `true` si le contexte a
-    /// changé.
+    /// 2.21.169 — ce message a-t-il déjà été observé par le contexte ?
+    fn has_observed(&self, event: &event_schema::NormalizedEvent) -> bool {
+        self.observed.contains(&message_dedupe_key(event))
+    }
+
+    /// Apprend d'un event rattaché à la trace, UNE fois par message
+    /// (2.21.169). Rend `true` si le contexte a changé.
     fn observe(&mut self, event: &event_schema::NormalizedEvent) -> bool {
+        let key = message_dedupe_key(event);
+        if self.observed.contains(&key) {
+            return false;
+        }
+        if self.observed_order.len() >= UE_CONTEXT_OBSERVED_MAX {
+            if let Some(oldest) = self.observed_order.pop_front() {
+                self.observed.remove(&oldest);
+            }
+        }
+        self.observed.insert(key.clone());
+        self.observed_order.push_back(key);
         let before = self.clone();
         let id = event.event_id.as_str();
         for ie in &event.information_elements {
@@ -927,13 +959,29 @@ impl UeContext {
                 Self::set(&mut self.registration, "DEREGISTERED", id, "Deregistration Accept");
                 Self::set(&mut self.rm_state, "RM-DEREGISTERED", id, "Deregistration Accept");
                 Self::set(&mut self.cm_state, "CM-IDLE", id, "Deregistration Accept");
+                // 2.21.169 (refus ANR1) — la preuve ENTIÈRE est remplacée :
+                // l'état RELEASED est attribué à l'event qui le prouve, pas
+                // à l'ancien event d'établissement.
                 for session in self.pdu_sessions.values_mut() {
-                    session.value = "RELEASED".into();
+                    *session = Proven {
+                        value: "RELEASED".into(),
+                        event_id: id.to_string(),
+                        source: "Deregistration Accept",
+                    };
                 }
             }
             _ => {}
         }
-        *self != before
+        self.plmn != before.plmn
+            || self.nr_cell_id != before.nr_cell_id
+            || self.tac != before.tac
+            || self.five_qi != before.five_qi
+            || self.qfi != before.qfi
+            || self.registration != before.registration
+            || self.rm_state != before.rm_state
+            || self.cm_state != before.cm_state
+            || self.pdu_sessions != before.pdu_sessions
+            || self.pending_completions != before.pending_completions
     }
 
     /// Charge utile `ue_context` : chaque champ porte sa valeur et sa preuve,
@@ -2821,7 +2869,15 @@ impl LiveTraceRegistry {
                 forget_technical_state(state);
                 // 2.21.167 — un enregistrement neuf repart de zéro, comme
                 // l'état technique : le contexte d'avant est périmé.
-                state.ue_context = UeContext::default();
+                // 2.21.169 — sauf si ce message a déjà été observé : un
+                // doublon ne remet plus le contexte à zéro.
+                if !state.ue_context.has_observed(event) {
+                    let observed = std::mem::take(&mut state.ue_context.observed);
+                    let observed_order = std::mem::take(&mut state.ue_context.observed_order);
+                    state.ue_context = UeContext::default();
+                    state.ue_context.observed = observed;
+                    state.ue_context.observed_order = observed_order;
+                }
                 if !seed_only {
                     state.trace.fresh_registrations =
                         state.trace.fresh_registrations.saturating_add(1);
@@ -12995,5 +13051,96 @@ mod tests {
         let state = state(u64::MAX, false, vec![]);
         let serialized = serde_json::to_value(&state.trace).unwrap();
         assert!(serialized.get("identity_in_clear").is_none(), "{serialized}");
+    }
+
+    /// 2.21.169 (refus ANR1 #10 7137693482) — un message DOUBLONNÉ ne mute
+    /// plus le contexte UE. Sur la capture N2 réelle : le
+    /// `PDUSessionResourceSetupResponse` re-servi ne produit pas de seconde
+    /// phase `complete`, et le `Registration Request` re-servi ne remet pas
+    /// le contexte à zéro. Avant : seconde phase `complete` et contexte effacé.
+    #[test]
+    fn duplicate_messages_do_not_mutate_the_ue_context_2_21_169() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&source, "N2"), &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events.sort_by_key(|event| event.packet_references.first().map(|p| p.packet_number).unwrap_or(0));
+        let pseudonym = events
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let r = trace_on(&pseudonym);
+        for event in &events {
+            r.route_normalized(event);
+        }
+        let setup_response = events
+            .iter()
+            .find(|e| e.message_name == "PDUSessionResourceSetupResponse")
+            .cloned()
+            .unwrap();
+        let registration_request = events
+            .iter()
+            .find(|e| e.message_name.ends_with("Registration Request"))
+            .cloned()
+            .unwrap();
+        // Doublons, puis un message distinct qui déclenche l'émission.
+        r.route_normalized(&setup_response);
+        r.route_normalized(&registration_request);
+        let mut distinct = events
+            .iter()
+            .find(|e| e.message_name == "InitialContextSetupResponse")
+            .cloned()
+            .unwrap();
+        distinct.event_id = format!("{}-distinct", distinct.event_id);
+        if let Some(reference) = distinct.packet_references.first_mut() {
+            reference.packet_number += 1_000;
+        }
+        r.route_normalized(&distinct);
+        let traces = r.traces.lock().unwrap();
+        let state = &traces["t"];
+        let pdu_completions = state
+            .events
+            .iter()
+            .filter(|e| e.kind == "procedure" && e.payload["phase"] == "complete")
+            .filter(|e| e.payload["procedure"] == "PDU Session Establishment")
+            .count();
+        assert_eq!(pdu_completions, 1, "une seule phase complete pour la session PDU");
+        let context = state.ue_context.payload();
+        assert_eq!(context["registration"]["value"], "REGISTERED", "doublon sans remise à zéro : {context}");
+        assert!(context["plmn"]["value"].is_string(), "{context}");
+        assert!(context["pdu_sessions"]["values"].as_array().is_some_and(|v| !v.is_empty()), "{context}");
+    }
+
+    /// 2.21.169 (refus ANR1) — sur `Deregistration Accept`, la session PDU
+    /// passée à RELEASED porte la preuve de l'event de désinscription, pas
+    /// celle de l'ancien établissement.
+    #[test]
+    fn a_released_session_carries_the_proof_of_the_releasing_event_2_21_169() {
+        use event_schema::{Direction, Protocol};
+        let mut context = UeContext::default();
+        let setup = mk_event(
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupResponse",
+            10,
+            Direction::Unknown,
+            vec![],
+            vec![("PDUSessionResourceSetupListSURes", "nested_list_sha256=x,pdu_session_id=1")],
+        );
+        let deregistration = mk_event("N2", Protocol::Nas5gs, "Deregistration Accept", 20, Direction::Unknown, vec![], vec![]);
+        context.observe(&setup);
+        context.observe(&deregistration);
+        let payload = context.payload();
+        let session = &payload["pdu_sessions"]["values"][0];
+        assert_eq!(session["state"], "RELEASED", "{payload}");
+        assert_eq!(session["event_id"], deregistration.event_id.as_str(), "{payload}");
+        assert_eq!(session["source"], "Deregistration Accept", "{payload}");
     }
 }

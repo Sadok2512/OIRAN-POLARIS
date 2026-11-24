@@ -1,5 +1,24 @@
 # Changelog
 
+## oiran-api 2.21.169 — 2026-11-24 — contexte UE : un doublon ne mute plus rien ; la libération porte sa propre preuve
+
+Ordre cœur #9 7138374225 (priorité 2), refus ANR1 #10 7137693482 de 2.21.167. Base : `2cf1b4d` (2.21.167).
+
+### Défauts
+- **Mutation avant dédoublonnage.** `UeContext::observe` était appelé au rattachement, **avant** le dédoublonnage des messages (`state.seen`). Un `PDUSessionResourceSetupResponse` re-servi remettait une complétion en attente, et le message distinct suivant émettait une **seconde** phase `complete`. Un `Registration Request` re-servi remettait le contexte à zéro avant d'être rejeté.
+- **Preuve de libération fausse.** Sur `Deregistration Accept`, seule la valeur passait à `RELEASED` : la session gardait l'`event_id` et la source de son **établissement**.
+
+### Corrigé
+- **Observation une seule fois par message**, par la **même clé** que le dédoublonnage des messages, `(capture_id, numéro de paquet, event_id)`. `UeContext` garde un ensemble borné à 16 384 clés (FIFO). Un doublon ne mute plus rien, **en direct comme à l'amorçage** : l'amorçage passe par le même `observe`, donc il est idempotent lui aussi.
+- **La remise à zéro** sur un enregistrement neuf n'a lieu que si le message n'a **pas** déjà été observé. Elle conserve l'ensemble des clés observées.
+- **La libération remplace la preuve entière** : valeur `RELEASED`, `event_id` de la désinscription, source `Deregistration Accept`.
+
+### Gardes, rouges sur `2cf1b4d`
+- `duplicate_messages_do_not_mutate_the_ue_context_2_21_169`, sur la capture N2 réelle. Le `PDUSessionResourceSetupResponse` et le `Registration Request` sont re-servis, puis un message distinct suit. Résultat : une seule phase `complete` pour la session PDU, et le contexte (`REGISTERED`, PLMN, session) intact. **Rouge avant** : deux phases `complete`.
+- `a_released_session_carries_the_proof_of_the_releasing_event_2_21_169` : la preuve de `RELEASED` est l'event de désinscription. **Rouge avant** : l'event d'établissement.
+
+Preuve rejouable : branche **`proof/oiran-2.21.169-guards-on-2cf1b4d`** (`ce21258`), qui n'ajoute que ces deux gardes.
+
 ## oiran-api 2.21.167 — 2026-11-24 — panneau UE Info : exposer ce qui est déjà décodé
 
 Ordre cœur #9 7135745591 (lot 2 sur 3), audit #9 7135657542. Base : `9c8979c` (2.21.165, en production). Lot indépendant de 2.21.166 ; la fusion des trois lots est demandée par le cœur.
