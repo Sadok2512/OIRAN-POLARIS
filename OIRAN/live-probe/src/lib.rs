@@ -14241,6 +14241,39 @@ mod tests {
         root
     }
 
+    /// 0.6.46 — le garde du garde : un test qui PANIQUE ne laisse pas son
+    /// répertoire temporaire. Le répertoire est réellement peuplé (fichier
+    /// creux de 1 Gio, comme les tests `work_bytes_*`) avant la panique.
+    #[test]
+    fn a_panicking_test_leaves_no_temporary_root_behind_0_6_46() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let recorder = seen.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let base = temporary_root("panic-guard-0-6-46");
+            fs::create_dir_all(base.join("pcap")).unwrap();
+            let file = fs::File::create(base.join("pcap/N3.pcap-0000000000000000.pcapng")).unwrap();
+            file.set_len(1_073_741_824).unwrap();
+            *recorder.lock().unwrap() = Some(base.to_path_buf());
+            assert!(base.join("pcap").is_dir(), "précondition : répertoire peuplé");
+            panic!("panique volontaire du garde 0.6.46");
+        }));
+        assert!(outcome.is_err(), "précondition : le corps a bien paniqué");
+        let path = seen.lock().unwrap().clone().expect("chemin enregistré avant la panique");
+        assert!(!path.exists(), "le répertoire temporaire a survécu à la panique : {}", path.display());
+    }
+
+    /// 0.6.46 — et un test qui RÉUSSIT ne le laisse pas non plus.
+    #[test]
+    fn a_passing_test_leaves_no_temporary_root_behind_0_6_46() {
+        let path = {
+            let base = temporary_root("pass-guard-0-6-46");
+            fs::write(base.join("marker"), b"x").unwrap();
+            base.to_path_buf()
+        };
+        assert!(!path.exists(), "le répertoire temporaire a survécu au test : {}", path.display());
+    }
+
+
     /// Global allocator shim that tracks the net live bytes and the all-time
     /// peak since the last reset. Used by the memory-bounded test for the
     /// `source_segments` → ingestion loop so we can prove the fix on a
