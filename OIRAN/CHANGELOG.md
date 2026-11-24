@@ -1,5 +1,24 @@
 # Changelog
 
+## oiran-api 2.21.162 — 2026-11-24 — lecteur live : le segment courant se choisit par date de fichier
+
+Upgrade **patch**, sans déploiement. Base `9cb2ca7` : les gardes d'ANR1 (`test/anr1-221159-rank-live-reader-guards`), posés sur 2.21.159 `5a75ba2`, PASS d'ANR1. Branche `fix/oiran-2.21.162-live-reader-newest-by-mtime`. Ce lot ne contient pas 2.21.160 et 2.21.161 (cible IMSI), qui sont sur leur propre branche.
+
+**Défaut** (garde d'ANR1, déclaré OUVERT et non bloquant depuis 2.21.158) : `reader_pass` triait les segments de chaque plan **par nom**, puis désignait le dernier comme segment courant et l'avant-dernier comme précédent. Après un redémarrage de sonde qui renumérote (`99 → 1`), le lecteur suivait l'ancien segment 99 et ignorait le segment 3, plus récent : son trafic n'était pas lu en live.
+
+**Correctif** : le tri se fait par **date de modification**, puis par nom à date égale, comme l'amorçage depuis 2.21.158. Un segment dont la date est illisible passe pour le plus ancien.
+
+**Coût, déclaré** : 2.21.130 avait quitté le tri par date pour économiser les `stat`. Avec 8 093 segments, une passe sans trafic prenait 643 ms au lab. Ici, une lecture des métadonnées par segment n'a lieu **qu'aux passes où le répertoire a changé** (création ou suppression d'un segment) **ou au rattrapage**. Les autres passes réutilisent la liste `recent` sans relire le répertoire, comme avant. **Je ne l'ai pas mesuré au lab.**
+
+**Ce qui ne change pas** : la détection des segments disparus, les sessions de reprise et le cache `recent`.
+
+Tests : les deux gardes d'ANR1 sont repris **tels quels** (commit `9cb2ca7`, non modifié).
+
+| Garde | Sur `9cb2ca7` (arbre séparé) | Sur 2.21.162 |
+|---|---|---|
+| `anr1_live_reader_follows_newest_segment_after_ring_renumbering_guard` | **échoue** : « le lecteur a suivi le segment 99 par nom » | passe |
+| `anr1_seed_order_is_rank_then_capture_id_then_seq_never_timestamp_guard` | passe (2.21.159) | passe |
+
 ## oiran-api 2.21.161 — 2026-11-23 — trace par clé IMSI : la dérivation part des chiffres canoniques
 
 Upgrade **patch**, sans déploiement. Au-dessus de 2.21.160 `c5ee672`, base `f419573`. Branche `fix/oiran-2.21.161-imsi-trace-canonical-digits`. Fait suite au REFUS d'ANR1 sur 2.21.160 (#10 7117296485).
@@ -47,6 +66,41 @@ Tests, par le routeur réel. Le run est celui du banc à cinq abonnés (`multi-i
 | `msisdn_imei_and_tmsi_traces_gain_no_derived_pseudonym_2_21_160` | passe | passe : aucun pseudonyme, `armed: true` |
 
 Patch de la preuve : `~/oiran-polaris-archives/2.21.160-preuve-echec-avant-sur-f419573.patch`.
+## oiran-api 2.21.159 — 2026-11-23 — amorçage de trace : ordre canonique (rang du segment, `capture_id`, `seq`), plus de tri par `ts`
+
+Upgrade **patch**, sans déploiement. Base `f419573` (2.21.158, en prod), branche `fix/oiran-2.21.159-seed-canonical-order`.
+- Arbitrage du cœur : #9 7113598180 (voie B-local).
+- Accord : #9 7116145380 (deux sources de rang choisies à l'exécution, une seule par passe).
+- Garde d'ANR1 : #10 7111105810.
+
+**Défaut** (garde d'ANR1) : `learn_history` triait l'historique d'amorçage par `(timestamp.seconds, timestamp.nanoseconds)`, ce qui compare des `ts` d'une capture à l'autre. Avec des horodatages contraires à l'ordre réel, une libération était apprise avant l'établissement, et le tunnel restait vivant.
+
+**Correctif (B-local)** :
+- `learn_ranked_history` trie, de façon stable, par **(rang du segment, `capture_id`, numéro de paquet)**. Le rang est porté **à côté** de l'event, jamais dedans.
+- `learn_history`, appelé sans rang, trie par `(capture_id, seq)`.
+- **`capture_id` est inchangé partout** : pas d'effet sur le contrôle du décodeur (`sha256:` + 64 hex), ni sur l'`event_id`, qui en dérive et reste identique entre amorçage et lecteur live, ni sur le SSE.
+- **Le rang est une date de FICHIER**, jamais la date de modification, qui avance pendant l'écriture, et jamais le `ts` d'un paquet. **Une seule source par passe** :
+  - la **date de création** (`metadata.created()`) si **tous** les segments retenus la rendent ;
+  - sinon, l'**horodatage de début de segment** du nom dumpcap (`…_<numéro>_<AAAAMMJJhhmmss>.pcapng`).
+- Un segment dont la source retenue ne donne pas de rang passe en tête du tri et il est compté. Les deux sources ne sont jamais mélangées dans un même tri.
+- Nouveaux compteurs de l'amorçage : `seed.rank_source_created`, `seed.rank_source_name`, `seed.rank_source_missing`. Le relevé d'ANR2 sur la date de création se lit donc au lab sur la première trace ouverte.
+
+**Ordre entre plans de même rang : arbitraire, et déclaré.** Des segments de plans différents qui tournent ensemble peuvent avoir le même rang ou des rangs voisins. Entre eux, l'ordre est celui des `capture_id` (haché du chemin), sans rapport avec la chronologie. Le test du cas dur de 2.21.134 montre qu'il n'y a **aucune perte** sur ce scénario, dans les deux ordres possibles (ci-dessous). Ce n'est pas une preuve générale.
+
+**`events_scanned` varie avec l'ordre sans que l'état appris change.** Sur la capture réelle N2+N4, il valait 45 avec le tri par `ts` contre 39 ou 43 avec le tri par capture, pour le même état appris (#9 7113385359). Ce compteur inclut les reprises de PFCP rejetés : une baisse n'est pas une perte d'events.
+
+**Sources de `ts` restantes**, listées sans être corrigées (décision du cœur) : les fenêtres d'âge `AFTER_THE_FACT_MAX_AGE_S` (rattachement après coup et reprise des PFCP rejetés). Ce sont des fenêtres, pas des tris.
+
+Tests :
+
+| Test | Sur `f419573` (arbre séparé) | Sur 2.21.159 |
+|---|---|---|
+| `ring_seed_history_uses_capture_id_and_seq_never_timestamp_2_21_157` (ANR1, repris **tel quel**) | **échoue** : tunnel vivant | passe, **par le départage `capture_id`** (rangs égaux). Son adaptation au rang revient à ANR1 |
+| `the_seed_follows_the_segment_rank_not_the_timestamp_nor_the_capture_id_2_21_159` : `ts` et `capture_id` contraires au rang | sa forme sans rang **échoue** : tunnel vivant | passe : l'apprentissage suit le rang |
+| `reused_tunnels_across_planes_of_the_same_rank_lose_nothing_against_the_timestamp_order_2_21_159` : cas dur de 2.21.134, N2 et N4 de même rang | sans objet (référence = tri par `ts`) | passe : débit, G-PDU rattachés, établissements refusés et messages routés **identiques** à la référence, que N2 ou N4 passe en premier |
+| `both_rank_sources_give_the_same_order_on_a_nominal_ring_2_21_159` : redémarrage au milieu | sans objet | passe : même ordre par les deux sources ; une passe compte 3 segments en date de création, 0 par le nom, 0 sans rang |
+
+Patch de la preuve : `~/oiran-polaris-archives/2.21.159-preuve-echec-avant-sur-f419573.patch`.
 
 ## oiran-api 2.21.158 — 2026-11-23 — amorçage de trace : les « 3 derniers segments » se choisissent par date de fichier
 
