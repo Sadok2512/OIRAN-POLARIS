@@ -1,5 +1,39 @@
 # Changelog
 
+## Fusion déployable oiran-api 2.21.165 — 2026-11-24 — ordre cœur #9 7131640379
+
+Une seule mise en production, sur `8640a0d` (fusion 2.21.163, en production), réunit : 2.21.164 reportée sur `8640a0d` (`/health` véridique ; delta relu PASS par ANR1 sur `452406e`, #10 7129528652) et 2.21.165 (`/sessions` lit `commit_seq` une fois par requête). Versions finales : oiran-api 2.21.165, live-probe 0.6.42. Le détail de chaque lot suit.
+
+## oiran-api 2.21.165 — 2026-11-24 — `/sessions` ne relit plus 199 fois le même fichier de 3 octets
+
+Ordre cœur #9 7131640379 (lot 2). Base : la fusion déployée `8640a0d`. Au lab, `/sessions` a mis 7,18 s sous trafic data, contre 0,48 s au repos (ANR2, #10).
+
+### Cause, mesurée
+Pour N sessions, `GET /sessions` lisait `commit_seq.txt` une fois par jeu dans `journey_signature`, PUIS une fois par session dans `cached_live_list_row_base` (N + 1 ouvertures), et faisait deux `statx` par callflow (un dans chaque fonction).
+
+### Correctif
+`SourceReads` : mémo des deux lectures de signature (`commit_seq` par jeu, `len`/`mtime` par callflow) pour la durée d'UNE requête. `sessions_blocking` en crée un et le passe à `journey_signature_with`, `cached_journey_index_with` et `cached_live_list_row_with` / `cached_live_list_row_base_with`. Les fonctions d'origine gardent leur signature et créent leur propre mémo : tous les autres appelants (préchauffage, `/sessions/filter`, `/subscribers`, détail…) se comportent exactement comme avant.
+
+**Sémantique d'invalidation inchangée.** L'instantané pris en tête de requête ne peut être que plus ancien que le contenu lu ensuite. Une ligne reconstruite est alors rangée sous l'ancienne signature, et la requête suivante, qui voit la nouvelle, la reconstruit. Jamais l'inverse : servir du périmé sous une signature plus récente que son contenu. Les deux `statx` par callflow tombent à un, par le même raisonnement.
+
+### Mesure (`strace -f`, fil qui sert la requête chaude, 198 sessions)
+| | `8640a0d` | 2.21.165 |
+|---|---|---|
+| ouvertures de `commit_seq.txt` | 199 | 1 |
+| `statx` sur les callflows | 396 | 198 |
+| appels d'E/S fichier (`statx`, `read`, `openat`, `close`, `readlink`) | 1 402 | 214 |
+| tous les appels du fil | 1 672 | 485 |
+
+Les 268 `mprotect` (allocateur, pas le disque) sont identiques avant et après.
+
+### Gardes
+`sessions_reads_commit_seq_once_per_request_2_21_165` : 198 sessions, ouvertures réelles comptées par inotify (`IN_OPEN` et `IN_CLOSE_NOWRITE` : inotify fusionne les événements identiques consécutifs non lus, et un `IN_OPEN` seul sous-compte). Sur `8640a0d` : **199** ouvertures, froide comme chaude ; échec. Après : **1**.
+`a_commit_seq_bump_alone_still_rebuilds_the_rows_2_21_165` : en régime établi, une republication qui ne change QUE `commit_seq` reconstruit toutes les lignes, puis le cache se reforme. Garde de non-régression : il passe avant et après.
+Patch de preuve : `~/oiran-polaris-archives/2.21.165-preuve-echec-avant-sur-8640a0d.patch`.
+
+### Hors périmètre, déclaré
+`/subscribers`, le détail et `/sessions/filter` (chemin sans génération) appellent toujours `cached_live_list_row` session par session, avec un mémo neuf à chaque appel : ils gardent N + 1 lectures. Ce lot ne vise que `/sessions`, comme ordonné.
+
 ## oiran-api 2.21.164 — 2026-11-24 — `/health` dit la vérité sur le pipeline, sans changer `status`
 
 **Base : la fusion déployée `8640a0d` (oiran-api 2.21.163, live-probe 0.6.42).** Ordre cœur #9 7131598395. La première écriture (`452406e`) reposait sur `f419573` : la poser aurait retiré les lots 2.21.159 à 2.21.163 de la production. ANR1 l'avait relue PASS et en avait refusé le déploiement direct (#10 7129528652). Le code de `/health` et les gardes sont repris tels quels, par `cherry-pick`.
