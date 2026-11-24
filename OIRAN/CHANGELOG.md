@@ -1,5 +1,23 @@
 # Changelog
 
+## oiran-api 2.21.164 — 2026-11-24 — `/health` dit la vérité sur le pipeline, sans changer `status`
+
+Ordre cœur #9 7127905530, point 1 ; proposition #9 7117606449, point 5. Du 23/11 13:33 au 24/11 07:28, `/health` a répondu `healthy` alors qu'aucune publication n'aboutissait (contre-pression : `archive/` comptée dans `work_bytes`) et que `/sessions/filter` répondait 503 `SESSION_FILTER_CACHE_WARMING`.
+
+### Ajouté à la réponse de `/health`
+- `continuous_import` : `present`, `state` (`CAPTURING`, `BLOCKED`, …), `blocked`, `error` (ex. `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`), `stop_reason` (ex. `BOUNDED_STORAGE_FULL`), `last_publication_epoch_ms` et `last_publication_age_ms` (dernière publication aboutie : `last_ingested_epoch_ms`, posé juste après `manifest-swap-complete` et persisté dans `job.json`), `pending_segments`, `closed_not_ingested_segments`, `open_segments`, `owned_bytes_percent`, `queue_occupancy_percent`. Les compteurs d'attente sont écrits à chaque cycle **avant** le contrôle de contre-pression, donc aussi pendant un blocage. `{"present": false}` sans import continu.
+- `sessions_filter_generation` : `enforced`, `ready`, `generation`, `commit_seq`, `ready_since_ms`, `age_ms`, `session_count`. `enforced=true` avec `ready=false` est exactement l'état où `/sessions/filter` répond 503.
+
+Lectures en mémoire seulement : mutex `jobs` le temps d'un clonage, `generation_slot` en lecture. Aucun accès disque, aucun `journey_signature`.
+
+### Ce qui ne change pas
+`status` reste `"healthy"` : p900 et d'éventuelles sondes le lisent ; le seuil d'un `degraded` se décide avec Sadok. Un garde le vérifie.
+
+### Gardes
+`health_shows_a_blocked_import_and_no_ready_generation_2_21_164` : vrai import continu, vraie contre-pression (répertoire de travail en vol de 512 Mio pour un budget de 128 Mio, compté aussi après 2.21.163), API en mode production (préchauffage installé, amorçage différé). `/health` montre `BLOCKED`, l'erreur, la raison, aucune publication, des segments en attente, `enforced=true` et `ready=false` ; `/sessions/filter` répond bien 503 au même moment ; `status` vaut `healthy`.
+`health_shows_the_last_publication_and_the_ready_generation_2_21_164` : publication réelle et préchauffage par l'observateur ; `/health` montre l'âge de la dernière publication et la génération READY avec son âge.
+Les deux échouent sur `f419573` (champs absents) ; patch : `~/oiran-polaris-archives/2.21.164-preuve-echec-avant-sur-f419573.patch`.
+
 ## oiran-api 2.21.158 — 2026-11-23 — amorçage de trace : les « 3 derniers segments » se choisissent par date de fichier
 
 Upgrade **patch**, sans déploiement. Base `23d613d` (2.21.157, PASS d'ANR1 #10 7111397052), branche `fix/oiran-2.21.158-seed-segments-by-mtime`.
