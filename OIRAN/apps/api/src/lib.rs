@@ -3753,6 +3753,62 @@ fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> V
 /// seulement si la signature change (sessions ajoutées, fichier callflow
 /// modifié : un `stat` par fichier, aucune lecture).
 fn journey_signature(state: &AppState) -> Vec<String> {
+    journey_signature_with(state, &SourceReads::new(state))
+}
+
+/// 2.21.165 (ordre cœur #9 7131640379) — lectures disque des signatures de
+/// sources, mémorisées pour la durée d'UNE requête. Avant 2.21.165, `GET
+/// /sessions` relisait `commit_seq.txt` une fois par jeu dans
+/// `journey_signature` PUIS une fois par session dans
+/// `cached_live_list_row_base` (N + 1 ouvertures pour N sessions), et faisait
+/// deux `statx` par callflow. Une seule valeur par clé et par requête : la
+/// requête voit un instantané cohérent des sources. Sémantique de
+/// l'invalidation inchangée : un instantané pris en tête de requête ne peut
+/// être que PLUS ANCIEN que le contenu lu ensuite ; une ligne reconstruite
+/// est alors rangée sous l'ancienne signature et la requête suivante, qui
+/// voit la nouvelle, la reconstruit. Jamais l'inverse (servir du périmé sous
+/// une signature plus récente que son contenu). Mono-fil : `/sessions`
+/// s'exécute tout entier dans un seul `spawn_blocking`.
+pub(crate) struct SourceReads<'a> {
+    state: &'a AppState,
+    commit_seq: std::cell::RefCell<HashMap<String, u64>>,
+    callflow_files: std::cell::RefCell<HashMap<(String, String), Option<(u64, u128)>>>,
+}
+
+impl<'a> SourceReads<'a> {
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self {
+            state,
+            commit_seq: Default::default(),
+            callflow_files: Default::default(),
+        }
+    }
+
+    fn commit_seq(&self, dataset_id: &str) -> u64 {
+        if let Some(value) = self.commit_seq.borrow().get(dataset_id) {
+            return *value;
+        }
+        let value = self.state.inner.capture_manager.dataset_commit_seq(dataset_id);
+        self.commit_seq.borrow_mut().insert(dataset_id.to_string(), value);
+        value
+    }
+
+    fn callflow_file_signature(&self, dataset_id: &str, session_id: &str) -> Option<(u64, u128)> {
+        let key = (dataset_id.to_string(), session_id.to_string());
+        if let Some(value) = self.callflow_files.borrow().get(&key) {
+            return *value;
+        }
+        let value = self
+            .state
+            .inner
+            .capture_manager
+            .callflow_file_signature(dataset_id, session_id);
+        self.callflow_files.borrow_mut().insert(key, value);
+        value
+    }
+}
+
+fn journey_signature_with(state: &AppState, reads: &SourceReads) -> Vec<String> {
     let mut signature = vec![format!("static:{}", state.inner.flows.len())];
     for dataset in state.inner.capture_manager.datasets() {
         // 2.21.74 — le commit logique fait partie de la génération. Taille
@@ -3762,16 +3818,11 @@ fn journey_signature(state: &AppState) -> Vec<String> {
         signature.push(format!(
             "dataset:{}:commit={}:sessions={}",
             dataset.dataset_id,
-            state
-                .inner
-                .capture_manager
-                .dataset_commit_seq(&dataset.dataset_id),
+            reads.commit_seq(&dataset.dataset_id),
             dataset.session_ids.len()
         ));
         for session_id in &dataset.session_ids {
-            let file = state
-                .inner
-                .capture_manager
+            let file = reads
                 .callflow_file_signature(&dataset.dataset_id, session_id)
                 .map(|(len, mtime)| format!("{len}:{mtime}"))
                 .unwrap_or_default();
@@ -3898,9 +3949,16 @@ fn session_filter_cache_is_ready(state: &AppState) -> bool {
 }
 
 fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
+    cached_journey_index_with(state, &SourceReads::new(state))
+}
+
+fn cached_journey_index_with(
+    state: &AppState,
+    reads: &SourceReads,
+) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
     let audit = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
     let started = std::time::Instant::now();
-    let signature = journey_signature(state);
+    let signature = journey_signature_with(state, reads);
     if let Ok(cache) = state.inner.journey_index_cache.lock() {
         if let Some((cached, index)) = cache.as_ref() {
             if *cached == signature {
@@ -5133,13 +5191,24 @@ fn cached_live_list_row(
     session_id: &String,
     journey_index: &subscriber_journey::JourneyIndex,
 ) -> Option<Value> {
+    cached_live_list_row_with(state, &SourceReads::new(state), dataset, session_id, journey_index)
+}
+
+fn cached_live_list_row_with(
+    state: &AppState,
+    reads: &SourceReads,
+    dataset: &live_probe::LiveDataset,
+    session_id: &String,
+    journey_index: &subscriber_journey::JourneyIndex,
+) -> Option<Value> {
     // 2.18.12 (audit perf) — la ligne de liste d'une session
     // continuous (lecture + parse du call flow, patch à la lecture,
     // identités tirées des events) est mise en cache, invalidée par
     // la signature du fichier callflow. Seuls le parcours abonné et
     // le vault (qui évoluent sans que le fichier change) sont
     // recalculés à chaque requête.
-    let (mut summary, events_identities) = cached_live_list_row_base(state, dataset, session_id)?;
+    let (mut summary, events_identities) =
+        cached_live_list_row_base_with(state, reads, dataset, session_id)?;
     decorate_subscriber_summary_by_id(&mut summary, session_id, &journey_index);
     if let Some(object) = summary.as_object_mut() {
         let mut identities = identity_summary_for_session(&state, session_id);
@@ -5164,20 +5233,25 @@ fn cached_live_list_row_base(
     dataset: &live_probe::LiveDataset,
     session_id: &String,
 ) -> Option<(Value, Value)> {
+    cached_live_list_row_base_with(state, &SourceReads::new(state), dataset, session_id)
+}
+
+fn cached_live_list_row_base_with(
+    state: &AppState,
+    reads: &SourceReads,
+    dataset: &live_probe::LiveDataset,
+    session_id: &String,
+) -> Option<(Value, Value)> {
     let audit = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
     let started = std::time::Instant::now();
     let key = (dataset.dataset_id.clone(), session_id.clone());
     // 2.21.3 — signature étendue avec `commit_seq` (live-probe 0.6.1).
     // Un bump de la publication incrémentale invalide la ligne même
     // si le mtime filesystem n'a pas encore été propagé (tmpfs/NFS).
-    let file_sig = state
-        .inner
-        .capture_manager
-        .callflow_file_signature(&dataset.dataset_id, session_id);
-    let commit_seq = state
-        .inner
-        .capture_manager
-        .dataset_commit_seq(&dataset.dataset_id);
+    // 2.21.165 — lus via le mémo de la requête : `/sessions` partage ces
+    // deux valeurs avec `journey_signature` au lieu de les relire.
+    let file_sig = reads.callflow_file_signature(&dataset.dataset_id, session_id);
+    let commit_seq = reads.commit_seq(&dataset.dataset_id);
     let signature: Option<ListRowCacheSignature> = file_sig.map(|(len, mtime)| (len, mtime, commit_seq));
     let cached = signature.and_then(|signature| {
         state.inner.list_row_cache.lock().ok().and_then(|cache| {
@@ -5254,7 +5328,11 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
 /// opérations (fs::read callflow, parse JSON) restent sur un thread du
 /// pool bloquant tokio.
 fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
-    let journey_index = cached_journey_index(state);
+    // 2.21.165 — un seul mémo pour toute la requête : `commit_seq` lu une
+    // fois par jeu, un `statx` par callflow (au lieu de N + 1 lectures et
+    // 2N `statx`).
+    let reads = SourceReads::new(state);
+    let journey_index = cached_journey_index_with(state, &reads);
     let mut unique = state
         .inner
         .flows
@@ -5275,7 +5353,8 @@ fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
         .collect::<BTreeMap<_, _>>();
     for dataset in state.inner.capture_manager.datasets() {
         for session_id in &dataset.session_ids {
-            let Some(summary) = cached_live_list_row(state, &dataset, session_id, &journey_index)
+            let Some(summary) =
+                cached_live_list_row_with(state, &reads, &dataset, session_id, &journey_index)
             else {
                 continue;
             };
@@ -18483,6 +18562,202 @@ mod tests {
             events_out.len(),
             "chaque event a sa propre clé après backfill"
         );
+    }
+
+    /// 2.21.165 — compte les ouvertures RÉELLES d'un fichier (événements
+    /// noyau `IN_OPEN` d'inotify), indépendamment du code qui l'ouvre.
+    struct OpenCounter2_21_165 {
+        fd: i32,
+    }
+
+    impl OpenCounter2_21_165 {
+        fn watch(path: &FsPath) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0, "inotify_init1");
+            let mut bytes = path.as_os_str().as_bytes().to_vec();
+            bytes.push(0);
+            // `IN_CLOSE_NOWRITE` aussi : inotify FUSIONNE les événements
+            // identiques consécutifs non lus, si bien que N ouvertures
+            // d'affilée ne donneraient qu'un `IN_OPEN`. Avec la fermeture,
+            // la file alterne ouverture / fermeture et rien n'est fusionné.
+            let watch = unsafe {
+                libc::inotify_add_watch(
+                    fd,
+                    bytes.as_ptr() as *const libc::c_char,
+                    libc::IN_OPEN | libc::IN_CLOSE_NOWRITE,
+                )
+            };
+            assert!(watch >= 0, "inotify_add_watch {}", path.display());
+            Self { fd }
+        }
+
+        /// Vide la file et rend le nombre d'ouvertures vues depuis le dernier appel.
+        fn drain(&self) -> usize {
+            let header = std::mem::size_of::<libc::inotify_event>();
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut opens = 0;
+            loop {
+                let read = unsafe { libc::read(self.fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len()) };
+                if read <= 0 {
+                    break;
+                }
+                let mut offset = 0usize;
+                while offset + header <= read as usize {
+                    let event = unsafe { &*(buffer.as_ptr().add(offset) as *const libc::inotify_event) };
+                    if event.mask & libc::IN_OPEN != 0 {
+                        opens += 1;
+                    }
+                    offset += header + event.len as usize;
+                }
+            }
+            opens
+        }
+    }
+
+    impl Drop for OpenCounter2_21_165 {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.fd) };
+        }
+    }
+
+    /// 2.21.165 — jet continu de `count` sessions, construit comme celui du
+    /// test 2.21.154 (callflows, events, découverte), avec `commit_seq.txt`.
+    fn continuous_sessions_fixture_2_21_165(label: &str, count: usize) -> (AppState, PathBuf, PathBuf) {
+        use live_probe::{CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let mut config = test_config(workspace, label);
+        config.reference_dataset_enabled = false;
+        let capture_root = temporary_directory(label);
+        config.capture_root = capture_root.clone();
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(dataset_dir.join("callflows")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let mut flow: Value =
+            serde_json::from_slice(&fs::read(workspace.join("OIRAN_5G_E2E_CALLFLOW.json")).unwrap()).unwrap();
+        let session_ids: Vec<String> = (0..count).map(|i| format!("5g-session-seq{i:011}")).collect();
+        for id in &session_ids {
+            flow["session_id"] = Value::from(id.clone());
+            fs::write(dataset_dir.join("callflows").join(format!("{id}.json")), serde_json::to_vec(&flow).unwrap()).unwrap();
+            fs::write(dataset_dir.join("callflows").join(format!("{id}.html")), b"<html></html>").unwrap();
+        }
+        let mut events = std::io::BufWriter::new(fs::File::create(dataset_dir.join("oiran_events.jsonl")).unwrap());
+        for i in 0..8usize {
+            writeln!(events, "{}", json!({
+                "event_id": format!("evt-{i:04}"), "capture_id": "sha256:stub", "capture_point_id": "N2",
+                "interface": "N2", "protocol": "NGAP", "message_name": "InitialUEMessage",
+                "decoding_status": "DECODED", "decoder_name": "stub", "decoder_version": "0",
+                "raw_payload_reference": "sha256:stub", "direction": "RAN_TO_CORE",
+                "source_endpoint": {"address": "10.0.0.1", "network_function": "gNB"},
+                "destination_endpoint": {"address": "10.0.0.2", "network_function": "AMF"},
+                "session_identifiers": [], "information_elements": [],
+                "packet_references": [{"source_file": "/captures/CONT/N2.pcapng", "packet_number": (i + 1) as u64,
+                    "byte_offset": 0, "interface_id": 0, "captured_length": 10, "original_length": 10}],
+                "errors": [],
+                "timestamp": {"seconds": 1_792_872_462_i64 + i as i64, "nanoseconds": 0_u64,
+                    "raw_ticks": 1_792_872_462_000_000_000_u64, "resolution_base": 10, "resolution_exponent": 9,
+                    "display": "1792872462.000000000Z"}
+            })).unwrap();
+        }
+        drop(events);
+        let commit_seq_path = dataset_dir.join(live_probe::commit_seq::COMMIT_SEQ_FILENAME);
+        fs::write(&commit_seq_path, b"7\n").unwrap();
+        let manifest = json!({
+            "dataset_id": CONTINUOUS_DATASET_ID, "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
+            "event_count": 8, "session_ids": session_ids, "decode_reports": {}, "checksums": {},
+            "state": "PUBLISHED",
+            "discovery": {
+                "ue_contexts": [], "pfcp_sessions": [], "gtpu_tunnels": [], "procedures": [],
+                "pdu_sessions": session_ids.iter().map(|id| json!({
+                    "session_id": id, "ue_context_id": "uectx-seq", "pdu_session_id": "1", "dnn": null, "snssai": null,
+                    "state": "ESTABLISHED", "establishment_timestamp_ns": 0, "release_timestamp_ns": null,
+                    "interfaces": ["N2"], "correlation_status": "CORRELATED", "event_ids": []
+                })).collect::<Vec<_>>(),
+                "background_event_ids": [], "unmatched_event_ids": [], "duplicate_observations": [], "event_accounting": {}
+            },
+            "capture_started_epoch_ms": null, "last_packet_epoch_ms": null, "fresh_packet_count": 0,
+            "active_ue_ips": [], "active_pdu_contexts": [],
+        });
+        fs::write(dataset_dir.join("dataset_manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let state = AppState::load(config).unwrap();
+        state.inner.capture_manager.recover_continuous_dataset_from_disk(&base).expect("hydrate");
+        (state, capture_root, commit_seq_path)
+    }
+
+    /// 2.21.165 (ordre cœur #9 7131640379) — `GET /sessions` sur un jeu
+    /// continu de 198 sessions (la taille du lab) : `commit_seq.txt` doit être
+    /// ouvert UNE fois par requête, pas N + 1 fois. Mesuré sur la requête en
+    /// régime établi (caches de lignes et d'index chauds), comme au lab.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_reads_commit_seq_once_per_request_2_21_165() {
+        const SESSIONS: usize = 198;
+        let (state, capture_root, commit_seq_path) = continuous_sessions_fixture_2_21_165("sessions-commit-seq-2-21-165", SESSIONS);
+        let app = router(state.clone(), None);
+        let counter = OpenCounter2_21_165::watch(&commit_seq_path);
+        // Requête froide : construit l'index et les lignes (hors mesure).
+        let cold = app.clone().oneshot(req("/api/v1/sessions?page_size=100", false)).await.unwrap();
+        assert_eq!(cold.status(), StatusCode::OK);
+        let cold_body = json_body(cold).await;
+        let cold_opens = counter.drain();
+        // Requête en régime établi : celle que mesure le lab. Les deux
+        // marqueurs bornent la requête dans une trace `strace -f`.
+        eprintln!("STRACE_MARK_WARM_BEGIN_2_21_165");
+        let warm = app.clone().oneshot(req("/api/v1/sessions?page_size=100", false)).await.unwrap();
+        assert_eq!(warm.status(), StatusCode::OK);
+        let warm_body = json_body(warm).await;
+        eprintln!("STRACE_MARK_WARM_END_2_21_165");
+        let warm_opens = counter.drain();
+        println!("COMMIT_SEQ_OPENS_2_21_165 sessions={SESSIONS} cold={cold_opens} warm={warm_opens}");
+        assert_eq!(warm_opens, 1, "commit_seq.txt ouvert une fois par requête, pas N + 1 = {}", SESSIONS + 1);
+        assert_eq!(cold_opens, 1, "même borne sur la requête froide");
+        assert_eq!(warm_body["meta"]["total"], SESSIONS, "les 198 sessions sont listées");
+        assert_eq!(cold_body["meta"]["total"], SESSIONS);
+        let ids = |body: &Value| -> Vec<String> {
+            body["data"].as_array().unwrap().iter().map(|row| row["session_id"].as_str().unwrap_or_default().to_string()).collect()
+        };
+        assert_eq!(ids(&cold_body), ids(&warm_body), "mêmes sessions, même ordre");
+        fs::remove_dir_all(capture_root).ok();
+    }
+
+    /// 2.21.165 — la sémantique d'invalidation est intacte : une
+    /// republication qui ne change QUE `commit_seq` (taille et `mtime` du
+    /// callflow identiques) reconstruit toujours les lignes à la requête
+    /// suivante.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_seq_bump_alone_still_rebuilds_the_rows_2_21_165() {
+        let (state, capture_root, commit_seq_path) = continuous_sessions_fixture_2_21_165("sessions-commit-seq-bump-2-21-165", 3);
+        let app = router(state.clone(), None);
+        let builds = || state.inner.list_row_cache_builds.load(std::sync::atomic::Ordering::SeqCst);
+        // Régime établi d'abord : une ligne n'entre en cache qu'une fois le
+        // patch à la lecture construit (asynchrone, `read_time_patch.status`
+        // « build… » = non cacheable). On répète jusqu'à deux requêtes
+        // consécutives sans aucune reconstruction.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut quiet = 0;
+        while quiet < 2 {
+            assert!(std::time::Instant::now() < deadline, "caches jamais stabilisés");
+            let before = builds();
+            let _ = json_body(app.clone().oneshot(req("/api/v1/sessions", false)).await.unwrap()).await;
+            if builds() == before {
+                quiet += 1;
+            } else {
+                quiet = 0;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        let steady = builds();
+        // Republication sub-seconde : seul `commit_seq` change (taille et
+        // `mtime` des callflows identiques).
+        fs::write(&commit_seq_path, b"8\n").unwrap();
+        let _ = json_body(app.clone().oneshot(req("/api/v1/sessions", false)).await.unwrap()).await;
+        assert_eq!(builds(), steady + 3, "chaque ligne reconstruite après le seul changement de commit_seq");
+        // Et le cache se reforme sous la nouvelle signature.
+        let _ = json_body(app.clone().oneshot(req("/api/v1/sessions", false)).await.unwrap()).await;
+        assert_eq!(builds(), steady + 3, "aucune reconstruction de plus une fois la nouvelle signature en cache");
+        fs::remove_dir_all(capture_root).ok();
     }
 }
 
