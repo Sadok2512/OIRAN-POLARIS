@@ -12860,7 +12860,15 @@ fn work_bytes(base: &Path) -> u64 {
             }
             continue;
         }
+        // 2.21.163 (ordre cœur #9 7126590830, audit #9 7117606449) —
+        // `archive/` est le dépôt de la rétention (`archive_stale_captures`,
+        // `dataset_dir.parent().join("archive")`) : déjà traité, jamais relu
+        // par l'import. Le compter dans le budget « en vol » bloquait toute
+        // publication dès qu'il dépassait `max_owned_bytes - 64 Mio` (lab,
+        // 23/11 13:33 → 24/11 07:28). Même erreur de catégorie que
+        // `.dataset.rollback.*` en 2.11.3.
         let excluded = name == "dataset"
+            || name == "archive"
             || name == ".dataset-next"
             || name == ".dataset-previous"
             || name.starts_with(".dataset-gc-")
@@ -24198,5 +24206,78 @@ Content-Length: 0\r\n\
         assert!(read(r#"{"subscriber_alias_pairs": "illisible"}"#).is_empty());
         assert!(read(r#"{"subscriber_alias_pairs": [["psn-a"]]}"#).is_empty());
         assert_eq!(read(r#"{"subscriber_alias_pairs": [["psn-a","psn-b"]]}"#).len(), 1);
+    }
+    /// 2.21.163 (ordre cœur #9 7126590830) — garde 1, rouge d'abord : un
+    /// `archive/` de rétention plus gros que `max_owned_bytes` sous la base
+    /// d'import, un segment N2 de taille normale ; la publication ABOUTIT.
+    /// Avant : `work_bytes` comptait `archive/`, chaque candidat déclenchait
+    /// `CONTINUOUS_SEGMENT_PENDING_BACKPRESSURE` et rien n'était publié.
+    #[test]
+    fn a_retention_archive_larger_than_the_budget_does_not_block_publication_2_21_163() {
+        let root = temporary_root("archive-budget-root");
+        let source = temporary_root("archive-budget-source");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        fs::create_dir_all(source.join("N2")).unwrap();
+        fs::copy(fixture.join("N2.pcapng"), source.join("N2/segment-0001.pcapng")).unwrap();
+        write_rotation_closures(&source, "N2", 1);
+        let max_owned_bytes: u64 = 128 * 1024 * 1024;
+        // Segment d'archive creux de 512 Mio : quatre fois le budget.
+        let segment = root.join(CONTINUOUS_CAPTURE_ID).join("archive/1795440270-3e265bf021040abf");
+        fs::create_dir_all(&segment).unwrap();
+        fs::File::create(segment.join("events.jsonl")).unwrap().set_len(512 * 1024 * 1024).unwrap();
+        assert!(directory_size(&root.join(CONTINUOUS_CAPTURE_ID).join("archive")) > max_owned_bytes, "précondition");
+        thread::sleep(Duration::from_millis(250));
+        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 8,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
+            })
+            .unwrap();
+        wait_for(|| manager.get(CONTINUOUS_CAPTURE_ID).is_some_and(|job| job.metrics.segments_ingested >= 1));
+        let job = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+        assert_ne!(job.error.as_deref(), Some("CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT"));
+        assert!(root.join(CONTINUOUS_CAPTURE_ID).join("dataset/dataset_manifest.json").exists(), "un jeu publié");
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// 2.21.163 — garde 2 : on a corrigé une catégorie, on n'a pas ouvert
+    /// les vannes. `archive/` (petit ou grand) n'entre plus dans le budget ;
+    /// un répertoire qui n'est ni `dataset*`, ni rollback, ni `archive`, ni
+    /// `pcap` (donc potentiellement du travail en vol) y entre toujours, et
+    /// un tel répertoire trop gros déclenche toujours la contre-pression.
+    #[test]
+    fn only_the_archive_leaves_the_import_budget_2_21_163() {
+        let base = temporary_root("archive-budget-unit");
+        fs::create_dir_all(base.join("dataset")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let empty = work_bytes(&base);
+        let small_archive = base.join("archive/1-aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&small_archive).unwrap();
+        fs::write(small_archive.join("events.jsonl"), vec![0u8; 4096]).unwrap();
+        assert_eq!(work_bytes(&base), empty, "un petit archive/ ne change rien au budget");
+        fs::File::create(small_archive.join("big.jsonl")).unwrap().set_len(2 * 1024 * 1024 * 1024).unwrap();
+        assert_eq!(work_bytes(&base), empty, "un grand archive/ non plus");
+        let other = base.join("staging-inflight");
+        fs::create_dir_all(&other).unwrap();
+        fs::File::create(other.join("part")).unwrap().set_len(2 * 1024 * 1024 * 1024).unwrap();
+        let staging = work_bytes(&base);
+        assert!(staging >= 2 * 1024 * 1024 * 1024, "un autre répertoire reste compté : {staging}");
+        let max_owned_bytes: u64 = 1_140_850_688;
+        assert!(
+            staging + 538_356 + MAX_CONTINUOUS_DERIVED_BYTES > max_owned_bytes,
+            "et il déclenche toujours la contre-pression"
+        );
+        fs::remove_dir_all(base).ok();
     }
 }
