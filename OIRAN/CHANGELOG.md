@@ -1,5 +1,25 @@
 # Changelog
 
+## oiran-api 2.21.172 / live-probe 0.6.45 — 2026-11-24 — la signature des identités porte le commit logique, lu en mémoire
+
+Ordre cœur #9 7142465934, refus ANR1 #10 7142383874 de 2.21.170. Base : `5dbd3af` (2.21.170).
+
+### Défaut
+La source d'un `complete` (`identity_source_signature`) ne portait que `len:mtime` du callflow. Or `journey_signature_with` documente depuis 2.21.74 que taille et mtime peuvent rester identiques lors d'une republication sous la seconde, et ajoute pour cela `dataset_commit_seq`. Contre-exemple d'ANR1 : republication, même taille, même mtime, `commit_seq` nouveau. L'empreinte reconstruisait l'ancienne, la liste annonçait encore `complete` et aucune reprise n'était programmée.
+
+### Pourquoi il n'y était pas
+**Un oubli, pas un choix.** J'ai pris la signature du seul fichier (`callflow_file_signature`) sans reprendre la règle de `journey_signature_with`. Je n'avais pas écarté `commit_seq` pour éviter une lecture disque.
+
+### Corrigé, sans lecture disque sur les listes
+- **live-probe 0.6.45** : `CaptureManager` garde le `commit_seq` de chaque jeu **en mémoire**. Il le lit une fois quand le jeu entre au registre (`register_dataset`, `upsert_dataset`, donc une fois par publication), par le même chemin que `dataset_commit_seq`. `upsert_dataset` le fait sous la même garde que l'insertion du jeu. Nouvelle méthode `dataset_commit_seq_in_memory(dataset_id)`.
+- **oiran-api 2.21.172** : la signature devient `dataset_id:commit=<seq en mémoire>:len:mtime`. **Aucune ouverture de `commit_seq.txt` par ligne de liste** : le garde de 2.21.165 qui compte ces ouvertures par requête reste vert.
+- **Coût déclaré (inchangé depuis 2.21.170)** : un `statx` du callflow par ligne de liste, pour `len:mtime`, hors du mémo `SourceReads`.
+
+### Garde, rouge sur `5dbd3af`
+- `a_complete_status_does_not_survive_a_commit_only_republication_2_21_172`, sur le jeu continu (fixture 2.21.165) : `complete`, puis `commit_seq` 7 → 8 et republication par le chemin réel (`recover_continuous_dataset_from_disk` → `upsert_dataset`). Le callflow est **inchangé** (même taille et même mtime, vérifiés). La liste passe **immédiatement** à `deferred` / `source_changed`, puis revient à `complete` après la reprise.
+
+Preuve rejouable : branche `proof/oiran-2.21.172-guards-on-5dbd3af`.
+
 ## oiran-api 2.21.170 — 2026-11-24 — un statut `complete` ne survit plus à un changement de source ; borne `tshark` à 300 s
 
 Ordre cœur #9 7138374225 (priorité 3), refus ANR1 #10 7137693482 de 2.21.168. Base : `5b98f64` (2.21.168).

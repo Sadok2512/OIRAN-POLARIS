@@ -1778,6 +1778,12 @@ pub struct CaptureManager {
     policy: Policy,
     jobs: Arc<Mutex<BTreeMap<String, CaptureJob>>>,
     datasets: Arc<Mutex<BTreeMap<String, LiveDataset>>>,
+    /// 0.6.45 (OIRAN API 2.21.172, ordre cœur #9 7142465934) — `commit_seq`
+    /// de chaque jeu, lu UNE fois quand le jeu entre au registre
+    /// (`register_dataset` / `upsert_dataset`, donc une fois par
+    /// publication) et servi ensuite depuis la mémoire. Les lectures par
+    /// ligne de liste n'ouvrent jamais `commit_seq.txt`.
+    commit_seqs: Arc<Mutex<HashMap<String, u64>>>,
     sequence: Arc<AtomicU64>,
     continuous_stop: Arc<AtomicBool>,
     continuous_runtime_evidence: Arc<Mutex<Option<PathBuf>>>,
@@ -2296,6 +2302,7 @@ impl CaptureManager {
             policy: Policy::default(),
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
             datasets: Arc::new(Mutex::new(BTreeMap::new())),
+            commit_seqs: Arc::new(Mutex::new(HashMap::new())),
             sequence: Arc::new(AtomicU64::new(1)),
             continuous_stop: Arc::new(AtomicBool::new(false)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
@@ -8458,8 +8465,26 @@ impl CaptureManager {
             }
             return Ok(());
         }
-        datasets.insert(dataset.dataset_id.clone(), dataset);
+        let dataset_id = dataset.dataset_id.clone();
+        datasets.insert(dataset_id.clone(), dataset);
+        drop(datasets);
+        self.remember_commit_seq(&dataset_id);
         Ok(())
+    }
+
+    /// 0.6.45 — lit `commit_seq.txt` du jeu (même chemin que
+    /// `dataset_commit_seq`) et le garde en mémoire. Appelé à l'entrée au
+    /// registre seulement.
+    fn remember_commit_seq(&self, dataset_id: &str) {
+        let seq = self.dataset_commit_seq(dataset_id);
+        self.commit_seqs.lock().unwrap().insert(dataset_id.to_string(), seq);
+    }
+
+    /// 0.6.45 — `commit_seq` du jeu tel qu'à sa dernière entrée au
+    /// registre, sans aucune lecture disque. `None` si le jeu n'est pas au
+    /// registre.
+    pub fn dataset_commit_seq_in_memory(&self, dataset_id: &str) -> Option<u64> {
+        self.commit_seqs.lock().unwrap().get(dataset_id).copied()
     }
 
     fn upsert_dataset(&self, dataset: LiveDataset, dataset_dir: &Path) -> Result<(), String> {
@@ -8471,12 +8496,16 @@ impl CaptureManager {
         // l'ancienne génération READY, soit un 503, jamais la nouvelle avec
         // des caches incomplets.
         let _generation_transition = self.heavy_memory_enter();
+        let dataset_id = dataset.dataset_id.clone();
         {
             self.datasets
                 .lock()
                 .unwrap()
-                .insert(dataset.dataset_id.clone(), dataset);
+                .insert(dataset_id.clone(), dataset);
         }
+        // 0.6.45 — sous la même garde que l'insertion : le `commit_seq` en
+        // mémoire et le jeu servi changent ensemble.
+        self.remember_commit_seq(&dataset_id);
         let observer = self.dataset_publish_observer.lock().unwrap().clone();
         if let Some(observer) = observer {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer())).is_err() {
