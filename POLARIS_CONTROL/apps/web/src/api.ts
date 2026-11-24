@@ -31,6 +31,13 @@ export const maskSubscriberIdentity = (value:string|undefined|null) => {
   const digits = value.replace(/^imsi-/i,'');
   return /^\d{4,}$/.test(digits) ? `…${digits.slice(-4)}` : 'PROTECTED';
 };
+// 0.36.31 — interrupteur `POLARIS_IDENTITIES_IN_CLEAR` : l'API ne pose
+// `identities_in_clear: true` que s'il est ouvert. Sinon, le navigateur
+// remasque comme en 0.36.30 (défense en profondeur).
+export const displaySubscriberIdentity = (value:string|undefined|null, identitiesInClear:boolean) => {
+  if (identitiesInClear && value && /^\d{5,15}$/.test(value.replace(/^imsi-/i,''))) return value.replace(/^imsi-/i,'');
+  return maskSubscriberIdentity(value);
+};
 export const reportedState = (value:string|undefined|null) => value && value !== 'UNKNOWN' ? value : '-- (non rapporté par UERANSIM)';
 const safeRefusalCode=/^[A-Z][A-Z0-9_]{2,63}$/;
 const sensitiveDigitRun=/\d{5,}/;

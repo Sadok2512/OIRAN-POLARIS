@@ -2861,23 +2861,29 @@ impl SrsranRuntime for DockerSrsranRuntime {
 }
 
 fn sanitize_log_line_unbounded(line: &str) -> Option<String> {
+    sanitize_log_line_unbounded_with(line, crate::subscriber_provisioning::identities_in_clear())
+}
+
+/// 0.36.31 — `clear` (interrupteur `POLARIS_IDENTITIES_IN_CLEAR`) laisse
+/// passer les lignes qui ne portent QUE l'IMSI, le SUPI ou le MSISDN. Une
+/// ligne qui porte aussi un identifiant temporaire, l'IMEI ou du matériel
+/// d'authentification reste remplacée.
+fn sanitize_log_line_unbounded_with(line: &str, clear: bool) -> Option<String> {
     let lower = line.to_ascii_lowercase();
-    if [
-        "imsi",
-        "supi",
+    let subscriber_identity = ["imsi", "supi", "msisdn"];
+    let always_redacted = [
         "suci",
         "guti",
         "tmsi",
         "imei",
         "imeisv",
-        "msisdn",
         "opc",
         "auth key",
         "subscriber key",
         " ki=",
-    ]
-    .iter()
-    .any(|m| lower.contains(m))
+    ];
+    if always_redacted.iter().any(|m| lower.contains(m))
+        || (!clear && subscriber_identity.iter().any(|m| lower.contains(m)))
     {
         return Some("[REDACTED_SUBSCRIBER_MATERIAL]".into());
     }
@@ -3106,6 +3112,31 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;
+
+    /// 0.36.31 — interrupteur, famille C (journaux srsRAN), les deux côtés.
+    #[test]
+    fn identities_switch_family_c_srsran_log_lines_0_36_31() {
+        let identity = "nas: attach imsi=001010000000201 msisdn=15550000201";
+        assert_eq!(
+            sanitize_log_line_unbounded_with(identity, false).as_deref(),
+            Some("[REDACTED_SUBSCRIBER_MATERIAL]")
+        );
+        assert_eq!(sanitize_log_line_unbounded_with(identity, true).as_deref(), Some(identity));
+        // Ouvert, le matériel d'authentification et les identités
+        // temporaires restent remplacés, même sur une ligne qui porte l'IMSI.
+        for line in [
+            "usim: imsi=001010000000201 ki=00112233445566778899aabbccddeeff",
+            "usim: imsi=001010000000201 opc=00112233445566778899aabbccddeeff",
+            "nas: imsi=001010000000201 guti=00101-1-1-0x01",
+            "nas: imei=356938035643809",
+        ] {
+            assert_eq!(
+                sanitize_log_line_unbounded_with(line, true).as_deref(),
+                Some("[REDACTED_SUBSCRIBER_MATERIAL]"),
+                "{line}"
+            );
+        }
+    }
     #[derive(Default)]
     struct ScriptExecutor {
         outputs: Mutex<VecDeque<Result<Output, String>>>,

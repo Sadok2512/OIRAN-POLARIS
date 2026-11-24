@@ -7756,6 +7756,13 @@ fn certified_target_pseudonym(
 }
 
 fn telemetry_reference_is_sensitive(value: &str) -> bool {
+    telemetry_reference_is_sensitive_with(value, subscriber_provisioning::identities_in_clear())
+}
+
+/// 0.36.31 — `clear` (interrupteur `POLARIS_IDENTITIES_IN_CLEAR`, ordre
+/// cœur #9 7135266817) lève les identités d'abonné (marqueurs
+/// imsi/supi/msisdn/imei, suites de chiffres) ET les adresses IPv4/IPv6.
+fn telemetry_reference_is_sensitive_with(value: &str, clear: bool) -> bool {
     const MAX_SAFE_CONSECUTIVE_DIGITS: usize = 4;
 
     let has_sensitive_digit_run = value
@@ -7783,7 +7790,7 @@ fn telemetry_reference_is_sensitive(value: &str) -> bool {
             !(character.is_ascii_hexdigit() || character == ':')
         })
         .any(|candidate| candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok());
-    looks_like_identity || looks_like_ipv4 || looks_like_ipv6
+    !clear && (looks_like_identity || looks_like_ipv4 || looks_like_ipv6)
 }
 
 fn safe_telemetry_reference(prefix: &str, value: &str) -> String {
@@ -7861,7 +7868,11 @@ fn telemetry_pseudonym_key() -> Option<&'static [u8]> {
 }
 
 fn safe_telemetry_code(value: &str) -> String {
-    if telemetry_reference_is_sensitive(value) {
+    safe_telemetry_code_with(value, subscriber_provisioning::identities_in_clear())
+}
+
+fn safe_telemetry_code_with(value: &str, clear: bool) -> String {
+    if telemetry_reference_is_sensitive_with(value, clear) {
         safe_telemetry_reference("error", value)
     } else {
         value.to_string()
@@ -8231,6 +8242,19 @@ fn configuration_json(state: &AppState, configuration: &DesiredConfiguration) ->
     })
 }
 
+/// 0.36.31 — réponse de profil (création, mise à jour, clonage, scénario) :
+/// interrupteur ouvert, l'IMSI du secret du profil remplace `PROTECTED`.
+/// Fermé, identique à `managed_profile_json`.
+fn managed_profile_response_json(state: &AppState, record: &ManagedUeProfile) -> Value {
+    let mut value = managed_profile_json(record);
+    if subscriber_provisioning::identities_in_clear() {
+        if let Ok(imsi) = state.profile_store.subscriber_imsi(record) {
+            value["subscriber_identity"] = Value::String(imsi);
+        }
+    }
+    value
+}
+
 fn managed_profile_json(record: &ManagedUeProfile) -> Value {
     json!({
         "ue_id": record.profile.ue_id,
@@ -8314,6 +8338,12 @@ async fn create_subscriber(
         return subscriber_error(error);
     }
     let backend = state.subscriber_backend.clone();
+    // 0.36.31 — l'IMSI créé, rendu dans la réponse seulement interrupteur ouvert.
+    let created_identity = if subscriber_provisioning::identities_in_clear() {
+        input.imsi.clone()
+    } else {
+        "PROTECTED".to_string()
+    };
     let result = tokio::task::spawn_blocking(move || backend.provision_batch(vec![(1, input)]))
         .await
         .map_err(|_| "OPEN5GS_DATABASE_UNAVAILABLE".to_string())
@@ -8331,7 +8361,7 @@ async fn create_subscriber(
             (
                 StatusCode::CREATED,
                 Json(
-                    json!({"slot":row.slot,"state":"PROVISIONED","subscriber_identity":"PROTECTED","authentication_material":"PROTECTED","open5gs_changed":true}),
+                    json!({"slot":row.slot,"state":"PROVISIONED","subscriber_identity":created_identity,"authentication_material":"PROTECTED","open5gs_changed":true}),
                 ),
             )
         }
@@ -9364,7 +9394,7 @@ async fn create_ue_profile(
         "CREATED",
         Some(&record.profile.ue_id),
     );
-    (StatusCode::CREATED, Json(managed_profile_json(&record)))
+    (StatusCode::CREATED, Json(managed_profile_response_json(&state, &record)))
 }
 
 async fn get_ue_profile(
@@ -9488,7 +9518,7 @@ async fn update_ue_profile(
         "UPDATED",
         Some(&ue_id),
     );
-    (StatusCode::OK, Json(managed_profile_json(&record)))
+    (StatusCode::OK, Json(managed_profile_response_json(&state, &record)))
 }
 
 fn scenario_execution_block_reason(
@@ -9582,7 +9612,7 @@ async fn assign_ue_profile_scenario(
         "UPDATED",
         Some(&ue_id),
     );
-    (StatusCode::OK, Json(managed_profile_json(&record)))
+    (StatusCode::OK, Json(managed_profile_response_json(&state, &record)))
 }
 
 #[derive(Deserialize)]
@@ -9631,7 +9661,7 @@ async fn clone_ue_profile(
         "CREATED",
         Some(&record.profile.ue_id),
     );
-    (StatusCode::CREATED, Json(managed_profile_json(&record)))
+    (StatusCode::CREATED, Json(managed_profile_response_json(&state, &record)))
 }
 
 async fn validate_ue_profile_provisioning(
@@ -10450,40 +10480,59 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 fn sanitize_history_record(record: &Value) -> Value {
+    sanitize_history_record_with(record, subscriber_provisioning::identities_in_clear())
+}
+
+fn sanitize_history_record_with(record: &Value, clear: bool) -> Value {
     let mut sanitized = record.clone();
-    sanitize_history_value(&mut sanitized);
+    sanitize_history_value(&mut sanitized, clear);
     sanitized
 }
 
-fn sanitize_history_value(value: &mut Value) {
+fn sanitize_history_value(value: &mut Value, clear: bool) {
     match value {
         Value::Object(fields) => {
             for (field, value) in fields {
                 if matches!(field.as_str(), "error_code" | "cause" | "terminal_result") {
                     if let Some(text) = value.as_str() {
-                        let sanitized_text = sanitize_history_text(text);
+                        let sanitized_text =
+                            sanitize_history_text_with(text, telemetry_pseudonym_key(), clear);
                         *value = json!(if sanitized_text.contains("addr-") {
                             sanitized_text
                         } else {
-                            safe_telemetry_code(text)
+                            safe_telemetry_code_with(text, clear)
                         });
                         continue;
                     }
                 }
-                sanitize_history_value(value);
+                sanitize_history_value(value, clear);
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(sanitize_history_value),
-        Value::String(text) => *text = sanitize_history_text(text),
+        Value::Array(items) => items.iter_mut().for_each(|item| sanitize_history_value(item, clear)),
+        Value::String(text) => {
+            *text = sanitize_history_text_with(text, telemetry_pseudonym_key(), clear)
+        }
         _ => {}
     }
 }
 
+// 0.36.31 — plus appelée par `sanitize_history_value` (qui passe
+// l'interrupteur explicitement) ; gardée comme point d'entrée nommé.
+#[allow(dead_code)]
 fn sanitize_history_text(value: &str) -> String {
     sanitize_history_text_with_key(value, telemetry_pseudonym_key())
 }
 
 fn sanitize_history_text_with_key(value: &str, key: Option<&[u8]>) -> String {
+    sanitize_history_text_with(value, key, subscriber_provisioning::identities_in_clear())
+}
+
+/// 0.36.31 — `clear` lève le remplacement des identités d'abonné ET des
+/// adresses (`addr-…`) : le texte est rendu tel quel.
+fn sanitize_history_text_with(value: &str, key: Option<&[u8]>, clear: bool) -> String {
+    if clear {
+        return value.to_string();
+    }
     let without_v4 = replace_address_tokens(value, key, |candidate| {
         candidate.contains('.') && candidate.parse::<Ipv4Addr>().is_ok()
     });
@@ -13390,7 +13439,10 @@ fn update_definition_record(
         .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?;
     let index = definition_record_index(&runtime, job_id).ok_or("SCENARIO_JOB_NOT_FOUND")?;
     update(&mut runtime.history[index]);
-    sanitize_history_value(&mut runtime.history[index]);
+    // 0.36.31 — l'History est assainie à l'ÉCRITURE : une entrée écrite
+    // interrupteur fermé est stockée masquée (référence HMAC irréversible)
+    // et le reste même si l'interrupteur s'ouvre ensuite.
+    sanitize_history_value(&mut runtime.history[index], subscriber_provisioning::identities_in_clear());
     let value = runtime.history[index].clone();
     persist_runtime(state, &runtime);
     Ok(value)
@@ -15550,6 +15602,19 @@ fn start_live_definition_scenario(
 /// Pull the current state slice for a UE and compose the Activity
 /// payload. Never panics; a broken docker exec yields an empty slice.
 fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &EffectiveIdentity) -> Value {
+    let mut payload = build_ue_activity_payload_inner(state, ue_id, identity);
+    // 0.36.31 — signal pour le portail web, qui remasque l'identité côté
+    // navigateur sinon. Ajouté SEULEMENT interrupteur ouvert : à 0, la
+    // réponse reste celle de 0.36.30, octet pour octet.
+    if subscriber_provisioning::identities_in_clear() {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("identities_in_clear".into(), Value::Bool(true));
+        }
+    }
+    payload
+}
+
+fn build_ue_activity_payload_inner(state: &AppState, ue_id: &str, identity: &EffectiveIdentity) -> Value {
     // 1. Does this UE belong to the controller surface? Any UE id
     //    outside the planned slot set returns a flat `running:false`
     //    with the strict reason so operators do not see confusing
@@ -23613,6 +23678,154 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
                 "stopped-UE payload must not expose {banned}: {body}",
             );
         }
+    }
+
+    /// 0.36.31 (ordre cœur #9 7133029202) — interrupteur
+    /// `POLARIS_IDENTITIES_IN_CLEAR`, famille B (télémétrie, ligne
+    /// `POLARIS_CONTROL_JOB`, History), les deux côtés. Fermé : masqué comme
+    /// en 0.36.30. Ouvert : IMSI, MSISDN et adresses IP en clair (ordre
+    /// 7135266817).
+    #[test]
+    fn identities_switch_family_b_telemetry_journal_history_0_36_31() {
+        const IMSI: &str = "001010000000201";
+        const MSISDN: &str = "15550000201";
+        let error = format!("UE_START_FAILED imsi-{IMSI}");
+        let journal = |clear: bool| {
+            format!(
+                "POLARIS_CONTROL_JOB job_id=job-03631 event=STEP_FAILED step_index=0 step_type=ue_start error={}",
+                safe_telemetry_code_with(&error, clear)
+            )
+        };
+        assert!(!journal(false).contains(IMSI), "fermé : {}", journal(false));
+        assert!(journal(true).contains(IMSI), "ouvert : {}", journal(true));
+        // Les adresses : masquées fermé, en clair ouvert.
+        assert!(!safe_telemetry_code_with("UE_START_FAILED from 10.45.0.2", false).contains("10.45.0.2"));
+        assert!(safe_telemetry_code_with("UE_START_FAILED from 10.45.0.2", true).contains("10.45.0.2"));
+
+        let record = json!({
+            "job_id": "history-imsi-03631",
+            "state": "FAILED",
+            "error_code": format!("UE_START_FAILED imsi-{IMSI}"),
+            "cause": format!("UE UE-31 msisdn {MSISDN}"),
+            "detail": format!("subscriber {IMSI} at 10.45.0.2 refused"),
+        });
+        let closed = sanitize_history_record_with(&record, false).to_string();
+        assert!(!closed.contains(IMSI) && !closed.contains(MSISDN), "History fermée : {closed}");
+        let open = sanitize_history_record_with(&record, true).to_string();
+        assert!(open.contains(IMSI) && open.contains(MSISDN), "History ouverte : {open}");
+        assert!(!closed.contains("10.45.0.2"), "adresse fermée : {closed}");
+        assert!(open.contains("10.45.0.2"), "adresse ouverte : {open}");
+    }
+
+    /// 0.36.31 — côté fermé, par les vraies routes : sans la variable
+    /// d'environnement (cas des tests et de la production actuelle), la
+    /// fiche UE, l'inventaire et l'History restent masqués comme en 0.36.30.
+    #[tokio::test]
+    async fn identities_switch_closed_by_default_on_real_routes_0_36_31() {
+        assert!(!subscriber_provisioning::identities_in_clear(), "la variable n'est pas posée dans les tests");
+        const IMSI: &str = "001010000000201";
+        let shared = Arc::new(state());
+        let operator = || {
+            Extension(EffectiveIdentity {
+                role: "operator".into(),
+                username: Some("operator-test".into()),
+                session_id: None,
+                csrf_valid: true,
+            })
+        };
+        let created = create_ue_profile(
+            State(shared.clone()),
+            operator(),
+            Json(profile_http_input("UE-31", &format!("imsi-{IMSI}"), "UE-31")),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(!created_body.to_string().contains(IMSI), "réponse de création : {created_body}");
+        let sheet = ue_activity(State(shared.clone()), operator(), AxumPath("UE-31".into())).await;
+        let sheet: Value = serde_json::from_slice(&to_bytes(sheet.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(!sheet.to_string().contains(IMSI), "fiche : {sheet}");
+        assert!(sheet.get("identities_in_clear").is_none(), "aucun signal à 0 : {sheet}");
+        let inventory = ues(State(shared.clone()), operator()).await.0;
+        assert!(!inventory.to_string().contains(IMSI), "inventaire : {inventory}");
+        shared.runtime.lock().unwrap().history.push(json!({
+            "job_id": "history-imsi-03631", "state": "FAILED",
+            "error_code": format!("UE_START_FAILED imsi-{IMSI}"),
+            "detail": format!("subscriber {IMSI} refused"),
+        }));
+        let history_payload = history(State(shared.clone())).await.0;
+        assert!(!history_payload.to_string().contains(IMSI), "History : {history_payload}");
+    }
+
+    /// 0.36.31 (ordre cœur #9 7135266817) — interrupteur FERMÉ = 0.36.30
+    /// octet pour octet. Le même jeu d'entrées passe par les fonctions de
+    /// masquage sous leurs noms de 0.36.30 ; l'empreinte SHA-256 de toutes
+    /// les sorties a été calculée sur `2626a2e` (0.36.30) et doit rester
+    /// identique.
+    #[test]
+    fn identities_switch_closed_is_byte_identical_to_0_36_30() {
+        let inputs = [
+            "imsi-001010000000201",
+            "001010000000201",
+            "UE_START_FAILED imsi-001010000000201",
+            "UE UE-31 msisdn 15550000201",
+            "UE_START_FAILED from 10.45.0.2",
+            "peer 2001:db8::1 refused",
+            "SCENARIO_STOP_REQUESTED",
+            "REFUS_12345_SYNTHETIQUE",
+            "UE-31",
+            "job-03631",
+            "psn-0123456789abcdef",
+            "subscriber 001010000000201 at 10.45.0.2 refused",
+        ];
+        let mut out = String::new();
+        for input in inputs {
+            out.push_str(&subscriber_provisioning::mask_subscriber_identity(input));
+            out.push('\u{1f}');
+            out.push_str(&safe_telemetry_code(input));
+            out.push('\u{1f}');
+            out.push_str(&safe_telemetry_reference("psn", input));
+            out.push('\u{1f}');
+            out.push_str(&safe_telemetry_reference("error", input));
+            out.push('\u{1f}');
+            let record = json!({"job_id": "golden", "error_code": input, "cause": input, "terminal_result": input, "detail": input, "nested": [input]});
+            out.push_str(&sanitize_history_record(&record).to_string());
+            out.push('\u{1e}');
+        }
+        let record = subscriber_provisioning::SubscriberRecord {
+            slot: "UE-31".into(),
+            imsi: "001010000000201".into(),
+            msisdn: Some("15550000201".into()),
+            k: "aa".repeat(16),
+            opc: "bb".repeat(16),
+            plmn_mcc: "001".into(),
+            plmn_mnc: "01".into(),
+            sst: 1,
+            sd: Some("010203".into()),
+            dnns: vec!["internet".into()],
+            ambr: subscriber_provisioning::SubscriberAmbr { uplink: 1, downlink: 1 },
+        };
+        for visibility in [
+            subscriber_provisioning::SubscriberIdentityVisibility::Protected,
+            subscriber_provisioning::SubscriberIdentityVisibility::Masked,
+            subscriber_provisioning::SubscriberIdentityVisibility::Imsi,
+        ] {
+            out.push_str(&serde_json::to_string(&subscriber_provisioning::sanitize_for_role(&record, visibility)).unwrap());
+            out.push('\u{1e}');
+        }
+        for role in ["viewer", "operator", "administrator", "unknown"] {
+            out.push_str(match subscriber_provisioning::SubscriberIdentityVisibility::for_role(role) {
+                subscriber_provisioning::SubscriberIdentityVisibility::Protected => "Protected",
+                subscriber_provisioning::SubscriberIdentityVisibility::Masked => "Masked",
+                subscriber_provisioning::SubscriberIdentityVisibility::Imsi => "Imsi",
+            });
+            out.push('\u{1e}');
+        }
+        let digest = Sha256::digest(out.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        println!("GOLDEN_0_36_30 {digest} bytes={}", out.len());
+        assert_eq!(digest, "daaefeb6f74d4dd02d236f0007e26283aa1feb2cbf8e9ee1f37f0884d88ddb39", "sortie fermée différente de 0.36.30");
     }
 
     #[tokio::test]

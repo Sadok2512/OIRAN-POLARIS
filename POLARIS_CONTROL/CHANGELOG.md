@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.36.31 — 2026-11-24 — Interrupteur `POLARIS_IDENTITIES_IN_CLEAR` : identités et adresses en clair sur demande
+
+Ordres cœur #9 7133029202 et 7135266817 ; audit #9 7133297354.
+
+- **Un seul réglage**, `POLARIS_IDENTITIES_IN_CLEAR`, lu une fois par processus (`subscriber_provisioning::identities_in_clear`).
+  - Absent, `0`, vide ou toute autre valeur : comportement **0.36.30 octet pour octet**. Une valeur non reconnue est signalée au démarrage, sans être répétée.
+  - `1` : l'IMSI, le MSISDN et les adresses IP sont rendus **en clair dans toutes les sorties de Control**.
+- **A — identités d'abonné.**
+  - `mask_subscriber_identity` rend l'IMSI canonique : fiche UE `/ues/:id/activity`, `/ues`, `/ue-profiles`, `/ue-profiles/:id`.
+  - `sanitize_for_role` rend l'IMSI et le MSISDN pour toute visibilité ; `for_role` donne `Imsi` à tout rôle.
+  - Les réponses de création, mise à jour, clonage et scénario de profil, et la création d'abonné, rendent l'IMSI au lieu de `PROTECTED`.
+- **B — télémétrie, journal et History.** `telemetry_reference_is_sensitive`, `safe_telemetry_code` (dont la ligne `POLARIS_CONTROL_JOB … error=`) et `sanitize_history_text` ne remplacent plus ni identités ni adresses.
+- **C — journaux srsRAN.** `sanitize_log_line` laisse passer les lignes qui ne portent que l'IMSI, le SUPI ou le MSISDN. La sortie `nr-cli` (`filter_identity_fields`) ne filtrait déjà pas l'IMSI : inchangée.
+- **D — portail web.** Interrupteur ouvert, l'API ajoute `identities_in_clear: true` à la réponse d'activité, et **seulement** dans ce cas. La page d'activité affiche alors l'identité via `displaySubscriberIdentity` ; sinon, elle remasque comme en 0.36.30. La fiche `simulator-control` affiche ce que rend l'API.
+- **Jamais ouverts**, quel que soit le réglage : K, OPc (`authentication_material: PROTECTED`), la clé HMAC de télémétrie, `/etc/oiran/secrets/`, et les identités temporaires et d'équipement (GUTI, TMSI, IMEI) dans les journaux srsRAN.
+- **Limites, déclarées.**
+  - L'History est assainie **à l'écriture** (`update_definition_record`). Les entrées écrites interrupteur fermé restent stockées masquées (références HMAC irréversibles). Seules les entrées écrites interrupteur ouvert sont en clair.
+  - Restent `PROTECTED` : l'inventaire LTE et la génération d'abonnés en lot, où l'IMSI n'est pas à portée dans la réponse.
+  - `safeAuditReference` (codes de refus du web) garde son contrôle de forme.
+- **Gardes.**
+  - `identities_switch_closed_is_byte_identical_to_0_36_30` : empreinte SHA-256 des sorties de toutes les fonctions de masquage sur un même jeu d'entrées. `daaefeb6…db39`, calculée sur `2626a2e` (0.36.30), est identique en 0.36.31 fermé.
+  - `identities_switch_closed_by_default_on_real_routes_0_36_31` : création de profil, fiche, inventaire et History par les vraies routes, masqués sans la variable.
+  - Familles A, B et C des deux côtés : `…_family_a_…`, `…_family_b_…`, `…_family_c_…`.
+  - Web : `0.36.31 opens the identity only when the API signals the switch, masks otherwise`.
+- Versions API et web alignées sur 0.36.31.
+
 ## 0.36.30 — 2026-11-22 — Pseudonymes à clé et état detach observé par UE
 
 - Remplace les pseudonymes sensibles dérivés d'un SHA-256 nu par un HMAC-SHA-256 à domaines séparés, alimenté par un secret privé stable du service ; l'absence de clé produit un masque opaque et jamais un digest réversible par dictionnaire.

@@ -800,10 +800,44 @@ pub enum SubscriberIdentityVisibility {
     Imsi,
 }
 
+/// 0.36.31 (ordre cœur #9 7133029202) — interrupteur unique des identités
+/// d'abonné de Control. `POLARIS_IDENTITIES_IN_CLEAR=1` : l'IMSI et le
+/// MSISDN provisionnés sont rendus en clair dans toutes les sorties de
+/// Control (API, History, journal, télémétrie). Absent, `0` ou toute autre
+/// valeur : comportement 0.36.30, masqué. Lu une fois par processus. Ne
+/// touche jamais le matériel d'authentification (K, OPc), les clés HMAC ni
+/// les adresses IP, qui restent pseudonymisées.
+pub fn identities_in_clear() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let raw = std::env::var("POLARIS_IDENTITIES_IN_CLEAR").ok();
+        let value = raw.as_deref().map(str::trim);
+        let clear = value == Some("1");
+        match value {
+            Some("1") => eprintln!(
+                "POLARIS_IDENTITIES_IN_CLEAR=1 : identités d'abonné (IMSI, MSISDN) rendues en clair par Control"
+            ),
+            None | Some("") | Some("0") => {}
+            Some(_) => eprintln!(
+                "POLARIS_IDENTITIES_IN_CLEAR : valeur non reconnue, identités masquées (attendu 0 ou 1)"
+            ),
+        }
+        clear
+    })
+}
+
 impl SubscriberIdentityVisibility {
     /// Convenience helper: operators and administrators see the IMSI;
     /// anyone else (viewers, unknown roles) stays `Protected`.
     pub fn for_role(role: &str) -> Self {
+        Self::for_role_with(role, identities_in_clear())
+    }
+
+    /// 0.36.31 — à l'interrupteur ouvert, tout rôle authentifié voit l'IMSI.
+    pub fn for_role_with(role: &str, clear: bool) -> Self {
+        if clear {
+            return SubscriberIdentityVisibility::Imsi;
+        }
         match role {
             "operator" | "administrator" => SubscriberIdentityVisibility::Imsi,
             _ => SubscriberIdentityVisibility::Protected,
@@ -815,9 +849,21 @@ pub fn sanitize_for_role(
     record: &SubscriberRecord,
     visibility: SubscriberIdentityVisibility,
 ) -> SanitizedSubscriber {
+    sanitize_for_role_with(record, visibility, identities_in_clear())
+}
+
+/// 0.36.31 — à l'interrupteur ouvert, toute visibilité rend l'IMSI et le
+/// MSISDN en clair ; `authentication_material` reste `PROTECTED` dans tous
+/// les cas.
+pub fn sanitize_for_role_with(
+    record: &SubscriberRecord,
+    visibility: SubscriberIdentityVisibility,
+    clear: bool,
+) -> SanitizedSubscriber {
+    let visibility = if clear { SubscriberIdentityVisibility::Imsi } else { visibility };
     let identity = match visibility {
         SubscriberIdentityVisibility::Imsi => record.imsi.clone(),
-        SubscriberIdentityVisibility::Masked => mask_subscriber_identity(&record.imsi),
+        SubscriberIdentityVisibility::Masked => mask_subscriber_identity_with(&record.imsi, clear),
         SubscriberIdentityVisibility::Protected => "PROTECTED".into(),
     };
     SanitizedSubscriber {
@@ -842,6 +888,20 @@ pub fn sanitize_for_role(
 }
 
 pub fn mask_subscriber_identity(identity: &str) -> String {
+    mask_subscriber_identity_with(identity, identities_in_clear())
+}
+
+/// 0.36.31 — à l'interrupteur ouvert, l'identité canonique (chiffres, sans
+/// le préfixe `imsi-`) est rendue telle quelle. Fermé par défaut : une
+/// valeur qui n'est pas une suite de chiffres reste masquée même ouvert.
+pub fn mask_subscriber_identity_with(identity: &str, clear: bool) -> String {
+    if clear {
+        let value = identity.trim();
+        let digits = value.strip_prefix("imsi-").unwrap_or(value);
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return digits.to_string();
+        }
+    }
     let suffix: String = identity.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
     if suffix.len() == 4 && suffix.chars().all(|character| character.is_ascii_digit()) {
         format!("…{suffix}")
@@ -1745,6 +1805,60 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         // Clean up so repeat runs stay deterministic.
         let _ = backend.mongosh(cleanup.as_bytes());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 0.36.31 (ordre cœur #9 7133029202) — interrupteur
+    /// `POLARIS_IDENTITIES_IN_CLEAR`, famille A, les deux côtés. Fermé :
+    /// comportement 0.36.30. Ouvert : IMSI et MSISDN en clair pour toute
+    /// visibilité et tout rôle ; K et OPc jamais.
+    #[test]
+    fn identities_switch_family_a_masks_when_closed_and_clears_when_open_0_36_31() {
+        let record = SubscriberRecord {
+            slot: "UE-31".into(),
+            imsi: "001010000000201".into(),
+            msisdn: Some("15550000201".into()),
+            k: "aa".repeat(16),
+            opc: "bb".repeat(16),
+            plmn_mcc: "001".into(),
+            plmn_mnc: "01".into(),
+            sst: 1,
+            sd: Some("010203".into()),
+            dnns: vec!["internet".into()],
+            ambr: SubscriberAmbr { uplink: 1, downlink: 1 },
+        };
+        // Fermé.
+        assert_eq!(mask_subscriber_identity_with("imsi-001010000000201", false), "…0201");
+        assert_eq!(mask_subscriber_identity_with("001010000000201", false), "…0201");
+        for visibility in [SubscriberIdentityVisibility::Masked, SubscriberIdentityVisibility::Protected] {
+            let closed = sanitize_for_role_with(&record, visibility, false);
+            let json = serde_json::to_string(&closed).unwrap();
+            assert!(!json.contains("001010000000201"), "{json}");
+            assert!(!json.contains("15550000201"), "{json}");
+        }
+        assert!(matches!(
+            SubscriberIdentityVisibility::for_role_with("viewer", false),
+            SubscriberIdentityVisibility::Protected
+        ));
+        // Ouvert.
+        assert_eq!(mask_subscriber_identity_with("imsi-001010000000201", true), "001010000000201");
+        assert_eq!(mask_subscriber_identity_with("001010000000201", true), "001010000000201");
+        assert_eq!(mask_subscriber_identity_with("not-an-identity", true), "PROTECTED");
+        for visibility in [
+            SubscriberIdentityVisibility::Masked,
+            SubscriberIdentityVisibility::Protected,
+            SubscriberIdentityVisibility::Imsi,
+        ] {
+            let open = sanitize_for_role_with(&record, visibility, true);
+            assert_eq!(open.subscriber_identity, "001010000000201");
+            assert_eq!(open.msisdn.as_deref(), Some("15550000201"));
+            assert_eq!(open.authentication_material, "PROTECTED");
+            let json = serde_json::to_string(&open).unwrap();
+            assert!(!json.contains(&"aa".repeat(16)) && !json.contains(&"bb".repeat(16)), "K/OPc jamais : {json}");
+        }
+        assert!(matches!(
+            SubscriberIdentityVisibility::for_role_with("viewer", true),
+            SubscriberIdentityVisibility::Imsi
+        ));
     }
 
     // 0.19.7 (#48) — identity visibility matrix.

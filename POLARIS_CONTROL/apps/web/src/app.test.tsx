@@ -2,7 +2,7 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { actionReasonMessages, api, eligibleTrafficTargets, eventFailureDetail, filterAndSortHistory, filterScenarioDefinitions, humanActionReason, humanApiRefusal, maskSubscriberIdentity, reportedState, safeAuditReference, secondsToDurationMs, targetedTrafficStartRequest, type ScenarioDefinition, type ScenarioState, type UeState } from './api';
+import { actionReasonMessages, api, eligibleTrafficTargets, eventFailureDetail, filterAndSortHistory, filterScenarioDefinitions, humanActionReason, humanApiRefusal, maskSubscriberIdentity, displaySubscriberIdentity, reportedState, safeAuditReference, secondsToDurationMs, targetedTrafficStartRequest, type ScenarioDefinition, type ScenarioState, type UeState } from './api';
 import { Scenarios } from './main';
 
 describe('POLARIS Control shell', () => {
@@ -80,6 +80,19 @@ describe('POLARIS Control shell', () => {
     expect(projected).not.toContain(raw.replace(/^imsi-/, ''));
     expect(maskSubscriberIdentity('…0201')).toBe('…0201');
     expect(maskSubscriberIdentity('not-an-identity')).toBe('PROTECTED');
+  });
+  it('0.36.31 opens the identity only when the API signals the switch, masks otherwise', () => {
+    const raw = ['imsi-','0010','1000000','0201'].join('');
+    const digits = raw.replace(/^imsi-/, '');
+    // Interrupteur fermé (champ absent ou false) : comportement 0.36.30.
+    expect(displaySubscriberIdentity(raw, false)).toBe('…0201');
+    expect(displaySubscriberIdentity(digits, false)).toBe('…0201');
+    // Interrupteur ouvert : l'IMSI canonique en clair.
+    expect(displaySubscriberIdentity(raw, true)).toBe(digits);
+    expect(displaySubscriberIdentity(digits, true)).toBe(digits);
+    // Ouvert, mais pas une identité canonique : masqué.
+    expect(displaySubscriberIdentity('not-an-identity', true)).toBe('PROTECTED');
+    expect(displaySubscriberIdentity('…0201', true)).toBe('…0201');
   });
   it('B11 never invents an absent UERANSIM state', () => expect(reportedState('UNKNOWN')).toBe('-- (non rapporté par UERANSIM)'));
   it('B12 renders the safe failure cause from timeline detail', () => expect(eventFailureDetail({detail:{error:'SHARED_UE_PROTECTED'}})).toContain('UE partagée protégée'));
