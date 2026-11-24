@@ -1,5 +1,24 @@
 # Changelog
 
+## oiran-api 2.21.162 — 2026-11-24 — lecteur live : le segment courant se choisit par date de fichier
+
+Upgrade **patch**, sans déploiement. Base `9cb2ca7` : les gardes d'ANR1 (`test/anr1-221159-rank-live-reader-guards`), posés sur 2.21.159 `5a75ba2`, PASS d'ANR1. Branche `fix/oiran-2.21.162-live-reader-newest-by-mtime`. Ce lot ne contient pas 2.21.160 et 2.21.161 (cible IMSI), qui sont sur leur propre branche.
+
+**Défaut** (garde d'ANR1, déclaré OUVERT et non bloquant depuis 2.21.158) : `reader_pass` triait les segments de chaque plan **par nom**, puis désignait le dernier comme segment courant et l'avant-dernier comme précédent. Après un redémarrage de sonde qui renumérote (`99 → 1`), le lecteur suivait l'ancien segment 99 et ignorait le segment 3, plus récent : son trafic n'était pas lu en live.
+
+**Correctif** : le tri se fait par **date de modification**, puis par nom à date égale, comme l'amorçage depuis 2.21.158. Un segment dont la date est illisible passe pour le plus ancien.
+
+**Coût, déclaré** : 2.21.130 avait quitté le tri par date pour économiser les `stat`. Avec 8 093 segments, une passe sans trafic prenait 643 ms au lab. Ici, une lecture des métadonnées par segment n'a lieu **qu'aux passes où le répertoire a changé** (création ou suppression d'un segment) **ou au rattrapage**. Les autres passes réutilisent la liste `recent` sans relire le répertoire, comme avant. **Je ne l'ai pas mesuré au lab.**
+
+**Ce qui ne change pas** : la détection des segments disparus, les sessions de reprise et le cache `recent`.
+
+Tests : les deux gardes d'ANR1 sont repris **tels quels** (commit `9cb2ca7`, non modifié).
+
+| Garde | Sur `9cb2ca7` (arbre séparé) | Sur 2.21.162 |
+|---|---|---|
+| `anr1_live_reader_follows_newest_segment_after_ring_renumbering_guard` | **échoue** : « le lecteur a suivi le segment 99 par nom » | passe |
+| `anr1_seed_order_is_rank_then_capture_id_then_seq_never_timestamp_guard` | passe (2.21.159) | passe |
+
 ## oiran-api 2.21.159 — 2026-11-23 — amorçage de trace : ordre canonique (rang du segment, `capture_id`, `seq`), plus de tri par `ts`
 
 Upgrade **patch**, sans déploiement. Base `f419573` (2.21.158, en prod), branche `fix/oiran-2.21.159-seed-canonical-order`.

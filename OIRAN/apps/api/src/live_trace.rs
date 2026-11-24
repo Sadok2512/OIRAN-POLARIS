@@ -3864,12 +3864,24 @@ pub(crate) fn reader_pass(
             // .pcapng`). Avant : tri par date de modification, soit
             // plusieurs `stat` par fichier et par passe, puis un `stat` de
             // chaque fichier.
-            let mut paths: Vec<_> = entries
+            // 2.21.162 (garde ANR1 `anr1_live_reader_follows_newest_segment_after_ring_renumbering_guard`,
+            // ordre #9 de reprise) — le segment le plus récent et le
+            // précédent se choisissent par DATE DE MODIFICATION, puis par
+            // nom à date égale, comme l'amorçage depuis 2.21.158. Avant :
+            // par nom ; après un redémarrage de sonde qui renumérote, le
+            // lecteur suivait un ancien segment comme segment courant et le
+            // trafic du nouveau n'était pas lu en live. Coût : une lecture
+            // des métadonnées par segment, seulement aux passes où le
+            // répertoire a changé (création ou suppression de segment) ou
+            // au rattrapage ; les autres passes réutilisent `recent`.
+            // Un segment dont la date est illisible passe pour le plus ancien.
+            let mut dated: Vec<(Option<std::time::SystemTime>, std::path::PathBuf)> = entries
                 .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("pcapng"))
+                .filter(|entry| entry.path().extension().and_then(|v| v.to_str()) == Some("pcapng"))
+                .map(|entry| (entry.metadata().ok().and_then(|meta| meta.modified().ok()), entry.path()))
                 .collect();
-            paths.sort();
+            dated.sort();
+            let paths: Vec<std::path::PathBuf> = dated.into_iter().map(|(_, path)| path).collect();
             // 2.21.78 (correction défaut 1) — détecte les fichiers
             // précédemment vus qui ont DISPARU. Le gap n'est PAS la
             // taille totale : c'est `last_size - consumed_bytes`. Un
