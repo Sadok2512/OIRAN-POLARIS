@@ -3137,6 +3137,62 @@ mod tests {
             );
         }
     }
+
+    /// 0.36.32 (ANR2 #10 7138095747, ordre cœur #9 7138374225) — le matériel
+    /// d'authentification n'est JAMAIS rendu, interrupteur ouvert ou fermé, sous
+    /// toutes ses formes : les deux variantes adverses d'ANR2 (`K=`, `key=` sur
+    /// une ligne qui porte l'identité d'abonné), puis les formes réellement
+    /// produites dans le dépôt (srsRAN `[usim] k = / opc = / op =`, UERANSIM
+    /// `key: / op:`, Open5GS `security:{k:"…",opc:"…"}`) et leurs voisines.
+    #[test]
+    fn authentication_material_is_never_rendered_in_any_form_0_36_32() {
+        let secret = "00112233445566778899aabbccddeeff";
+        let lines = [
+            // Variantes adverses d'ANR2.
+            format!("nas: attach imsi=001010000000201 K={secret}"),
+            format!("nas: attach imsi=001010000000201 key={secret}"),
+            // srsRAN ue.conf, section [usim].
+            format!("k = {secret}"),
+            format!("opc = {secret}"),
+            format!("op = {secret}"),
+            format!("usim: imsi=001010000000201 k={secret} opc={secret}"),
+            // UERANSIM.
+            format!("key: '{secret}'"),
+            format!("op: '{secret}'"),
+            format!("authentication_key: {secret}"),
+            // Open5GS (document Mongo).
+            format!("security:{{k:\"{secret}\",op:null,opc:\"{secret}\",amf:\"8000\"}}"),
+            format!("\"key\": \"{secret}\""),
+            // Voisines : casse, séparateurs, clés dérivées, SQN.
+            format!("Ki: {secret}"),
+            format!("KI = {secret}"),
+            format!("OPc={secret}"),
+            format!("Op-C : {secret}"),
+            format!("K_asme: {secret}"),
+            format!("k_enb={secret}"),
+            format!("K-NAS-enc = {secret}"),
+            format!("SQN={secret}"),
+            format!("secret_key={secret}"),
+            format!("auth key {secret}"),
+            format!("subscriber key: {secret}"),
+            format!("usim auth key: {secret}"),
+        ];
+        for clear in [false, true] {
+            for line in &lines {
+                let rendered = sanitize_log_line_unbounded_with(line, clear);
+                assert_eq!(
+                    rendered.as_deref(),
+                    Some("[REDACTED_SUBSCRIBER_MATERIAL]"),
+                    "clear={clear} : {line}"
+                );
+                assert!(!rendered.unwrap_or_default().contains(secret));
+            }
+        }
+        // Contrôle : une ligne ordinaire passe (pas de faux positif grossier).
+        let ordinary = "rrc: RRC Connection Setup complete, rnti=0x46 cell=1";
+        assert_eq!(sanitize_log_line_unbounded_with(ordinary, false).as_deref(), Some(ordinary));
+        assert_eq!(sanitize_log_line_unbounded_with(ordinary, true).as_deref(), Some(ordinary));
+    }
     #[derive(Default)]
     struct ScriptExecutor {
         outputs: Mutex<VecDeque<Result<Output, String>>>,
