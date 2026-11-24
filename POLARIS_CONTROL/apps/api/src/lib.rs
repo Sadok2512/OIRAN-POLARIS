@@ -7849,7 +7849,19 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 0.36.32 (ANR2 #10 7138095747) — clé de télémétrie FIXÉE par un test
+    /// pour ce fil : rend les empreintes de sortie indépendantes de la clé de
+    /// la machine (`/etc/oiran/secrets/…`). Jamais compilé hors tests.
+    static TEST_TELEMETRY_KEY: std::cell::Cell<Option<&'static [u8]>> = const { std::cell::Cell::new(None) };
+}
+
 fn telemetry_pseudonym_key() -> Option<&'static [u8]> {
+    #[cfg(test)]
+    if let Some(key) = TEST_TELEMETRY_KEY.with(|key| key.get()) {
+        return Some(key);
+    }
     static KEY: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     KEY.get_or_init(|| {
         let path = std::env::var("POLARIS_TELEMETRY_PSEUDONYM_KEY_FILE")
@@ -23766,6 +23778,9 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
     /// identique.
     #[test]
     fn identities_switch_closed_is_byte_identical_to_0_36_30() {
+        // 0.36.32 — clé de télémétrie fixée par le test (ANR2 #10 7138095747 :
+        // l'empreinte dépendait de la clé de la machine).
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"golden-fixed-telemetry-key-0.36.32-0123456789".as_slice())));
         let inputs = [
             "imsi-001010000000201",
             "001010000000201",
@@ -23824,8 +23839,9 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             out.push('\u{1e}');
         }
         let digest = Sha256::digest(out.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
         println!("GOLDEN_0_36_30 {digest} bytes={}", out.len());
-        assert_eq!(digest, "daaefeb6f74d4dd02d236f0007e26283aa1feb2cbf8e9ee1f37f0884d88ddb39", "sortie fermée différente de 0.36.30");
+        assert_eq!(digest, "ae83ab2c9b90e0e5b1da915c0c7f0f2e4aa39772f60dcfc84ab5c8b2ddcfce35", "sortie fermée différente de 0.36.30");
     }
 
     #[tokio::test]

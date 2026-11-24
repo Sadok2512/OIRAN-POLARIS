@@ -2870,6 +2870,14 @@ fn sanitize_log_line_unbounded(line: &str) -> Option<String> {
 /// d'authentification reste remplacée.
 fn sanitize_log_line_unbounded_with(line: &str, clear: bool) -> Option<String> {
     let lower = line.to_ascii_lowercase();
+    // 0.36.32 (ANR2 #10 7138095747, ordre cœur #9 7138374225) — le matériel
+    // d'authentification est reconnu PAR CONTENU, quel que soit l'interrupteur :
+    // tout nom de champ suivi de `=` ou `:` qui désigne une clé (K, Ki, key,
+    // OP, OPc, SQN, *key, K_*, secret). Avant, seul ` ki=` était reconnu, et
+    // une ligne `K=<valeur>` ou `key=<valeur>` passait en clair à `1`.
+    if line_carries_authentication_material(&lower) {
+        return Some("[REDACTED_SUBSCRIBER_MATERIAL]".into());
+    }
     let subscriber_identity = ["imsi", "supi", "msisdn"];
     let always_redacted = [
         "suci",
@@ -2895,6 +2903,64 @@ fn sanitize_log_line_unbounded_with(line: &str, clear: bool) -> Option<String> {
         return None;
     }
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// 0.36.32 — un nom de champ désigne-t-il du matériel d'authentification ?
+/// `k`, `ki`, `key`, `op`, `opc`, `op_c`/`op-c`, `sqn`, tout nom finissant par
+/// `key` (`auth key`, `subscriber key`, `authentication_key`, `secret_key`…),
+/// commençant par `k_`/`k-` (`k_asme`, `k_enb`, `k_nas_enc`…) ou contenant
+/// `secret`. Fermé par défaut : un faux positif retire une ligne, jamais
+/// l'inverse.
+fn is_authentication_field_name(name: &str) -> bool {
+    let name = name.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == '{' || c == '[' || c == ',');
+    if name.is_empty() {
+        return false;
+    }
+    matches!(name, "k" | "ki" | "key" | "op" | "opc" | "op_c" | "op-c" | "sqn")
+        || name.ends_with("key")
+        || name.starts_with("k_")
+        || name.starts_with("k-")
+        || name.contains("secret")
+}
+
+/// 0.36.32 — la ligne (déjà en minuscules) porte-t-elle un champ de matériel
+/// d'authentification, sous la forme `nom=…`, `nom = …`, `nom: …`,
+/// `"nom": …`, `{nom:…}` ? On examine le nom qui précède chaque séparateur,
+/// y compris un nom en deux mots (`auth key`, `subscriber key`).
+fn line_carries_authentication_material(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'=' && *byte != b':' {
+            continue;
+        }
+        // Remonte avant les blancs et guillemets qui précèdent le séparateur.
+        let mut end = index;
+        while end > 0 && matches!(bytes[end - 1], b' ' | b'\t' | b'"' | b'\'') {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'_' | b'-')) {
+            start -= 1;
+        }
+        let word = &lower[start..end];
+        if is_authentication_field_name(word) {
+            return true;
+        }
+        // Nom en deux mots : « auth key », « subscriber key ».
+        let mut before = start;
+        while before > 0 && bytes[before - 1] == b' ' {
+            before -= 1;
+        }
+        let mut first = before;
+        while first > 0 && bytes[first - 1].is_ascii_alphanumeric() {
+            first -= 1;
+        }
+        if first < before && is_authentication_field_name(&lower[first..end]) {
+            return true;
+        }
+    }
+    // Formes sans séparateur déjà connues (en-têtes de vidage).
+    ["auth key", "subscriber key"].iter().any(|marker| lower.contains(marker))
 }
 
 fn sanitize_log_line(line: &str) -> Option<String> {
@@ -3136,6 +3202,62 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    /// 0.36.32 (ANR2 #10 7138095747, ordre cœur #9 7138374225) — le matériel
+    /// d'authentification n'est JAMAIS rendu, interrupteur ouvert ou fermé, sous
+    /// toutes ses formes : les deux variantes adverses d'ANR2 (`K=`, `key=` sur
+    /// une ligne qui porte l'identité d'abonné), puis les formes réellement
+    /// produites dans le dépôt (srsRAN `[usim] k = / opc = / op =`, UERANSIM
+    /// `key: / op:`, Open5GS `security:{k:"…",opc:"…"}`) et leurs voisines.
+    #[test]
+    fn authentication_material_is_never_rendered_in_any_form_0_36_32() {
+        let secret = "00112233445566778899aabbccddeeff";
+        let lines = [
+            // Variantes adverses d'ANR2.
+            format!("nas: attach imsi=001010000000201 K={secret}"),
+            format!("nas: attach imsi=001010000000201 key={secret}"),
+            // srsRAN ue.conf, section [usim].
+            format!("k = {secret}"),
+            format!("opc = {secret}"),
+            format!("op = {secret}"),
+            format!("usim: imsi=001010000000201 k={secret} opc={secret}"),
+            // UERANSIM.
+            format!("key: '{secret}'"),
+            format!("op: '{secret}'"),
+            format!("authentication_key: {secret}"),
+            // Open5GS (document Mongo).
+            format!("security:{{k:\"{secret}\",op:null,opc:\"{secret}\",amf:\"8000\"}}"),
+            format!("\"key\": \"{secret}\""),
+            // Voisines : casse, séparateurs, clés dérivées, SQN.
+            format!("Ki: {secret}"),
+            format!("KI = {secret}"),
+            format!("OPc={secret}"),
+            format!("Op-C : {secret}"),
+            format!("K_asme: {secret}"),
+            format!("k_enb={secret}"),
+            format!("K-NAS-enc = {secret}"),
+            format!("SQN={secret}"),
+            format!("secret_key={secret}"),
+            format!("auth key {secret}"),
+            format!("subscriber key: {secret}"),
+            format!("usim auth key: {secret}"),
+        ];
+        for clear in [false, true] {
+            for line in &lines {
+                let rendered = sanitize_log_line_unbounded_with(line, clear);
+                assert_eq!(
+                    rendered.as_deref(),
+                    Some("[REDACTED_SUBSCRIBER_MATERIAL]"),
+                    "clear={clear} : {line}"
+                );
+                assert!(!rendered.unwrap_or_default().contains(secret));
+            }
+        }
+        // Contrôle : une ligne ordinaire passe (pas de faux positif grossier).
+        let ordinary = "rrc: RRC Connection Setup complete, rnti=0x46 cell=1";
+        assert_eq!(sanitize_log_line_unbounded_with(ordinary, false).as_deref(), Some(ordinary));
+        assert_eq!(sanitize_log_line_unbounded_with(ordinary, true).as_deref(), Some(ordinary));
     }
     #[derive(Default)]
     struct ScriptExecutor {

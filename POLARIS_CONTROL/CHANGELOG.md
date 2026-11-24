@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.36.32 — 2026-11-24 — Le matériel d'authentification n'est jamais rendu dans les journaux srsRAN ; garde « octet pour octet » déterministe
+
+Ordre cœur #9 7138374225 (priorité 1), refus ANR2 #10 7138095747. Base : `e949ffe` (0.36.31, non déployée).
+
+- **Fuite de secret corrigée.** `sanitize_log_line` (journaux srsRAN) ne reconnaissait que ` ki=`, `opc`, `auth key` et `subscriber key`. Une ligne `K=<valeur>`, `key=<valeur>`, `k = <valeur>`, `op = <valeur>`, `Ki: <valeur>`… passait **telle quelle**. **Interrupteur fermé aussi** : le défaut existait déjà en 0.36.30 déployée, et 0.36.31 l'exposait de plus quand la ligne portait aussi l'IMSI.
+- **Reconnaissance par contenu** (`line_carries_authentication_material`), quel que soit l'interrupteur. Tout nom de champ suivi de `=` ou `:`, avec ou sans espaces ni guillemets, quelle que soit la casse, et y compris un nom en deux mots, est examiné. La ligne est remplacée si ce nom vaut `k`, `ki`, `key`, `op`, `opc`, `op_c`/`op-c` ou `sqn`, s'il **finit par `key`** (`auth key`, `subscriber key`, `authentication_key`, `secret_key`…), s'il **commence par `k_`/`k-`** (`K_asme`, `K_eNB`, `K-NAS-enc`…) ou s'il contient `secret`. C'est fermé par défaut : un faux positif retire une ligne, jamais l'inverse.
+- **Formes relevées dans le dépôt** et couvertes : srsRAN `[usim]` (`k = `, `opc = `, `op = `), UERANSIM (`key: `, `op: `, `authentication_key: `), Open5GS (`security:{k:"…",opc:"…"}`), JSON (`"key": `), et leurs voisines.
+- **Garde** : `authentication_material_is_never_rendered_in_any_form_0_36_32`. Il reprend les deux variantes adverses d'ANR2 (`K=` et `key=` sur une ligne qui porte l'IMSI), plus 21 autres formes, chacune **interrupteur fermé et ouvert**, avec une ligne ordinaire en contrôle (pas de faux positif). **Rouge sur `e949ffe`** dès l'interrupteur fermé (`k = …` rendu tel quel) : branche de preuve poussée **`proof/control-0.36.32-secret-guard-on-e949ffe`**, rejouable par tous.
+- **Garde « octet pour octet » rendu autonome.** L'empreinte dépendait de la clé de télémétrie de la machine (`telemetry_pseudonym_key`). Un crochet **réservé aux tests** (`TEST_TELEMETRY_KEY`, fil courant, `#[cfg(test)]`) fixe la clé. L'empreinte de référence a été **recalculée sur `2626a2e` (0.36.30)** avec ce seul crochet : **`ae83ab2c…ce35`, 3 870 octets**. 0.36.32 interrupteur fermé donne la même. L'ancienne valeur `daaefeb6…` venait d'une machine **sans** clé : elle était fausse partout ailleurs.
+- Versions API et web alignées sur 0.36.32.
+
 ## 0.36.31 — 2026-11-24 — Interrupteur `POLARIS_IDENTITIES_IN_CLEAR` : identités et adresses en clair sur demande
 
 Ordres cœur #9 7133029202 et 7135266817 ; audit #9 7133297354.
