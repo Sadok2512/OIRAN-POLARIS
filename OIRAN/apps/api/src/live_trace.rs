@@ -243,6 +243,27 @@ pub(crate) struct PublishedSeedStats {
     /// Bornes appliquées, rendues telles quelles.
     pub(crate) max_sessions: u64,
     pub(crate) max_events: u64,
+    /// 2.21.177 — `event_id` du call flow publié absents de l'index (index
+    /// en retard sur la génération) : jamais `ok` tant qu'il en manque.
+    pub(crate) missing_events: u64,
+    /// 2.21.177 — essais d'interrogation du jeu publié, et leur borne.
+    pub(crate) attempts: u64,
+    pub(crate) max_attempts: u64,
+    /// 2.21.177 — un nouvel essai est programmé.
+    pub(crate) retry_pending: bool,
+}
+
+/// 2.21.177 (refus ANR1 #10 7146440592, ordre cœur #9 7146569811) — un
+/// amorçage dont la raison peut se résoudre d'elle-même RETENTE, borné.
+pub(crate) const PUBLISHED_SEED_MAX_ATTEMPTS: u64 = 30;
+const PUBLISHED_SEED_RETRY_SPACING: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Raisons qui peuvent se résoudre sans intervention.
+fn published_reason_is_retryable(reason: &str) -> bool {
+    matches!(
+        reason,
+        "compact_index_building" | "compact_index_lagging" | "journey_index_not_built" | "publication_in_progress"
+    )
 }
 
 /// 2.21.176 — résultat d'un résolveur de jeu publié : events bruts de
@@ -500,9 +521,11 @@ pub(crate) fn normalized_event_from_json(v: &Value) -> Option<event_schema::Norm
 /// pseudonymisée ici, avec la clé du lecteur (celle des décodeurs), sur une
 /// COPIE de l'event. La comparaison porte donc sur un pseudonyme calculé à la
 /// volée ; le jeu stocké et le format des events ne changent pas.
-/// 2.21.176 — nom des candidats « IP de l'UE » d'un G-PDU, posés sur la
-/// copie routée par `route_live`. Servent à la comparaison seulement.
-const GPDU_UE_IP_CANDIDATE: &str = "gpdu_ue_ip_candidate";
+/// 2.21.177 — pseudonymes des adresses internes d'un G-PDU, posés sur la
+/// copie routée par `route_live`, nommés par leur POSITION. Servent à la
+/// comparaison seulement ; jamais appris.
+const GPDU_INNER_SOURCE_PSEUDONYM: &str = "gpdu_inner_source_pseudonym";
+const GPDU_INNER_DESTINATION_PSEUDONYM: &str = "gpdu_inner_destination_pseudonym";
 
 pub(crate) fn route_live(
     traces: &LiveTraceRegistry,
@@ -513,32 +536,56 @@ pub(crate) fn route_live(
         traces.route_normalized(event);
         return;
     }
-    // `ue_ip` n'est posé par le décodeur que si la direction a pu être
-    // déduite ; les deux adresses internes le sont toujours. L'une d'elles
-    // est celle de l'UE : chacune devient un CANDIDAT de comparaison, sous un
-    // nom propre — jamais appris, jamais `ue_ip`, les valeurs d'origine
-    // restent intactes.
-    let candidates: Vec<String> = event
-        .session_identifiers
-        .iter()
-        .filter(|id| {
-            !id.pseudonymized && matches!(id.name.as_str(), "ue_ip" | "inner_source_ip" | "inner_destination_ip")
-        })
-        .filter_map(|id| event_schema::pseudonym_ip_text(key, &id.value))
-        .collect::<BTreeSet<String>>()
-        .into_iter()
-        .collect();
-    if candidates.is_empty() {
+    // 2.21.177 (refus ANR1 #10 7146440592, ordre cœur #9 7146569811) — les
+    // deux adresses internes sont pseudonymisées SÉPARÉMENT, chacune sous le
+    // nom de sa position. Laquelle est l'UE n'est PAS décidé ici : c'est la
+    // trace qui le décide, par le sens que lui donne SA session (côté cœur
+    // ou côté radio de la destination). Le `ue_ip` du décodeur, déduit de
+    // pools d'adresses par défaut, n'est pas utilisé.
+    let mut positions: Vec<(&'static str, String)> = Vec::new();
+    for (position, name) in [
+        (GPDU_INNER_SOURCE_PSEUDONYM, "inner_source_ip"),
+        (GPDU_INNER_DESTINATION_PSEUDONYM, "inner_destination_ip"),
+    ] {
+        if let Some(value) = event
+            .session_identifiers
+            .iter()
+            .find(|id| id.name == name && !id.pseudonymized)
+            .and_then(|id| event_schema::pseudonym_ip_text(key, &id.value))
+        {
+            positions.push((position, value));
+        }
+    }
+    if positions.is_empty() {
         traces.route_normalized(event);
         return;
     }
     let mut event = event.clone();
-    event.session_identifiers.extend(candidates.into_iter().map(|value| event_schema::NamedValue {
-        name: GPDU_UE_IP_CANDIDATE.into(),
+    event.session_identifiers.extend(positions.into_iter().map(|(name, value)| event_schema::NamedValue {
+        name: name.into(),
         value,
         pseudonymized: true,
     }));
     traces.route_normalized(&event);
+}
+
+/// 2.21.177 — programme (ou non) un nouvel essai d'après le dernier bilan,
+/// et pose l'état rendu : `not_consulted`, `consulted`, `bounded`, ou
+/// `retrying` tant qu'un essai est programmé.
+fn schedule_published_retry(state: &mut TraceState) {
+    let published = &mut state.trace.seed.published;
+    let retry = published_reason_is_retryable(published.reason) && published.attempts < PUBLISHED_SEED_MAX_ATTEMPTS;
+    published.retry_pending = retry;
+    state.published_retry_due = retry.then(|| std::time::Instant::now() + PUBLISHED_SEED_RETRY_SPACING);
+    state.trace.seed.published_state = if retry {
+        "retrying"
+    } else if !published.consulted {
+        "not_consulted"
+    } else if published.bounded {
+        "bounded"
+    } else {
+        "consulted"
+    };
 }
 
 /// 2.21.105 — choisit les fichiers du ring à relire pour l'amorçage :
@@ -1174,6 +1221,8 @@ struct TraceState {
     seid_tunnels: HashMap<String, HashSet<(String, String)>>,
     /// 2.21.105 — la trace attend son amorçage depuis le ring.
     needs_seed: bool,
+    /// 2.21.177 — prochain essai d'interrogation du jeu publié.
+    published_retry_due: Option<std::time::Instant>,
     /// 2.21.105 — la trace est dans la passe d'amorçage en cours :
     /// seule cible de `learn_from_ring`.
     seeding: bool,
@@ -1704,11 +1753,6 @@ fn ue_ip_pseudonyms(event: &event_schema::NormalizedEvent) -> Vec<String> {
         _ => {}
     }
     for id in &event.session_identifiers {
-        // 2.21.176 — candidats d'un G-PDU (copie routée par `route_live`).
-        if id.name == GPDU_UE_IP_CANDIDATE && id.pseudonymized && event.protocol.as_str() == "GTP-U" {
-            out.push(id.value.clone());
-            continue;
-        }
         if id.name == "ue_ip" && id.pseudonymized {
             out.push(id.value.clone());
         }
@@ -1900,6 +1944,42 @@ impl LiveTraceRegistry {
         out
     }
 
+    /// 2.21.177 — reprend l'interrogation du JEU PUBLIÉ (pas du ring) pour
+    /// les traces dont le dernier essai a rendu une raison provisoire et
+    /// dont l'échéance est passée. Borné à `PUBLISHED_SEED_MAX_ATTEMPTS`.
+    pub(crate) fn retry_published_seed(&self) {
+        let now = std::time::Instant::now();
+        let due: Vec<String> = {
+            let mut traces = self.traces.lock().unwrap();
+            let mut due = Vec::new();
+            for (id, state) in traces.iter_mut() {
+                if state.published_retry_due.is_some_and(|at| at <= now) && !state.seeding {
+                    state.published_retry_due = None;
+                    state.seeding = true;
+                    due.push(id.clone());
+                }
+            }
+            due
+        };
+        if due.is_empty() {
+            return;
+        }
+        let published = self.published_for_seeding();
+        let stats = published.stats.clone();
+        learn_ranked_history(self, published.events.into_iter().map(|event| (Some(0u128), event)).collect());
+        let mut traces = self.traces.lock().unwrap();
+        for id in due {
+            if let Some(state) = traces.get_mut(&id) {
+                state.seeding = false;
+                let attempts = state.trace.seed.published.attempts.saturating_add(1);
+                state.trace.seed.published = stats.clone();
+                state.trace.seed.published.attempts = attempts;
+                state.trace.seed.published.max_attempts = PUBLISHED_SEED_MAX_ATTEMPTS;
+                schedule_published_retry(state);
+            }
+        }
+    }
+
     /// 2.21.176 — interroge le jeu publié pour l'amorçage en cours. Sans
     /// résolveur, ou sans pseudonyme : non consulté, raison rendue.
     fn published_for_seeding(&self) -> PublishedSeed {
@@ -2012,13 +2092,9 @@ impl LiveTraceRegistry {
                 state.trace.seed.rank_source_name = report.rank_source_name;
                 state.trace.seed.rank_source_missing = report.rank_source_missing;
                 state.trace.seed.published = report.published.clone();
-                state.trace.seed.published_state = if !report.published.consulted {
-                    "not_consulted"
-                } else if report.published.bounded {
-                    "bounded"
-                } else {
-                    "consulted"
-                };
+                state.trace.seed.published.attempts = 1;
+                state.trace.seed.published.max_attempts = PUBLISHED_SEED_MAX_ATTEMPTS;
+                schedule_published_retry(state);
             }
         }
     }
@@ -2681,18 +2757,44 @@ impl LiveTraceRegistry {
             // l'UE de l'abonné. SIP : adresse du paquet ou du SDP (couvre
             // REGISTER et tout message sans SDP, avec des URI qui ne sont
             // ni IMSI ni MSISDN). PFCP : IE 93.
-            // 2.21.176 (arbitrage cœur #9 7145423680 / 7145721924, voie ii) —
-            // le G-PDU aussi : l'IP de l'UE survit au handover et au
-            // rétablissement, le couple (adresse, TEID) non. Sa valeur est
-            // pseudonymisée À LA VOLÉE par le lecteur (`route_live`), jamais
-            // dans le jeu stocké.
-            let match_ue_ip = (is_sip || is_pfcp || is_gpdu_data)
+            let match_ue_ip = (is_sip || is_pfcp)
                 && ev_ue_ip_pseudonyms
                     .iter()
                     .any(|ip| state.ue_ip_keys.contains_key(ip));
+            // 2.21.177 (refus ANR1 #10 7146440592) — IP de l'UE d'un G-PDU,
+            // désignée par le SENS que donne la session de CET abonné : la
+            // destination du paquet GTP-U est-elle une adresse côté cœur
+            // (UPF) connue de la trace → montant, l'UE est la SOURCE
+            // interne ; une adresse côté radio (gNB) connue → descendant,
+            // l'UE est la DESTINATION interne. Sinon : aucune comparaison par
+            // IP. L'adresse du pair n'est jamais candidate : un paquet B → A
+            // sur le tunnel montant de B désigne B, pas A.
+            let match_gpdu_ue_ip = is_gpdu_data && {
+                let destination = event_schema::normalize_ip(&event.destination_endpoint.address);
+                let core_side = state.core_tunnel_endpoints.iter().any(|(address, _)| *address == destination);
+                let radio_side = !core_side
+                    && state.tunnel_endpoints.iter().any(|pair| {
+                        pair.0 == destination
+                            && !state.core_tunnel_endpoints.iter().any(|(address, _)| *address == pair.0)
+                    });
+                let position = if core_side {
+                    Some(GPDU_INNER_SOURCE_PSEUDONYM)
+                } else if radio_side {
+                    Some(GPDU_INNER_DESTINATION_PSEUDONYM)
+                } else {
+                    None
+                };
+                position.is_some_and(|position| {
+                    event
+                        .session_identifiers
+                        .iter()
+                        .any(|id| id.name == position && id.pseudonymized && state.ue_ip_keys.contains_key(&id.value))
+                })
+            };
             let matched = forced
                 || match_call
                 || match_ue_ip
+                || match_gpdu_ue_ip
                 || match_pseudo
                 || match_keys
                 || match_seid
@@ -4127,6 +4229,8 @@ pub(crate) fn reader_pass(
         let report = seed_from_ring(root, key, traces);
         traces.finish_seed(&report);
     }
+    // 2.21.177 — reprises bornées de l'interrogation du jeu publié.
+    traces.retry_published_seed();
     for interface in [
         "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
         "S6a", "IMS",
@@ -4903,6 +5007,7 @@ pub(crate) async fn create(
             // 2.21.105 — le lecteur relit le ring de signalisation
             // pour cette trace à sa prochaine passe.
             needs_seed: true,
+            published_retry_due: None,
             seeding: false,
         },
     );
@@ -5477,6 +5582,7 @@ mod tests {
             ended_sip_call_ids: HashSet::new(),
             seid_tunnels: HashMap::new(),
             needs_seed: true,
+            published_retry_due: None,
             seeding: false,
         }
     }
@@ -9110,12 +9216,158 @@ mod tests {
         let clear = gpdu.session_identifiers.iter().find(|id| id.name == "inner_source_ip").unwrap().value.clone();
         let pseudonym = event_schema::pseudonym_ip_text(&key, &clear).unwrap();
         let r = trace_on("psn-ue-ip-only-2-21-176");
-        r.traces.lock().unwrap().get_mut("t").unwrap().ue_ip_keys.insert(pseudonym, HashSet::new());
+        {
+            let mut traces = r.traces.lock().unwrap();
+            let t = traces.get_mut("t").unwrap();
+            t.ue_ip_keys.insert(pseudonym, HashSet::new());
+            // 2.21.177 — la session de l'abonné connaît l'UPF (côté cœur) :
+            // ce G-PDU qui lui est destiné est MONTANT, l'UE est la source
+            // interne. Le TEID, lui, reste inconnu de la trace.
+            let upf = event_schema::normalize_ip(&gpdu.destination_endpoint.address);
+            t.core_tunnel_endpoints.insert((upf, "0x7fffffff".into()));
+        }
         route_live(&r, &gpdu, &key);
         let traces = r.traces.lock().unwrap();
         let trace = &traces["t"].trace;
         assert_eq!(trace.gpdu_seen, 1);
         assert_eq!(trace.gpdu_attached, 1, "no_match={}", trace.gpdu_rejected_no_match);
+    }
+
+    /// 2.21.177 — un G-PDU construit à partir d'un G-PDU réel : extrémités
+    /// du tunnel, TEID et adresses internes posés par le garde.
+    fn gpdu_2_21_177(
+        base: &event_schema::NormalizedEvent,
+        tunnel: (&str, &str, &str),
+        inner: (&str, &str),
+        event_id: &str,
+    ) -> event_schema::NormalizedEvent {
+        let mut event = base.clone();
+        event.event_id = event_id.into();
+        event.source_endpoint.address = tunnel.0.into();
+        event.destination_endpoint.address = tunnel.1.into();
+        for id in event.session_identifiers.iter_mut() {
+            match id.name.as_str() {
+                "teid" => id.value = tunnel.2.into(),
+                "inner_source_ip" => id.value = inner.0.into(),
+                "inner_destination_ip" => id.value = inner.1.into(),
+                _ => {}
+            }
+        }
+        event.session_identifiers.retain(|id| id.name != "ue_ip");
+        if let Some(reference) = event.packet_references.first_mut() {
+            reference.packet_number += event_id.len() as u64 * 1_000;
+        }
+        event
+    }
+
+    /// 2.21.177 (refus ANR1 #10 7146440592, ordre cœur #9 7146569811) — DEUX
+    /// abonnés suivis, DEUX tunnels. Un paquet UE-B → UE-A passe d'abord par
+    /// le tunnel MONTANT de B (vers l'UPF), puis par le tunnel DESCENDANT de A
+    /// (vers le gNB de A). Les TEID sont inconnus des deux traces : seul le
+    /// chemin par l'IP de l'UE peut rattacher. Exigé : B rattache le premier,
+    /// A le second, chacun UNE fois. Le tunnel de B ne s'attache jamais à A
+    /// par l'adresse du pair, et le paquet n'est pas compté deux fois. Avant
+    /// 2.21.177 (deux adresses internes candidates) : A et B rattachaient
+    /// les deux passages.
+    #[test]
+    fn a_peer_address_never_attaches_another_subscribers_tunnel_2_21_177() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let base = decode_reference_capture_2_21_176("N3.pcapng", "N3", &key)
+            .into_iter()
+            .find(|e| e.protocol.as_str() == "GTP-U" && e.session_identifiers.iter().any(|id| id.name == "inner_source_ip"))
+            .expect("un G-PDU réel");
+        let (upf, gnb_a, gnb_b) = ("10.77.22.13", "10.77.22.20", "10.77.22.21");
+        let (ip_a, ip_b) = ("10.45.0.2", "10.45.0.3");
+        let r = LiveTraceRegistry::new();
+        for (id, pseudonym, ip, core_teid, gnb, radio_teid) in
+            [("a", "psn-ue-a-2-21-177", ip_a, "0x0000a001", gnb_a, "0x0000a002"), ("b", "psn-ue-b-2-21-177", ip_b, "0x0000b001", gnb_b, "0x0000b002")]
+        {
+            let mut trace = state(u64::MAX, false, vec![pseudonym.into()]);
+            trace.trace.trace_id = id.into();
+            trace.core_tunnel_endpoints.insert((upf.into(), core_teid.into()));
+            trace.tunnel_endpoints.insert((upf.into(), core_teid.into()));
+            trace.tunnel_endpoints.insert((gnb.into(), radio_teid.into()));
+            trace.ue_ip_keys.insert(event_schema::pseudonym_ip_text(&key, ip).unwrap(), HashSet::new());
+            r.traces.lock().unwrap().insert(id.into(), trace);
+        }
+        // B → A sur le tunnel montant de B (TEID inconnu des deux traces).
+        let uplink_b = gpdu_2_21_177(&base, (gnb_b, upf, "0x0000b0ff"), (ip_b, ip_a), "evt-uplink-b-2-21-177");
+        // Le même paquet livré sur le tunnel descendant de A.
+        let downlink_a = gpdu_2_21_177(&base, (upf, gnb_a, "0x0000a0ff"), (ip_b, ip_a), "evt-downlink-a-2-21-177");
+        route_live(&r, &uplink_b, &key);
+        route_live(&r, &downlink_a, &key);
+        let traces = r.traces.lock().unwrap();
+        let (a, b) = (&traces["a"].trace, &traces["b"].trace);
+        assert_eq!(a.gpdu_seen, 2);
+        assert_eq!(b.gpdu_seen, 2);
+        assert_eq!(b.gpdu_attached, 1, "B : seulement son tunnel montant (no_match={})", b.gpdu_rejected_no_match);
+        assert_eq!(a.gpdu_attached, 1, "A : seulement son tunnel descendant (no_match={})", a.gpdu_rejected_no_match);
+    }
+
+    /// 2.21.177 — l'amorçage RETENTE quand le jeu publié n'est pas encore
+    /// lisible, et le DIT : premier essai « index en retard », la trace est
+    /// `retrying` ; l'essai suivant rend les liens, et le N3 se rattache.
+    #[test]
+    fn the_seed_retries_the_published_dataset_and_says_so_2_21_177() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut published = decode_reference_capture_2_21_176("N2.pcapng", "N2", &key);
+        published.extend(decode_reference_capture_2_21_176("N4.pcapng", "N4", &key));
+        let pseudonym = published
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .unwrap();
+        let r = trace_on(&pseudonym);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        r.set_published_resolver(std::sync::Arc::new(move |_pseudonyms: &[String]| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                PublishedSeed {
+                    events: Vec::new(),
+                    stats: PublishedSeedStats { consulted: true, reason: "compact_index_lagging", missing_events: 7, ..Default::default() },
+                }
+            } else {
+                PublishedSeed {
+                    events: published.clone(),
+                    stats: PublishedSeedStats { consulted: true, reason: "ok", events: published.len() as u64, ..Default::default() },
+                }
+            }
+        }));
+        let (dir, bytes) = n3_ring_file("published-retry-2-21-177");
+        let root = dir.parent().unwrap().join("ring");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(ring_directory("N3"))).unwrap();
+        let mut hooks = CountingHooks::default();
+        // Passe 1 : amorçage, index en retard → reprise programmée.
+        reader_pass(&root, &key, &r, &mut HashMap::new(), &mut HashMap::new(), &mut HashMap::new(), true, false, std::time::Instant::now(), &mut hooks);
+        {
+            let traces = r.traces.lock().unwrap();
+            let seed = serde_json::to_value(&traces["t"].trace.seed).unwrap();
+            assert_eq!(seed["published_state"], "retrying", "{seed}");
+            assert_eq!(seed["published"]["retry_pending"], true, "{seed}");
+            assert_eq!(seed["published"]["attempts"], 1, "{seed}");
+            assert_eq!(seed["published"]["max_attempts"], PUBLISHED_SEED_MAX_ATTEMPTS, "{seed}");
+            assert_eq!(seed["published"]["missing_events"], 7, "{seed}");
+        }
+        // L'échéance est passée : essai suivant.
+        r.traces.lock().unwrap().get_mut("t").unwrap().published_retry_due = Some(std::time::Instant::now());
+        r.retry_published_seed();
+        {
+            let traces = r.traces.lock().unwrap();
+            let seed = serde_json::to_value(&traces["t"].trace.seed).unwrap();
+            assert_eq!(seed["published_state"], "consulted", "{seed}");
+            assert_eq!(seed["published"]["attempts"], 2, "{seed}");
+            assert_eq!(seed["published"]["retry_pending"], false, "{seed}");
+        }
+        // Le N3 arrive : rattaché grâce aux liens obtenus à la reprise.
+        fs::write(root.join(ring_directory("N3")).join("n3_00001.pcapng"), &bytes).unwrap();
+        reader_pass(&root, &key, &r, &mut HashMap::new(), &mut HashMap::new(), &mut HashMap::new(), true, false, std::time::Instant::now(), &mut hooks);
+        let traces = r.traces.lock().unwrap();
+        assert!(traces["t"].trace.gpdu_attached > 0, "no_match={}", traces["t"].trace.gpdu_rejected_no_match);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "deux essais, pas de boucle");
+        drop(traces);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {

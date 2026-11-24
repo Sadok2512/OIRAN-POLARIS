@@ -1379,7 +1379,25 @@ fn resolve_published_seed(state: &AppState, pseudonyms: &[String]) -> live_trace
         let Some(root) = state.inner.capture_manager.dataset_root(&dataset_id) else {
             continue;
         };
-        let bundle = state.inner.compact_index_registry.ensure_tracking(&root);
+        // 2.21.177 (refus ANR1 #10 7146440592) — l'index est lié à la
+        // génération PUBLIÉE : les fichiers d'events du manifeste en vigueur
+        // (registre en mémoire). Un shard plus récent que l'index le fait
+        // reconstruire, au lieu d'être silencieusement absent.
+        let expected: Vec<PathBuf> = state
+            .inner
+            .capture_manager
+            .datasets()
+            .into_iter()
+            .find(|dataset| dataset.dataset_id == dataset_id)
+            .map(|dataset| {
+                if dataset.event_shards.is_empty() {
+                    vec![root.join("oiran_events.jsonl")]
+                } else {
+                    dataset.event_shards.iter().map(|shard| root.join(&shard.path)).collect()
+                }
+            })
+            .unwrap_or_else(|| vec![root.join("oiran_events.jsonl")]);
+        let bundle = state.inner.compact_index_registry.ensure_tracking_for(&root, &expected);
         spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
         if !bundle.all_ready() {
             reason = "compact_index_building";
@@ -1398,8 +1416,14 @@ fn resolve_published_seed(state: &AppState, pseudonyms: &[String]) -> live_trace
             &state.inner.read_time_patch_counters,
         );
         for id in &ids {
-            if let Some(event) = scoped.get(id).and_then(live_trace::normalized_event_from_json) {
-                events.push(event);
+            match scoped.get(id).and_then(live_trace::normalized_event_from_json) {
+                Some(event) => events.push(event),
+                // 2.21.177 — un `event_id` du call flow publié absent de
+                // l'index : index en retard sur la génération. Jamais `ok`.
+                None => {
+                    stats.missing_events += 1;
+                    reason = "compact_index_lagging";
+                }
             }
         }
         stats.sessions_used += 1;
@@ -19755,6 +19779,107 @@ mod tests {
             "le PFCP publié qui porte l'IP de l'UE (IE 93) est rendu"
         );
         assert!(resolved.events.iter().any(|event| event.protocol.as_str() == "NGAP"), "le N2 publié est rendu");
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(capture_root).ok();
+    }
+
+    /// 2.21.177 (refus ANR1 #10 7146440592) — le contre-exemple d'ANR1 :
+    /// index compact PRÊT sur la génération G (N2 seul), publication de G+1
+    /// (le N4 arrive), interrogation IMMÉDIATE. Un `ok` n'est admis que s'il
+    /// rend le PFCP de G+1 ; la reprise doit finir par l'obtenir. Avant
+    /// 2.21.177 : l'index de G, jamais redécouvert, rendait `ok` sans G+1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_resolver_never_says_ok_on_an_index_older_than_the_publication_2_21_177() {
+        use live_probe::{ContinuousImportConfig, CONTINUOUS_CAPTURE_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let label = "published-seed-lag-2-21-177";
+        let capture_root = temporary_directory(&format!("{label}-root"));
+        let source = temporary_directory(&format!("{label}-source"));
+        let copy_plane = |plane: &str| {
+            fs::create_dir_all(source.join(plane)).unwrap();
+            fs::copy(
+                workspace.join(format!("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/{plane}.pcapng")),
+                source.join(format!("{plane}/segment-0001.pcapng")),
+            )
+            .unwrap();
+            let lower = plane.to_ascii_lowercase();
+            let mut closures = fs::OpenOptions::new().create(true).append(true).open(source.join("capture-rotation.jsonl")).unwrap();
+            writeln!(
+                closures,
+                r#"{{"timestamp":"2026-11-06T00:00:00Z","interface":"br-oiran-{lower}","plane":"{lower}","exit_code":0,"packets_captured":0,"packets_dropped":0}}"#
+            )
+            .unwrap();
+        };
+        copy_plane("N2");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let manager = CaptureManager::with_pseudonym_key_path(capture_root.clone(), false, capture_root.join(".oiran-pseudonym.key")).unwrap();
+        let mut config = test_config(workspace, label);
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        config.continuous_import_enabled = true;
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+        state
+            .inner
+            .capture_manager
+            .start_continuous_import(ContinuousImportConfig {
+                scan_interval: std::time::Duration::from_millis(200),
+                stable_age: std::time::Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 8,
+                ..ContinuousImportConfig::bounded(source.clone())
+            })
+            .unwrap();
+        let ingested = |state: &AppState, n: u64| {
+            state
+                .inner
+                .capture_manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.segments_ingested >= n && job.metrics.pending_segments == 0)
+        };
+        let waiting = state.clone();
+        tokio::task::spawn_blocking(move || wait_2_21_164(|| ingested(&waiting, 1))).await.unwrap();
+        // Génération G : index prêt, résolution `ok` sur le N2.
+        let subscriber = cached_journey_index(&state)
+            .subscribers()
+            .into_iter()
+            .find(|record| record.session_count > 0)
+            .expect("un abonné dans G")
+            .subscriber_pseudonym;
+        let resolve_until_settled = |state: AppState, subscriber: String| {
+            tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    let resolved = resolve_published_seed(&state, &[subscriber.clone()]);
+                    let retryable = matches!(resolved.stats.reason, "compact_index_building" | "compact_index_lagging");
+                    if !retryable || std::time::Instant::now() > deadline {
+                        return resolved;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        let at_g = resolve_until_settled(state.clone(), subscriber.clone()).await.unwrap();
+        assert_eq!(at_g.stats.reason, "ok", "{:?}", at_g.stats);
+        // Génération G+1 : le N4 de l'abonné est publié.
+        copy_plane("N4");
+        let waiting = state.clone();
+        tokio::task::spawn_blocking(move || wait_2_21_164(|| ingested(&waiting, 2))).await.unwrap();
+        state.inner.capture_manager.stop(CONTINUOUS_CAPTURE_ID, "operator").ok();
+        let _ = cached_journey_index(&state);
+        let carries_g1 = |events: &[event_schema::NormalizedEvent]| {
+            events.iter().any(|event| event.protocol.as_str() == "PFCP" && event.information_elements.iter().any(|ie| ie.id == Some(93)))
+        };
+        // Interrogation IMMÉDIATE, avant tout poll de l'index.
+        let immediate = resolve_published_seed(&state, &[subscriber.clone()]);
+        if immediate.stats.reason == "ok" {
+            assert!(carries_g1(&immediate.events), "`ok` sans les events de G+1 : {:?}", immediate.stats);
+        }
+        // La reprise finit par obtenir G+1.
+        let settled = resolve_until_settled(state.clone(), subscriber).await.unwrap();
+        assert_eq!(settled.stats.reason, "ok", "{:?}", settled.stats);
+        assert!(carries_g1(&settled.events), "G+1 rejoué : {:?}", settled.stats);
         fs::remove_dir_all(source).ok();
         fs::remove_dir_all(capture_root).ok();
     }

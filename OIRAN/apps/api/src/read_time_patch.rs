@@ -1300,6 +1300,58 @@ impl CompactJsonlIndexRegistry {
         guard.entry(key).or_insert_with(|| bundle.clone()).clone()
     }
 
+    /// 2.21.177 (refus ANR1 #10 7146440592) — comme `ensure_tracking`, mais
+    /// LIÉ à la génération publiée : `expected` est la liste exacte des
+    /// fichiers d'events du manifeste en vigueur (en mémoire, aucun
+    /// `read_dir`). Si le jeu d'index suivi ne couvre pas exactement ces
+    /// fichiers — un shard écrit par une publication ultérieure, ou un
+    /// shard retiré —, il est REMPLACÉ par un jeu neuf sur ces fichiers, qui
+    /// se construit alors à froid (`all_ready() == false` jusque-là).
+    pub fn ensure_tracking_for(&self, dataset_root: &Path, expected: &[PathBuf]) -> Arc<DatasetIndexes> {
+        let key = dataset_root
+            .canonicalize()
+            .unwrap_or_else(|_| dataset_root.to_path_buf());
+        let mut wanted: Vec<PathBuf> = expected.to_vec();
+        wanted.sort();
+        let covers = |bundle: &DatasetIndexes| {
+            let mut tracked: Vec<PathBuf> = bundle
+                .flat
+                .iter()
+                .chain(bundle.shards.iter())
+                .map(|index| index.path().to_path_buf())
+                .collect();
+            tracked.sort();
+            tracked == wanted
+        };
+        {
+            let guard = self.tracked.lock().unwrap();
+            if let Some(existing) = guard.get(&key) {
+                if covers(existing) {
+                    return existing.clone();
+                }
+            }
+        }
+        let flat_path = dataset_root.join("oiran_events.jsonl");
+        let mut flat = None;
+        let mut shards = Vec::new();
+        for path in wanted.clone() {
+            if path == flat_path {
+                flat = Some(Arc::new(CompactJsonlIndex::new(path)));
+            } else {
+                shards.push(Arc::new(CompactJsonlIndex::new(path)));
+            }
+        }
+        let bundle = Arc::new(DatasetIndexes { flat, shards });
+        let mut guard = self.tracked.lock().unwrap();
+        match guard.get(&key) {
+            Some(existing) if covers(existing) => existing.clone(),
+            _ => {
+                guard.insert(key, bundle.clone());
+                bundle
+            }
+        }
+    }
+
     /// Pousse l'état agrégé de TOUS les indexes du registre vers les
     /// compteurs partagés. Idempotent ; appelé par le worker après
     /// chaque passe (initial build ou extend_from_tail).

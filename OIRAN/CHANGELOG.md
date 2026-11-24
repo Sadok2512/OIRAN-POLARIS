@@ -1,5 +1,34 @@
 # Changelog
 
+## oiran-api 2.21.177 — 2026-11-24 — le G-PDU d'un autre abonné ne se rattache plus par l'adresse du pair ; l'amorçage ne dit plus `ok` sur un index en retard
+
+Ordre cœur #9 7146569811, refus ANR1 #10 7146440592 de 2.21.176. Base : `da9502b` (2.21.176). Seul `oiran-api` change. Le volet B de 2.21.176 (interrogation ciblée du jeu publié) est conservé tel quel.
+
+### Défaut 1 — corrélation par l'adresse du pair
+2.21.176 acceptait les **deux** adresses internes d'un G-PDU comme candidates. Un paquet UE-B → UE-A sur le tunnel montant de B était donc rattaché à A, par l'adresse du pair. Puis le même paquet, livré sur le tunnel descendant de A, l'était une seconde fois. Résultat : du trafic attribué au mauvais abonné, et un débit doublé.
+
+### Corrigé : le sens vient de la session de l'abonné, pas du décodeur
+- `route_live` pseudonymise les deux adresses internes **séparément**, chacune sous le nom de sa **position** (`gpdu_inner_source_pseudonym`, `gpdu_inner_destination_pseudonym`). Il ne décide pas laquelle est l'UE.
+- Chaque trace décide par **sa** session :
+  - si la destination du paquet GTP-U est une adresse **côté cœur** qu'elle connaît (`core_tunnel_endpoints`, appris du F-TEID PFCP et du tunnel montant N2), le paquet est **montant** et l'UE est la **source** interne ;
+  - si c'est une adresse **côté radio** connue (les autres couples de `tunnel_endpoints`), le paquet est **descendant** et l'UE est la **destination** interne ;
+  - sinon, **aucune comparaison par IP**.
+- **Pourquoi pas le sens du décodeur** : `decoder-gtpu` déduit le sens, et donc `ue_ip`, de pools d'adresses UE par défaut (`default_ue_ip_pools`, `infer_direction_from_inner_ipv4`). C'est une heuristique de configuration, pas une preuve.
+- **Limite déclarée** : après un handover vers un gNB dont l'adresse n'est pas encore connue de la trace, le sens descendant n'est pas établi et ce G-PDU n'est pas comparé par IP. Le sens montant (vers l'UPF) reste établi.
+
+### Défaut 2 — index compact prêt mais en retard, amorçage sans reprise
+- L'index compact d'un jeu était mis en cache **une fois pour toutes** par `ensure_tracking`, avec la liste des fichiers présents à ce moment-là. Un shard écrit par une publication ultérieure n'était **jamais** indexé. Le résolveur rendait alors `ok` sans les events de la nouvelle génération.
+- **Corrigé** : `ensure_tracking_for(root, expected)` lie l'index aux fichiers d'events **du manifeste publié**, lus dans le registre en mémoire, sans `read_dir`. Un écart entraîne un jeu d'index neuf, construit à froid. Un `event_id` du call flow absent de l'index donne `missing_events` et la raison `compact_index_lagging`, **jamais `ok`**.
+- **Reprise bornée, et dite** : une raison provisoire (`compact_index_building`, `compact_index_lagging`, `journey_index_not_built`, `publication_in_progress`) programme un nouvel essai, qui n'interroge que le **jeu publié**, pas le ring. Les essais sont espacés de 2 s, **au plus 30** (`PUBLISHED_SEED_MAX_ATTEMPTS`). La trace rend `seed.published.attempts`, `max_attempts`, `retry_pending`, `missing_events`, et `seed.published_state = "retrying"` tant qu'un essai est programmé.
+
+### Gardes
+- `a_peer_address_never_attaches_another_subscribers_tunnel_2_21_177` : **deux abonnés suivis, deux tunnels**, TEID inconnus des deux traces. Un paquet B → A sur le tunnel montant de B, puis sur le tunnel descendant de A. Exigé : B rattache le premier, A le second, **une fois chacun**. **Rouge sur `da9502b`.**
+- `the_resolver_never_says_ok_on_an_index_older_than_the_publication_2_21_177` : index **prêt** sur G (N2), publication de G+1 (N4), interrogation **immédiate**. `ok` n'est admis qu'avec le PFCP de G+1, et la reprise l'obtient. **Rouge sur `da9502b`.**
+- `the_seed_retries_the_published_dataset_and_says_so_2_21_177` : premier essai « en retard », la trace passe en `retrying` (`attempts=1`, `missing_events` rendu). L'essai suivant rend les liens et le N3 se rattache. Exactement deux appels au résolveur.
+- `a_gpdu_attaches_by_its_ue_ip_alone_2_21_176` est adapté : la trace connaît l'UPF de sa session, le TEID reste inconnu.
+
+Preuve rejouable : branche `proof/oiran-2.21.177-guards-on-da9502b`.
+
 ## oiran-api 2.21.176 — 2026-11-24 — la trace live rattache le N3 d'un abonné dont la session précède le ring : amorçage sur le jeu publié, IP de l'UE comme clé de G-PDU
 
 Ordres cœur #9 7145234285, 7145423680, 7145721924 ; audit #9 7145300842 et 7145472269. Base : `aed583b` (2.21.175). Seul `oiran-api` est touché ; `event-schema`, `decoder-gtpu` et le format stocké sont inchangés.
