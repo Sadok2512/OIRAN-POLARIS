@@ -1,5 +1,36 @@
 # Changelog
 
+## oiran-api 2.21.174 / live-probe 0.6.46 — 2026-11-24 — les répertoires temporaires des tests se suppriment eux-mêmes, même en cas de panique
+
+Ordre cœur #9 7143938762 et 7144069142, audit #9 7143903772. Base : `99f9797` (2.21.173). **Tests uniquement** : aucun code de production modifié. Montée de version : patch sur les deux composants.
+
+### Défaut
+`temporary_root` (live-probe, `#[cfg(test)]`) rendait un `PathBuf` dans `/tmp`. **108 des 120** tests appelants ne supprimaient jamais leur répertoire. Les tests `work_bytes_*` y laissent des fichiers creux de 10 × 1 Gio et 3 380 541 933 octets apparents. Le 24/11, faute de CI, chaque passage manuel des gardes sur l'hôte du lab laissait environ 14 Go, et le disque s'est rempli.
+
+### Corrigé
+- **`temporary_root` rend un porteur `TempRoot`** : `Deref<Target = Path>`, `AsRef<Path>`, et **`Drop` qui supprime le répertoire**.
+- `Drop` s'exécute aussi pendant le **déroulement d'une panique** : les cibles de test ignorent le `panic = "abort"` de `[profile.release]`. Un test qui échoue nettoie donc aussi derrière lui.
+- **Nom unique** : `nom-epoch_ms-pid-compteur`. Deux tests parallèles ne partagent jamais, donc ne se suppriment jamais, le même répertoire.
+- **Tous les appelants sont traités, sans exception.** Les **141** appels, dans **120** fonctions de test, passent par le porteur :
+  - 82 `.clone()` deviennent `.to_path_buf()` (positions données par le compilateur) ;
+  - 5 passages par valeur deviennent `.to_path_buf()` ;
+  - 5 chaînes `temporary_root(..).join(..)`, qui auraient supprimé le répertoire aussitôt, lient désormais le porteur à une variable ;
+  - `ArchivedLabShapedDataset` garde le porteur vivant avec le jeu rendu.
+- **Les fichiers creux gardent leur taille.**
+
+### Gardes
+- `a_panicking_test_leaves_no_temporary_root_behind_0_6_46` : un répertoire peuplé (fichier creux de 1 Gio), puis une panique dans `catch_unwind`. Le répertoire doit avoir disparu.
+- `a_passing_test_leaves_no_temporary_root_behind_0_6_46` : même chose sans panique.
+
+Preuve rejouable : branche `proof/live-probe-0.6.46-guards-on-99f9797`.
+
+### OUVERT, déclaré
+- **Fils d'import qui survivent au test.** 16 tests lancent un import continu et l'arrêtent par `.stop(`, mais le fil termine sa dernière écriture (`job.json`, `audit.jsonl`) **après** la fin du test et recrée un petit répertoire. Mesure sur un passage complet : 16 répertoires, 174 686 octets (`du -sb`), contre environ 14 Go avant. Les retenir demanderait que `stop` attende la fin du fil : c'est du comportement de production, hors de ce lot.
+- **Autres créateurs de temporaires, hors `temporary_root`** :
+  - `apps/api` `temporary_directory` : 26 appels, 28 `remove_dir_all` dans le fichier ;
+  - `live-probe/src/commit_seq.rs` `tmp_dir` : 5 appels, 0 suppression ;
+  - `live-probe/tests/vtap_wiring.rs` `tmp_dir` : 6 appels, 6 suppressions.
+
 ## oiran-api 2.21.173 — 2026-11-24 — flow, source et cache d'une même génération avant tout `Complete`
 
 Ordre cœur #9 7143568156, refus ANR1 #10 7143535580 de 2.21.172. Base : `3d22d00` (2.21.172).

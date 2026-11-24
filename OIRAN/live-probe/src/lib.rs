@@ -13822,7 +13822,7 @@ mod tests {
         let key_path = root.join(".oiran-pseudonym.key");
 
         let manager_1 =
-            CaptureManager::with_pseudonym_key_path(root.clone(), false, key_path.clone())
+            CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, key_path.clone())
                 .unwrap();
         assert!(manager_1.quarantined_segments_snapshot().is_empty());
 
@@ -13862,7 +13862,7 @@ mod tests {
         // L'identité quarantinée est rechargée depuis `root/quarantine.json`.
         drop(manager_1);
         let manager_2 =
-            CaptureManager::with_pseudonym_key_path(root.clone(), false, key_path).unwrap();
+            CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, key_path).unwrap();
         assert!(
             manager_2.is_segment_quarantined(path, size, &sha256),
             "la quarantaine doit survivre au redémarrage"
@@ -14223,8 +14223,9 @@ mod tests {
         // de publication. On rejoue la même assertion sur un
         // SpillingEventIdSet pour prouver que le comportement
         // transitif est identique.
-        let tmp_dir = temporary_root("expand-session-evidence-ids-disk")
-            .join("ids");
+        // 0.6.46 — le porteur vit jusqu'à la fin du test.
+        let tmp_root = temporary_root("expand-session-evidence-ids-disk");
+        let tmp_dir = tmp_root.join("ids");
         let mut ids = SpillingEventIdSet::new(&tmp_dir, 1024).unwrap();
         ids.insert("n2-event").unwrap();
         expand_session_evidence_ids_disk(&mut ids, &edges, &mut |_| {}).unwrap();
@@ -14235,10 +14236,82 @@ mod tests {
         assert!(!ids.contains("other-b").unwrap());
     }
 
-    fn temporary_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("oiran-live-probe-{name}-{}", epoch_ms()));
+    /// 0.6.46 (ordre cœur #9 7143938762) — répertoire temporaire de test
+    /// qui se SUPPRIME À LA DESTRUCTION, y compris quand le test panique :
+    /// `Drop` s'exécute pendant le déroulement de la pile (les cibles de test
+    /// ignorent le `panic = "abort"` du profil release). Avant 0.6.46,
+    /// `temporary_root` rendait un `PathBuf` et 108 des 120 tests appelants
+    /// ne supprimaient jamais leur répertoire : environ 14 Go abandonnés dans
+    /// `/tmp` à chaque passage (fichiers creux des tests `work_bytes_*`), qui
+    /// ont rempli le disque du lab le 24/11.
+    /// `Deref<Target = Path>` : les appelants gardent `base.join(..)`,
+    /// `&base`, `base.display()`. Le nom porte le pid et un compteur, pour
+    /// que deux tests parallèles ne partagent jamais — et donc ne se
+    /// suppriment jamais — le même répertoire.
+    pub(crate) struct TempRoot(PathBuf);
+
+    impl std::ops::Deref for TempRoot {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempRoot {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static TEMP_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_root(name: &str) -> TempRoot {
+        let sequence = TEMP_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "oiran-live-probe-{name}-{}-{}-{sequence}",
+            epoch_ms(),
+            std::process::id()
+        ));
         fs::create_dir_all(&root).unwrap();
-        root
+        TempRoot(root)
+    }
+
+    /// 0.6.46 — le garde du garde : un test qui PANIQUE ne laisse pas son
+    /// répertoire temporaire. Le répertoire est réellement peuplé (fichier
+    /// creux de 1 Gio, comme les tests `work_bytes_*`) avant la panique.
+    #[test]
+    fn a_panicking_test_leaves_no_temporary_root_behind_0_6_46() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let recorder = seen.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let base = temporary_root("panic-guard-0-6-46");
+            fs::create_dir_all(base.join("pcap")).unwrap();
+            let file = fs::File::create(base.join("pcap/N3.pcap-0000000000000000.pcapng")).unwrap();
+            file.set_len(1_073_741_824).unwrap();
+            *recorder.lock().unwrap() = Some(base.to_path_buf());
+            assert!(base.join("pcap").is_dir(), "précondition : répertoire peuplé");
+            panic!("panique volontaire du garde 0.6.46");
+        }));
+        assert!(outcome.is_err(), "précondition : le corps a bien paniqué");
+        let path = seen.lock().unwrap().clone().expect("chemin enregistré avant la panique");
+        assert!(!path.exists(), "le répertoire temporaire a survécu à la panique : {}", path.display());
+    }
+
+    /// 0.6.46 — et un test qui RÉUSSIT ne le laisse pas non plus.
+    #[test]
+    fn a_passing_test_leaves_no_temporary_root_behind_0_6_46() {
+        let path = {
+            let base = temporary_root("pass-guard-0-6-46");
+            fs::write(base.join("marker"), b"x").unwrap();
+            base.to_path_buf()
+        };
+        assert!(!path.exists(), "le répertoire temporaire a survécu au test : {}", path.display());
     }
 
     /// Global allocator shim that tracks the net live bytes and the all-time
@@ -14584,10 +14657,10 @@ mod tests {
         assert!(fs::metadata(&path).unwrap().len() >= 300 * MIB as u64);
         thread::sleep(Duration::from_millis(500));
         let guard = reset_allocation_peak();
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 400 * MIB as u64,
@@ -14642,10 +14715,10 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
 
         let guard = reset_allocation_peak();
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 700 * MIB as u64,
@@ -14731,10 +14804,10 @@ mod tests {
         assert!(rejected_size > 100);
         assert!(fs::metadata(&accepted).unwrap().len() <= 100);
         thread::sleep(Duration::from_millis(500));
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -14947,7 +15020,7 @@ mod tests {
     fn injected_disk_sample_at_99_percent_rejects_capture_with_budget_blocker() {
         let root = temporary_root("continuous-injected-99-refusal");
         let mut manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -14989,7 +15062,7 @@ mod tests {
         let root = temporary_root("disk-resume-root");
         fs::create_dir_all(source.join("N2")).unwrap();
         let mut manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -15006,7 +15079,7 @@ mod tests {
         };
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -15067,7 +15140,7 @@ mod tests {
     #[test]
     fn production_native_config_accepts_finalized_helper_segments() {
         let root = temporary_root("native-config");
-        let mut config = ContinuousImportConfig::native(root);
+        let mut config = ContinuousImportConfig::native(root.to_path_buf());
         assert_eq!(config.stable_age, Duration::ZERO);
         assert_eq!(config.native_segment_seconds, Some(15));
         assert_eq!(
@@ -15115,7 +15188,7 @@ mod tests {
         fs::copy(fixture.join("N2.pcapng"), &bootstrap).unwrap();
         thread::sleep(Duration::from_millis(250));
         let config = ContinuousImportConfig {
-            source_root: source.clone(),
+            source_root: source.to_path_buf(),
             scan_interval: Duration::from_millis(200),
             stable_age: Duration::from_millis(200),
             max_owned_bytes: 128 * 1024 * 1024,
@@ -15126,7 +15199,7 @@ mod tests {
             runtime_pdu_evidence: None,
             vtap_out_dirs: Vec::new(),
         };
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let published_event_counts = Arc::new(Mutex::new(Vec::<usize>::new()));
         let published_event_counts_observer = published_event_counts.clone();
         let published_manifest = root
@@ -15204,7 +15277,7 @@ mod tests {
         });
         drop(manager);
 
-        let restarted = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let restarted = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         restarted.start_continuous_import(config).unwrap();
         wait_for(|| {
             restarted
@@ -15286,7 +15359,7 @@ mod tests {
         fs::write(&state_path, serde_json::to_vec_pretty(&seed).unwrap()).unwrap();
 
         let config = ContinuousImportConfig {
-            source_root: source.clone(),
+            source_root: source.to_path_buf(),
             scan_interval: Duration::from_millis(200),
             stable_age: Duration::from_millis(200),
             max_owned_bytes: 128 * 1024 * 1024,
@@ -15298,7 +15371,7 @@ mod tests {
             vtap_out_dirs: Vec::new(),
         };
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -15571,14 +15644,14 @@ mod tests {
         write_rotation_closures(&source, "N3", 250);
         thread::sleep(Duration::from_millis(500));
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -15676,14 +15749,14 @@ mod tests {
         write_rotation_closures(&source, "N3", 250);
         thread::sleep(Duration::from_millis(500));
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 // Storage just big enough to hold ~8 live segments + the
@@ -15772,14 +15845,14 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
 
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -15985,14 +16058,14 @@ mod tests {
         let vtap_checksum = sha256_hex_file(&vtap_pcap).unwrap();
         thread::sleep(Duration::from_millis(250));
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source,
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -16001,7 +16074,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
-                vtap_out_dirs: vec![vtap_dir.clone()],
+                vtap_out_dirs: vec![vtap_dir.to_path_buf()],
             })
             .unwrap();
         let manifest = root.join(CONTINUOUS_CAPTURE_ID).join("dataset/dataset_manifest.json");
@@ -16053,7 +16126,7 @@ mod tests {
         thread::sleep(Duration::from_millis(250));
 
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -16062,7 +16135,7 @@ mod tests {
 
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source,
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -16131,14 +16204,14 @@ mod tests {
         thread::sleep(Duration::from_millis(250));
 
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source,
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -16236,7 +16309,7 @@ mod tests {
     fn quarantine_key_is_lifted_when_file_identity_changes() {
         let root = temporary_root("quarantine-identity-change");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -16312,10 +16385,10 @@ mod tests {
         write_rotation_closures(&source, "N2", 1);
         write_rotation_closures(&source, "N4", 1);
         thread::sleep(Duration::from_millis(250));
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source,
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -16741,7 +16814,7 @@ mod tests {
     #[test]
     fn aged_cached_activity_is_not_reported_without_new_ingestion() {
         let root = temporary_root("aged-cached-activity");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let observed = 100_000;
         let aged = observed + ACTIVE_PACKET_WINDOW_MS + 1;
         let runtime_ids = (1..=3)
@@ -16896,7 +16969,7 @@ mod tests {
     fn republish_preserves_every_prior_event_id_even_when_ring_rotates() {
         let root = temporary_root("preserve-event-ids");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -16976,7 +17049,7 @@ mod tests {
     fn three_incremental_cycles_append_three_immutable_shards() {
         let root = temporary_root("three-immutable-shards");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(), false, root.join(".oiran-pseudonym.key"),
+            root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
         ).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
@@ -17004,7 +17077,7 @@ mod tests {
 
         let full_root = temporary_root("three-immutable-shards-full");
         let full_manager = CaptureManager::with_pseudonym_key_path(
-            full_root.clone(), false, root.join(".oiran-pseudonym.key"),
+            full_root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
         ).unwrap();
         let full_base = full_root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(full_base.join("pcap")).unwrap();
@@ -17087,7 +17160,7 @@ mod tests {
     fn successive_runs_of_same_ue_get_distinct_sessions_without_overwriting() {
         let root = temporary_root("successive-runs-same-ue");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(), false, root.join(".oiran-pseudonym.key"),
+            root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
         ).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
@@ -17161,7 +17234,7 @@ mod tests {
 
         let root = temporary_root("legacy-shard-zero-immutable");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(), false, root.join(".oiran-pseudonym.key"),
+            root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
         ).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
@@ -17233,7 +17306,7 @@ mod tests {
         use serde_json::Value;
         let root = temporary_root("retention-purge");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -17376,7 +17449,7 @@ mod tests {
     fn derived_output_cap_accepts_small_publication_under_default_limit() {
         let root = temporary_root("derived-cap-ok");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -17424,7 +17497,7 @@ mod tests {
         let _reset = LimitReset;
         let root = temporary_root("derived-cap-fail");
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
@@ -17477,7 +17550,7 @@ mod tests {
     #[test]
     fn continuous_checkpoint_keeps_five_sessions_across_restart_and_republish() {
         let root = temporary_root("continuous-five-session-checkpoint");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -17530,7 +17603,7 @@ mod tests {
         assert_eq!(checkpoint.session_ids.len(), 5);
 
         drop(manager);
-        let restarted = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let restarted = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let resumed = restarted
             .process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024)
             .unwrap();
@@ -17621,7 +17694,7 @@ Content-Length: 0\r\n\
         let sip_ims_events = |specs: &[CaptureInterface], label: &str| {
             let root = temporary_root(label);
             let manager = CaptureManager::with_pseudonym_key_path(
-                root.clone(),
+                root.to_path_buf(),
                 false,
                 root.join(".oiran-pseudonym.key"),
             )
@@ -17653,7 +17726,7 @@ Content-Length: 0\r\n\
     #[test]
     fn production_pipeline_decodes_three_pcap_gpdus_into_three_bound_pdu_callflows() {
         let root = temporary_root("runtime-pcap-e2e");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
         let seconds = (epoch_ms() / 1000) as u32;
@@ -17776,14 +17849,14 @@ Content-Length: 0\r\n\
         write_rotation_closures(&source, "N3", 1);
 
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -17880,10 +17953,10 @@ Content-Length: 0\r\n\
         // 2.8.3: the 8 synthetic N2 segments are promoted to CLOSED via
         // the rotation JSONL contract.
         write_rotation_closures(&source, "N2", 8);
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -18269,7 +18342,7 @@ Content-Length: 0\r\n\
     #[test]
     fn atomic_temp_budget_failure_preserves_previous_dataset() {
         let root = temporary_root("continuous-atomic-budget");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -18299,7 +18372,7 @@ Content-Length: 0\r\n\
         // 2.9.2 (#9 comment 6710853974): the registry now returns
         // every decoder-backed plane (11 interfaces, N6 excluded —
         // see `interface_specs_covers_every_decoder_backed_plane`).
-        let manager = { let tmp = temporary_root("interfaces"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = { let tmp = temporary_root("interfaces"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
         let interfaces = manager.interfaces();
         // 2.11.0 (devmat) : 12 interfaces (11 core planes + IMS).
         assert_eq!(interfaces.len(), 12);
@@ -18321,7 +18394,7 @@ Content-Length: 0\r\n\
 
     #[test]
     fn validation_rejects_custom_device_filter_and_unbounded_values() {
-        let manager = { let tmp = temporary_root("validation"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = { let tmp = temporary_root("validation"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
         let mut request = CaptureRequest::default();
         request.interfaces = vec!["eth0".into()];
         request.duration_seconds = 901;
@@ -18393,7 +18466,7 @@ Content-Length: 0\r\n\
 
     #[test]
     fn execution_is_fail_closed_until_deployment_enables_it() {
-        let manager = { let tmp = temporary_root("locked"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = { let tmp = temporary_root("locked"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
         assert!(manager
             .start(CaptureRequest::default(), "operator")
             .is_err());
@@ -18402,7 +18475,7 @@ Content-Length: 0\r\n\
 
     #[test]
     fn stop_enforces_exact_owner_and_is_idempotent_after_completion() {
-        let manager = { let tmp = temporary_root("ownership"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = { let tmp = temporary_root("ownership"); CaptureManager::with_pseudonym_key_path(tmp.to_path_buf(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
         let id = "live-owned-0001".to_string();
         let job = CaptureJob {
             capture_id: id.clone(),
@@ -18456,7 +18529,7 @@ Content-Length: 0\r\n\
     #[test]
     fn completed_capture_registers_real_decoded_dataset_with_provenance() {
         let root = temporary_root("pipeline");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let capture_id = "live-pipeline-fixture";
         let pcap_dir = root.join(capture_id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -18484,7 +18557,7 @@ Content-Length: 0\r\n\
     #[test]
     fn empty_capture_is_explicit_and_never_fabricates_a_session() {
         let root = temporary_root("empty");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let capture_id = "live-empty-fixture";
         let pcap_dir = root.join(capture_id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -18505,7 +18578,7 @@ Content-Length: 0\r\n\
     #[test]
     fn finalized_capture_with_empty_interface_creates_derived_dataset_layout() {
         let root = temporary_root("partial-interface-pipeline");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let capture_id = "live-partial-interface-fixture";
         let pcap_dir = root.join(capture_id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -18539,7 +18612,7 @@ Content-Length: 0\r\n\
     #[test]
     fn recoverable_failed_capture_is_not_promoted_during_registry_recovery() {
         let root = temporary_root("recoverable-failed");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let id = "live-recoverable-failed";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -18576,7 +18649,7 @@ Content-Length: 0\r\n\
         };
         manager.persist_job(&job).unwrap();
 
-        let recovered = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap().get(id).unwrap();
+        let recovered = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap().get(id).unwrap();
         assert_eq!(recovered.state, CaptureState::Failed);
         assert!(recovered.dataset_id.is_none());
         assert_eq!(
@@ -18588,7 +18661,7 @@ Content-Length: 0\r\n\
     #[test]
     fn valid_capture_with_no_supported_messages_is_registered_empty() {
         let root = temporary_root("unsupported-packets");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let id = "live-unsupported-packets";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -18612,7 +18685,7 @@ Content-Length: 0\r\n\
     #[test]
     fn decoder_failure_does_not_finalize_or_register_dataset() {
         let root = temporary_root("decoder-failure");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let id = "live-decoder-failure";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -18629,7 +18702,7 @@ Content-Length: 0\r\n\
     #[test]
     fn dataset_registration_rejects_missing_final_manifest() {
         let root = temporary_root("registration-failure");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let id = "live-registration-failure";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -18691,7 +18764,7 @@ Content-Length: 0\r\n\
             .unwrap(),
         )
         .unwrap();
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let job = CaptureJob {
             capture_id: id.into(),
             probe_id: PROBE_ID.into(),
@@ -18717,7 +18790,7 @@ Content-Length: 0\r\n\
         };
         manager.persist_job(&job).unwrap();
         drop(manager);
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let original_job = fs::read(root.join(id).join("job.json")).unwrap();
         let original_hashes = source_files
             .iter()
@@ -18765,7 +18838,7 @@ Content-Length: 0\r\n\
     #[test]
     fn registry_recovery_reclassifies_legacy_helper_exit_as_failed() {
         let root = temporary_root("legacy-failure");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let id = "live-legacy-failure";
         let job = CaptureJob {
             capture_id: id.into(),
@@ -18792,7 +18865,7 @@ Content-Length: 0\r\n\
         };
         fs::create_dir_all(root.join(id).join("pcap")).unwrap();
         manager.persist_job(&job).unwrap();
-        let recovered = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap().get(id).unwrap();
+        let recovered = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap().get(id).unwrap();
         assert_eq!(recovered.state, CaptureState::Failed);
         assert_eq!(
             recovered.error.as_deref(),
@@ -18804,7 +18877,7 @@ Content-Length: 0\r\n\
     #[test]
     fn lifecycle_persists_starting_capturing_and_terminal_states() {
         let root = temporary_root("lifecycle");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let id = "live-lifecycle";
         let mut job = CaptureJob {
             capture_id: id.into(),
@@ -18971,7 +19044,7 @@ Content-Length: 0\r\n\
         )
         .unwrap();
 
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let first = manager
             .import_derived_dataset(&import_root, dataset_id, "operator")
             .unwrap();
@@ -19076,14 +19149,14 @@ Content-Length: 0\r\n\
         write_pcap(&growing, &[vec![0x11u8; 128]]);
         thread::sleep(Duration::from_millis(250));
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(),
+            root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
@@ -22214,10 +22287,10 @@ Content-Length: 0\r\n\
 
         // CaptureManager de test.
         let manager = CaptureManager::with_helper_and_interface_root(
-            root.clone(),
+            root.to_path_buf(),
             false,
             CaptureHelperClient::new(root.join("helper.sock"), 0),
-            root.clone(),
+            root.to_path_buf(),
             root.join("pseudonym.key"),
         )
         .expect("manager");
@@ -22407,10 +22480,10 @@ Content-Length: 0\r\n\
         )
         .unwrap();
         let manager = CaptureManager::with_helper_and_interface_root(
-            root.clone(),
+            root.to_path_buf(),
             false,
             CaptureHelperClient::new(root.join("helper.sock"), 0),
-            root.clone(),
+            root.to_path_buf(),
             root.join("pseudonym.key"),
         )
         .expect("manager");
@@ -22477,10 +22550,10 @@ Content-Length: 0\r\n\
         let (_, name_a) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block1);
         let (_, name_b) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block2);
         let manager = CaptureManager::with_helper_and_interface_root(
-            root.clone(),
+            root.to_path_buf(),
             false,
             CaptureHelperClient::new(root.join("helper.sock"), 0),
-            root.clone(),
+            root.to_path_buf(),
             root.join("pseudonym.key"),
         )
         .expect("manager");
@@ -22543,10 +22616,10 @@ Content-Length: 0\r\n\
         fs::create_dir_all(&ds_parent).unwrap();
         fs::write(ds_parent.join("import_state.json"), b"{not json}").unwrap();
         let manager = CaptureManager::with_helper_and_interface_root(
-            root.clone(),
+            root.to_path_buf(),
             false,
             CaptureHelperClient::new(root.join("helper.sock"), 0),
-            root.clone(),
+            root.to_path_buf(),
             root.join("pseudonym.key"),
         )
         .expect("manager");
@@ -22683,10 +22756,10 @@ Content-Length: 0\r\n\
         )
         .unwrap();
         let manager = CaptureManager::with_helper_and_interface_root(
-            root.clone(),
+            root.to_path_buf(),
             false,
             CaptureHelperClient::new(root.join("helper.sock"), 0),
-            root.clone(),
+            root.to_path_buf(),
             root.join("pseudonym.key"),
         )
         .expect("manager");
@@ -22805,7 +22878,8 @@ Content-Length: 0\r\n\
         // retourne Err et laisse le fichier existant intact (ici il
         // n'est plus accessible via `target` car le parent n'existe
         // plus — on vérifie donc sur une copie préservée).
-        let preserved = temporary_root("atomic-prev-preserved").join("job.json");
+        let preserved_root = temporary_root("atomic-prev-preserved");
+        let preserved = preserved_root.join("job.json");
         fs::copy(&target, &preserved).unwrap();
         fs::remove_dir_all(&root).unwrap();
         let outcome = atomic_write_with_prev(&target, b"V2");
@@ -23239,7 +23313,7 @@ Content-Length: 0\r\n\
         let root = temporary_root(label);
         // Même clé de pseudonymisation pour tous les gestionnaires comparés.
         let manager = CaptureManager::with_pseudonym_key_path(
-            root.clone(), false, pseudonym_key.to_path_buf(),
+            root.to_path_buf(), false, pseudonym_key.to_path_buf(),
         ).unwrap();
         manager.callflow_reuse_enabled.store(reuse, Ordering::SeqCst);
         manager.in_memory_session_events_limit.store(events_in_memory_limit, Ordering::SeqCst);
@@ -23305,7 +23379,8 @@ Content-Length: 0\r\n\
             // Cycle 2 : le plan de données du même autre UE.
             vec![("N3.pcap-one.pcapng", one.join("N3.pcapng"))],
         ];
-        let key = temporary_root("reuse-shared-key").join(".oiran-pseudonym.key");
+        let key_root = temporary_root("reuse-shared-key");
+        let key = key_root.join(".oiran-pseudonym.key");
         for (path_label, limit) in [("memoire", usize::MAX), ("relecture", 0usize)] {
             let (with, sessions_with, files_with, manifest_with) =
                 run_reuse_cycles_2_21_143(&format!("reuse-on-{path_label}"), true, limit, &cycles, None, &key);
@@ -23352,7 +23427,8 @@ Content-Length: 0\r\n\
             vec![("N2.pcap-five.pcapng", five.clone()), ("N4.pcap-five.pcapng", five.clone())],
             vec![("N4.pcap-five-replay.pcapng", five.clone())],
         ];
-        let key = temporary_root("reuse-replay-key").join(".oiran-pseudonym.key");
+        let key_root = temporary_root("reuse-replay-key");
+        let key = key_root.join(".oiran-pseudonym.key");
         for limit in [usize::MAX, 0usize] {
             let (with, sessions_with, files_with, _) =
                 run_reuse_cycles_2_21_143(&format!("reuse-replay-on-{limit}"), true, limit, &cycles, None, &key);
@@ -23420,6 +23496,7 @@ Content-Length: 0\r\n\
             vec![("N2.pcap-one.pcapng", one.join("N2.pcapng"))],
             vec![("N4.pcap-one.pcapng", one.join("N4.pcapng"))],
         ];
+        let key_root = temporary_root("reuse-legacy-key");
         let (counters, _, _, manifest) =
             run_reuse_cycles_2_21_143(
                 "reuse-legacy-manifest",
@@ -23427,7 +23504,7 @@ Content-Length: 0\r\n\
                 0,
                 &cycles,
                 Some(1),
-                &temporary_root("reuse-legacy-key").join(".oiran-pseudonym.key"),
+                &key_root.join(".oiran-pseudonym.key"),
             );
         assert_eq!(counters[1].0, 0, "manifeste sans clés : rien n'est repris : {counters:?}");
         assert!(counters[1].1 >= 5, "tout est reconstruit une fois : {counters:?}");
@@ -23471,6 +23548,9 @@ Content-Length: 0\r\n\
     /// (un autre UE, octobre), puis la rétention un cycle, puis un cycle
     /// de plus sans rétention.
     struct ArchivedLabShapedDataset {
+        /// 0.6.46 — garde le répertoire temporaire vivant aussi longtemps
+        /// que le jeu rendu ; il est supprimé quand le test le lâche.
+        _root: TempRoot,
         manager: CaptureManager,
         base: PathBuf,
         segment: PathBuf,
@@ -23501,7 +23581,7 @@ Content-Length: 0\r\n\
         let registration = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-registration.pcap");
         let one = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
         let root = temporary_root(label);
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         // Chemin de production : relecture des fragments.
         manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
         let base = root.join(CONTINUOUS_CAPTURE_ID);
@@ -23571,6 +23651,7 @@ Content-Length: 0\r\n\
         assert_eq!((reused, rebuilt), (1, 1), "la session restante est reprise, la nouvelle construite");
         assert!(manifest().session_ids.iter().any(|id| remaining.contains(id)));
         ArchivedLabShapedDataset {
+            _root: root,
             manager,
             segment: segments[0].clone(),
             base,
@@ -24107,7 +24188,7 @@ Content-Length: 0\r\n\
     #[test]
     fn listing_datasets_holds_the_lock_for_a_bounded_time_on_a_lab_sized_dataset_2_21_154() {
         let root = temporary_root("lock-bound-2-21-154");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let dataset = lab_sized_dataset_2_21_154(700_000);
         manager.datasets.lock().unwrap().insert(dataset.dataset_id.clone(), dataset);
         let mut slowest = std::time::Duration::ZERO;
@@ -24152,7 +24233,7 @@ Content-Length: 0\r\n\
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let corpus = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
         let root = temporary_root("masked-imeisv-five-2-21-154");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
         let mut selected = BTreeSet::new();
@@ -24277,10 +24358,10 @@ Content-Length: 0\r\n\
         fs::File::create(segment.join("events.jsonl")).unwrap().set_len(512 * 1024 * 1024).unwrap();
         assert!(directory_size(&root.join(CONTINUOUS_CAPTURE_ID).join("archive")) > max_owned_bytes, "précondition");
         thread::sleep(Duration::from_millis(250));
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
-                source_root: source.clone(),
+                source_root: source.to_path_buf(),
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes,
