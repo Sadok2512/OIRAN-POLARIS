@@ -5071,6 +5071,38 @@ fn correlate_sessions_by_pseudonyms(state: &AppState, pseudos: &HashSet<String>)
     matches
 }
 
+/// PREUVE 2.21.176 — surface d'API SANS EFFET, pour que les gardes de
+/// 2.21.176 compilent sur `aed583b` : le comportement est celui d'avant
+/// (aucun jeu publié consulté, aucun candidat IP pour un G-PDU).
+#[cfg(test)]
+#[derive(Clone, Default, Debug, PartialEq)]
+pub(crate) struct PublishedSeedStats {
+    pub(crate) consulted: bool,
+    pub(crate) reason: &'static str,
+    pub(crate) events: u64,
+}
+#[cfg(test)]
+pub(crate) struct PublishedSeed {
+    pub(crate) events: Vec<event_schema::NormalizedEvent>,
+    pub(crate) stats: PublishedSeedStats,
+}
+#[cfg(test)]
+impl LiveTraceRegistry {
+    pub(crate) fn set_published_resolver(
+        &self,
+        _resolver: std::sync::Arc<dyn Fn(&[String]) -> PublishedSeed + Send + Sync>,
+    ) {
+    }
+}
+#[cfg(test)]
+pub(crate) fn route_live(
+    traces: &LiveTraceRegistry,
+    event: &event_schema::NormalizedEvent,
+    _key: &event_schema::PseudonymKey,
+) {
+    traces.route_normalized(event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8647,6 +8679,104 @@ mod tests {
             "chaque event écarté est compté une fois"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 2.21.176 — décode une capture réelle du jeu de référence.
+    fn decode_reference_capture_2_21_176(
+        file: &str,
+        interface: &str,
+        key: &event_schema::PseudonymKey,
+    ) -> Vec<event_schema::NormalizedEvent> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1")
+            .join(file);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&ring_decode_config(&path, interface), key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        events
+    }
+
+    /// 2.21.176 (ordres cœur #9 7145423680 / 7145721924) — LE cas mesuré par
+    /// ANR2 : une UE dont la session est ANTÉRIEURE à la fenêtre du ring. Le
+    /// ring ne contient QUE du N3 réel (aucun N2, aucun N4) ; les liens de
+    /// l'abonné — tunnels du N2, F-TEID et IP de l'UE du PFCP — ne peuvent
+    /// venir que du JEU PUBLIÉ construit sur N2+N4, rendu par le résolveur.
+    /// Exigé : des G-PDU rattachés à la trace. Avant 2.21.176 : 0 rattaché,
+    /// tous en `rejected_no_match`.
+    #[test]
+    fn gpdus_attach_through_the_published_dataset_without_n2_in_the_ring_2_21_176() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut published = decode_reference_capture_2_21_176("N2.pcapng", "N2", &key);
+        published.extend(decode_reference_capture_2_21_176("N4.pcapng", "N4", &key));
+        let pseudonym = published
+            .iter()
+            .flat_map(|e| e.session_identifiers.iter())
+            .find(|id| id.name == "subscriber_pseudonym")
+            .map(|id| id.value.clone())
+            .expect("pseudonyme d'abonné dans le N2 publié");
+        let r = trace_on(&pseudonym);
+        let published_for_resolver = published.clone();
+        r.set_published_resolver(std::sync::Arc::new(move |_pseudonyms: &[String]| PublishedSeed {
+            events: published_for_resolver.clone(),
+            stats: PublishedSeedStats {
+                consulted: true,
+                reason: "ok",
+                events: published_for_resolver.len() as u64,
+                ..Default::default()
+            },
+        }));
+        // Ring : N3 seulement.
+        let (dir, bytes) = n3_ring_file("published-seed-2-21-176");
+        let root = dir.parent().unwrap().join("ring");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(ring_directory("N3"))).unwrap();
+        fs::write(root.join(ring_directory("N3")).join("n3_00001.pcapng"), &bytes).unwrap();
+        assert!(!root.join(ring_directory("N2")).exists(), "précondition : aucun N2 dans le ring");
+        let mut states = HashMap::new();
+        let mut sessions = HashMap::new();
+        let mut dirs = HashMap::new();
+        let mut hooks = CountingHooks::default();
+        reader_pass(&root, &key, &r, &mut states, &mut sessions, &mut dirs, true, false, std::time::Instant::now(), &mut hooks);
+        let traces = r.traces.lock().unwrap();
+        let trace = &traces["t"].trace;
+        assert!(trace.gpdu_seen > 0, "précondition : le N3 réel a été lu ({})", trace.gpdu_seen);
+        assert!(
+            trace.gpdu_attached > 0,
+            "aucun G-PDU rattaché : seen={} no_match={} endpoint_mismatch={}",
+            trace.gpdu_seen,
+            trace.gpdu_rejected_no_match,
+            trace.gpdu_rejected_endpoint_mismatch
+        );
+        assert_eq!(trace.seed.files, 0, "rien n'est venu du ring de signalisation");
+        drop(traces);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// 2.21.176 (volet A) — un G-PDU dont le TEID est INCONNU de la trace se
+    /// rattache par la seule IP de l'UE. Le décodeur la pose en clair ; le
+    /// lecteur la pseudonymise à la volée (`route_live`) avec sa clé, puis
+    /// la compare à `ue_ip_keys`. Avant : `match_ue_ip` excluait le GTP-U.
+    #[test]
+    fn a_gpdu_attaches_by_its_ue_ip_alone_2_21_176() {
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let gpdu = decode_reference_capture_2_21_176("N3.pcapng", "N3", &key)
+            .into_iter()
+            .find(|e| e.protocol.as_str() == "GTP-U" && e.session_identifiers.iter().any(|id| id.name == "inner_source_ip"))
+            .expect("un G-PDU réel avec ses adresses internes");
+        // L'UE est l'une des deux adresses internes : la source, pour ce garde.
+        let clear = gpdu.session_identifiers.iter().find(|id| id.name == "inner_source_ip").unwrap().value.clone();
+        let pseudonym = event_schema::pseudonym_ip_text(&key, &clear).unwrap();
+        let r = trace_on("psn-ue-ip-only-2-21-176");
+        r.traces.lock().unwrap().get_mut("t").unwrap().ue_ip_keys.insert(pseudonym, HashSet::new());
+        route_live(&r, &gpdu, &key);
+        let traces = r.traces.lock().unwrap();
+        let trace = &traces["t"].trace;
+        assert_eq!(trace.gpdu_seen, 1);
+        assert_eq!(trace.gpdu_attached, 1, "no_match={}", trace.gpdu_rejected_no_match);
     }
 
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
