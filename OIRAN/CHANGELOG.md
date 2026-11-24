@@ -1,5 +1,21 @@
 # Changelog
 
+## oiran-api 2.21.161 — 2026-11-23 — trace par clé IMSI : la dérivation part des chiffres canoniques
+
+Upgrade **patch**, sans déploiement. Au-dessus de 2.21.160 `c5ee672`, base `f419573`. Branche `fix/oiran-2.21.161-imsi-trace-canonical-digits`. Fait suite au REFUS d'ANR1 sur 2.21.160 (#10 7117296485).
+
+**Défaut de 2.21.160** (trouvé par ANR1) : `derived_subscriber_pseudonym` vérifiait `canonical_digits(saisie)`, puis jetait le résultat et pseudonymisait la **saisie brute** avec `pseudonym_subscriber_text`, qui s'arrête au premier caractère non numérique. Une saisie IMSI acceptée avec des séparateurs (par exemple `001 01 …` ou `IMSI-001-01-…`) donnait **un autre pseudonyme** que celui des décodeurs. La trace était alors annoncée `armed: false` et ne rattachait rien, sans aucun signal.
+
+**Correctif** : la dérivation part des chiffres canoniques, ceux que la route promet déjà avec `canonical_digits` (préfixes `imsi-`, `supi-`… retirés, séparateurs ignorés, au moins 5 chiffres). Elle leur applique `pseudonym_subscriber_digits`, la fonction des décodeurs, avec la clé du `capture_manager`.
+
+Test, permanent : `a_formatted_imsi_uses_the_same_canonical_digits_2_21_161`. Trois formes formatées d'un même IMSI synthétique donnent le pseudonyme de la forme canonique, et le run de l'abonné est rattaché.
+
+| | Sur `c5ee672` (arbre séparé) | Sur 2.21.161 |
+|---|---|---|
+| forme `IMSI-001 01 …` | **échoue** : `armed: false`, mais pseudonyme différent | passe |
+
+Patch de la preuve : `~/oiran-polaris-archives/2.21.161-preuve-echec-avant-sur-c5ee672.patch`. Les quatre tests de 2.21.160 restent verts.
+
 ## oiran-api 2.21.160 — 2026-11-23 — trace par clé IMSI : le pseudonyme dérivé est rendu à la cible
 
 Upgrade **patch**, sans déploiement. Base `f419573` (2.21.158, en prod), indépendante de 2.21.159. Branche `fix/oiran-2.21.160-imsi-trace-derived-pseudonym`.

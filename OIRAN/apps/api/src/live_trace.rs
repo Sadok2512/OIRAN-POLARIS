@@ -4212,10 +4212,16 @@ fn derived_subscriber_pseudonym(state: &AppState, key_type: &str, value: &str) -
     if key_type != "imsi" {
         return None;
     }
-    canonical_digits(value)?;
-    Some(event_schema::pseudonym_subscriber_text(
+    // 2.21.161 (REFUS ANR1 #10 7117296485) — les chiffres CANONIQUES de la
+    // saisie, ceux que la route promet déjà (`canonical_digits` : préfixes
+    // retirés, séparateurs ignorés), puis la fonction des décodeurs sur ces
+    // chiffres. En 2.21.160, la saisie brute passait à
+    // `pseudonym_subscriber_text`, qui s'arrête au premier caractère non
+    // numérique : une saisie avec séparateurs donnait un autre pseudonyme.
+    let digits = canonical_digits(value)?;
+    Some(event_schema::pseudonym_subscriber_digits(
         state.inner.capture_manager.pseudonym_key().as_ref(),
-        value.as_bytes(),
+        digits.as_bytes(),
     ))
 }
 

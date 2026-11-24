@@ -16134,6 +16134,27 @@ mod tests {
         assert!(messages_of_2_21_160(&app, &trace_id).await > 0);
     }
 
+    /// 2.21.161 (REFUS ANR1 #10 7117296485, garde permanent) — une saisie
+    /// IMSI acceptée sous une forme formatée (préfixe, séparateurs) dérive
+    /// le MÊME pseudonyme que sa forme canonique, celui des décodeurs, et
+    /// rattache le run. En 2.21.160 : un autre pseudonyme, `armed: false`,
+    /// et rien de rattaché.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_formatted_imsi_uses_the_same_canonical_digits_2_21_161() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let derived = event_schema::pseudonym_subscriber_digits(state.inner.capture_manager.pseudonym_key().as_ref(), b"001010000000607");
+        for (k, formatted) in ["IMSI-001 01 0000000607", "001-01-0000000607", " imsi-001010000000607 "].iter().enumerate() {
+            let opened = open_trace_2_21_160(&app, "imsi", formatted).await;
+            assert_eq!(opened["data"]["subscriber_pseudonyms"], json!([derived.clone()]), "forme {k} : {opened}");
+            assert_eq!(opened["data"]["armed"], false, "forme {k}");
+        }
+        let opened = open_trace_2_21_160(&app, "imsi", "001 01 0000000607").await;
+        let trace_id = opened["data"]["trace_id"].as_str().unwrap().to_owned();
+        state.inner.live_traces.route_for_test(&run_carrying_2_21_160(&state, &derived));
+        assert!(messages_of_2_21_160(&app, &trace_id).await > 0, "le run de l'abonné est rattaché");
+    }
+
     /// 2.21.160 — un IMSI VOISIN ne rattache rien : le chemin est ouvert,
     /// pas permissif.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
