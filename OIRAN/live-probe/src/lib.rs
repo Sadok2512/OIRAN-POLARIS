@@ -14271,6 +14271,14 @@ mod tests {
 
     static TEMP_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    thread_local! {
+        /// 0.6.47 — journal, PAR FIL, des racines créées par `temporary_root`.
+        /// Chaque test tourne sur son propre fil : un garde qui appelle des
+        /// tests sur son fil sait exactement quelles racines ils ont créées.
+        static TEMP_ROOTS_CREATED_ON_THIS_THREAD: std::cell::RefCell<Vec<PathBuf>> =
+            std::cell::RefCell::new(Vec::new());
+    }
+
     fn temporary_root(name: &str) -> TempRoot {
         let sequence = TEMP_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -14279,7 +14287,30 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
+        TEMP_ROOTS_CREATED_ON_THIS_THREAD.with(|created| created.borrow_mut().push(root.clone()));
         TempRoot(root)
+    }
+
+    /// 0.6.47 (refus ANR1 #10 7144715047, ordre cœur #9 7144888102) — garde de
+    /// DURÉE DE VIE. Il exécute, sur son propre fil, les quatre tests dont le
+    /// porteur vivait dans un bloc-expression, dont
+    /// `stop_enforces_exact_owner_and_is_idempotent_after_completion`, qui fait
+    /// PERSISTER un job (`update` → `persist_job` → `create_dir_all`) APRÈS la
+    /// construction du manager. Une fois ces tests finis, et donc toutes leurs
+    /// valeurs détruites, aucune des racines qu'ils ont créées ne doit
+    /// exister. En 0.6.46, `ownership` était recréée après la mort de son
+    /// porteur et restait sur le disque.
+    #[test]
+    fn a_manager_never_outlives_its_temporary_root_0_6_47() {
+        TEMP_ROOTS_CREATED_ON_THIS_THREAD.with(|created| created.borrow_mut().clear());
+        stop_enforces_exact_owner_and_is_idempotent_after_completion();
+        real_interface_discovery_is_allowlisted();
+        validation_rejects_custom_device_filter_and_unbounded_values();
+        execution_is_fail_closed_until_deployment_enables_it();
+        let created = TEMP_ROOTS_CREATED_ON_THIS_THREAD.with(|created| created.borrow().clone());
+        assert_eq!(created.len(), 4, "précondition : les quatre tests ont créé leur racine : {created:?}");
+        let survivors: Vec<_> = created.iter().filter(|path| path.exists()).collect();
+        assert!(survivors.is_empty(), "racines survivant à leur test : {survivors:?}");
     }
 
     /// 0.6.46 — le garde du garde : un test qui PANIQUE ne laisse pas son
