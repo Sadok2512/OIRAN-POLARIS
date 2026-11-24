@@ -9370,6 +9370,37 @@ mod tests {
         let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
+    /// 2.21.178 (ordre cœur #9 7147700904) — garde d'ASCENDANCE de 2.21.166 :
+    /// la configuration de décodage du lecteur live porte la table
+    /// d'adresses du lab, jamais une table vide. C'est le défaut exact qui a
+    /// fait régresser la production en 2.21.173 (train parti de `9c8979c`,
+    /// sans `4cad449`) : `endpoints: HashMap::new()`, plus aucun participant
+    /// nommé hors inférence par port, et 0 message servi à la trace.
+    #[test]
+    fn the_live_reader_never_decodes_with_an_empty_endpoint_table_2_21_178() {
+        assert!(std::env::var_os("OIRAN_ENDPOINT_MAP_FILE").is_none(), "précondition : table par défaut");
+        let config = ring_decode_config(std::path::Path::new("/nonexistent/n2_00001.pcapng"), "N2");
+        assert!(!config.endpoints.is_empty(), "table d'adresses du lecteur live VIDE à la construction");
+        // Les adresses du lab que 2.21.166 a apportées, plan par plan.
+        for (address, function) in [
+            ("10.77.21.11", "AMF"),
+            ("10.77.21.20", "gNB"),
+            ("10.77.23.12", "SMF"),
+            ("10.77.23.13", "UPF"),
+            ("10.77.20.10", "NRF"),
+            ("10.77.20.14", "AUSF"),
+            ("10.77.20.19", "BSF"),
+        ] {
+            assert_eq!(
+                config.endpoints.get(address).map(String::as_str),
+                Some(function),
+                "{address} doit être nommé {function} dans la table du lecteur live"
+            );
+        }
+        // Même table que l'import continu : une seule source.
+        assert_eq!(config.endpoints, live_probe::endpoint_map());
+    }
+
     fn n3_ring_file(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
         let bytes = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
