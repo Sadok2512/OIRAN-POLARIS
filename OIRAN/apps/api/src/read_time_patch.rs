@@ -3530,6 +3530,46 @@ mod pfcp_cache_tests {
     use serde_json::json;
 
     #[test]
+    fn cold_pfcp_session_reads_only_the_served_shards_2_21_182() {
+        let dir = std::env::temp_dir().join(format!("rtp-cold-pfcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.as_path();
+        std::fs::create_dir_all(root.join("event-shards")).unwrap();
+        let mut shards = Vec::new();
+        for name in ["first", "second", "retired"] {
+            let path = format!("event-shards/{name}.jsonl");
+            let event = json!({
+                "event_id": name, "capture_id": name, "protocol": "PFCP",
+                "interface": "N4", "pfcp_sequence": "7",
+                "message_name": "PFCP Session Establishment Request"
+            });
+            let bytes = format!("{event}\n");
+            std::fs::write(root.join(&path), &bytes).unwrap();
+            if name != "retired" {
+                shards.push(json!({
+                    "path": path, "sha256": name, "bytes": bytes.len(), "event_count": 1
+                }));
+            }
+        }
+        std::fs::write(
+            root.join("dataset_manifest.json"),
+            json!({"event_shards": shards}).to_string(),
+        ).unwrap();
+        let mut events = vec![json!({
+            "event_id": "response", "protocol": "PFCP", "interface": "N4",
+            "message_name": "PFCP Session Establishment Response",
+            "decoded_ie_tree": [{"name": "pfcp_sequence", "source": "session_identifiers", "value": "7"}]
+        })];
+        let start = std::time::Instant::now();
+        let added = extend_items_with_pfcp_siblings_from_jsonl(&mut events, root).unwrap();
+        eprintln!("cold_pfcp_access_ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
+        let ids: BTreeSet<_> = events.iter().map(|event| event["event_id"].as_str().unwrap()).collect();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(ids, BTreeSet::from(["first", "second", "response"]));
+        assert_eq!(added, 2);
+    }
+
+    #[test]
     fn index_keeps_only_offsets_and_rereads_matching_lines() {
         let dir =
             std::env::temp_dir().join(format!("rtp-cache-{}-{}", std::process::id(), line!()));
