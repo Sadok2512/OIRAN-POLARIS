@@ -30,6 +30,7 @@ Après le `revert`, `live-probe/src/lib.rs` est **identique** à `d8718cf`. Le C
      - un shard entièrement périmé sort de la liste ;
      - un shard partiellement périmé est remplacé par un `shard-retained-<sha16>` de ses seules lignes retenues. Son `sha256`, son `event_count` et ses `capture_ends` sont calculés **pendant l'écriture**, sans passage dédié ;
   4. **conservation vérifiée** avant de rendre la main : archivés + retenus = events lus, sinon `CONTINUOUS_RETENTION_CONSERVATION_FAILED`, et rien n'est publié.
+- **Fin de capture inter-shards** (ordre #10 7165335535) : après renseignement des anciens manifestes, `apply_incremental_retention` calcule le maximum de chaque capture sur l’ensemble des shards avant d’appliquer la coupure. Le garde adverse maintient les deux shards tant que cette fin globale est au-dessus de la coupure.
 - **Aucun fichier de données supprimé** : pour un shard qui sort, seul son **lien** de préparation est retiré.
 - `concatenate_files`, devenue sans appelant, est supprimée.
 

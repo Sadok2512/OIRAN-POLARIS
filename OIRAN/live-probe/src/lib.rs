@@ -11460,7 +11460,8 @@ struct IncrementalRetentionOutcome {
 /// antérieurs sont des liens en lecture seule) :
 /// 1. chaque shard sans `capture_ends` (manifeste ancien) est lu UNE fois
 ///    pour la calculer, et elle est inscrite ;
-/// 2. captures périmées = celles dont la fin est non nulle et < `cutoff`
+/// 2. la fin d'une capture est le maximum de ses fins sur tous les shards.
+///    Elle est périmée si cette fin est non nulle et < `cutoff`
 ///    (règle de `archive_stale_captures`) ;
 /// 3. aucune → rien n'est écrit, la liste est inchangée ;
 /// 4. sinon, seuls les shards qui portent une capture périmée sont lus :
@@ -11487,11 +11488,15 @@ fn apply_incremental_retention(
             outcome.capture_end_scans += 1;
         }
     }
-    let stale: BTreeSet<String> = shards
-        .iter()
-        .flat_map(|shard| shard.capture_ends.iter())
-        .filter(|(_, end)| **end != 0 && **end < cutoff)
-        .map(|(cid, _)| cid.clone())
+    let mut capture_ends = BTreeMap::<&str, u64>::new();
+    for (capture_id, &shard_end) in shards.iter().flat_map(|shard| &shard.capture_ends) {
+        let end = capture_ends.entry(capture_id.as_str()).or_default();
+        *end = (*end).max(shard_end);
+    }
+    let stale: BTreeSet<String> = capture_ends
+        .into_iter()
+        .filter(|(_, end)| *end != 0 && *end < cutoff)
+        .map(|(capture_id, _)| capture_id.to_owned())
         .collect();
     outcome.stale_captures = stale.len();
     if stale.is_empty() {
