@@ -1,5 +1,71 @@
 # Changelog
 
+## live-probe 0.7.0 / oiran-api 2.21.181 — 2026-11-25 — rétention par shard : plus aucune réécriture du jeu quand rien n'est périmé ; ramassage de 0.6.49/0.6.50 retiré
+
+Ordres cœur #9 7161008626 (arbitrage, défaut 2 en tête) et 7161327955 (GO sur `capture_ends`, sous condition de compatibilité du retour arrière). Audit #9 7161092645. Base : `eaef7db` (descendant de la production `d8718cf`).
+
+**Type de montée.**
+- live-probe : **mineure** (0.6.50 → 0.7.0). Le format du manifeste change, de façon additive.
+- oiran-api : patch, aucun code API modifié dans ce lot.
+
+### Retrait du ramassage (commit `revert` visible, sans rebase)
+Le ramassage des shards de 0.6.49/0.6.50 (`373eaad`, `eaef7db`) est retiré :
+- il prenait pour vérité le manifeste qu'il venait d'écrire ;
+- il ne consultait pas l'arborescence `captures/`, d'où l'incident #10 7160217000, sans perte d'events (#10 7160585770).
+
+Après le `revert`, `live-probe/src/lib.rs` est **identique** à `d8718cf`. Le CHANGELOG et les versions sont conservés. Le ramassage reviendra dans un lot distinct.
+
+### Défaut 2 (fermé ici pour les écritures)
+`cebce8e` (2.7.27) filtrait le fichier plat en place. Quand les shards sont devenus immuables (`f11320e`/`25b5272`, 2.11.14/2.11.15), la rétention a été adaptée en **concaténant tous les shards** dans un `shard-retained-*` neuf, à **chaque** publication. La branche ne dépendait que de la coupure et de l'existence de shards, pas d'une capture périmée : au lab, le commit 447 a réécrit 364 426 events pour 0 archivé.
+
+### Corrigé
+- **Champ additif `EventShard.capture_ends`** : `capture_id` → plus grand `timestamp.seconds`, la règle de `scan_capture_ends`.
+  - `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`.
+  - Il est rempli quand le shard est écrit, **pendant le comptage existant**, en une seule lecture du fichier : `count_valid_event_records_and_capture_ends`.
+- **`apply_incremental_retention`**, qui remplace la concaténation :
+  1. un shard sans `capture_ends` (manifeste ancien) est lu **une fois**, puis sa valeur est inscrite ;
+  2. **aucune capture périmée → rien n'est écrit**, la liste est inchangée (journal `CONTINUOUS_RETENTION_INCREMENTAL`, `bytes_rewritten: 0`) ;
+  3. sinon, **seuls** les shards qui portent une capture périmée sont lus :
+     - les lignes périmées vont dans **un** segment d'archive (même format qu'avant), ou nulle part si l'archive est désactivée (option 2.21.155) ;
+     - un shard entièrement périmé sort de la liste ;
+     - un shard partiellement périmé est remplacé par un `shard-retained-<sha16>` de ses seules lignes retenues. Son `sha256`, son `event_count` et ses `capture_ends` sont calculés **pendant l'écriture**, sans passage dédié ;
+  4. **conservation vérifiée** avant de rendre la main : archivés + retenus = events lus, sinon `CONTINUOUS_RETENTION_CONSERVATION_FAILED`, et rien n'est publié.
+- **Aucun fichier de données supprimé** : pour un shard qui sort, seul son **lien** de préparation est retiré.
+- `concatenate_files`, devenue sans appelant, est supprimée.
+
+### Retour arrière : condition bloquante du cœur, vérifiée au code puis par l'exécution
+- `d8718cf` : **aucun `deny_unknown_fields`** sur `EventShard` (`live-probe/src/lib.rs:1253-1254`) ni sur `LiveDataset` (`:1147-1148`).
+- Les 10 `deny_unknown_fields` de l'arbre portent sur d'autres structures : `LteExportRequest` (`apps/api/src/lib.rs:3308`), `probe_registry.rs`, `lte_evidence.rs`.
+- Toutes les lectures du manifeste passent par `LiveDataset` ou par `serde_json::Value`.
+- **Exécution** : branche `proof/live-probe-0.7.0-on-d8718cf` @ `c366d38`, test `d8718cf_continues_on_a_manifest_carrying_capture_ends_0_7_0_compat`. Le code `d8718cf` relit un manifeste portant `capture_ends`, valide le point de reprise et publie le cycle suivant : **PASS**.
+
+### Gardes (lancés à la main ; durée cumulée des quatre : 3,35 s)
+- `three_publications_without_a_stale_capture_rewrite_nothing_0_7_0` : trois publications sous rétention de 3 650 jours, sans rien de périmé. À chacune :
+  - ajout seul, et les identités des shards antérieurs sont inchangées ;
+  - aucun `shard-retained-*` ;
+  - inode et date des fichiers antérieurs inchangés ;
+  - octets écrits = ceux du seul shard neuf.
+
+  **Échoue sur `d8718cf`** (`c366d38`) : `shard-retained-2bce03a882793e57.jsonl`.
+- `a_stale_capture_takes_only_its_shard_out_and_conserves_every_event_0_7_0` :
+  - seul le shard périmé sort, le shard récent est repris tel quel ;
+  - l'archive porte **exactement** ses lignes ;
+  - `retenus + archivés = avant` par l'`event_count`.
+
+  **Échoue sur `d8718cf`**.
+- `an_old_manifest_without_capture_ends_is_completed_once_0_7_0` : un manifeste ancien est lu et complété, et rien n'est réécrit.
+- `a_manifest_with_capture_ends_reads_with_the_d8718cf_schema_0_7_0` : le manifeste écrit par 0.7.0 se lit avec les dérivations de `d8718cf`, recopiées.
+
+**Tests existants adaptés, déclarés :**
+- `archived_lab_shaped_dataset_2_21_146` attendait **un** `shard-retained-*`, donc la réécriture complète. Il attend désormais 2 shards repris, sans réécriture : le fichier plat entièrement périmé sort, le shard de l'UE restant est repris à l'identique.
+- `retention_purges_events_older_than_configured_days` ajoute une ligne à un shard **à la main**. Il retire désormais aussi `capture_ends` de ce shard, pour que le manifeste reste cohérent : la fin est alors recalculée une fois.
+
+### OUVERT, déclaré
+- La publication **relit** encore tous les shards pour reconstruire les sessions (`load_paths_spilling_representatives_with_progress`), ainsi que la lecture des `event_id` retenus sous rétention : lot distinct, sur décision du cœur.
+- Le shard qui sort de la liste reste sur disque, non référencé (copié dans `archive/`) : à traiter par le futur lot de ramassage.
+- L'écart `retention-safety-20261123T1324Z` (469 chemins, `event_count=1844825`) est mesuré par ANR2.
+- `quarantined_segment_is_removed_from_pending_and_counted_in_quarantined_metrics` : un échec sous charge le 25/11, sans cause attribuée.
+
 ## live-probe 0.6.50 / oiran-api 2.21.180 — 2026-11-25 — le ramassage des shards ne retire plus ceux de la génération encore servie
 
 Refus ANR1 #10 7157701325 de 0.6.49 / 2.21.179 (`373eaad`). Base : `373eaad`, qui contient la production `d8718cf` (2.21.178). Montée : patch. Seul le code de live-probe change.

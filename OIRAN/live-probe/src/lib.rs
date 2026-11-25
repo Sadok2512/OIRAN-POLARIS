@@ -1256,6 +1256,15 @@ pub struct EventShard {
     pub sha256: String,
     pub bytes: u64,
     pub event_count: usize,
+    /// 0.7.0 (ordre cœur #9 7161327955) — fin de chaque capture du shard
+    /// (`capture_id` → plus grand `timestamp.seconds`, même règle que
+    /// `scan_capture_ends`). Permet à la rétention de décider PAR SHARD sans
+    /// relire le jeu. Champ ADDITIF : absent d'un manifeste ancien (vide
+    /// alors, calculé une fois puis inscrit), et ignoré par un binaire
+    /// antérieur (aucun `deny_unknown_fields` sur `EventShard` ni sur
+    /// `LiveDataset` en `d8718cf`) : le retour arrière reste possible.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capture_ends: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -5671,6 +5680,7 @@ impl CaptureManager {
         fs::create_dir_all(next.join("event-shards")).map_err(display_error)?;
         fs::copy(&archive_events, &restored_path).map_err(display_error)?;
         let restored = EventShard {
+            capture_ends: BTreeMap::new(),
             path: restored_name,
             sha256: archive_sha.clone(),
             bytes: fs::metadata(&restored_path).map_err(display_error)?.len(),
@@ -7481,6 +7491,7 @@ impl CaptureManager {
                 event_shards = if prior.event_shards.is_empty() {
                     let path = prior_dir.join("oiran_events.jsonl");
                     vec![EventShard {
+                        capture_ends: BTreeMap::new(),
                         path: "oiran_events.jsonl".into(),
                         sha256: sha256_hex_file(&path)?,
                         bytes: fs::metadata(&path).map_err(display_error)?.len(),
@@ -7509,7 +7520,9 @@ impl CaptureManager {
             let shard_path = dataset_dir.join(&shard_name);
             fs::rename(&decoded_spool_path, &shard_path).map_err(display_error)?;
             let shard_bytes = fs::metadata(&shard_path).map_err(display_error)?.len();
-            let shard_events = count_valid_event_records(&shard_path)?;
+            // 0.7.0 — le comptage qui avait déjà lieu relève aussi la fin de
+            // chaque capture : même lecture du fichier, aucun passage de plus.
+            let (shard_events, shard_capture_ends) = count_valid_event_records_and_capture_ends(&shard_path)?;
             let shard_appended = shard_bytes != 0 || event_shards.is_empty();
             if !shard_appended {
                 fs::remove_file(&shard_path).map_err(display_error)?;
@@ -7519,6 +7532,7 @@ impl CaptureManager {
                     sha256: shard_sha,
                     bytes: shard_bytes,
                     event_count: shard_events,
+                    capture_ends: shard_capture_ends,
                 });
                 publication_bytes_written = shard_bytes;
             }
@@ -7544,35 +7558,19 @@ impl CaptureManager {
         // built in staging, archived capture-wise, and selected by the next
         // manifest. Historical files remain untouched and unreferenced.
         if capture_id == CONTINUOUS_CAPTURE_ID {
-            if let (Some(cutoff), Some(paths)) = (retention_cutoff_epoch_s(), event_paths.as_ref()) {
-                let retained = dataset_dir.join(".retention-input.jsonl");
-                concatenate_files(paths, &retained)?;
+            // 0.7.0 (ordre cœur #9 7161327955, défaut 2) — rétention PAR
+            // SHARD. Avant : tous les shards étaient concaténés en un
+            // `shard-retained-*` à CHAQUE publication, même sans capture
+            // périmée (adaptation de 2.7.27 aux shards immuables de 2.11.14).
+            // Désormais rien n'est réécrit tant que rien n'est périmé.
+            if let (Some(cutoff), Some(_)) = (retention_cutoff_epoch_s(), event_paths.as_ref()) {
                 let archive_root = dataset_dir
                     .parent()
                     .map(|p| p.join("archive"))
                     .unwrap_or_else(|| dataset_dir.join("archive"));
-                archive_stale_captures(&retained, &archive_root, cutoff)?;
-                let retained_sha = sha256_hex_file(&retained)?;
-                let retained_name = format!(
-                    "event-shards/shard-retained-{}.jsonl",
-                    &retained_sha[..16]
-                );
-                let retained_path = dataset_dir.join(&retained_name);
-                if dataset_dir.join("event-shards").exists() {
-                    fs::remove_dir_all(dataset_dir.join("event-shards")).map_err(display_error)?;
-                }
-                fs::create_dir_all(dataset_dir.join("event-shards")).map_err(display_error)?;
-                fs::rename(&retained, &retained_path).map_err(display_error)?;
-                let retained_bytes = fs::metadata(&retained_path).map_err(display_error)?.len();
-                let retained_events = count_valid_event_records(&retained_path)?;
-                event_shards = vec![EventShard {
-                    path: retained_name,
-                    sha256: retained_sha,
-                    bytes: retained_bytes,
-                    event_count: retained_events,
-                }];
-                publication_bytes_written = retained_bytes;
-                event_paths = Some(vec![retained_path]);
+                let outcome = apply_incremental_retention(dataset_dir, &mut event_shards, &archive_root, cutoff)?;
+                publication_bytes_written = publication_bytes_written.saturating_add(outcome.bytes_rewritten);
+                event_paths = Some(event_shards.iter().map(|shard| dataset_dir.join(&shard.path)).collect());
             }
         }
         self.publish_events_to_dataset_dir(
@@ -9614,28 +9612,51 @@ pub fn load_dataset_events(dataset_dir: &Path) -> Result<Vec<EventRecord>, Strin
     Ok(events)
 }
 
-fn concatenate_files(paths: &[PathBuf], output: &Path) -> Result<(), String> {
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(output)
-        .map_err(display_error)?;
-    let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
-    for path in paths {
-        let mut reader = BufReader::with_capacity(
-            STREAM_CHUNK_BYTES,
-            fs::File::open(path).map_err(display_error)?,
-        );
-        std::io::copy(&mut reader, &mut writer).map_err(display_error)?;
-    }
-    writer.flush().map_err(display_error)?;
-    writer.get_ref().sync_all().map_err(display_error)
-}
 
 /// Validate a persisted event artifact without rebuilding the complete
 /// dataset in memory. Registration runs both before and after continuous
 /// publication, so using `load_path` here used to retain one full
 /// `Vec<EventRecord>` and made RSS proportional to history size.
+/// 0.7.0 (ordre cœur #9 7161327955) — `count_valid_event_records` et la fin
+/// de chaque capture (`scan_capture_ends`) en UNE lecture du fichier : la
+/// validation reste celle de `session_engine::load_jsonl`, la fin de capture
+/// reste `max(timestamp.seconds)` par `capture_id` lu dans la ligne brute.
+fn count_valid_event_records_and_capture_ends(path: &Path) -> Result<(usize, BTreeMap<String, u64>), String> {
+    let file = fs::File::open(path).map_err(display_error)?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+    let mut count = 0usize;
+    let mut capture_ends: BTreeMap<String, u64> = BTreeMap::new();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line.map_err(display_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed = session_engine::load_jsonl(line.as_bytes())
+            .map_err(|error| format!("line {}: {error}", line_number + 1))?;
+        if parsed.len() != 1 {
+            return Err(format!("DATASET_REGISTRATION_EVENT_INVALID line {}", line_number + 1));
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if let Some(cid) = value.get("capture_id").and_then(serde_json::Value::as_str) {
+            let ts = value
+                .get("timestamp")
+                .and_then(|ts| ts.get("seconds"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let entry = capture_ends.entry(cid.to_owned()).or_insert(0);
+            if ts > *entry {
+                *entry = ts;
+            }
+        }
+        count = count.saturating_add(1);
+        if count % 1024 == 0 {
+            release_unused_heap_pages();
+        }
+    }
+    release_unused_heap_pages();
+    Ok((count, capture_ends))
+}
+
 fn count_valid_event_records(path: &Path) -> Result<usize, String> {
     let file = fs::File::open(path).map_err(display_error)?;
     let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
@@ -11420,6 +11441,225 @@ fn archive_stale_captures(
         })
     );
     Ok(())
+}
+
+/// 0.7.0 — bilan d'une rétention incrémentale.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IncrementalRetentionOutcome {
+    stale_captures: usize,
+    shards_dropped: usize,
+    shards_rewritten: usize,
+    bytes_rewritten: u64,
+    events_archived: u64,
+    events_retained_in_rewritten: u64,
+    capture_end_scans: usize,
+}
+
+/// 0.7.0 (ordre cœur #9 7161327955, défaut 2) — rétention PAR SHARD sur la
+/// liste `shards` du jeu en préparation (`dataset_dir`, où les shards
+/// antérieurs sont des liens en lecture seule) :
+/// 1. chaque shard sans `capture_ends` (manifeste ancien) est lu UNE fois
+///    pour la calculer, et elle est inscrite ;
+/// 2. captures périmées = celles dont la fin est non nulle et < `cutoff`
+///    (règle de `archive_stale_captures`) ;
+/// 3. aucune → rien n'est écrit, la liste est inchangée ;
+/// 4. sinon, seuls les shards qui portent une capture périmée sont lus :
+///    les lignes périmées vont dans UN segment d'archive (ou nulle part si
+///    l'archive est désactivée, option 2.21.155) ; un shard entièrement
+///    périmé sort de la liste ; un shard partiellement périmé est remplacé
+///    par un `shard-retained-<sha16>` de ses seules lignes retenues, dont
+///    `sha256`, `event_count` et `capture_ends` sont calculés PENDANT
+///    l'écriture ;
+/// 5. conservation vérifiée avant de rendre la main : archivés + retenus =
+///    `event_count` des shards lus, sinon erreur et rien n'est publié.
+/// Seul un LIEN de la préparation est retiré pour un shard qui sort ;
+/// aucun fichier de données n'est supprimé.
+fn apply_incremental_retention(
+    dataset_dir: &Path,
+    shards: &mut Vec<EventShard>,
+    archive_root: &Path,
+    cutoff: u64,
+) -> Result<IncrementalRetentionOutcome, String> {
+    let mut outcome = IncrementalRetentionOutcome::default();
+    for shard in shards.iter_mut() {
+        if shard.capture_ends.is_empty() && shard.event_count > 0 {
+            shard.capture_ends = scan_capture_ends(&dataset_dir.join(&shard.path))?;
+            outcome.capture_end_scans += 1;
+        }
+    }
+    let stale: BTreeSet<String> = shards
+        .iter()
+        .flat_map(|shard| shard.capture_ends.iter())
+        .filter(|(_, end)| **end != 0 && **end < cutoff)
+        .map(|(cid, _)| cid.clone())
+        .collect();
+    outcome.stale_captures = stale.len();
+    if stale.is_empty() {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_RETENTION_INCREMENTAL",
+                "cutoff_epoch_s": cutoff,
+                "stale_captures": 0,
+                "shards": shards.len(),
+                "bytes_rewritten": 0,
+                "capture_end_scans": outcome.capture_end_scans,
+            })
+        );
+        return Ok(outcome);
+    }
+    let archive_enabled = retention_archive_enabled();
+    let now_s = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0);
+    let capture_list_sha = sha256_hex(stale.iter().cloned().collect::<Vec<_>>().join("\n").as_bytes());
+    let archive_id = format!("{now_s}-{}", &capture_list_sha[..16]);
+    let segment_dir = archive_root.join(&archive_id);
+    let segment_events = segment_dir.join("events.jsonl");
+    let mut archive_writer = if archive_enabled {
+        fs::create_dir_all(&segment_dir)
+            .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: mkdir: {error}"))?;
+        Some(BufWriter::with_capacity(
+            STREAM_CHUNK_BYTES,
+            fs::File::create(&segment_events)
+                .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment: {error}"))?,
+        ))
+    } else {
+        None
+    };
+    let mut archive_hash = Sha256Hasher::new();
+    let mut events_read = 0u64;
+    let mut kept: Vec<EventShard> = Vec::with_capacity(shards.len());
+    let mut temporaries: Vec<PathBuf> = Vec::new();
+    let result = (|| -> Result<(), String> {
+        for shard in shards.drain(..) {
+            if !shard.capture_ends.keys().any(|cid| stale.contains(cid)) {
+                kept.push(shard);
+                continue;
+            }
+            let source = dataset_dir.join(&shard.path);
+            let tmp = dataset_dir.join("event-shards").join(format!(".retention-{}.tmp", kept.len() + temporaries.len()));
+            fs::create_dir_all(tmp.parent().unwrap_or(dataset_dir)).map_err(display_error)?;
+            temporaries.push(tmp.clone());
+            let mut retained_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, fs::File::create(&tmp).map_err(display_error)?);
+            let mut retained_hash = Sha256Hasher::new();
+            let mut retained_bytes = 0u64;
+            let mut retained_count = 0usize;
+            let mut retained_ends: BTreeMap<String, u64> = BTreeMap::new();
+            let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, fs::File::open(&source).map_err(display_error)?);
+            for line in reader.lines() {
+                let line = line.map_err(display_error)?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                events_read += 1;
+                let value: serde_json::Value = serde_json::from_str(&line)
+                    .map_err(|error| format!("CONTINUOUS_ARCHIVE_PARSE_FAILED: {error}"))?;
+                let cid = value.get("capture_id").and_then(serde_json::Value::as_str).unwrap_or("");
+                if stale.contains(cid) {
+                    if let Some(writer) = archive_writer.as_mut() {
+                        writer.write_all(line.as_bytes()).and_then(|_| writer.write_all(b"\n"))
+                            .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: body: {error}"))?;
+                    }
+                    archive_hash.update(line.as_bytes());
+                    archive_hash.update(b"\n");
+                    outcome.events_archived += 1;
+                } else {
+                    retained_writer.write_all(line.as_bytes()).and_then(|_| retained_writer.write_all(b"\n")).map_err(display_error)?;
+                    retained_hash.update(line.as_bytes());
+                    retained_hash.update(b"\n");
+                    retained_bytes += line.len() as u64 + 1;
+                    retained_count += 1;
+                    let ts = value.get("timestamp").and_then(|ts| ts.get("seconds")).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let entry = retained_ends.entry(cid.to_owned()).or_insert(0);
+                    if ts > *entry {
+                        *entry = ts;
+                    }
+                }
+            }
+            retained_writer.flush().map_err(display_error)?;
+            retained_writer.get_ref().sync_all().map_err(display_error)?;
+            drop(retained_writer);
+            // Un shard qui sort ou est remplacé : seul son LIEN de
+            // préparation est retiré ; un fichier régulier n'est jamais
+            // supprimé ici.
+            if fs::symlink_metadata(&source).map(|meta| meta.file_type().is_symlink()).unwrap_or(false) {
+                fs::remove_file(&source).map_err(display_error)?;
+            }
+            if retained_count == 0 {
+                fs::remove_file(&tmp).map_err(display_error)?;
+                outcome.shards_dropped += 1;
+                continue;
+            }
+            let sha = retained_hash.finish_hex();
+            let name = format!("event-shards/shard-retained-{}.jsonl", &sha[..16]);
+            fs::rename(&tmp, dataset_dir.join(&name)).map_err(display_error)?;
+            outcome.shards_rewritten += 1;
+            outcome.bytes_rewritten += retained_bytes;
+            outcome.events_retained_in_rewritten += retained_count as u64;
+            kept.push(EventShard {
+                path: name,
+                sha256: sha,
+                bytes: retained_bytes,
+                event_count: retained_count,
+                capture_ends: retained_ends,
+            });
+        }
+        Ok(())
+    })();
+    let read_before: u64 = events_read;
+    if let Err(error) = result {
+        for tmp in &temporaries {
+            let _ = fs::remove_file(tmp);
+        }
+        let _ = fs::remove_file(&segment_events);
+        let _ = fs::remove_dir(&segment_dir);
+        return Err(error);
+    }
+    // Conservation : chaque event lu est archivé ou retenu.
+    if outcome.events_archived + outcome.events_retained_in_rewritten != read_before {
+        let _ = fs::remove_file(&segment_events);
+        let _ = fs::remove_dir(&segment_dir);
+        return Err(format!(
+            "CONTINUOUS_RETENTION_CONSERVATION_FAILED: read={read_before} archived={} retained={}",
+            outcome.events_archived, outcome.events_retained_in_rewritten
+        ));
+    }
+    let archive_sha256 = archive_hash.finish_hex();
+    if let Some(mut writer) = archive_writer {
+        writer.flush().map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: flush: {error}"))?;
+        writer.get_ref().sync_all().map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: fsync: {error}"))?;
+        let manifest = serde_json::json!({
+            "archive_id": archive_id,
+            "created_epoch_s": now_s,
+            "cutoff_epoch_s": cutoff,
+            "retention_days": retention_days(),
+            "captures": stale.iter().collect::<Vec<_>>(),
+            "event_count": outcome.events_archived,
+            "events_sha256": archive_sha256,
+            "schema_version": "2.7.27",
+        });
+        fs::write(segment_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: manifest: {error}"))?;
+    }
+    *shards = kept;
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "CONTINUOUS_CAPTURE_ARCHIVE",
+            "mode": "incremental",
+            "archive_id": archive_id,
+            "archive_written": archive_enabled,
+            "cutoff_epoch_s": cutoff,
+            "retention_days": retention_days(),
+            "capture_count": stale.len(),
+            "event_count_archived": outcome.events_archived,
+            "shards_dropped": outcome.shards_dropped,
+            "shards_rewritten": outcome.shards_rewritten,
+            "bytes_rewritten": outcome.bytes_rewritten,
+            "capture_end_scans": outcome.capture_end_scans,
+            "archive_sha256": archive_sha256,
+        })
+    );
+    Ok(outcome)
 }
 
 /// 2.21.155 — `segment_events` à `None` : les events hors fenêtre ne sont
@@ -17518,6 +17758,11 @@ mod tests {
         manifest["event_shards"][0]["event_count"] = serde_json::json!(first.event_count + 1);
         manifest["event_shards"][0]["bytes"] = serde_json::json!(fs::metadata(&events_path).unwrap().len());
         manifest["event_shards"][0]["sha256"] = serde_json::json!(sha256_hex_file(&events_path).unwrap());
+        // 0.7.0 — le test ajoute une ligne à un shard à la main (un shard
+        // n'est jamais réécrit en production) : il retire aussi la fin de
+        // captures inscrite, qui ne couvre plus le shard. La rétention la
+        // recalcule alors une fois, comme pour un manifeste ancien.
+        manifest["event_shards"][0].as_object_mut().unwrap().remove("capture_ends");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
         // Retention 3650 days: the backdated canary (3651 days old)
         // is purged; the ~12-day-old fixture events survive comfortably.
@@ -23609,7 +23854,7 @@ Content-Length: 0\r\n\
             let body: String = ids.iter().map(|id| format!("{{\"event_id\":\"{id}\",\"x\":1}}\n")).collect();
             fs::write(&path, &body).unwrap();
             (
-                EventShard { path: format!("event-shards/{name}"), sha256: sha256_hex(body.as_bytes()), bytes: body.len() as u64, event_count: ids.len() },
+                EventShard { path: format!("event-shards/{name}"), sha256: sha256_hex(body.as_bytes()), bytes: body.len() as u64, event_count: ids.len(), capture_ends: BTreeMap::new() },
                 path,
             )
         };
@@ -23732,6 +23977,219 @@ Content-Length: 0\r\n\
             .collect()
     }
 
+    /// 0.7.0 — banc de rétention en forme de lab (shards, pas de fichier
+    /// plat) : un gestionnaire réel, un cycle = une publication continue.
+    struct RetentionBench0_7_0 {
+        _root: TempRoot,
+        manager: CaptureManager,
+        base: PathBuf,
+    }
+
+    impl RetentionBench0_7_0 {
+        fn new(label: &str) -> Self {
+            let root = temporary_root(label);
+            let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
+            manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
+            let base = root.join(CONTINUOUS_CAPTURE_ID);
+            fs::create_dir_all(base.join("pcap")).unwrap();
+            Self { _root: root, manager, base }
+        }
+
+        fn cycle(&self, retention_days: Option<u64>, segments: &[(&str, PathBuf)]) -> LiveDataset {
+            let mut selected = BTreeSet::new();
+            for (name, source) in segments {
+                let path = self.base.join("pcap").join(name);
+                fs::copy(source, &path).unwrap();
+                selected.insert(path);
+            }
+            TEST_RETENTION_DAYS.with(|value| value.set(retention_days));
+            let published = self
+                .manager
+                .process_continuous_capture_selected(&self.base, &interface_specs(), 1024 * 1024 * 1024, &selected);
+            TEST_RETENTION_DAYS.with(|value| value.set(None));
+            published.unwrap()
+        }
+
+        fn manifest(&self) -> LiveDataset {
+            serde_json::from_slice(&fs::read(self.base.join("dataset/dataset_manifest.json")).unwrap()).unwrap()
+        }
+
+        fn shard_file(&self, shard: &EventShard) -> PathBuf {
+            self.base.join("dataset").join(&shard.path)
+        }
+    }
+
+    fn corpus_0_7_0() -> (PathBuf, PathBuf, PathBuf) {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        (
+            workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap"),
+            workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-registration.pcap"),
+            workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1"),
+        )
+    }
+
+    /// Identité d'un shard telle que `d8718cf` la connaît (sans le champ
+    /// additif) : chemin, empreinte, taille, nombre d'events.
+    fn shard_identity_0_7_0(shard: &EventShard) -> (String, String, u64, usize) {
+        (shard.path.clone(), shard.sha256.clone(), shard.bytes, shard.event_count)
+    }
+
+    /// 0.7.0 (ordre cœur #9 7161327955, défaut 2) — LE garde : trois
+    /// publications sous rétention sans aucune capture périmée (fenêtre de
+    /// 3 650 jours). À chacune : la liste de shards est l'ancienne PLUS le
+    /// shard neuf (ajout seul, identités inchangées), aucun
+    /// `shard-retained-*`, les fichiers des shards antérieurs gardent leur
+    /// inode et leur date, et les octets écrits sont ceux du seul shard neuf.
+    /// Avant 0.7.0 : chaque publication concaténait tout le jeu dans un
+    /// `shard-retained-*` neuf.
+    #[test]
+    fn three_publications_without_a_stale_capture_rewrite_nothing_0_7_0() {
+        use std::os::unix::fs::MetadataExt as _;
+        let bench = RetentionBench0_7_0::new("retention-no-rewrite-0-7-0");
+        let (five, registration, one) = corpus_0_7_0();
+        bench.cycle(None, &[("N2.pcap-five.pcapng", five.clone())]);
+        let segments: [&[(&str, PathBuf)]; 3] = [
+            &[("N2.pcap-registration.pcapng", registration.clone())],
+            &[("N2.pcap-one.pcapng", one.join("N2.pcapng"))],
+            &[("N4.pcap-one.pcapng", one.join("N4.pcapng"))],
+        ];
+        for (round, segment) in segments.iter().enumerate() {
+            let before = bench.manifest();
+            let stamps: Vec<(u64, i64)> = before
+                .event_shards
+                .iter()
+                .map(|shard| {
+                    let meta = fs::metadata(bench.shard_file(shard)).unwrap();
+                    (meta.ino(), meta.mtime())
+                })
+                .collect();
+            let published = bench.cycle(Some(3650), segment);
+            let after = bench.manifest();
+            assert!(
+                after.event_shards.iter().all(|shard| !shard.path.contains("shard-retained-")),
+                "publication {round} : aucune réécriture ({:?})",
+                after.event_shards.iter().map(|shard| shard.path.clone()).collect::<Vec<_>>()
+            );
+            assert_eq!(after.event_shards.len(), before.event_shards.len() + 1, "publication {round} : ajout seul ; avant {:?} ; après {:?}", before.event_shards.iter().map(|s| (s.path.clone(), s.event_count)).collect::<Vec<_>>(), after.event_shards.iter().map(|s| (s.path.clone(), s.event_count)).collect::<Vec<_>>());
+            let prefix: Vec<_> = after.event_shards[..before.event_shards.len()].iter().map(shard_identity_0_7_0).collect();
+            let previous: Vec<_> = before.event_shards.iter().map(shard_identity_0_7_0).collect();
+            assert_eq!(prefix, previous, "publication {round} : les shards antérieurs sont repris tels quels");
+            for (shard, stamp) in before.event_shards.iter().zip(&stamps) {
+                let meta = fs::metadata(bench.shard_file(shard)).unwrap();
+                assert_eq!((meta.ino(), meta.mtime()), *stamp, "publication {round} : {} jamais réécrit", shard.path);
+            }
+            let new_shard = after.event_shards.last().unwrap();
+            assert_eq!(published.publication_bytes_written, new_shard.bytes, "publication {round} : seuls les octets du shard neuf");
+            assert_eq!(after.event_count, before.event_count + new_shard.event_count);
+        }
+    }
+
+    /// 0.7.0 (ordre cœur #9 7161327955) — sûreté des données : trois
+    /// publications (A ancienne, B récente, puis C sous rétention de 60
+    /// jours, coupure entre A et B). Seul le shard de A sort ; B est repris
+    /// tel quel ; l'archive porte EXACTEMENT les lignes de A ; et
+    /// `retenus + archivés = avant` par l'`event_count` du manifeste.
+    #[test]
+    fn a_stale_capture_takes_only_its_shard_out_and_conserves_every_event_0_7_0() {
+        let bench = RetentionBench0_7_0::new("retention-conservation-0-7-0");
+        let (five, _, one) = corpus_0_7_0();
+        let after_a = bench.cycle(None, &[("N2.pcap-five.pcapng", five.clone())]);
+        let after_b = bench.cycle(None, &[("N2.pcap-one.pcapng", one.join("N2.pcapng")), ("N4.pcap-one.pcapng", one.join("N4.pcapng"))]);
+        assert_eq!(after_b.event_shards.len(), 2);
+        let shard_a = after_b.event_shards[0].clone();
+        let shard_b = after_b.event_shards[1].clone();
+        let mut lines_a: Vec<String> = fs::read_to_string(bench.shard_file(&shard_a)).unwrap().lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+        lines_a.sort();
+        assert_eq!(lines_a.len(), after_a.event_count, "précondition : A porte ses events");
+        let after_c = bench.cycle(Some(60), &[("N3.pcap-one.pcapng", one.join("N3.pcapng"))]);
+        assert!(after_c.event_shards.iter().all(|shard| shard.path != shard_a.path), "le shard de A sort");
+        assert_eq!(after_c.event_shards[0], shard_b, "B repris tel quel");
+        assert!(after_c.event_shards.iter().all(|shard| !shard.path.contains("shard-retained-")), "aucune réécriture : A est entièrement périmé, B ne l'est pas");
+        let segments: Vec<PathBuf> = fs::read_dir(bench.base.join("archive")).unwrap().flatten().map(|entry| entry.path()).collect();
+        assert_eq!(segments.len(), 1, "un segment d'archive");
+        let mut archived: Vec<String> = fs::read_to_string(segments[0].join("events.jsonl")).unwrap().lines().map(str::to_owned).collect();
+        archived.sort();
+        assert_eq!(archived, lines_a, "l'archive porte exactement les lignes de A");
+        let archive_manifest: Value = serde_json::from_slice(&fs::read(segments[0].join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(archive_manifest["event_count"].as_u64().unwrap() as usize, lines_a.len());
+        let new_c = after_c.event_shards.last().unwrap();
+        assert_eq!(
+            after_c.event_count + archived.len(),
+            after_b.event_count + new_c.event_count,
+            "conservation : retenus + archivés = avant (+ shard neuf de C)"
+        );
+        assert!(shard_a_file_kept_0_7_0(&bench, &shard_a), "aucun fichier de données supprimé");
+    }
+
+    fn shard_a_file_kept_0_7_0(bench: &RetentionBench0_7_0, shard: &EventShard) -> bool {
+        bench.shard_file(shard).is_file()
+    }
+
+    /// 0.7.0 — un manifeste écrit par un binaire antérieur (sans
+    /// `capture_ends`) est lu, la fin des captures est calculée une fois et
+    /// inscrite, et rien n'est réécrit.
+    #[test]
+    fn an_old_manifest_without_capture_ends_is_completed_once_0_7_0() {
+        let bench = RetentionBench0_7_0::new("retention-old-manifest-0-7-0");
+        let (five, registration, _) = corpus_0_7_0();
+        bench.cycle(None, &[("N2.pcap-five.pcapng", five.clone())]);
+        bench.cycle(None, &[("N2.pcap-registration.pcapng", registration.clone())]);
+        let manifest_path = bench.base.join("dataset/dataset_manifest.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        for shard in value["event_shards"].as_array_mut().unwrap() {
+            shard.as_object_mut().unwrap().remove("capture_ends");
+        }
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let old = bench.manifest();
+        assert!(old.event_shards.iter().all(|shard| shard.capture_ends.is_empty()), "précondition : manifeste ancien");
+        let (_, _, one) = corpus_0_7_0();
+        let after = bench.cycle(Some(3650), &[("N2.pcap-one.pcapng", one.join("N2.pcapng"))]);
+        assert!(after.event_shards.iter().all(|shard| !shard.capture_ends.is_empty()), "fin des captures inscrite pour chaque shard");
+        assert!(after.event_shards.iter().all(|shard| !shard.path.contains("shard-retained-")), "rien n'est réécrit");
+        let prefix: Vec<_> = after.event_shards[..old.event_shards.len()].iter().map(shard_identity_0_7_0).collect();
+        assert_eq!(prefix, old.event_shards.iter().map(shard_identity_0_7_0).collect::<Vec<_>>());
+    }
+
+    /// 0.7.0 (condition bloquante du cœur #9 7161327955) — le retour
+    /// arrière reste possible : un manifeste écrit par 0.7.0, qui porte
+    /// `capture_ends`, se lit avec le schéma de `d8718cf`. `EventShardD8718cf`
+    /// et `LiveDatasetHeadD8718cf` reprennent mot pour mot les dérivations de
+    /// `d8718cf` (`#[derive(Deserialize)]`, aucun `deny_unknown_fields`),
+    /// champs utiles seulement ; le passage croisé sur l'arbre `d8718cf`
+    /// lui-même est fait par la branche `proof/…-compat-on-d8718cf`.
+    #[test]
+    fn a_manifest_with_capture_ends_reads_with_the_d8718cf_schema_0_7_0() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct EventShardD8718cf {
+            path: String,
+            sha256: String,
+            bytes: u64,
+            event_count: usize,
+        }
+        #[derive(Deserialize)]
+        struct LiveDatasetHeadD8718cf {
+            event_count: usize,
+            event_shards: Vec<EventShardD8718cf>,
+        }
+        let bench = RetentionBench0_7_0::new("retention-compat-0-7-0");
+        let (five, registration, _) = corpus_0_7_0();
+        bench.cycle(None, &[("N2.pcap-five.pcapng", five.clone())]);
+        bench.cycle(Some(3650), &[("N2.pcap-registration.pcapng", registration.clone())]);
+        let bytes = fs::read(bench.base.join("dataset/dataset_manifest.json")).unwrap();
+        let raw: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(raw["event_shards"][0]["capture_ends"].is_object(), "précondition : le manifeste porte le champ additif");
+        let old: LiveDatasetHeadD8718cf = serde_json::from_slice(&bytes).expect("lisible par le schéma d8718cf");
+        let new = bench.manifest();
+        assert_eq!(old.event_count, new.event_count);
+        assert_eq!(
+            old.event_shards,
+            new.event_shards.iter().map(|shard| EventShardD8718cf { path: shard.path.clone(), sha256: shard.sha256.clone(), bytes: shard.bytes, event_count: shard.event_count }).collect::<Vec<_>>()
+        );
+        // Et le manifeste complet, au schéma courant, se relit à l'identique.
+        let full: LiveDataset = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(full.event_shards, new.event_shards);
+    }
+
     fn archived_lab_shaped_dataset_2_21_146(label: &str) -> ArchivedLabShapedDataset {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let five = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
@@ -23797,8 +24255,14 @@ Content-Length: 0\r\n\
             "tous les events des captures anciennes sont dans l'archive"
         );
         assert!(dataset_dir.join("oiran_events.jsonl").is_file(), "le fichier plat d'origine n'est pas supprimé");
-        assert_eq!(archived.event_shards.len(), 1);
-        assert!(archived.event_shards[0].path.starts_with("event-shards/shard-retained-"));
+        // 0.7.0 (défaut 2) — avant : tout le jeu réécrit en UN
+        // `shard-retained-*`. Désormais seul le shard qui porte les captures
+        // périmées (le fichier plat, entièrement périmé) sort ; le shard de
+        // l'UE restant et le shard neuf restent TELS QUELS, rien n'est réécrit.
+        assert_eq!(archived.event_shards.len(), 2, "{:?}", archived.event_shards);
+        assert!(archived.event_shards.iter().all(|shard| shard.path != "oiran_events.jsonl"), "le fichier plat sort du manifeste");
+        assert!(archived.event_shards.iter().all(|shard| !shard.path.contains("shard-retained-")), "aucune réécriture");
+        assert_eq!(archived.event_shards[0], before.event_shards[1], "le shard de l'UE restant est repris tel quel");
         let archived_sessions: BTreeSet<String> = archived.session_ids.iter().cloned().collect();
         assert!(archived_sessions.is_disjoint(&old_sessions), "les sessions archivées sortent de l'Analyzer");
         assert_eq!(archived_sessions, remaining, "les sessions restantes gardent leur id, aucun id nouveau");
