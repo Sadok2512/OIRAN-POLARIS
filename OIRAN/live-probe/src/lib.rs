@@ -1830,6 +1830,8 @@ pub struct CaptureManager {
     /// Persistance : `<root>/quarantine.json`. Chargé au `new()`,
     /// réécrit atomiquement à chaque nouveau segment quarantiné.
     quarantined_segments: Arc<Mutex<BTreeMap<SegmentQuarantineKey, SegmentQuarantineEntry>>>,
+    #[cfg(test)]
+    after_quarantine_insert: Option<Arc<dyn Fn() + Send + Sync>>,
     // 2.7.6: per-deployment HMAC-SHA256 secret. Loaded once from a root-only
     // 0600 file at startup and shared by every import this manager runs,
     // including after a probe restart against the same key path. Wrapped in
@@ -2194,6 +2196,13 @@ impl CaptureManager {
             },
         );
         persist_quarantined_segments(&self.root, &guard);
+        #[cfg(test)]
+        if let Some(pause) = &self.after_quarantine_insert {
+            // The fixture must be able to observe the table while the
+            // worker is held before its next inventory scan.
+            drop(guard);
+            pause();
+        }
         true
     }
 
@@ -2322,6 +2331,8 @@ impl CaptureManager {
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
             vtap_publication_triggers: Arc::new(Mutex::new(BTreeSet::new())),
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
+            #[cfg(test)]
+            after_quarantine_insert: None,
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
             sbi_hpack_carry_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
@@ -16614,12 +16625,20 @@ mod tests {
         write_rotation_closures(&source, "N2", 1);
         thread::sleep(Duration::from_millis(250));
 
-        let manager = CaptureManager::with_pseudonym_key_path(
+        let mut manager = CaptureManager::with_pseudonym_key_path(
             root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
+        let (paused, wait_for_pause) = std::sync::mpsc::sync_channel(1);
+        let (resume, wait_for_observation) = std::sync::mpsc::channel();
+        let wait_for_observation = Mutex::new(wait_for_observation);
+        manager.after_quarantine_insert = Some(Arc::new(move || {
+            paused.send(()).unwrap();
+            // Disconnect also releases the worker if the test panics.
+            let _ = wait_for_observation.lock().unwrap().recv();
+        }));
         manager
             .start_continuous_import(ContinuousImportConfig {
                 source_root: source.to_path_buf(),
@@ -16635,6 +16654,18 @@ mod tests {
             })
             .unwrap();
 
+        wait_for_pause
+            .recv_timeout(Duration::from_secs(30))
+            .expect("worker paused after the quarantine table was persisted");
+        let mut resume = Some(resume);
+        let mut observe_job = || {
+            let snapshot = manager.get(CONTINUOUS_CAPTURE_ID).expect("continuous job");
+            if let Some(resume) = resume.take() {
+                resume.send(()).unwrap();
+            }
+            snapshot
+        };
+
         // Attend la quarantaine puis un cycle supplémentaire pour que
         // les compteurs soient re-publiés après la quarantaine.
         wait_for(|| {
@@ -16645,7 +16676,7 @@ mod tests {
         });
         thread::sleep(Duration::from_millis(500));
 
-        let job = manager.get(CONTINUOUS_CAPTURE_ID).expect("continuous job");
+        let job = observe_job();
         assert_eq!(
             job.metrics.pending_segments, 0,
             "2.21.68 : un segment quarantiné ne doit PLUS être compté en attente ; metrics: {:?}",
