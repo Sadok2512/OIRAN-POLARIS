@@ -317,6 +317,7 @@ struct N3FlowAggregate {
     last_seen_ns: i128,
     last_packet: Option<event_schema::PacketReference>,
     qfi: Option<u8>,
+    duplex_consistent: bool,
 }
 
 #[derive(Default)]
@@ -341,6 +342,7 @@ impl N3FlowAggregator {
             .and_then(|item| item.value.as_deref())
             .and_then(parse_qfi);
         let teid = identifier("teid");
+        let duplex_consistent = event.interface == "N3" && !identifier("ue_ip").is_empty();
         let mut direction = event.direction.as_str().to_string();
         if direction == "UNKNOWN" {
             let known = self
@@ -377,6 +379,7 @@ impl N3FlowAggregator {
             last_seen_ns: timestamp_ns,
             last_packet,
             qfi,
+            duplex_consistent,
         };
         if key.direction != "UNKNOWN" {
             let unknown_key = N3FlowKey {
@@ -449,6 +452,16 @@ impl N3FlowAggregator {
                         status: DecodeStatus::Decoded,
                     });
                 }
+                if flow.duplex_consistent {
+                    flow.event.information_elements.push(InformationElement {
+                        id: None,
+                        name: "aggregate_duplex_consistent".into(),
+                        length: 0,
+                        value: Some("true".into()),
+                        raw_sha256: None,
+                        status: DecodeStatus::Decoded,
+                    });
+                }
                 let first_packet = flow
                     .event
                     .packet_references
@@ -505,6 +518,15 @@ fn set_tunnel_direction(event: &mut NormalizedEvent, direction: &str) {
 }
 
 fn merge_gtpu_aggregate(target: &mut N3FlowAggregate, source: N3FlowAggregate) {
+    fn ue_ip(event: &NormalizedEvent) -> Option<&str> {
+        event.session_identifiers.iter().find(|identifier| identifier.name == "ue_ip")
+            .map(|identifier| identifier.value.as_str())
+    }
+    target.duplex_consistent = target.duplex_consistent
+        && source.duplex_consistent
+        && target.event.source_endpoint.address == source.event.source_endpoint.address
+        && target.event.destination_endpoint.address == source.event.destination_endpoint.address
+        && ue_ip(&target.event) == ue_ip(&source.event);
     target.packet_count = target.packet_count.saturating_add(source.packet_count);
     target.wire_bytes = target.wire_bytes.saturating_add(source.wire_bytes);
     target.first_seen_ns = target.first_seen_ns.min(source.first_seen_ns);
