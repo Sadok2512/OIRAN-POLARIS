@@ -23977,6 +23977,46 @@ Content-Length: 0\r\n\
             .collect()
     }
 
+    #[test]
+    fn a_capture_spanning_shards_survives_until_its_global_end_expires_0_7_0() {
+        let root = temporary_root("retention-global-capture-end");
+        let archive_root = root.join("archive");
+        let capture_id = "sha256:spanning";
+        fs::create_dir_all(root.join("event-shards")).unwrap();
+
+        let mut shards = Vec::new();
+        for (path, end, packet) in [
+            ("event-shards/early.jsonl", 100, 1),
+            ("event-shards/late.jsonl", 300, 2),
+        ] {
+            let event_path = root.join(path);
+            write_jsonl(
+                &event_path,
+                &[archive_test_line(path, capture_id, end, packet)],
+            );
+            let bytes = fs::read(event_path).unwrap();
+            shards.push(EventShard {
+                path: path.to_owned(),
+                sha256: sha256_hex(&bytes),
+                bytes: bytes.len() as u64,
+                event_count: 1,
+                capture_ends: BTreeMap::from([(capture_id.to_owned(), end)]),
+            });
+        }
+        let before = shards.clone();
+
+        TEST_RETENTION_ARCHIVE.with(|enabled| enabled.set(Some(true)));
+        let result = apply_incremental_retention(&root, &mut shards, &archive_root, 200);
+        TEST_RETENTION_ARCHIVE.with(|enabled| enabled.set(None));
+
+        assert_eq!(result.unwrap().events_archived, 0, "capture still live in the late shard");
+        assert_eq!(shards, before);
+        assert!(!archive_root.exists());
+        for shard in &shards {
+            assert_eq!(sha256_hex_file(&root.join(&shard.path)).unwrap(), shard.sha256);
+        }
+    }
+
     /// 0.7.0 — banc de rétention en forme de lab (shards, pas de fichier
     /// plat) : un gestionnaire réel, un cycle = une publication continue.
     struct RetentionBench0_7_0 {
