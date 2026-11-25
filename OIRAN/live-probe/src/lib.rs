@@ -23732,6 +23732,177 @@ Content-Length: 0\r\n\
             .collect()
     }
 
+    /// 0.7.0 — banc de rétention en forme de lab (shards, pas de fichier
+    /// plat) : un gestionnaire réel, un cycle = une publication continue.
+    struct RetentionBench0_7_0 {
+        _root: TempRoot,
+        manager: CaptureManager,
+        base: PathBuf,
+    }
+
+    impl RetentionBench0_7_0 {
+        fn new(label: &str) -> Self {
+            let root = temporary_root(label);
+            let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
+            manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
+            let base = root.join(CONTINUOUS_CAPTURE_ID);
+            fs::create_dir_all(base.join("pcap")).unwrap();
+            Self { _root: root, manager, base }
+        }
+
+        fn cycle(&self, retention_days: Option<u64>, segments: &[(&str, PathBuf)]) -> LiveDataset {
+            let mut selected = BTreeSet::new();
+            for (name, source) in segments {
+                let path = self.base.join("pcap").join(name);
+                fs::copy(source, &path).unwrap();
+                selected.insert(path);
+            }
+            TEST_RETENTION_DAYS.with(|value| value.set(retention_days));
+            let published = self
+                .manager
+                .process_continuous_capture_selected(&self.base, &interface_specs(), 1024 * 1024 * 1024, &selected);
+            TEST_RETENTION_DAYS.with(|value| value.set(None));
+            published.unwrap()
+        }
+
+        fn manifest(&self) -> LiveDataset {
+            serde_json::from_slice(&fs::read(self.base.join("dataset/dataset_manifest.json")).unwrap()).unwrap()
+        }
+
+        fn shard_file(&self, shard: &EventShard) -> PathBuf {
+            self.base.join("dataset").join(&shard.path)
+        }
+    }
+
+    fn corpus_0_7_0() -> (PathBuf, PathBuf, PathBuf) {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        (
+            workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap"),
+            workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-registration.pcap"),
+            workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1"),
+        )
+    }
+
+    /// Identité d'un shard telle que `d8718cf` la connaît (sans le champ
+    /// additif) : chemin, empreinte, taille, nombre d'events.
+    fn shard_identity_0_7_0(shard: &EventShard) -> (String, String, u64, usize) {
+        (shard.path.clone(), shard.sha256.clone(), shard.bytes, shard.event_count)
+    }
+
+    /// 0.7.0 (ordre cœur #9 7161327955, défaut 2) — LE garde : trois
+    /// publications sous rétention sans aucune capture périmée (fenêtre de
+    /// 3 650 jours). À chacune : la liste de shards est l'ancienne PLUS le
+    /// shard neuf (ajout seul, identités inchangées), aucun
+    /// `shard-retained-*`, les fichiers des shards antérieurs gardent leur
+    /// inode et leur date, et les octets écrits sont ceux du seul shard neuf.
+    /// Avant 0.7.0 : chaque publication concaténait tout le jeu dans un
+    /// `shard-retained-*` neuf.
+    #[test]
+    fn three_publications_without_a_stale_capture_rewrite_nothing_0_7_0() {
+        use std::os::unix::fs::MetadataExt as _;
+        let bench = RetentionBench0_7_0::new("retention-no-rewrite-0-7-0");
+        let (five, registration, one) = corpus_0_7_0();
+        bench.cycle(None, &[("N2.pcap-five.pcapng", five.clone())]);
+        let segments: [&[(&str, PathBuf)]; 3] = [
+            &[("N2.pcap-registration.pcapng", registration.clone())],
+            &[("N2.pcap-one.pcapng", one.join("N2.pcapng"))],
+            &[("N4.pcap-one.pcapng", one.join("N4.pcapng"))],
+        ];
+        for (round, segment) in segments.iter().enumerate() {
+            let before = bench.manifest();
+            let stamps: Vec<(u64, i64)> = before
+                .event_shards
+                .iter()
+                .map(|shard| {
+                    let meta = fs::metadata(bench.shard_file(shard)).unwrap();
+                    (meta.ino(), meta.mtime())
+                })
+                .collect();
+            let published = bench.cycle(Some(3650), segment);
+            let after = bench.manifest();
+            assert!(
+                after.event_shards.iter().all(|shard| !shard.path.contains("shard-retained-")),
+                "publication {round} : aucune réécriture ({:?})",
+                after.event_shards.iter().map(|shard| shard.path.clone()).collect::<Vec<_>>()
+            );
+            assert_eq!(after.event_shards.len(), before.event_shards.len() + 1, "publication {round} : ajout seul ; avant {:?} ; après {:?}", before.event_shards.iter().map(|s| (s.path.clone(), s.event_count)).collect::<Vec<_>>(), after.event_shards.iter().map(|s| (s.path.clone(), s.event_count)).collect::<Vec<_>>());
+            let prefix: Vec<_> = after.event_shards[..before.event_shards.len()].iter().map(shard_identity_0_7_0).collect();
+            let previous: Vec<_> = before.event_shards.iter().map(shard_identity_0_7_0).collect();
+            assert_eq!(prefix, previous, "publication {round} : les shards antérieurs sont repris tels quels");
+            for (shard, stamp) in before.event_shards.iter().zip(&stamps) {
+                let meta = fs::metadata(bench.shard_file(shard)).unwrap();
+                assert_eq!((meta.ino(), meta.mtime()), *stamp, "publication {round} : {} jamais réécrit", shard.path);
+            }
+            let new_shard = after.event_shards.last().unwrap();
+            assert_eq!(published.publication_bytes_written, new_shard.bytes, "publication {round} : seuls les octets du shard neuf");
+            assert_eq!(after.event_count, before.event_count + new_shard.event_count);
+        }
+    }
+
+    /// 0.7.0 (ordre cœur #9 7161327955) — sûreté des données : trois
+    /// publications (A ancienne, B récente, puis C sous rétention de 60
+    /// jours, coupure entre A et B). Seul le shard de A sort ; B est repris
+    /// tel quel ; l'archive porte EXACTEMENT les lignes de A ; et
+    /// `retenus + archivés = avant` par l'`event_count` du manifeste.
+    #[test]
+    fn a_stale_capture_takes_only_its_shard_out_and_conserves_every_event_0_7_0() {
+        let bench = RetentionBench0_7_0::new("retention-conservation-0-7-0");
+        let (five, _, one) = corpus_0_7_0();
+        let after_a = bench.cycle(None, &[("N2.pcap-five.pcapng", five.clone())]);
+        let after_b = bench.cycle(None, &[("N2.pcap-one.pcapng", one.join("N2.pcapng")), ("N4.pcap-one.pcapng", one.join("N4.pcapng"))]);
+        assert_eq!(after_b.event_shards.len(), 2);
+        let shard_a = after_b.event_shards[0].clone();
+        let shard_b = after_b.event_shards[1].clone();
+        let mut lines_a: Vec<String> = fs::read_to_string(bench.shard_file(&shard_a)).unwrap().lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+        lines_a.sort();
+        assert_eq!(lines_a.len(), after_a.event_count, "précondition : A porte ses events");
+        let after_c = bench.cycle(Some(60), &[("N3.pcap-one.pcapng", one.join("N3.pcapng"))]);
+        assert!(after_c.event_shards.iter().all(|shard| shard.path != shard_a.path), "le shard de A sort");
+        assert_eq!(after_c.event_shards[0], shard_b, "B repris tel quel");
+        assert!(after_c.event_shards.iter().all(|shard| !shard.path.contains("shard-retained-")), "aucune réécriture : A est entièrement périmé, B ne l'est pas");
+        let segments: Vec<PathBuf> = fs::read_dir(bench.base.join("archive")).unwrap().flatten().map(|entry| entry.path()).collect();
+        assert_eq!(segments.len(), 1, "un segment d'archive");
+        let mut archived: Vec<String> = fs::read_to_string(segments[0].join("events.jsonl")).unwrap().lines().map(str::to_owned).collect();
+        archived.sort();
+        assert_eq!(archived, lines_a, "l'archive porte exactement les lignes de A");
+        let archive_manifest: Value = serde_json::from_slice(&fs::read(segments[0].join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(archive_manifest["event_count"].as_u64().unwrap() as usize, lines_a.len());
+        let new_c = after_c.event_shards.last().unwrap();
+        assert_eq!(
+            after_c.event_count + archived.len(),
+            after_b.event_count + new_c.event_count,
+            "conservation : retenus + archivés = avant (+ shard neuf de C)"
+        );
+        assert!(shard_a_file_kept_0_7_0(&bench, &shard_a), "aucun fichier de données supprimé");
+    }
+
+    fn shard_a_file_kept_0_7_0(bench: &RetentionBench0_7_0, shard: &EventShard) -> bool {
+        bench.shard_file(shard).is_file()
+    }
+
+    /// PREUVE de compatibilité (condition du cœur #9 7161327955) — sur le
+    /// code `d8718cf` lui-même : un manifeste qui porte `capture_ends` (champ
+    /// ajouté par 0.7.0) est relu par le chemin réel de publication de
+    /// `d8718cf`, qui valide le point de reprise et publie le cycle suivant.
+    /// C'est le scénario du retour arrière après la pose de 0.7.0. Doit PASSER.
+    #[test]
+    fn d8718cf_continues_on_a_manifest_carrying_capture_ends_0_7_0_compat() {
+        let bench = RetentionBench0_7_0::new("retention-compat-on-d8718cf");
+        let (five, registration, _) = corpus_0_7_0();
+        bench.cycle(None, &[("N2.pcap-five.pcapng", five.clone())]);
+        let manifest_path = bench.base.join("dataset/dataset_manifest.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        for shard in value["event_shards"].as_array_mut().unwrap() {
+            shard["capture_ends"] = serde_json::json!({"sha256:example": 1_790_000_000u64});
+        }
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let reread: LiveDataset = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).expect("schéma d8718cf : champ inconnu toléré");
+        let before = reread.event_shards.len();
+        let after = bench.cycle(None, &[("N2.pcap-registration.pcapng", registration.clone())]);
+        assert_eq!(after.event_shards.len(), before + 1, "d8718cf a repris le jeu et publié par-dessus");
+        assert_eq!(after.event_shards[..before], reread.event_shards[..], "shards antérieurs repris");
+    }
+
     fn archived_lab_shaped_dataset_2_21_146(label: &str) -> ArchivedLabShapedDataset {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let five = workspace.join("benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap");
