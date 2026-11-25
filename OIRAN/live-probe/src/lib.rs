@@ -19624,6 +19624,42 @@ Content-Length: 0\r\n\
         assert_eq!(kept, vec![lone]);
     }
 
+    #[test]
+    fn d8718cf_reopens_and_republishes_the_candidate_empty_checkpoint() {
+        let base = PathBuf::from(
+            std::env::var_os("OIRAN_TEST_EMPTY_CHECKPOINT")
+                .expect("set OIRAN_TEST_EMPTY_CHECKPOINT to the candidate test export"),
+        );
+        let dataset_dir = base.join("dataset");
+        let empty: LiveDataset = serde_json::from_slice(
+            &fs::read(dataset_dir.join("dataset_manifest.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(empty.event_count, 0);
+        assert_eq!(empty.event_shards.len(), 1);
+        validate_dataset_artifacts(&empty, &dataset_dir).unwrap();
+        assert!(load_dataset_events(&dataset_dir).unwrap().is_empty());
+
+        let root = temporary_root("retention-rollback-reader");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let fresh = base.join("pcap/N2.pcap-rollback.pcapng");
+        fs::copy(source, &fresh).unwrap();
+        TEST_RETENTION_DAYS.with(|value| value.set(Some(3650)));
+        let result = manager.process_continuous_capture_selected(
+            &base,
+            &interface_specs(),
+            1024 * 1024 * 1024,
+            &BTreeSet::from([fresh]),
+        );
+        TEST_RETENTION_DAYS.with(|value| value.set(None));
+        let resumed = result.unwrap();
+        assert!(resumed.event_count > 0);
+        assert_eq!(load_dataset_events(&dataset_dir).unwrap().len(), resumed.event_count);
+    }
+
     // --- 2.7.27 archive-based retention regression tests -----------
 
     /// Writes a jsonl line matching the fields `scan_capture_ends` /
