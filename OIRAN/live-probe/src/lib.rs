@@ -14698,6 +14698,106 @@ mod tests {
         }
     }
 
+    /// 0.6.50 (refus ANR1 #10 7157701325) — garde adverse de la fenêtre de
+    /// publication. Le registre sert la génération G : trois shards
+    /// historiques âgés d'une heure, qui portent les 64 events du jeu de
+    /// référence. Deux orphelins plus récents occupent la bande, qui ne
+    /// protège donc aucun shard de G. La publication G+1 est une rétention :
+    /// un seul shard compacté, aucun shard de G cité. On s'arrête APRÈS
+    /// `commit_incremental_publication` et AVANT `upsert_dataset` (le
+    /// registre sert encore G), et on lit G comme la route live
+    /// (`apps/api/src/lib.rs`, `expected`) : `datasets()` → `dataset_root` →
+    /// `event_shards`. Chaque shard de G existe, et les 64 events y sont, un
+    /// par identifiant. Puis G+1 entre au registre et G+2 est commise : G
+    /// n'est plus servie ni précédente, ses shards partent alors (hors bande
+    /// et grâce). Avant 0.6.50 : les trois shards de G étaient retirés au
+    /// commit de G+1, la lecture échouait.
+    #[test]
+    fn the_commit_keeps_every_shard_of_the_generation_still_served_0_6_50() {
+        let root = temporary_root("event-shard-gc-served-0-6-50");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        let current = root.join(CONTINUOUS_CAPTURE_ID).join("dataset");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let lines: Vec<String> = fs::read_to_string(workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        let event_id = |line: &str| serde_json::from_str::<Value>(line).unwrap()["event_id"].as_str().unwrap().to_owned();
+        let all_ids: BTreeSet<String> = lines.iter().map(|line| event_id(line)).collect();
+        assert_eq!(lines.len(), 64, "précondition : le jeu de référence");
+        assert_eq!(all_ids.len(), 64, "précondition : un identifiant par event");
+        // G : trois shards historiques âgés d'une heure.
+        let historical = ["shard-hist-0.jsonl", "shard-hist-1.jsonl", "shard-hist-2.jsonl"];
+        let hour = std::time::Duration::from_secs(3600);
+        for (name, chunk) in historical.iter().zip(lines.chunks(lines.len().div_ceil(3))) {
+            let path = current.join("event-shards").join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, chunk.join("\n") + "\n").unwrap();
+            fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(SystemTime::now() - hour).unwrap();
+        }
+        // La bande : deux orphelins plus récents que G, que rien ne cite.
+        write_aged_0_6_49(&current.join("event-shards/shard-band-a.jsonl"), std::time::Duration::from_secs(20 * 60));
+        write_aged_0_6_49(&current.join("event-shards/shard-band-b.jsonl"), std::time::Duration::from_secs(25 * 60));
+        let generation_g = gc_dataset_0_6_49(&historical);
+        fs::write(current.join("dataset_manifest.json"), serde_json::to_vec(&generation_g).unwrap()).unwrap();
+        manager.datasets.lock().unwrap().insert(CONTINUOUS_DATASET_ID.to_owned(), generation_g);
+        // G+1, rétention : un shard compacté qui remplace toute la liste.
+        let staging = root.join(CONTINUOUS_CAPTURE_ID).join(".dataset-next");
+        fs::create_dir_all(staging.join("callflows")).unwrap();
+        fs::create_dir_all(staging.join("event-shards")).unwrap();
+        fs::write(staging.join("event-shards/shard-retained-0123456789abcdef.jsonl"), lines.join("\n") + "\n").unwrap();
+        let generation_g1 = commit_incremental_publication(
+            &current,
+            &staging,
+            gc_dataset_0_6_49(&["shard-retained-0123456789abcdef.jsonl"]),
+        )
+        .unwrap();
+        // Pause : commit fait, `upsert_dataset` pas encore. Lecture de G
+        // comme la route live.
+        let served = manager
+            .datasets()
+            .into_iter()
+            .find(|dataset| dataset.dataset_id == CONTINUOUS_DATASET_ID)
+            .expect("le registre sert encore G");
+        let served_root = manager.dataset_root(CONTINUOUS_DATASET_ID).unwrap();
+        assert_eq!(served_root, current);
+        let expected: Vec<PathBuf> = served.event_shards.iter().map(|shard| served_root.join(&shard.path)).collect();
+        assert_eq!(expected.len(), 3, "le registre sert G et ses trois shards");
+        let mut read_ids = BTreeSet::new();
+        let mut read_events = 0usize;
+        for path in &expected {
+            let text = fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("shard de la génération servie retiré par le commit : {} ({error})", path.display()));
+            read_events += count_valid_event_records(path).unwrap();
+            read_ids.extend(text.lines().filter(|line| !line.trim().is_empty()).map(event_id));
+        }
+        assert_eq!(read_events, 64, "aucun event de G ne manque");
+        assert_eq!(read_ids, all_ids, "chaque event de G est lu, par identifiant");
+        // G+1 entre au registre ; G+2 est commise. G n'est plus ni servie ni
+        // précédente : ses shards âgés, hors bande, partent maintenant.
+        manager.datasets.lock().unwrap().insert(CONTINUOUS_DATASET_ID.to_owned(), generation_g1);
+        fs::create_dir_all(staging.join("callflows")).unwrap();
+        commit_incremental_publication(
+            &current,
+            &staging,
+            gc_dataset_0_6_49(&["shard-retained-0123456789abcdef.jsonl"]),
+        )
+        .unwrap();
+        for name in historical {
+            assert!(!current.join("event-shards").join(name).exists(), "{name} ramassé deux commits plus tard");
+        }
+        for name in ["shard-band-a.jsonl", "shard-band-b.jsonl", "shard-retained-0123456789abcdef.jsonl"] {
+            assert!(current.join("event-shards").join(name).exists(), "{name}");
+        }
+    }
+
     /// Global allocator shim that tracks the net live bytes and the all-time
     /// peak since the last reset. Used by the memory-bounded test for the
     /// `source_segments` → ingestion loop so we can prove the fix on a
