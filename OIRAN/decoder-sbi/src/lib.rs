@@ -2633,6 +2633,54 @@ mod tests {
     /// 2.18.0 — Un message SBI sans `gpsi` ni `pei` n'émet aucun
     /// IE identité (invariant « jamais d'hypothèse »).
     #[test]
+    fn nausf_request_identity_reaches_the_pdu_session() {
+        let key = test_key();
+        let fixture_supi = "imsi-001010000000001";
+        let expected = pseudonym_subscriber_text(&key, fixture_supi.as_bytes());
+        let client = TcpEndpoint { address: "192.0.2.1".into(), port: 51001 };
+        let server = TcpEndpoint { address: "192.0.2.2".into(), port: 7777 };
+        let mut request = PREFACE.to_vec();
+        let headers = Encoder::new().encode([
+            (b":method".as_slice(), b"POST".as_slice()),
+            (b":path".as_slice(), b"/nausf-auth/v1/ue-authentications".as_slice()),
+            (b"content-type".as_slice(), b"application/json".as_slice()),
+        ]);
+        let body = serde_json::json!({"supiOrSuci": fixture_supi}).to_string();
+        request.extend(frame(1, 4, 1, &headers));
+        request.extend(frame(0, 1, 1, body.as_bytes()));
+        let response = Encoder::new().encode([(b":status".as_slice(), b"201".as_slice())]);
+        let connection = ReassembledConnection {
+            key: TcpConnectionKey::new(client.clone(), server.clone()).0,
+            directions: [
+                direction(client.clone(), server.clone(), request, 1),
+                direction(server, client, frame(1, 5, 1, &response), 2),
+            ],
+        };
+        let (events, _) = decode_connections(&[connection], "fixture", "SBI", &HashMap::new(), &key);
+        let [event] = events.as_slice() else { panic!("expected a single SBI event") };
+        assert_eq!(event.message_name, "UeAuthenticate");
+        let wire = event.to_json();
+        let mut n2: Value = serde_json::from_str(&wire).unwrap();
+        n2["event_id"] = Value::String("fixture-n2".into());
+        n2["interface"] = Value::String("N2".into());
+        n2["protocol"] = Value::String("NGAP".into());
+        n2["message_name"] = Value::String("PDUSessionResourceSetupRequest".into());
+        n2["session_identifiers"] = serde_json::json!([
+            {"name":"ran_ue_ngap_id","value":"1"},
+            {"name":"pdu_session_id","value":"1"},
+            {"name":"subscriber_pseudonym","value":expected,"pseudonymized":true}
+        ]);
+        let mut records = session_engine::load_jsonl(format!("{wire}\n{n2}\n").as_bytes()).unwrap();
+        let discovery = session_engine::discover_sessions(&mut records);
+        let [session] = discovery.pdu_sessions.as_slice() else { panic!("expected one PDU session") };
+        assert!(session.event_ids.contains(&event.event_id), "N12 event absent from the PDU session");
+        assert!(event.session_identifiers.iter().any(|id|
+            id.name == "subscriber_pseudonym" && id.value == expected && id.pseudonymized
+        ));
+        assert!(!wire.contains(fixture_supi));
+    }
+
+    #[test]
     fn body_without_gpsi_or_pei_emits_no_identity_ie() {
         let fields = json_fields(
             br#"{"supi":"imsi-001010000000001","pduSessionId":1,"dnn":"internet"}"#,
