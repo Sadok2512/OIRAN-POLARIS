@@ -9250,7 +9250,177 @@ fn commit_incremental_publication(
         })
     );
     fs::remove_dir_all(staging).map_err(display_error)?;
+    // 0.6.49 (ordre cœur #9 7146380288, volets 2-3) — ramassage des shards
+    // d'events orphelins, sur le modèle des générations de call flows, au
+    // même point du commit et avec la même journalisation, y compris zéro.
+    // Le staging est déjà retiré : ses liens ne protègent plus rien.
+    let report = remove_unreferenced_event_shards(
+        current,
+        &dataset,
+        EVENT_SHARD_ORPHAN_BAND,
+        EVENT_SHARD_GRACE_MS,
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "EVENT_SHARD_ORPHANS_REMOVED",
+            "count": report.removed,
+            "bytes": report.removed_bytes,
+            "kept_unreferenced": report.kept_unreferenced,
+            "referenced": report.referenced,
+            "trees_consulted": report.trees_consulted,
+            "skipped": report.skipped,
+        })
+    );
     Ok(dataset)
+}
+
+/// 0.6.49 — les plus récents shards non référencés ne partent JAMAIS : une
+/// publication en cours peut en avoir écrit un que le manifeste n'a pas
+/// encore adopté (même principe que `kept` des générations de call flows).
+const EVENT_SHARD_ORPHAN_BAND: usize = 2;
+/// 0.6.49 — et un shard non référencé n'est retiré qu'à partir de cet âge
+/// (date de modification : un shard est écrit une fois, jamais rouvert).
+const EVENT_SHARD_GRACE_MS: u64 = CALLFLOW_GENERATION_GRACE_MS;
+
+#[derive(Debug, Default, PartialEq)]
+struct EventShardGcReport {
+    removed: usize,
+    removed_bytes: u64,
+    kept_unreferenced: usize,
+    referenced: usize,
+    trees_consulted: usize,
+    /// Raison d'un ramassage non fait (`None` s'il a eu lieu).
+    skipped: Option<&'static str>,
+}
+
+/// 0.6.49 — un arbre de jeu voisin du jeu courant, dont les shards et le
+/// manifeste PROTÈGENT les shards du jeu courant : staging, précédent,
+/// rollback opérateur, arbre en cours de retrait.
+fn is_dataset_sibling_tree(name: &str) -> bool {
+    name == ".dataset-next"
+        || name == ".dataset-previous"
+        || name.starts_with(".dataset-previous-")
+        || name.starts_with(".dataset-rollback.")
+        || name.starts_with(".dataset.rollback.")
+        || name.starts_with(".dataset-gc-")
+}
+
+/// 0.6.49 — noms de fichiers de shards (basename) cités par le manifeste
+/// d'un arbre ; `None` si le manifeste est absent ou illisible.
+fn manifest_shard_names(tree: &Path) -> Option<BTreeSet<String>> {
+    let bytes = fs::read(tree.join("dataset_manifest.json")).ok()?;
+    let manifest: Value = serde_json::from_slice(&bytes).ok()?;
+    Some(
+        manifest
+            .get("event_shards")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|shard| shard.get("path").and_then(Value::as_str))
+            .filter_map(|path| Path::new(path).file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            .collect(),
+    )
+}
+
+/// 0.6.49 — retire de `current/event-shards/` les shards qu'AUCUN arbre ne
+/// référence. Sécurité, dans cet ordre :
+/// 1. le manifeste COURANT (celui qui vient d'être écrit, `dataset`) ;
+/// 2. le manifeste de CHAQUE arbre voisin (`is_dataset_sibling_tree`) ; un
+///    voisin au manifeste illisible protège TOUS les noms de son
+///    `event-shards/` ;
+/// 3. tout fichier ou lien de MÊME NOM dans le `event-shards/` d'un voisin
+///    (le staging référence par liens, un rollback peut copier) ;
+/// 4. la bande des `band` non référencés les plus récents, jamais retirés ;
+/// 5. le délai de grâce.
+/// Aucune suppression hors de `current/event-shards/`, aucun répertoire,
+/// aucun lien : seulement des fichiers réguliers.
+fn remove_unreferenced_event_shards(
+    current: &Path,
+    dataset: &LiveDataset,
+    band: usize,
+    grace_ms: u64,
+) -> EventShardGcReport {
+    let mut report = EventShardGcReport::default();
+    let shard_dir = current.join("event-shards");
+    // Un jeu au format plat ne référence aucun shard : tout y paraîtrait
+    // orphelin. Rien n'est ramassé.
+    if dataset.event_shards.is_empty() {
+        report.skipped = Some("current_manifest_lists_no_shard");
+        return report;
+    }
+    let mut referenced: BTreeSet<String> = dataset
+        .event_shards
+        .iter()
+        .filter_map(|shard| Path::new(&shard.path).file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .collect();
+    let Some(base) = current.parent() else {
+        report.skipped = Some("dataset_parent_unknown");
+        return report;
+    };
+    let Ok(siblings) = fs::read_dir(base) else {
+        report.skipped = Some("dataset_parent_unreadable");
+        return report;
+    };
+    for sibling in siblings.flatten() {
+        let name = sibling.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_dataset_sibling_tree(name) || !sibling.path().is_dir() {
+            continue;
+        }
+        report.trees_consulted += 1;
+        let tree = sibling.path();
+        match manifest_shard_names(&tree) {
+            Some(names) => referenced.extend(names),
+            None => {}
+        }
+        if let Ok(entries) = fs::read_dir(tree.join("event-shards")) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    referenced.insert(name.to_owned());
+                }
+            }
+        }
+    }
+    report.referenced = referenced.len();
+    let Ok(entries) = fs::read_dir(&shard_dir) else {
+        return report;
+    };
+    let mut unreferenced: Vec<(u64, PathBuf, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if referenced.contains(&name) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else { continue };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|age| age.as_millis() as u64)
+            .unwrap_or(u64::MAX);
+        unreferenced.push((modified_ms, entry.path(), metadata.len()));
+    }
+    // Les plus récents d'abord ; la bande n'est jamais retirée.
+    unreferenced.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let now = epoch_ms();
+    for (index, (modified_ms, path, bytes)) in unreferenced.into_iter().enumerate() {
+        let old_enough = modified_ms != u64::MAX && now.saturating_sub(modified_ms) >= grace_ms;
+        if index < band || !old_enough {
+            report.kept_unreferenced += 1;
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            report.removed += 1;
+            report.removed_bytes = report.removed_bytes.saturating_add(bytes);
+        } else {
+            report.kept_unreferenced += 1;
+        }
+    }
+    report
 }
 
 /// 2.21.150 — nombre et taille des générations de call flows présentes
@@ -14432,6 +14602,100 @@ mod tests {
             base.to_path_buf()
         };
         assert!(!path.exists(), "le répertoire temporaire a survécu au test : {}", path.display());
+    }
+
+    /// 0.6.49 — un jeu publié minimal pour les gardes du ramassage : un
+    /// manifeste qui ne cite que `shards`.
+    fn gc_dataset_0_6_49(shards: &[&str]) -> LiveDataset {
+        serde_json::from_value(serde_json::json!({
+            "dataset_id": CONTINUOUS_DATASET_ID, "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous/dataset", "event_count": 0,
+            "session_ids": [], "decode_reports": {}, "checksums": {}, "state": "PUBLISHED",
+            "event_shards": shards.iter().map(|name| serde_json::json!({
+                "path": format!("event-shards/{name}"), "sha256": "x", "bytes": 1, "event_count": 1
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    fn write_aged_0_6_49(path: &Path, age: std::time::Duration) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}\n").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    /// 0.6.49 (ordre cœur #9 7146380288, volet 3) — le ramassage AU COMMIT
+    /// réel : `dataset/event-shards/` porte un shard cité par le manifeste
+    /// courant, un orphelin LIBRE, un orphelin cité par le manifeste d'un
+    /// ARBRE DE ROLLBACK, et un orphelin que le staging d'à côté cite par
+    /// lien. Après `commit_incremental_publication` : l'orphelin libre a
+    /// disparu ; celui du rollback et celui du lien sont GARDÉS ; rien n'est
+    /// touché hors de `dataset/event-shards/`. Avant 0.6.49 : aucun ramassage,
+    /// l'orphelin libre restait.
+    #[test]
+    fn the_commit_removes_free_orphan_shards_and_keeps_the_rollbacks_0_6_49() {
+        let root = temporary_root("event-shard-gc-0-6-49");
+        let current = root.join("dataset");
+        let old = std::time::Duration::from_secs(3600);
+        for name in ["shard-live.jsonl", "shard-orphan.jsonl", "shard-rollback.jsonl", "shard-linked.jsonl"] {
+            write_aged_0_6_49(&current.join("event-shards").join(name), old);
+        }
+        // Deux orphelins plus récents encore, que la bande protège : le libre
+        // ancien n'est donc pas protégé par elle.
+        write_aged_0_6_49(&current.join("event-shards/shard-band-1.jsonl"), std::time::Duration::from_secs(1));
+        write_aged_0_6_49(&current.join("event-shards/shard-band-2.jsonl"), std::time::Duration::from_secs(2));
+        fs::write(current.join("dataset_manifest.json"), serde_json::to_vec(&gc_dataset_0_6_49(&["shard-live.jsonl"])).unwrap()).unwrap();
+        // Arbre de rollback opérateur qui cite un shard du jeu courant.
+        let rollback = root.join(".dataset-rollback.20261124T224000Z");
+        fs::create_dir_all(&rollback).unwrap();
+        fs::write(rollback.join("dataset_manifest.json"), serde_json::to_vec(&gc_dataset_0_6_49(&["shard-rollback.jsonl"])).unwrap()).unwrap();
+        // Arbre précédent dont le event-shards/ porte un lien de même nom.
+        let previous = root.join(".dataset-previous");
+        fs::create_dir_all(previous.join("event-shards")).unwrap();
+        std::os::unix::fs::symlink(current.join("event-shards/shard-linked.jsonl"), previous.join("event-shards/shard-linked.jsonl")).unwrap();
+        // Staging de la publication : rien de neuf, juste ses call flows.
+        let staging = root.join(".dataset-next");
+        fs::create_dir_all(staging.join("callflows")).unwrap();
+        commit_incremental_publication(&current, &staging, gc_dataset_0_6_49(&["shard-live.jsonl"])).unwrap();
+        let shard = |name: &str| current.join("event-shards").join(name).exists();
+        assert!(!shard("shard-orphan.jsonl"), "l'orphelin libre et ancien est retiré");
+        assert!(shard("shard-live.jsonl"), "le shard du manifeste courant reste");
+        assert!(shard("shard-rollback.jsonl"), "le shard cité par l'arbre de rollback reste");
+        assert!(shard("shard-linked.jsonl"), "le shard lié depuis un arbre voisin reste");
+        assert!(shard("shard-band-1.jsonl") && shard("shard-band-2.jsonl"), "la bande des plus récents reste");
+        assert!(rollback.join("dataset_manifest.json").is_file(), "rien n'est touché hors de dataset/event-shards/");
+        assert!(fs::symlink_metadata(previous.join("event-shards/shard-linked.jsonl")).is_ok());
+    }
+
+    /// 0.6.49 — la bande et le délai de grâce : sur cinq orphelins anciens,
+    /// les deux plus récents restent ; un orphelin plus jeune que le délai
+    /// reste ; un jeu au format plat ne ramasse rien ; le bilan est exact.
+    #[test]
+    fn the_shard_gc_keeps_the_newest_band_and_the_grace_window_0_6_49() {
+        let root = temporary_root("event-shard-gc-band-0-6-49");
+        let current = root.join("dataset");
+        for (index, minutes) in [60u64, 50, 40, 30, 20].into_iter().enumerate() {
+            write_aged_0_6_49(&current.join(format!("event-shards/shard-old-{index}.jsonl")), std::time::Duration::from_secs(minutes * 60));
+        }
+        write_aged_0_6_49(&current.join("event-shards/shard-young.jsonl"), std::time::Duration::from_secs(60));
+        write_aged_0_6_49(&current.join("event-shards/shard-live.jsonl"), std::time::Duration::from_secs(7200));
+        let flat = remove_unreferenced_event_shards(&current, &gc_dataset_0_6_49(&[]), 2, 15 * 60 * 1000);
+        assert_eq!(flat.skipped, Some("current_manifest_lists_no_shard"));
+        assert_eq!(flat.removed, 0);
+        let report = remove_unreferenced_event_shards(&current, &gc_dataset_0_6_49(&["shard-live.jsonl"]), 2, 15 * 60 * 1000);
+        // Non référencés, du plus récent au plus ancien : young (1 min),
+        // old-4 (20), old-3 (30), old-2 (40), old-1 (50), old-0 (60). Bande :
+        // young et old-4. Retirés : old-3, old-2, old-1, old-0.
+        assert_eq!(report.removed, 4, "{report:?}");
+        assert_eq!(report.kept_unreferenced, 2, "{report:?}");
+        assert_eq!(report.removed_bytes, 4 * 3);
+        for kept in ["shard-young.jsonl", "shard-old-4.jsonl", "shard-live.jsonl"] {
+            assert!(current.join("event-shards").join(kept).exists(), "{kept}");
+        }
+        for gone in ["shard-old-0.jsonl", "shard-old-1.jsonl", "shard-old-2.jsonl", "shard-old-3.jsonl"] {
+            assert!(!current.join("event-shards").join(gone).exists(), "{gone}");
+        }
     }
 
     /// Global allocator shim that tracks the net live bytes and the all-time

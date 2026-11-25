@@ -1,5 +1,41 @@
 # Changelog
 
+## live-probe 0.6.49 / oiran-api 2.21.179 — 2026-11-25 — les shards d'events orphelins sont ramassés au commit, sans jamais toucher un shard qu'un arbre référence
+
+Ordre cœur #9 7146380288 (volets 2 et 3 ; volet 1 rendu en #9 7146415368). Base : `d8718cf` (2.21.178 PASS, qui contient la production `4cad449`). Montée : patch. Seul le code de live-probe change. oiran-api monte parce que l'artefact déployé l'embarque.
+
+### Défaut 1 (fermé ici) — aucune expiration des shards d'events
+`commit_incremental_publication` déplaçait les nouveaux shards dans `dataset/event-shards/` et ne ramassait que les générations de call flows. Mesure d'ANR2 (#10 7146006934) : 633 fichiers non référencés, 125 463 231 602 octets.
+
+### Corrigé : `remove_unreferenced_event_shards`, au commit, sur le modèle des générations de call flows
+- **Même endroit** (fin de `commit_incremental_publication`, staging déjà retiré), **même forme**, **même journal** : `EVENT_SHARD_ORPHANS_REMOVED` à **chaque** commit, y compris zéro, avec `count`, `bytes`, `kept_unreferenced`, `referenced`, `trees_consulted` et `skipped`.
+- **Sécurité, dans cet ordre** :
+  1. le manifeste **courant**, celui qui vient d'être écrit ;
+  2. le manifeste de **chaque arbre voisin** : `.dataset-next`, `.dataset-previous`, `.dataset-previous-*`, `.dataset-rollback.*`, `.dataset.rollback.*`, `.dataset-gc-*` ;
+  3. tout fichier ou **lien de même nom** dans le `event-shards/` d'un voisin, puisque le staging référence par lien et qu'un rollback peut copier ;
+  4. la **bande des 2** non référencés les plus récents (`EVENT_SHARD_ORPHAN_BAND`), jamais retirés ;
+  5. le **délai de grâce de 15 min** (`EVENT_SHARD_GRACE_MS`, celui des générations de call flows), sur la date de modification, puisqu'un shard est écrit une fois.
+- **Aucune suppression hors de `dataset/event-shards/`**, et seulement des fichiers réguliers : jamais un lien, jamais un répertoire.
+- **Rien n'est ramassé** si le manifeste courant ne liste aucun shard (format plat) : `skipped = "current_manifest_lists_no_shard"`.
+
+### Coût par commit, mesuré
+`strace -f -e trace=statx,newfstatat,lstat,unlink,unlinkat,openat,getdents64` sur le garde unitaire (7 fichiers, dont 6 non référencés), appels de mise en place et de démontage du test retirés :
+- 1 ouverture de la racine et 1 de `event-shards/`, lues par 2 `getdents64` chacune ;
+- **1 `statx` par fichier non référencé**, aucun par fichier référencé ;
+- **1 `unlink` par fichier retiré** ;
+- par arbre voisin présent : 1 lecture de manifeste et 1 ouverture de son `event-shards/`.
+
+`commit_seq.txt` et les call flows ne sont pas touchés.
+
+### Gardes
+- `the_commit_removes_free_orphan_shards_and_keeps_the_rollbacks_0_6_49`, au **commit réel** : un shard du manifeste courant, un orphelin libre et ancien, un orphelin cité par un **arbre de rollback**, un orphelin lié depuis `.dataset-previous`, et deux orphelins récents. Après le commit, seul l'orphelin libre a disparu ; le rollback, le lien et la bande sont gardés, et rien n'est touché hors de `dataset/event-shards/`. **Rouge sur `d8718cf`.**
+- `the_shard_gc_keeps_the_newest_band_and_the_grace_window_0_6_49` : la bande, le délai de grâce, le format plat et un bilan exact.
+
+Preuve rejouable : branche `proof/live-probe-0.6.49-guards-on-d8718cf`.
+
+### OUVERT, déclaré
+**Défaut 2, l'amplification d'écriture.** Avec `OIRAN_DATASET_RETENTION_DAYS`, chaque publication réécrit encore tout le jeu dans un `shard-retained-…`. Désormais, l'ancien est ramassé après le délai de grâce et hors de la bande, au lieu de s'accumuler. Mais le débit d'écriture reste celui du jeu entier par publication. Sa correction attend ton choix entre (a) dates de fin par capture dans le manifeste et (b) cadence (#9 7146415368).
+
 ## oiran-api 2.21.178 / live-probe 0.6.48 — 2026-11-24 — fusion de 2.21.166 dans le train : la production n'est plus en arrière du candidat
 
 Ordre cœur #9 7147700904. **Fusion** (`git merge --no-ff 4cad449`) sur la tête du train `86f9b93` (2.21.177), **sans rebase** : les verdicts d'ANR1 sur 2.21.167 → 2.21.177 restent valides commit par commit. Montée : patch sur les deux composants.
