@@ -54,6 +54,40 @@ class CargoTargetExpiry(unittest.TestCase):
         self.assertTrue((self.root / "linked").is_symlink())
         self.assertTrue(outside.is_dir())
 
+    def test_same_filesystem_bind_mount_keeps_outside_evidence(self):
+        old = self.build("old")
+        self.age(old)
+        mountpoint = old / "foreign-bind"
+        mountpoint.mkdir()
+        outside = Path(self.home.name) / "outside"
+        outside.mkdir()
+        evidence = outside / "evidence"
+        evidence.write_text("outside cache")
+
+        commands = '''
+            mount --bind "$1" "$2"
+            test "$(stat -c %d "$2")" = "$(stat -c %d "$2/..")"
+            python3 - "$3" "$4" <<'PYTHON'
+import runpy
+import subprocess
+import sys
+from pathlib import Path
+try:
+    runpy.run_path(sys.argv[1])["expire"](Path(sys.argv[2]))
+except (OSError, subprocess.CalledProcessError):
+    pass
+PYTHON
+        '''
+        result = subprocess.run(
+            ["unshare", "-Ur", "-m", "--propagation", "private", "bash", "-ceu",
+             commands, "bind-fixture", str(outside), str(mountpoint),
+             str(WRAPPER.resolve()), str(self.root)],
+            env=self.env, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(evidence.is_file(), "expiry deleted a file outside the managed cache")
+        self.assertEqual(evidence.read_text(), "outside cache")
+
     def test_next_build_sweeps_expired_targets(self):
         old = self.build("old")
         self.age(old)
