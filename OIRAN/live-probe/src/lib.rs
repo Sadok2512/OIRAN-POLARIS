@@ -24064,6 +24064,85 @@ Content-Length: 0\r\n\
         }
     }
 
+    #[test]
+    fn retention_rejects_manifest_count_mismatch_at_publication_0_7_0() {
+        let bench = RetentionBench0_7_0::new("retention-count-mismatch");
+        let (five, _, one) = corpus_0_7_0();
+        bench.cycle(None, &[("N2.pcap-five.pcapng", five)]);
+        let dataset_dir = bench.base.join("dataset");
+        let manifest_path = dataset_dir.join("dataset_manifest.json");
+        let mut manifest = bench.manifest();
+        manifest.event_shards[0].event_count += 1;
+        manifest.event_count += 1;
+        let original = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&manifest_path, &original).unwrap();
+
+        let fresh = bench.base.join("pcap/N2.pcap-one.pcapng");
+        fs::copy(one.join("N2.pcapng"), &fresh).unwrap();
+        TEST_RETENTION_DAYS.with(|value| value.set(Some(60)));
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(Some(true)));
+        let result = bench.manager.process_continuous_capture_selected(
+            &bench.base,
+            &interface_specs(),
+            1024 * 1024 * 1024,
+            &BTreeSet::from([fresh]),
+        );
+        TEST_RETENTION_DAYS.with(|value| value.set(None));
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(None));
+
+        let error = result.expect_err("an affected shard disagrees with the source manifest");
+        assert!(error.contains("CONTINUOUS_RETENTION_CONSERVATION_FAILED"), "{error}");
+        assert!(error.contains(&manifest.event_shards[0].path), "{error}");
+        assert_eq!(fs::read(manifest_path).unwrap(), original);
+        assert_eq!(
+            sha256_hex_file(&bench.shard_file(&manifest.event_shards[0])).unwrap(),
+            manifest.event_shards[0].sha256,
+        );
+        assert!(!bench.base.join("archive").exists());
+        assert!(!bench.base.join(".dataset-next").exists());
+    }
+
+    #[test]
+    fn retention_publishes_and_reopens_an_empty_checkpoint_0_7_0() {
+        let bench = RetentionBench0_7_0::new("retention-empty-checkpoint");
+        let (five, _, one) = corpus_0_7_0();
+        let first = bench.cycle(None, &[("N2.pcap-five.pcapng", five)]);
+        assert!(first.event_count > 0);
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(Some(true)));
+        let empty = bench.cycle(Some(1), &[]);
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(None));
+
+        let dataset_dir = bench.base.join("dataset");
+        assert_eq!(empty.event_count, 0);
+        validate_dataset_artifacts(&empty, &dataset_dir).unwrap();
+        assert!(load_dataset_events(&dataset_dir).unwrap().is_empty());
+        let archives: Vec<_> = fs::read_dir(bench.base.join("archive"))
+            .unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(archives.len(), 1);
+        let archive: Value = serde_json::from_slice(
+            &fs::read(archives[0].join("manifest.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(archive["event_count"].as_u64(), Some(first.event_count as u64));
+
+        if let Some(checkpoint) = std::env::var_os("OIRAN_TEST_EXPORT_EMPTY_CHECKPOINT") {
+            fs::rename(&bench.base, checkpoint).unwrap();
+            return;
+        }
+        let manager = CaptureManager::with_pseudonym_key_path(
+            bench._root.to_path_buf(), false, bench._root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        let fresh = bench.base.join("pcap/N2.pcap-one.pcapng");
+        fs::copy(one.join("N2.pcapng"), &fresh).unwrap();
+        let resumed = manager.process_continuous_capture_selected(
+            &bench.base,
+            &interface_specs(),
+            1024 * 1024 * 1024,
+            &BTreeSet::from([fresh]),
+        ).unwrap();
+        assert!(resumed.event_count > 0);
+        assert_eq!(load_dataset_events(&dataset_dir).unwrap().len(), resumed.event_count);
+    }
+
     fn corpus_0_7_0() -> (PathBuf, PathBuf, PathBuf) {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         (
