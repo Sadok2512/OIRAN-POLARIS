@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.182 — périmètre PFCP du manifeste servi
+
+Montée patch. Ordre #10 7174690790, base `fb459e4`. L’enrichissement PFCP et son préchauffage choisissent les shards dans le manifeste servi. L’index reste en mémoire et conserve son mode incrémental. La reconstruction à froid reste ouverte.
+
 ## live-probe 0.7.0 / oiran-api 2.21.181 — 2026-11-25 — rétention par shard : plus aucune réécriture du jeu quand rien n'est périmé ; ramassage de 0.6.49/0.6.50 retiré
 
 Ordres cœur #9 7161008626 (arbitrage, défaut 2 en tête) et 7161327955 (GO sur `capture_ends`, sous condition de compatibilité du retour arrière). Audit #9 7161092645. Base : `eaef7db` (descendant de la production `d8718cf`).

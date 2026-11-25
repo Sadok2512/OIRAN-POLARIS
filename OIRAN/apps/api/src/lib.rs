@@ -1398,7 +1398,11 @@ fn resolve_published_seed(state: &AppState, pseudonyms: &[String]) -> live_trace
             })
             .unwrap_or_else(|| vec![root.join("oiran_events.jsonl")]);
         let bundle = state.inner.compact_index_registry.ensure_tracking_for(&root, &expected);
-        spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
+        spawn_compact_index_workers(
+            &state.inner.compact_index_registry,
+            &bundle,
+            state.inner.capture_manager.dataset_events_source(&dataset_id),
+        );
         if !bundle.all_ready() {
             reason = "compact_index_building";
             continue;
@@ -1446,7 +1450,6 @@ fn apply_read_time_patch(
     dataset_root: &std::path::Path,
     session_id: &str,
 ) -> read_time_patch::PatchStatus {
-    let _ = session_id; // conservé pour les logs futurs, plus de cache LRU par session en 2.14.11.
     if items.is_empty() {
         return read_time_patch::PatchStatus::NotApplicable;
     }
@@ -1463,7 +1466,13 @@ fn apply_read_time_patch(
         .compact_index_registry
         .ensure_tracking(dataset_root);
     // Spawn des workers de construction / d'extension (idempotent).
-    spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
+    let pfcp_source = state.inner.capture_manager.dataset_id_for_session(session_id)
+        .and_then(|id| state.inner.capture_manager.dataset_events_source(&id))
+        .or_else(|| {
+            (state.inner.reference_dataset_root.as_deref() == Some(dataset_root))
+                .then(|| reference_pfcp_sources(state)).flatten()
+        });
+    spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle, pfcp_source);
     if !bundle.all_ready() {
         state
             .inner
@@ -1508,6 +1517,7 @@ fn compact_index_poll_seconds() -> u64 {
 fn spawn_compact_index_workers(
     registry: &Arc<read_time_patch::CompactJsonlIndexRegistry>,
     bundle: &Arc<read_time_patch::DatasetIndexes>,
+    pfcp_source: Option<(PathBuf, Vec<live_probe::EventShard>)>,
 ) {
     let mut to_build: Vec<Arc<read_time_patch::CompactJsonlIndex>> = Vec::new();
     if let Some(flat) = &bundle.flat {
@@ -1520,25 +1530,10 @@ fn spawn_compact_index_workers(
             to_build.push(shard.clone());
         }
     }
-    // 2.15.4 — préchauffe le cache PFCP du dataset en arrière-plan, pour que
-    // le premier /events ou /callflow n'ait pas à relire tous les shards.
-    if let Some(first) = to_build.first() {
-        let path = first.path().to_path_buf();
-        let root = if path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            == Some("event-shards")
-        {
-            path.parent()
-                .and_then(|p| p.parent())
-                .map(std::path::Path::to_path_buf)
-        } else {
-            path.parent().map(std::path::Path::to_path_buf)
-        };
-        if let Some(root) = root {
+    if !to_build.is_empty() {
+        if let Some((root, shards)) = pfcp_source {
             tokio::task::spawn_blocking(move || {
-                let _ = read_time_patch::cached_pfcp_index(&root);
+                let _ = read_time_patch::cached_pfcp_index_for_shards(&root, &shards);
             });
         }
     }
@@ -4912,7 +4907,11 @@ fn prewarm_live_list_row_cache_locked(state: &AppState) -> ListRowPrewarmStats {
             .dataset_root(&dataset.dataset_id)
         {
             let bundle = state.inner.compact_index_registry.ensure_tracking(&root);
-            spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
+            spawn_compact_index_workers(
+                &state.inner.compact_index_registry,
+                &bundle,
+                Some((root, dataset.event_shards.clone())),
+            );
             // 2.21.63 — attendre les workers déjà réclamés sous la garde de
             // publication : la première requête ne doit jamais payer les
             // lignes. La borne explicite empêche un index cassé de bloquer
@@ -8827,6 +8826,14 @@ async fn session_events(
         })
 }
 
+fn reference_pfcp_sources(state: &AppState) -> Option<(PathBuf, Vec<live_probe::EventShard>)> {
+    let root = state.inner.reference_dataset_root.as_ref()?;
+    let shards = read_time_patch::pfcp_manifest_shards(root).map_err(|error| {
+        eprintln!("PFCP_INDEX_REFERENCE_MANIFEST_FAILED: {error}");
+    }).ok()?;
+    Some((root.clone(), shards))
+}
+
 fn session_events_blocking(state: &AppState, id: &str, query: &ListQuery) -> Response {
     // 2.14.8 (ANR1 #10) — chaque chemin fournit (items, dataset_root
     // optionnel) : A (reference_dataset_enabled) → `state.inner.storage_path`
@@ -8837,19 +8844,19 @@ fn session_events_blocking(state: &AppState, id: &str, query: &ListQuery) -> Res
     // C (LTE evidence) → pas de JSONL raw cross-référençable, on
     // sert tel quel (les callflows LTE sont produits dans un autre
     // flux et n'ont pas le mélange old/new shards).
-    let (mut items, dataset_root): (Vec<Value>, Option<PathBuf>) =
+    let (mut items, sources) =
         if let Some(flow_value) = flow_value_for(state, id) {
             // Path A : events déjà patchés à `AppState::load` ; la
             // ré-application depuis le dataset_dir configuré reste
             // idempotente (compteurs inchangés).
             let items = flow_value["events"].as_array().cloned().unwrap_or_default();
-            (items, state.inner.reference_dataset_root.clone())
+            (items, reference_pfcp_sources(state))
         } else if let Some((dataset_id, flow)) = live_flow_for(state, id) {
             let items = serde_json::to_value(flow.events)
                 .ok()
                 .and_then(|value| value.as_array().cloned())
                 .unwrap_or_default();
-            (items, state.inner.capture_manager.dataset_root(&dataset_id))
+            (items, state.inner.capture_manager.dataset_events_source(&dataset_id))
         } else {
             match state.inner.lte_evidence_store.callflow_page_by_session(
                 id,
@@ -8876,13 +8883,14 @@ fn session_events_blocking(state: &AppState, id: &str, query: &ListQuery) -> Res
     // lecture, par la même fonction que `/callflow`, sur la liste
     // persistée dans son ordre de stockage et AVANT tout ajout.
     read_time_patch::backfill_stable_event_keys_in_items(&mut items);
-    let patch_status = if let Some(root) = dataset_root.as_deref() {
+    let patch_status = if let Some((root, _)) = sources.as_ref() {
         apply_read_time_patch(state, &mut items, root, id)
     } else {
         read_time_patch::PatchStatus::NotApplicable
     };
-    if let Some(root) = dataset_root.as_deref() {
-        let _ = read_time_patch::extend_items_with_pfcp_siblings_from_jsonl(&mut items, root);
+    if let Some((root, shards)) = sources.as_ref() {
+        let keys = read_time_patch::collect_pfcp_session_keys(&items);
+        let _ = read_time_patch::extend_items_with_pfcp_siblings_for_shards(&mut items, root, shards, &keys);
     }
     read_time_patch::fill_unknown_participants_by_interface(&mut items);
     filter_events(&mut items, query);
@@ -9107,14 +9115,14 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
             // indépendamment du curseur. Les deux chemins (insertion page 1,
             // comptage total pour toutes les pages) utilisent les MÊMES
             // clés — garantie que `total_events` est cohérent.
-            let dataset_root = if flow_value_for(state, id).is_some() {
-                state.inner.reference_dataset_root.clone()
+            let sources = if flow_value_for(state, id).is_some() {
+                reference_pfcp_sources(state)
             } else {
                 live_flow_for(state, id).and_then(|(dataset_id, _)| {
-                    state.inner.capture_manager.dataset_root(&dataset_id)
+                    state.inner.capture_manager.dataset_events_source(&dataset_id)
                 })
             };
-            let session_keys = if dataset_root.is_some() {
+            let session_keys = if sources.is_some() {
                 read_time_patch::collect_pfcp_session_keys(
                     &load_persisted_callflow_events(state, id),
                 )
@@ -9126,14 +9134,15 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
             // même si cette page ne contient pas les events PFCP porteurs.
             let mut pfcp_siblings_added = 0usize;
             if cursor.is_none() {
-                if let (Some(root), Some(events)) = (
-                    dataset_root.as_deref(),
+                if let (Some((root, shards)), Some(events)) = (
+                    sources.as_ref(),
                     value.get_mut("events").and_then(Value::as_array_mut),
                 ) {
                     pfcp_siblings_added =
-                        read_time_patch::insert_pfcp_siblings_into_callflow_using_session_keys(
+                        read_time_patch::insert_pfcp_siblings_into_callflow_for_shards(
                             events,
                             root,
+                            shards,
                             &session_keys,
                         )
                         .unwrap_or_default();
@@ -9144,10 +9153,11 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
             // est le MÊME sur toutes les pages. Preuve par test :
             // `multi_page_total_events_is_coherent_and_no_event_id_duplicate_2_21_70`
             // dans `read_time_patch::callflow_pfcp_insert_tests`.
-            let session_sibling_count: usize = if let Some(root) = dataset_root.as_deref() {
-                read_time_patch::count_pfcp_siblings_for_persisted_events(
+            let session_sibling_count: usize = if let Some((root, shards)) = sources.as_ref() {
+                read_time_patch::count_pfcp_siblings_for_shards(
                     &load_persisted_callflow_events(state, id),
                     root,
+                    shards,
                 )
                 .unwrap_or(0)
             } else {

@@ -1549,6 +1549,31 @@ pub fn extend_items_with_pfcp_siblings_using_session_keys(
     dataset_root: &Path,
     session_keys: &PfcpSessionKeys,
 ) -> Result<usize, String> {
+    let shards = pfcp_manifest_shards(dataset_root)?;
+    extend_items_with_pfcp_siblings_for_shards(items, dataset_root, &shards, session_keys)
+}
+
+pub fn pfcp_manifest_shards(root: &Path) -> Result<Vec<live_probe::EventShard>, String> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        event_shards: Vec<live_probe::EventShard>,
+    }
+    match std::fs::read(root.join("dataset_manifest.json")) {
+        Ok(bytes) => serde_json::from_slice::<Manifest>(&bytes)
+            .map(|manifest| manifest.event_shards)
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn extend_items_with_pfcp_siblings_for_shards(
+    items: &mut Vec<Value>,
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+    session_keys: &PfcpSessionKeys,
+) -> Result<usize, String> {
     let known_sequences = &session_keys.known_sequences;
     let known_seids = &session_keys.known_seids;
     let known_interfaces = &session_keys.known_interfaces;
@@ -1563,13 +1588,9 @@ pub fn extend_items_with_pfcp_siblings_using_session_keys(
     if known_sequences.is_empty() && known_seids.is_empty() {
         return Ok(0);
     }
-    // 2.15.4 — index PFCP du dataset en cache (reconstruit seulement si
-    // les fichiers JSONL changent). 2.15.2/2.15.3 relisaient tous les
-    // shards à CHAQUE /events et /callflow : détail de session > 60 s en
-    // prod (ANR1 #10 6894872305).
-    let index = cached_pfcp_index(dataset_root)?;
     let mut keys: BTreeSet<String> = known_sequences.iter().map(|s| format!("seq:{s}")).collect();
     keys.extend(known_seids.iter().map(|s| format!("seid:{s}")));
+    let index = cached_pfcp_index_for_shards(dataset_root, shards)?;
     let candidates = pfcp_events_for_keys(&index, &keys);
     let mut added = 0usize;
     for value in candidates.iter() {
@@ -1615,9 +1636,19 @@ pub fn count_pfcp_siblings_for_persisted_events(
     events: &[Value],
     dataset_root: &Path,
 ) -> Result<usize, String> {
+    let shards = pfcp_manifest_shards(dataset_root)?;
+    count_pfcp_siblings_for_shards(events, dataset_root, &shards)
+}
+
+pub fn count_pfcp_siblings_for_shards(
+    events: &[Value],
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+) -> Result<usize, String> {
     let mut scratch = events.to_vec();
     let before = scratch.len();
-    extend_items_with_pfcp_siblings_from_jsonl(&mut scratch, dataset_root)?;
+    let keys = collect_pfcp_session_keys(&scratch);
+    extend_items_with_pfcp_siblings_for_shards(&mut scratch, dataset_root, shards, &keys)?;
     Ok(scratch.len().saturating_sub(before))
 }
 
@@ -1789,21 +1820,16 @@ static PFCP_EVENT_CACHE: std::sync::LazyLock<std::sync::Mutex<PfcpCache>> =
 /// pas construire l'index deux fois en parallèle).
 static PFCP_INDEX_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn dataset_jsonl_files(dataset_root: &Path) -> Vec<(PathBuf, u64, u128)> {
-    let mut paths = Vec::new();
-    let flat = dataset_root.join("oiran_events.jsonl");
-    if flat.is_file() {
-        paths.push(flat);
-    }
-    if let Ok(entries) = std::fs::read_dir(dataset_root.join("event-shards")) {
-        let mut shards: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("jsonl"))
-            .collect();
-        shards.sort();
-        paths.extend(shards);
-    }
+fn dataset_jsonl_files(
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+) -> Vec<(PathBuf, u64, u128)> {
+    let paths: Vec<PathBuf> = if shards.is_empty() {
+        let flat = dataset_root.join("oiran_events.jsonl");
+        flat.is_file().then_some(flat).into_iter().collect()
+    } else {
+        shards.iter().map(|shard| dataset_root.join(&shard.path)).collect()
+    };
     paths
         .into_iter()
         .map(|path| {
@@ -1849,7 +1875,15 @@ fn pfcp_keys(value: &Value) -> Vec<String> {
 }
 
 pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex>, String> {
-    let signature = dataset_jsonl_files(dataset_root);
+    let shards = pfcp_manifest_shards(dataset_root)?;
+    cached_pfcp_index_for_shards(dataset_root, &shards)
+}
+
+pub fn cached_pfcp_index_for_shards(
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+) -> Result<std::sync::Arc<PfcpIndex>, String> {
+    let signature = dataset_jsonl_files(dataset_root, shards);
     let lookup = |signature: &Vec<(PathBuf, u64, u128)>| {
         PFCP_EVENT_CACHE.lock().ok().and_then(|cache| {
             cache
@@ -2123,12 +2157,22 @@ pub fn insert_pfcp_siblings_into_callflow_using_session_keys(
     dataset_root: &Path,
     session_keys: &PfcpSessionKeys,
 ) -> Result<usize, String> {
+    let shards = pfcp_manifest_shards(dataset_root)?;
+    insert_pfcp_siblings_into_callflow_for_shards(events, dataset_root, &shards, session_keys)
+}
+
+pub fn insert_pfcp_siblings_into_callflow_for_shards(
+    events: &mut Vec<Value>,
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+    session_keys: &PfcpSessionKeys,
+) -> Result<usize, String> {
     let known: BTreeSet<String> = events
         .iter()
         .filter_map(|e| e.get("event_id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let mut scratch = events.clone();
-    extend_items_with_pfcp_siblings_using_session_keys(&mut scratch, dataset_root, session_keys)?;
+    extend_items_with_pfcp_siblings_for_shards(&mut scratch, dataset_root, shards, session_keys)?;
     let mut added = 0usize;
     for raw in scratch.into_iter().filter(|e| {
         e.get("event_id")
@@ -3567,6 +3611,37 @@ mod pfcp_cache_tests {
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(ids, BTreeSet::from(["first", "second", "response"]));
         assert_eq!(added, 2);
+    }
+
+    #[test]
+    fn registered_pfcp_shards_override_disk_and_evict_retired_offsets() {
+        let root = std::env::temp_dir().join(format!("rtp-registered-pfcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("event-shards")).unwrap();
+        let shards: Vec<_> = ["active", "retired"].into_iter().map(|name| {
+            let path = format!("event-shards/{name}.jsonl");
+            let event = json!({"event_id":name,"protocol":"PFCP","pfcp_sequence":"7"});
+            let body = format!("{event}\n");
+            std::fs::write(root.join(&path), &body).unwrap();
+            live_probe::EventShard {
+                path, sha256: name.into(), bytes: body.len() as u64,
+                event_count: 1, capture_ends: Default::default(),
+            }
+        }).collect();
+        std::fs::write(
+            root.join("dataset_manifest.json"),
+            json!({"event_shards": shards}).to_string(),
+        ).unwrap();
+        let keys = BTreeSet::from(["seq:7".to_owned()]);
+        let both = cached_pfcp_index_for_shards(&root, &shards).unwrap();
+        assert_eq!(pfcp_events_for_keys(&both, &keys).len(), 2);
+
+        let active = cached_pfcp_index_for_shards(&root, &shards[..1]).unwrap();
+        let events = pfcp_events_for_keys(&active, &keys);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_id"], "active");
+        assert!(root.join(&shards[1].path).is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

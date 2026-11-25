@@ -2882,6 +2882,15 @@ impl CaptureManager {
         Some(self.dataset_root_for(&stored_dataset_id, &capture_id))
     }
 
+    pub fn dataset_events_source(&self, dataset_id: &str) -> Option<(PathBuf, Vec<EventShard>)> {
+        let datasets = self.datasets.lock().unwrap();
+        let dataset = datasets.get(dataset_id)?;
+        Some((
+            self.dataset_root_for(&dataset.dataset_id, &dataset.capture_id),
+            dataset.event_shards.clone(),
+        ))
+    }
+
     fn dataset_root_for(&self, stored_dataset_id: &str, capture_id: &str) -> PathBuf {
         if stored_dataset_id.starts_with("derived-") {
             self.root
