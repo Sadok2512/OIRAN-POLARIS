@@ -61,18 +61,80 @@ def stamp_info(target):
     return None
 
 
+class MountedCachePath(Exception):
+    pass
+
+
+@contextmanager
+def directory_fd(path, parent_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def mount_id(fd):
+    # st_dev and os.path.ismount() cannot identify same-device bind mounts.
+    with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as info:
+        for line in info:
+            if line.startswith("mnt_id:"):
+                return int(line.split(":", 1)[1])
+    raise OSError("cannot determine mount boundary for Cargo expiry")
+
+
+def remove_open_directory(parent_fd, name, fd, cache_mount, preserve_stamp=False):
+    if mount_id(fd) != cache_mount:
+        raise MountedCachePath(name)
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if preserve_stamp and entry.name == STAMP:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                with directory_fd(entry.name, fd) as child:
+                    remove_open_directory(fd, entry.name, child, cache_mount)
+            else:
+                # unlink removes links themselves and refuses mounted files.
+                os.unlink(entry.name, dir_fd=fd)
+    if preserve_stamp:
+        os.unlink(STAMP, dir_fd=fd)
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    opened = os.fstat(fd)
+    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        raise OSError(f"Cargo directory replaced during expiry: {name}")
+    os.rmdir(name, dir_fd=parent_fd)
+
+
 def expire(root):
     with lock_file(root / ".lock", fcntl.LOCK_EX | fcntl.LOCK_NB):
-        cutoff = time.time() - RETENTION_SECONDS
-        for target in sorted(root.iterdir()):
-            if not KEY.fullmatch(target.name):
-                continue
-            stamp = stamp_info(target)
-            if stamp is not None and stamp.st_mtime < cutoff:
-                subprocess.run(["rm", "-rf", "--one-file-system", "--", str(target)], check=True)
-                if target.exists():
-                    raise OSError(f"managed Cargo target not fully removed: {target}")
-                print(f"cargo-target-expired {target.name}", file=sys.stderr)
+        with directory_fd(root.parent) as parent_fd, directory_fd(root.name, parent_fd) as root_fd:
+            cache_mount = mount_id(root_fd)
+            if cache_mount != mount_id(parent_fd):
+                raise OSError("refusing to expire a mounted Cargo cache root")
+            cutoff = time.time() - RETENTION_SECONDS
+            for name in sorted(os.listdir(root_fd)):
+                if not KEY.fullmatch(name):
+                    continue
+                target = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(target.st_mode) or target.st_uid != os.getuid():
+                    continue
+                with directory_fd(name, root_fd) as target_fd:
+                    if mount_id(target_fd) != cache_mount:
+                        print(f"cargo-target-expiry retained mounted target {name}", file=sys.stderr)
+                        continue
+                    try:
+                        stamp = os.stat(STAMP, dir_fd=target_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if not stat.S_ISREG(stamp.st_mode) or stamp.st_uid != os.getuid() or stamp.st_mtime >= cutoff:
+                        continue
+                    try:
+                        remove_open_directory(root_fd, name, target_fd, cache_mount, preserve_stamp=True)
+                    except MountedCachePath:
+                        print(f"cargo-target-expiry retained target with mounted directory {name}", file=sys.stderr)
+                        continue
+                    print(f"cargo-target-expired {name}", file=sys.stderr)
+
 
 
 def run_cargo(root, key, args):
