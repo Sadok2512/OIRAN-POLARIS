@@ -1,5 +1,28 @@
 # Changelog
 
+## live-probe 0.6.50 / oiran-api 2.21.180 — 2026-11-25 — le ramassage des shards ne retire plus ceux de la génération encore servie
+
+Refus ANR1 #10 7157701325 de 0.6.49 / 2.21.179 (`373eaad`). Base : `373eaad`, qui contient la production `d8718cf` (2.21.178). Montée : patch. Seul le code de live-probe change.
+
+### Défaut (fermé ici)
+`commit_incremental_publication` lisait le manifeste précédent avant l'écriture atomique, mais n'en gardait que `callflows_path`. Le ramassage de 0.6.49, exécuté dans le même appel, ne protégeait que les shards du **nouveau** manifeste et ceux des arbres voisins. Or le registre de l'API sert encore la génération précédente jusqu'à `upsert_dataset`, appelé par le worker **après** le retour du commit. La route live construit `expected` depuis ce registre (`apps/api/src/lib.rs`). Une publication de rétention, qui remplace toute la liste par un shard compacté, laissait donc les shards historiques âgés, hors bande, à la merci du ramassage pendant cette fenêtre. C'est la même course que celle fermée pour les call flows en 2.21.150.
+
+### Corrigé
+- Le manifeste précédent est lu **une fois**, avant l'écriture atomique. On en garde sa génération de call flows (comme avant) **et** la liste de ses shards (`dataset_shard_names`).
+- `remove_unreferenced_event_shards` reçoit cette liste et l'ajoute **sans condition** à l'ensemble protégé de ce commit (sécurité 1 bis). Un shard de la génération servie vit donc au moins jusqu'au deuxième commit qui suit, puis la bande et le délai de grâce s'appliquent, comme pour les générations de call flows.
+- Si le manifeste précédent est présent mais **illisible**, on ne sait pas ce que sert le registre. Rien n'est ramassé à ce commit (`skipped = "previous_manifest_unreadable"`).
+- Le journal `EVENT_SHARD_ORPHANS_REMOVED` porte `previous_manifest_shards`, le nombre de shards protégés à ce titre.
+
+### Gardes
+- `the_commit_keeps_every_shard_of_the_generation_still_served_0_6_50` (garde adverse demandé par ANR1). Le registre d'un vrai `CaptureManager` sert G : **trois shards historiques âgés d'une heure**, qui portent les 64 events du jeu de référence. Deux orphelins plus récents occupent la bande, qui ne protège donc aucun shard de G. G+1 est une **rétention** : un seul shard compacté, aucun shard de G cité. Arrêt **après** `commit_incremental_publication` et **avant** l'entrée de G+1 au registre. G est lue comme le fait la route live : `datasets()`, puis `dataset_root`, puis `event_shards`. Chacun des trois shards existe, et les **64 events** y sont, un par identifiant. Ensuite G+1 entre au registre et G+2 est commise : les shards de G partent alors, et la bande reste.
+- `an_unreadable_previous_manifest_stops_the_shard_gc_0_6_50` : un manifeste précédent illisible arrête le ramassage, en appel direct et par le commit réel.
+- Les gardes de 0.6.49 repassent, avec la nouvelle signature.
+
+Preuve rejouable : branche `proof/live-probe-0.6.50-guard-on-373eaad` (`41f8b83`), qui pose le garde adverse seul sur `373eaad`, sans le correctif.
+
+### Limite déclarée
+Le garde lit G par la même liste que la route live : le registre, puis la racine, puis `event_shards`. Il ne passe pas par l'index compact de l'API (`ensure_tracking_for`), ni par la raison `seed.published`, qui consomment exactement cette liste. Le commit étant privé à live-probe, le garde vit dans live-probe.
+
 ## live-probe 0.6.49 / oiran-api 2.21.179 — 2026-11-25 — les shards d'events orphelins sont ramassés au commit, sans jamais toucher un shard qu'un arbre référence
 
 Ordre cœur #9 7146380288 (volets 2 et 3 ; volet 1 rendu en #9 7146415368). Base : `d8718cf` (2.21.178 PASS, qui contient la production `4cad449`). Montée : patch. Seul le code de live-probe change. oiran-api monte parce que l'artefact déployé l'embarque.

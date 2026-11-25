@@ -9179,14 +9179,26 @@ fn commit_incremental_publication(
     let staged_callflows = staging.join("callflows");
     fs::rename(&staged_callflows, &generation).map_err(display_error)?;
 
-    let previous_callflows = if current.join("dataset_manifest.json").is_file() {
-        fs::read(current.join("dataset_manifest.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<LiveDataset>(&bytes).ok())
-            .and_then(|prior| prior.callflows_path)
-    } else {
-        None
-    };
+    // 0.6.50 (refus ANR1 #10 7157701325) — le manifeste PRÉCÉDENT est lu
+    // une fois, avant l'écriture atomique, et on en garde DEUX choses : sa
+    // génération de call flows (2.21.150) et la liste de ses shards. Jusqu'à
+    // `upsert_dataset`, le registre de l'API sert encore cette génération et
+    // ouvre ces shards-là ; le ramassage plus bas les protège sans condition.
+    // Un manifeste précédent présent mais illisible : on ne sait pas ce
+    // qu'il cite, le ramassage n'a pas lieu à ce commit (`None`).
+    let prior_manifest_path = current.join("dataset_manifest.json");
+    let (previous_callflows, previous_shards): (Option<String>, Option<BTreeSet<String>>) =
+        if prior_manifest_path.is_file() {
+            match fs::read(&prior_manifest_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<LiveDataset>(&bytes).ok())
+            {
+                Some(prior) => (prior.callflows_path.clone(), Some(dataset_shard_names(&prior))),
+                None => (None, None),
+            }
+        } else {
+            (None, Some(BTreeSet::new()))
+        };
     dataset.callflows_path = Some(format!("callflow-generations/{generation_name}"));
     dataset.publication_files_created = count_regular_files(&generation)
         .saturating_add(new_shard_count)
@@ -9257,6 +9269,7 @@ fn commit_incremental_publication(
     let report = remove_unreferenced_event_shards(
         current,
         &dataset,
+        previous_shards.as_ref(),
         EVENT_SHARD_ORPHAN_BAND,
         EVENT_SHARD_GRACE_MS,
     );
@@ -9268,6 +9281,7 @@ fn commit_incremental_publication(
             "bytes": report.removed_bytes,
             "kept_unreferenced": report.kept_unreferenced,
             "referenced": report.referenced,
+            "previous_manifest_shards": report.previous_protected,
             "trees_consulted": report.trees_consulted,
             "skipped": report.skipped,
         })
@@ -9290,8 +9304,20 @@ struct EventShardGcReport {
     kept_unreferenced: usize,
     referenced: usize,
     trees_consulted: usize,
+    /// 0.6.50 — shards cités par le manifeste PRÉCÉDENT, protégés sans
+    /// condition à ce commit.
+    previous_protected: usize,
     /// Raison d'un ramassage non fait (`None` s'il a eu lieu).
     skipped: Option<&'static str>,
+}
+
+/// 0.6.50 — noms (basename) des shards cités par un manifeste chargé.
+fn dataset_shard_names(dataset: &LiveDataset) -> BTreeSet<String> {
+    dataset
+        .event_shards
+        .iter()
+        .filter_map(|shard| Path::new(&shard.path).file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .collect()
 }
 
 /// 0.6.49 — un arbre de jeu voisin du jeu courant, dont les shards et le
@@ -9326,6 +9352,10 @@ fn manifest_shard_names(tree: &Path) -> Option<BTreeSet<String>> {
 /// 0.6.49 — retire de `current/event-shards/` les shards qu'AUCUN arbre ne
 /// référence. Sécurité, dans cet ordre :
 /// 1. le manifeste COURANT (celui qui vient d'être écrit, `dataset`) ;
+/// 1 bis. (0.6.50, refus ANR1 #10 7157701325) le manifeste PRÉCÉDENT
+///    (`previous`, lu avant l'écriture atomique) : sans condition, car le
+///    registre de l'API le sert jusqu'à `upsert_dataset`. `None` = manifeste
+///    précédent présent mais illisible : rien n'est ramassé ;
 /// 2. le manifeste de CHAQUE arbre voisin (`is_dataset_sibling_tree`) ; un
 ///    voisin au manifeste illisible protège TOUS les noms de son
 ///    `event-shards/` ;
@@ -9338,6 +9368,7 @@ fn manifest_shard_names(tree: &Path) -> Option<BTreeSet<String>> {
 fn remove_unreferenced_event_shards(
     current: &Path,
     dataset: &LiveDataset,
+    previous: Option<&BTreeSet<String>>,
     band: usize,
     grace_ms: u64,
 ) -> EventShardGcReport {
@@ -9349,11 +9380,13 @@ fn remove_unreferenced_event_shards(
         report.skipped = Some("current_manifest_lists_no_shard");
         return report;
     }
-    let mut referenced: BTreeSet<String> = dataset
-        .event_shards
-        .iter()
-        .filter_map(|shard| Path::new(&shard.path).file_name().and_then(|n| n.to_str()).map(str::to_owned))
-        .collect();
+    let Some(previous) = previous else {
+        report.skipped = Some("previous_manifest_unreadable");
+        return report;
+    };
+    let mut referenced: BTreeSet<String> = dataset_shard_names(dataset);
+    report.previous_protected = previous.len();
+    referenced.extend(previous.iter().cloned());
     let Some(base) = current.parent() else {
         report.skipped = Some("dataset_parent_unknown");
         return report;
@@ -14680,10 +14713,11 @@ mod tests {
         }
         write_aged_0_6_49(&current.join("event-shards/shard-young.jsonl"), std::time::Duration::from_secs(60));
         write_aged_0_6_49(&current.join("event-shards/shard-live.jsonl"), std::time::Duration::from_secs(7200));
-        let flat = remove_unreferenced_event_shards(&current, &gc_dataset_0_6_49(&[]), 2, 15 * 60 * 1000);
+        let none = BTreeSet::new();
+        let flat = remove_unreferenced_event_shards(&current, &gc_dataset_0_6_49(&[]), Some(&none), 2, 15 * 60 * 1000);
         assert_eq!(flat.skipped, Some("current_manifest_lists_no_shard"));
         assert_eq!(flat.removed, 0);
-        let report = remove_unreferenced_event_shards(&current, &gc_dataset_0_6_49(&["shard-live.jsonl"]), 2, 15 * 60 * 1000);
+        let report = remove_unreferenced_event_shards(&current, &gc_dataset_0_6_49(&["shard-live.jsonl"]), Some(&none), 2, 15 * 60 * 1000);
         // Non référencés, du plus récent au plus ancien : young (1 min),
         // old-4 (20), old-3 (30), old-2 (40), old-1 (50), old-0 (60). Bande :
         // young et old-4. Retirés : old-3, old-2, old-1, old-0.
@@ -14695,6 +14729,132 @@ mod tests {
         }
         for gone in ["shard-old-0.jsonl", "shard-old-1.jsonl", "shard-old-2.jsonl", "shard-old-3.jsonl"] {
             assert!(!current.join("event-shards").join(gone).exists(), "{gone}");
+        }
+    }
+
+    /// 0.6.50 (refus ANR1 #10 7157701325) — un manifeste précédent présent
+    /// mais illisible : on ne sait pas ce que sert le registre, rien n'est
+    /// ramassé, la raison est dite.
+    #[test]
+    fn an_unreadable_previous_manifest_stops_the_shard_gc_0_6_50() {
+        let root = temporary_root("event-shard-gc-unreadable-0-6-50");
+        let current = root.join("dataset");
+        for name in ["shard-a.jsonl", "shard-b.jsonl", "shard-c.jsonl", "shard-live.jsonl"] {
+            write_aged_0_6_49(&current.join("event-shards").join(name), std::time::Duration::from_secs(3600));
+        }
+        let report = remove_unreferenced_event_shards(&current, &gc_dataset_0_6_49(&["shard-live.jsonl"]), None, 0, 0);
+        assert_eq!(report.skipped, Some("previous_manifest_unreadable"), "{report:?}");
+        assert_eq!(report.removed, 0, "{report:?}");
+        for name in ["shard-a.jsonl", "shard-b.jsonl", "shard-c.jsonl"] {
+            assert!(current.join("event-shards").join(name).exists(), "{name}");
+        }
+        // Par le commit réel : un manifeste précédent corrompu, rien ne part.
+        fs::write(current.join("dataset_manifest.json"), b"{not json").unwrap();
+        let staging = root.join(".dataset-next");
+        fs::create_dir_all(staging.join("callflows")).unwrap();
+        commit_incremental_publication(&current, &staging, gc_dataset_0_6_49(&["shard-live.jsonl"])).unwrap();
+        for name in ["shard-a.jsonl", "shard-b.jsonl", "shard-c.jsonl"] {
+            assert!(current.join("event-shards").join(name).exists(), "{name}");
+        }
+    }
+
+    /// 0.6.50 (refus ANR1 #10 7157701325) — garde adverse de la fenêtre de
+    /// publication. Le registre sert la génération G : trois shards
+    /// historiques âgés d'une heure, qui portent les 64 events du jeu de
+    /// référence. Deux orphelins plus récents occupent la bande, qui ne
+    /// protège donc aucun shard de G. La publication G+1 est une rétention :
+    /// un seul shard compacté, aucun shard de G cité. On s'arrête APRÈS
+    /// `commit_incremental_publication` et AVANT `upsert_dataset` (le
+    /// registre sert encore G), et on lit G comme la route live
+    /// (`apps/api/src/lib.rs`, `expected`) : `datasets()` → `dataset_root` →
+    /// `event_shards`. Chaque shard de G existe, et les 64 events y sont, un
+    /// par identifiant. Puis G+1 entre au registre et G+2 est commise : G
+    /// n'est plus servie ni précédente, ses shards partent alors (hors bande
+    /// et grâce). Avant 0.6.50 : les trois shards de G étaient retirés au
+    /// commit de G+1, la lecture échouait.
+    #[test]
+    fn the_commit_keeps_every_shard_of_the_generation_still_served_0_6_50() {
+        let root = temporary_root("event-shard-gc-served-0-6-50");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        let current = root.join(CONTINUOUS_CAPTURE_ID).join("dataset");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let lines: Vec<String> = fs::read_to_string(workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        let event_id = |line: &str| serde_json::from_str::<Value>(line).unwrap()["event_id"].as_str().unwrap().to_owned();
+        let all_ids: BTreeSet<String> = lines.iter().map(|line| event_id(line)).collect();
+        assert_eq!(lines.len(), 64, "précondition : le jeu de référence");
+        assert_eq!(all_ids.len(), 64, "précondition : un identifiant par event");
+        // G : trois shards historiques âgés d'une heure.
+        let historical = ["shard-hist-0.jsonl", "shard-hist-1.jsonl", "shard-hist-2.jsonl"];
+        let hour = std::time::Duration::from_secs(3600);
+        for (name, chunk) in historical.iter().zip(lines.chunks(lines.len().div_ceil(3))) {
+            let path = current.join("event-shards").join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, chunk.join("\n") + "\n").unwrap();
+            fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(SystemTime::now() - hour).unwrap();
+        }
+        // La bande : deux orphelins plus récents que G, que rien ne cite.
+        write_aged_0_6_49(&current.join("event-shards/shard-band-a.jsonl"), std::time::Duration::from_secs(20 * 60));
+        write_aged_0_6_49(&current.join("event-shards/shard-band-b.jsonl"), std::time::Duration::from_secs(25 * 60));
+        let generation_g = gc_dataset_0_6_49(&historical);
+        fs::write(current.join("dataset_manifest.json"), serde_json::to_vec(&generation_g).unwrap()).unwrap();
+        manager.datasets.lock().unwrap().insert(CONTINUOUS_DATASET_ID.to_owned(), generation_g);
+        // G+1, rétention : un shard compacté qui remplace toute la liste.
+        let staging = root.join(CONTINUOUS_CAPTURE_ID).join(".dataset-next");
+        fs::create_dir_all(staging.join("callflows")).unwrap();
+        fs::create_dir_all(staging.join("event-shards")).unwrap();
+        fs::write(staging.join("event-shards/shard-retained-0123456789abcdef.jsonl"), lines.join("\n") + "\n").unwrap();
+        let generation_g1 = commit_incremental_publication(
+            &current,
+            &staging,
+            gc_dataset_0_6_49(&["shard-retained-0123456789abcdef.jsonl"]),
+        )
+        .unwrap();
+        // Pause : commit fait, `upsert_dataset` pas encore. Lecture de G
+        // comme la route live.
+        let served = manager
+            .datasets()
+            .into_iter()
+            .find(|dataset| dataset.dataset_id == CONTINUOUS_DATASET_ID)
+            .expect("le registre sert encore G");
+        let served_root = manager.dataset_root(CONTINUOUS_DATASET_ID).unwrap();
+        assert_eq!(served_root, current);
+        let expected: Vec<PathBuf> = served.event_shards.iter().map(|shard| served_root.join(&shard.path)).collect();
+        assert_eq!(expected.len(), 3, "le registre sert G et ses trois shards");
+        let mut read_ids = BTreeSet::new();
+        let mut read_events = 0usize;
+        for path in &expected {
+            let text = fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("shard de la génération servie retiré par le commit : {} ({error})", path.display()));
+            read_events += count_valid_event_records(path).unwrap();
+            read_ids.extend(text.lines().filter(|line| !line.trim().is_empty()).map(event_id));
+        }
+        assert_eq!(read_events, 64, "aucun event de G ne manque");
+        assert_eq!(read_ids, all_ids, "chaque event de G est lu, par identifiant");
+        // G+1 entre au registre ; G+2 est commise. G n'est plus ni servie ni
+        // précédente : ses shards âgés, hors bande, partent maintenant.
+        manager.datasets.lock().unwrap().insert(CONTINUOUS_DATASET_ID.to_owned(), generation_g1);
+        fs::create_dir_all(staging.join("callflows")).unwrap();
+        commit_incremental_publication(
+            &current,
+            &staging,
+            gc_dataset_0_6_49(&["shard-retained-0123456789abcdef.jsonl"]),
+        )
+        .unwrap();
+        for name in historical {
+            assert!(!current.join("event-shards").join(name).exists(), "{name} ramassé deux commits plus tard");
+        }
+        for name in ["shard-band-a.jsonl", "shard-band-b.jsonl", "shard-retained-0123456789abcdef.jsonl"] {
+            assert!(current.join("event-shards").join(name).exists(), "{name}");
         }
     }
 
