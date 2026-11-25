@@ -15428,6 +15428,14 @@ fn active_grant_covers(state: &AppState, requested: &[String]) -> bool {
     })
 }
 
+/// The runtime reuses this ID to find the history record after each write.
+/// Keep it independent of scenario text and split the hex nonce so the
+/// history sanitizer cannot mistake a decimal run for a subscriber ID.
+fn live_definition_job_id(nonce: &str) -> String {
+    let (first, second) = nonce.split_at(6);
+    format!("definition-{first}-{second}")
+}
+
 fn start_live_definition_scenario(
     state: Arc<AppState>,
     definition_id: &str,
@@ -15509,7 +15517,7 @@ fn start_live_definition_scenario(
             Json(json!({"error":"VOICE_TWO_DISTINCT_UES_REQUIRED"})),
         ));
     }
-    let job_id = format!("{}-{}", definition.id, random_hex(6));
+    let job_id = live_definition_job_id(&random_hex(6));
     let initial_jobs = state
         .multi_ue
         .lock()
@@ -24408,6 +24416,20 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             recovered.history[0]["steps"][0]["error"],
             "CONTROLLER_RESTART_INTERRUPTED_STEP"
         );
+    }
+
+    #[test]
+    fn live_definition_job_id_survives_history_sanitization() {
+        let nonce = "d71722729201";
+        let old_id = format!("live-state-test-{nonce}");
+        assert_ne!(sanitize_history_text_with(&old_id, None, false), old_id);
+
+        let job_id = live_definition_job_id(nonce);
+        let mut record = json!({"job_id": job_id, "detail": "subscriber imsi=123456789012345"});
+        sanitize_history_value(&mut record, false);
+        assert!(valid_job_id(&job_id));
+        assert_eq!(record["job_id"], job_id);
+        assert_ne!(record["detail"], "subscriber imsi=123456789012345");
     }
 
     #[test]
