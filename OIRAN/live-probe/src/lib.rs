@@ -16612,7 +16612,6 @@ mod tests {
         let truncated_path = source.join("N2/final-1.pcapng");
         fs::write(&truncated_path, &n2[..n2.len() * 3 / 5 + 7]).unwrap();
         write_rotation_closures(&source, "N2", 1);
-        thread::sleep(Duration::from_millis(250));
 
         let manager = CaptureManager::with_pseudonym_key_path(
             root.to_path_buf(),
@@ -16635,17 +16634,20 @@ mod tests {
             })
             .unwrap();
 
-        // Attend la quarantaine puis un cycle supplémentaire pour que
-        // les compteurs soient re-publiés après la quarantaine.
-        wait_for(|| {
-            manager
-                .quarantined_segments_snapshot()
-                .iter()
-                .any(|((p, _, _), _)| p == &truncated_path.display().to_string())
-        });
-        thread::sleep(Duration::from_millis(500));
+        // The quarantine registry is updated during ingestion, before the
+        // worker publishes the next scan's inventory to the job. Observe
+        // that inventory directly and assert on the same snapshot.
+        let path = truncated_path.display().to_string();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let job = loop {
+            let snapshot = manager.get(CONTINUOUS_CAPTURE_ID).expect("continuous job");
+            if snapshot.metrics.quarantined_segment_paths.contains(&path) || Instant::now() >= deadline {
+                break snapshot;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
 
-        let job = manager.get(CONTINUOUS_CAPTURE_ID).expect("continuous job");
         assert_eq!(
             job.metrics.pending_segments, 0,
             "2.21.68 : un segment quarantiné ne doit PLUS être compté en attente ; metrics: {:?}",
@@ -16669,7 +16671,8 @@ mod tests {
                 .quarantined_segment_paths
                 .iter()
                 .any(|p| p == &truncated_path.display().to_string()),
-            "le chemin du segment quarantiné doit être listé"
+            "le scan doit publier le chemin du segment quarantiné ; metrics: {:?}",
+            job.metrics
         );
         if let Some(pct) = job.metrics.queue_occupancy_percent {
             assert!(
@@ -16678,7 +16681,6 @@ mod tests {
             );
         }
 
-        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     /// 2.21.68 (ordre #9 7006248573) — `owned_bytes_percent` n'est pas
