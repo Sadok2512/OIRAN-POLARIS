@@ -29,9 +29,9 @@ Après le `revert`, `live-probe/src/lib.rs` est **identique** à `d8718cf`. Le C
      - les lignes périmées vont dans **un** segment d'archive (même format qu'avant), ou nulle part si l'archive est désactivée (option 2.21.155) ;
      - un shard entièrement périmé sort de la liste ;
      - un shard partiellement périmé est remplacé par un `shard-retained-<sha16>` de ses seules lignes retenues. Son `sha256`, son `event_count` et ses `capture_ends` sont calculés **pendant l'écriture**, sans passage dédié ;
-  4. **conservation vérifiée** avant de rendre la main : archivés + retenus = events lus, sinon `CONTINUOUS_RETENTION_CONSERVATION_FAILED`, et rien n'est publié.
+  4. **conservation par shard** (ordre #10 7172270838) : archivés + retenus doit égaler le `event_count` déclaré dans le manifeste source pour chaque shard traité. En cas d’écart, la publication s’arrête avant tout remplacement ou publication d’archive.
 - **Fin de capture inter-shards** (ordre #10 7165335535) : après renseignement des anciens manifestes, `apply_incremental_retention` calcule le maximum de chaque capture sur l’ensemble des shards avant d’appliquer la coupure. Le garde adverse maintient les deux shards tant que cette fin globale est au-dessus de la coupure.
-- **Aucun fichier de données supprimé** : pour un shard qui sort, seul son **lien** de préparation est retiré.
+- **Jeu entièrement expiré** (ordre #10 7172270838) : la publication conserve un shard vide, reconnu par le lecteur de retour arrière. L’archive est préparée en privé, puis rendue visible après validation du jeu et avant le basculement du manifeste. Les shards sources restent intacts.
 - `concatenate_files`, devenue sans appelant, est supprimée.
 
 ### Retour arrière : condition bloquante du cœur, vérifiée au code puis par l'exécution

@@ -5424,7 +5424,10 @@ impl CaptureManager {
         };
         let next_bytes = directory_size(&next);
         let new_shard_bytes = directory_regular_file_bytes(&next.join("event-shards"));
-        let derived_bytes = next_bytes.saturating_sub(new_shard_bytes);
+        let staged_archive_bytes = directory_size(&next.join(STAGED_RETENTION_ARCHIVE));
+        let derived_bytes = next_bytes
+            .saturating_sub(new_shard_bytes)
+            .saturating_sub(staged_archive_bytes);
         let derived_limit = derived_output_hard_limit_bytes();
         if derived_bytes > derived_limit {
             let _ = fs::remove_dir_all(&next);
@@ -7564,10 +7567,7 @@ impl CaptureManager {
             // périmée (adaptation de 2.7.27 aux shards immuables de 2.11.14).
             // Désormais rien n'est réécrit tant que rien n'est périmé.
             if let (Some(cutoff), Some(_)) = (retention_cutoff_epoch_s(), event_paths.as_ref()) {
-                let archive_root = dataset_dir
-                    .parent()
-                    .map(|p| p.join("archive"))
-                    .unwrap_or_else(|| dataset_dir.join("archive"));
+                let archive_root = dataset_dir.join(STAGED_RETENTION_ARCHIVE);
                 let outcome = apply_incremental_retention(dataset_dir, &mut event_shards, &archive_root, cutoff)?;
                 publication_bytes_written = publication_bytes_written.saturating_add(outcome.bytes_rewritten);
                 event_paths = Some(event_shards.iter().map(|shard| dataset_dir.join(&shard.path)).collect());
@@ -9189,10 +9189,38 @@ fn commit_incremental_publication(
     dataset.publication_files_created = count_regular_files(&generation)
         .saturating_add(new_shard_count)
         .saturating_add(1);
-    atomic_write(
-        &current.join("dataset_manifest.json"),
-        &serde_json::to_vec_pretty(&dataset).map_err(|error| error.to_string())?,
-    )?;
+    let manifest = serde_json::to_vec_pretty(&dataset).map_err(|error| error.to_string())?;
+    // Dataset validation and the derived-output limit have passed. Publish
+    // the complete archive before exposing the manifest that drops its events.
+    let staged_archives = staging.join(STAGED_RETENTION_ARCHIVE);
+    let mut published_archive = None;
+    if staged_archives.is_dir() {
+        let archive_root = staging.with_file_name("archive");
+        fs::create_dir_all(&archive_root).map_err(display_error)?;
+        let segment = fs::read_dir(&staged_archives)
+            .map_err(display_error)?
+            .next()
+            .ok_or_else(|| "CONTINUOUS_ARCHIVE_WRITE_FAILED: missing staged segment".to_string())?
+            .map_err(display_error)?;
+        let target = archive_root.join(segment.file_name());
+        fs::rename(segment.path(), &target)
+            .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: publish: {error}"))?;
+        let sync_archive = fs::File::open(&archive_root)
+            .and_then(|dir| dir.sync_all())
+            .and_then(|()| fs::File::open(staging.parent().unwrap_or(Path::new("."))))
+            .and_then(|dir| dir.sync_all());
+        if let Err(error) = sync_archive {
+            let _ = fs::remove_dir_all(&target);
+            return Err(format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: sync: {error}"));
+        }
+        published_archive = Some(target);
+    }
+    if let Err(error) = atomic_write(&current.join("dataset_manifest.json"), &manifest) {
+        if let Some(segment) = published_archive {
+            let _ = fs::remove_dir_all(segment);
+        }
+        return Err(error);
+    }
     // 2.21.63 — `publish_events_to_dataset_dir` écrit son marqueur dans le
     // staging. Le swap incrémental ne déplace que les shards/callflows et
     // réécrit le manifest : sans ce bump au vrai point de commit, le dataset
@@ -11443,6 +11471,8 @@ fn archive_stale_captures(
     Ok(())
 }
 
+const STAGED_RETENTION_ARCHIVE: &str = ".retention-archive";
+
 /// 0.7.0 — bilan d'une rétention incrémentale.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct IncrementalRetentionOutcome {
@@ -11451,7 +11481,6 @@ struct IncrementalRetentionOutcome {
     shards_rewritten: usize,
     bytes_rewritten: u64,
     events_archived: u64,
-    events_retained_in_rewritten: u64,
     capture_end_scans: usize,
 }
 
@@ -11471,10 +11500,9 @@ struct IncrementalRetentionOutcome {
 ///    par un `shard-retained-<sha16>` de ses seules lignes retenues, dont
 ///    `sha256`, `event_count` et `capture_ends` sont calculés PENDANT
 ///    l'écriture ;
-/// 5. conservation vérifiée avant de rendre la main : archivés + retenus =
-///    `event_count` des shards lus, sinon erreur et rien n'est publié.
-/// Seul un LIEN de la préparation est retiré pour un shard qui sort ;
-/// aucun fichier de données n'est supprimé.
+/// 5. chaque shard traité doit rendre exactement le nombre d'événements
+///    déclaré par le manifeste. Les remplacements et le manifeste d'archive
+///    sont préparés uniquement après validation de tous ces comptes.
 fn apply_incremental_retention(
     dataset_dir: &Path,
     shards: &mut Vec<EventShard>,
@@ -11531,23 +11559,24 @@ fn apply_incremental_retention(
         None
     };
     let mut archive_hash = Sha256Hasher::new();
-    let mut events_read = 0u64;
-    let mut kept: Vec<EventShard> = Vec::with_capacity(shards.len());
-    let mut temporaries: Vec<PathBuf> = Vec::new();
+    let mut kept = Vec::with_capacity(shards.len());
+    let mut temporaries = Vec::new();
+    let mut replacements = Vec::new();
     let result = (|| -> Result<(), String> {
-        for shard in shards.drain(..) {
+        for (index, shard) in shards.iter().enumerate() {
             if !shard.capture_ends.keys().any(|cid| stale.contains(cid)) {
-                kept.push(shard);
+                kept.push(shard.clone());
                 continue;
             }
             let source = dataset_dir.join(&shard.path);
-            let tmp = dataset_dir.join("event-shards").join(format!(".retention-{}.tmp", kept.len() + temporaries.len()));
+            let tmp = dataset_dir.join("event-shards").join(format!(".retention-{index}.tmp"));
             fs::create_dir_all(tmp.parent().unwrap_or(dataset_dir)).map_err(display_error)?;
             temporaries.push(tmp.clone());
             let mut retained_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, fs::File::create(&tmp).map_err(display_error)?);
             let mut retained_hash = Sha256Hasher::new();
             let mut retained_bytes = 0u64;
             let mut retained_count = 0usize;
+            let mut archived_count = 0usize;
             let mut retained_ends: BTreeMap<String, u64> = BTreeMap::new();
             let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, fs::File::open(&source).map_err(display_error)?);
             for line in reader.lines() {
@@ -11555,7 +11584,6 @@ fn apply_incremental_retention(
                 if line.trim().is_empty() {
                     continue;
                 }
-                events_read += 1;
                 let value: serde_json::Value = serde_json::from_str(&line)
                     .map_err(|error| format!("CONTINUOUS_ARCHIVE_PARSE_FAILED: {error}"))?;
                 let cid = value.get("capture_id").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -11566,7 +11594,7 @@ fn apply_incremental_retention(
                     }
                     archive_hash.update(line.as_bytes());
                     archive_hash.update(b"\n");
-                    outcome.events_archived += 1;
+                    archived_count += 1;
                 } else {
                     retained_writer.write_all(line.as_bytes()).and_then(|_| retained_writer.write_all(b"\n")).map_err(display_error)?;
                     retained_hash.update(line.as_bytes());
@@ -11580,15 +11608,17 @@ fn apply_incremental_retention(
                     }
                 }
             }
+            let processed = archived_count + retained_count;
+            if processed != shard.event_count {
+                return Err(format!(
+                    "CONTINUOUS_RETENTION_CONSERVATION_FAILED: shard={} expected={} processed={processed} archived={archived_count} retained={retained_count}",
+                    shard.path, shard.event_count,
+                ));
+            }
+            outcome.events_archived += archived_count as u64;
             retained_writer.flush().map_err(display_error)?;
             retained_writer.get_ref().sync_all().map_err(display_error)?;
             drop(retained_writer);
-            // Un shard qui sort ou est remplacé : seul son LIEN de
-            // préparation est retiré ; un fichier régulier n'est jamais
-            // supprimé ici.
-            if fs::symlink_metadata(&source).map(|meta| meta.file_type().is_symlink()).unwrap_or(false) {
-                fs::remove_file(&source).map_err(display_error)?;
-            }
             if retained_count == 0 {
                 fs::remove_file(&tmp).map_err(display_error)?;
                 outcome.shards_dropped += 1;
@@ -11596,10 +11626,9 @@ fn apply_incremental_retention(
             }
             let sha = retained_hash.finish_hex();
             let name = format!("event-shards/shard-retained-{}.jsonl", &sha[..16]);
-            fs::rename(&tmp, dataset_dir.join(&name)).map_err(display_error)?;
+            replacements.push((tmp, dataset_dir.join(&name)));
             outcome.shards_rewritten += 1;
             outcome.bytes_rewritten += retained_bytes;
-            outcome.events_retained_in_rewritten += retained_count as u64;
             kept.push(EventShard {
                 path: name,
                 sha256: sha,
@@ -11610,7 +11639,6 @@ fn apply_incremental_retention(
         }
         Ok(())
     })();
-    let read_before: u64 = events_read;
     if let Err(error) = result {
         for tmp in &temporaries {
             let _ = fs::remove_file(tmp);
@@ -11619,14 +11647,23 @@ fn apply_incremental_retention(
         let _ = fs::remove_dir(&segment_dir);
         return Err(error);
     }
-    // Conservation : chaque event lu est archivé ou retenu.
-    if outcome.events_archived + outcome.events_retained_in_rewritten != read_before {
-        let _ = fs::remove_file(&segment_events);
-        let _ = fs::remove_dir(&segment_dir);
-        return Err(format!(
-            "CONTINUOUS_RETENTION_CONSERVATION_FAILED: read={read_before} archived={} retained={}",
-            outcome.events_archived, outcome.events_retained_in_rewritten
-        ));
+    for (temporary, replacement) in replacements {
+        fs::rename(temporary, replacement).map_err(display_error)?;
+    }
+    if kept.is_empty() {
+        // The rollback reader already accepts an empty shard. With no shard
+        // entries it expects the legacy flat file instead.
+        let bytes = b"";
+        let sha256 = sha256_hex(bytes);
+        let path = format!("event-shards/shard-retained-{}.jsonl", &sha256[..16]);
+        atomic_write(&dataset_dir.join(&path), bytes)?;
+        kept.push(EventShard {
+            path,
+            sha256,
+            bytes: 0,
+            event_count: 0,
+            capture_ends: BTreeMap::new(),
+        });
     }
     let archive_sha256 = archive_hash.finish_hex();
     if let Some(mut writer) = archive_writer {
@@ -11642,7 +11679,7 @@ fn apply_incremental_retention(
             "events_sha256": archive_sha256,
             "schema_version": "2.7.27",
         });
-        fs::write(segment_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?)
+        atomic_write(&segment_dir.join("manifest.json"), &serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?)
             .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: manifest: {error}"))?;
     }
     *shards = kept;
@@ -11652,7 +11689,7 @@ fn apply_incremental_retention(
             "event": "CONTINUOUS_CAPTURE_ARCHIVE",
             "mode": "incremental",
             "archive_id": archive_id,
-            "archive_written": archive_enabled,
+            "archive_staged": archive_enabled,
             "cutoff_epoch_s": cutoff,
             "retention_days": retention_days(),
             "capture_count": stale.len(),
