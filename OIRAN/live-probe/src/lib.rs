@@ -14434,6 +14434,70 @@ mod tests {
         assert!(!path.exists(), "le répertoire temporaire a survécu au test : {}", path.display());
     }
 
+    /// 0.6.49 — un jeu publié minimal pour les gardes du ramassage : un
+    /// manifeste qui ne cite que `shards`.
+    fn gc_dataset_0_6_49(shards: &[&str]) -> LiveDataset {
+        serde_json::from_value(serde_json::json!({
+            "dataset_id": CONTINUOUS_DATASET_ID, "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous/dataset", "event_count": 0,
+            "session_ids": [], "decode_reports": {}, "checksums": {}, "state": "PUBLISHED",
+            "event_shards": shards.iter().map(|name| serde_json::json!({
+                "path": format!("event-shards/{name}"), "sha256": "x", "bytes": 1, "event_count": 1
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    fn write_aged_0_6_49(path: &Path, age: std::time::Duration) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}\n").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    /// 0.6.49 (ordre cœur #9 7146380288, volet 3) — le ramassage AU COMMIT
+    /// réel : `dataset/event-shards/` porte un shard cité par le manifeste
+    /// courant, un orphelin LIBRE, un orphelin cité par le manifeste d'un
+    /// ARBRE DE ROLLBACK, et un orphelin que le staging d'à côté cite par
+    /// lien. Après `commit_incremental_publication` : l'orphelin libre a
+    /// disparu ; celui du rollback et celui du lien sont GARDÉS ; rien n'est
+    /// touché hors de `dataset/event-shards/`. Avant 0.6.49 : aucun ramassage,
+    /// l'orphelin libre restait.
+    #[test]
+    fn the_commit_removes_free_orphan_shards_and_keeps_the_rollbacks_0_6_49() {
+        let root = temporary_root("event-shard-gc-0-6-49");
+        let current = root.join("dataset");
+        let old = std::time::Duration::from_secs(3600);
+        for name in ["shard-live.jsonl", "shard-orphan.jsonl", "shard-rollback.jsonl", "shard-linked.jsonl"] {
+            write_aged_0_6_49(&current.join("event-shards").join(name), old);
+        }
+        // Deux orphelins plus récents encore, que la bande protège : le libre
+        // ancien n'est donc pas protégé par elle.
+        write_aged_0_6_49(&current.join("event-shards/shard-band-1.jsonl"), std::time::Duration::from_secs(1));
+        write_aged_0_6_49(&current.join("event-shards/shard-band-2.jsonl"), std::time::Duration::from_secs(2));
+        fs::write(current.join("dataset_manifest.json"), serde_json::to_vec(&gc_dataset_0_6_49(&["shard-live.jsonl"])).unwrap()).unwrap();
+        // Arbre de rollback opérateur qui cite un shard du jeu courant.
+        let rollback = root.join(".dataset-rollback.20261124T224000Z");
+        fs::create_dir_all(&rollback).unwrap();
+        fs::write(rollback.join("dataset_manifest.json"), serde_json::to_vec(&gc_dataset_0_6_49(&["shard-rollback.jsonl"])).unwrap()).unwrap();
+        // Arbre précédent dont le event-shards/ porte un lien de même nom.
+        let previous = root.join(".dataset-previous");
+        fs::create_dir_all(previous.join("event-shards")).unwrap();
+        std::os::unix::fs::symlink(current.join("event-shards/shard-linked.jsonl"), previous.join("event-shards/shard-linked.jsonl")).unwrap();
+        // Staging de la publication : rien de neuf, juste ses call flows.
+        let staging = root.join(".dataset-next");
+        fs::create_dir_all(staging.join("callflows")).unwrap();
+        commit_incremental_publication(&current, &staging, gc_dataset_0_6_49(&["shard-live.jsonl"])).unwrap();
+        let shard = |name: &str| current.join("event-shards").join(name).exists();
+        assert!(!shard("shard-orphan.jsonl"), "l'orphelin libre et ancien est retiré");
+        assert!(shard("shard-live.jsonl"), "le shard du manifeste courant reste");
+        assert!(shard("shard-rollback.jsonl"), "le shard cité par l'arbre de rollback reste");
+        assert!(shard("shard-linked.jsonl"), "le shard lié depuis un arbre voisin reste");
+        assert!(shard("shard-band-1.jsonl") && shard("shard-band-2.jsonl"), "la bande des plus récents reste");
+        assert!(rollback.join("dataset_manifest.json").is_file(), "rien n'est touché hors de dataset/event-shards/");
+        assert!(fs::symlink_metadata(previous.join("event-shards/shard-linked.jsonl")).is_ok());
+    }
+
     /// Global allocator shim that tracks the net live bytes and the all-time
     /// peak since the last reset. Used by the memory-bounded test for the
     /// `source_segments` → ingestion loop so we can prove the fix on a
