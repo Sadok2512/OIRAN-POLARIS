@@ -1773,11 +1773,40 @@ pub struct PfcpIndex {
     /// 2.18.10 — octets déjà indexés par fichier (même ordre que `files`),
     /// toujours en fin de ligne complète.
     scanned: Vec<u64>,
+    /// PREUVE seulement — instrumentation de comptage, aucun changement de
+    /// comportement : ce que l'appel qui a construit l'index a lu.
+    work: PfcpIndexWork,
+}
+
+/// PREUVE seulement — mêmes champs que 2.21.181.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PfcpIndexWork {
+    pub files_served: usize,
+    pub files_reused: usize,
+    pub tables_loaded: usize,
+    pub fallback_files: usize,
+    pub bytes_read: u64,
+    pub lines_parsed: u64,
+    pub tables_written: usize,
+    pub table_write_failed: usize,
+    pub source: &'static str,
 }
 
 impl PfcpIndex {
     pub fn entries(&self) -> usize {
         self.entries
+    }
+
+    pub fn work(&self) -> PfcpIndexWork {
+        self.work
+    }
+}
+
+/// PREUVE seulement — oublie l'index d'un jeu (premier accès à froid).
+#[cfg(test)]
+fn forget_pfcp_caches_under(root: &Path) {
+    if let Ok(mut cache) = PFCP_EVENT_CACHE.lock() {
+        cache.remove(root);
     }
 }
 
@@ -1885,8 +1914,10 @@ pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex
             by_key: std::collections::HashMap::new(),
             entries: 0,
             scanned: Vec::new(),
+            work: PfcpIndexWork::default(),
         },
     };
+    index.work = PfcpIndexWork { files_served: signature.len(), source: "read_dir", ..PfcpIndexWork::default() };
     for (path, _, _) in &signature {
         let file_idx = match index.files.iter().position(|known| known == path) {
             Some(position) => position,
@@ -1897,7 +1928,14 @@ pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex
             }
         };
         let from = index.scanned[file_idx];
-        let (scanned, added) = scan_pfcp_file(path, file_idx as u32, from, &mut index.by_key)?;
+        let (scanned, added, bytes, parsed) = scan_pfcp_file(path, file_idx as u32, from, &mut index.by_key)?;
+        index.work.bytes_read += bytes;
+        index.work.lines_parsed += parsed;
+        if bytes > 0 {
+            index.work.fallback_files += 1;
+        } else {
+            index.work.files_reused += 1;
+        }
         index.scanned[file_idx] = scanned;
         index.entries += added;
     }
@@ -1927,8 +1965,10 @@ fn scan_pfcp_file(
     file_idx: u32,
     from: u64,
     by_key: &mut std::collections::HashMap<String, Vec<(u32, u64)>>,
-) -> Result<(u64, usize), String> {
+) -> Result<(u64, usize, u64, u64), String> {
     use std::io::{Seek, SeekFrom};
+    let mut bytes_read = 0u64;
+    let mut lines_parsed = 0u64;
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(from)).map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(&file);
@@ -1945,6 +1985,7 @@ fn scan_pfcp_file(
         }
         let start = offset;
         offset += read as u64;
+        bytes_read += read as u64;
         if offset.saturating_sub(advised_offset) >= 16 * 1024 * 1024 {
             advise_read_range(
                 &file,
@@ -1956,6 +1997,7 @@ fn scan_pfcp_file(
         if !line.contains("\"protocol\":\"PFCP\"") {
             continue;
         }
+        lines_parsed += 1;
         let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
             continue;
         };
@@ -1974,7 +2016,7 @@ fn scan_pfcp_file(
         advised_offset,
         offset.saturating_sub(advised_offset),
     );
-    Ok((offset, added))
+    Ok((offset, added, bytes_read, lines_parsed))
 }
 
 #[cfg(target_family = "unix")]
@@ -3522,6 +3564,126 @@ mod pfcp_interface_guard_tests {
         assert_eq!(ids, vec!["evt-n4-req", "evt-n4-resp"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+mod pfcp_first_access_tests_2_21_181 {
+    use super::*;
+    use serde_json::json;
+
+    fn unique_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rtp-{label}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(root.join("event-shards")).unwrap();
+        root
+    }
+
+    fn pfcp(id: &str, seid: &str, name: &str) -> String {
+        json!({"event_id":id,"capture_id":"c","protocol":"PFCP","interface":"N4","message_name":name,
+            "session_identifiers":[{"name":"f_seid","value":seid}]})
+        .to_string()
+    }
+
+    /// Un shard : `filler` lignes NGAP puis les lignes PFCP données.
+    fn write_shard(root: &Path, name: &str, filler: usize, pfcp_lines: &[String]) {
+        let mut body = String::new();
+        for index in 0..filler {
+            body.push_str(&json!({"event_id":format!("{name}-ngap-{index}"),"protocol":"NGAP","pad":"x".repeat(200)}).to_string());
+            body.push('\n');
+        }
+        for line in pfcp_lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        std::fs::write(root.join("event-shards").join(name), body).unwrap();
+    }
+
+    /// La table qu'écrit la publication (live-probe, au commit).
+    fn publish_table(root: &Path, name: &str) {
+        // PREUVE : live-probe d8718cf n'a pas d'écrivain de table ; même
+        // format v1, écrit à la main. Le code d8718cf ne le lit pas.
+        let shard = root.join("event-shards").join(name);
+        let bytes = std::fs::metadata(&shard).unwrap().len();
+        let mut text = format!("oiran-pfcp-shard-index v1\nbytes {bytes}\n");
+        let mut offset = 0u64;
+        for line in std::fs::read_to_string(&shard).unwrap().split_inclusive('\n') {
+            if line.contains("\"protocol\":\"PFCP\"") {
+                let value: Value = serde_json::from_str(line.trim_end()).unwrap();
+                for key in pfcp_keys(&value) {
+                    text.push_str(&format!("{key}\t{offset}\n"));
+                }
+            }
+            offset += line.len() as u64;
+        }
+        std::fs::create_dir_all(root.join("event-shards-pfcp")).unwrap();
+        std::fs::write(root.join("event-shards-pfcp").join(format!("{name}.idx")), text).unwrap();
+    }
+
+    fn write_manifest(root: &Path, shards: &[&str]) {
+        let manifest = json!({"event_shards": shards.iter().map(|name| json!({"path": format!("event-shards/{name}")})).collect::<Vec<_>>()});
+        std::fs::write(root.join("dataset_manifest.json"), manifest.to_string()).unwrap();
+    }
+
+    fn session_items() -> Vec<Value> {
+        vec![json!({"event_id":"evt-req","capture_id":"c","protocol":"PFCP","interface":"N4",
+            "message_name":"PFCP Session Establishment Request",
+            "session_identifiers":[{"name":"f_seid","value":"0x00000000000000aa"}]})]
+    }
+
+    /// 2.21.181 (ordre cœur #9 7158375080 / 7159438952) — le PREMIER accès,
+    /// à froid, sur un jeu de trois générations (quatre shards servis, de
+    /// 2 000 lignes chacun), plus un ORPHELIN de `event-shards/` qui porte
+    /// un event PFCP de la même session :
+    /// - l'index ne lit AUCUN octet de shard et n'analyse AUCUNE ligne : il
+    ///   charge les quatre tables écrites à la publication ;
+    /// - les frères de la session viennent des shards servis, jamais de
+    ///   l'orphelin ;
+    /// - un shard ramassé et un shard neuf : le premier accès suivant ne
+    ///   charge que la table du neuf, aucune reconstruction.
+    /// Avant 2.21.181 : un `read_dir` de `event-shards/`, tout relu (orphelin
+    /// compris), et reconstruction complète dès qu'un fichier disparaît.
+    #[test]
+    fn the_first_access_loads_published_tables_and_never_reads_the_shards_2_21_181() {
+        let root = unique_root("pfcp-first-access");
+        write_shard(&root, "shard-g1-a.jsonl", 2000, &[pfcp("evt-req", "0x00000000000000aa", "PFCP Session Establishment Request")]);
+        write_shard(&root, "shard-g1-b.jsonl", 2000, &[pfcp("evt-mod", "0x00000000000000aa", "PFCP Session Modification Request")]);
+        write_shard(&root, "shard-g2-c.jsonl", 2000, &[pfcp("evt-del", "0x00000000000000aa", "PFCP Session Deletion Request")]);
+        write_shard(&root, "shard-g3-d.jsonl", 2000, &[pfcp("evt-other", "0x00000000000000bb", "PFCP Session Establishment Request")]);
+        write_shard(&root, "shard-orphan.jsonl", 2000, &[pfcp("evt-orphan", "0x00000000000000aa", "PFCP Session Report Request")]);
+        for name in ["shard-g1-a.jsonl", "shard-g1-b.jsonl", "shard-g2-c.jsonl", "shard-g3-d.jsonl"] {
+            publish_table(&root, name);
+        }
+        write_manifest(&root, &["shard-g1-a.jsonl", "shard-g1-b.jsonl", "shard-g2-c.jsonl", "shard-g3-d.jsonl"]);
+        forget_pfcp_caches_under(&root);
+        let mut items = session_items();
+        let added = extend_items_with_pfcp_siblings_from_jsonl(&mut items, &root).unwrap();
+        let ids: BTreeSet<&str> = items.iter().filter_map(|item| item["event_id"].as_str()).collect();
+        assert!(!ids.contains("evt-orphan"), "un orphelin que personne ne sert n'entre jamais dans une session : {ids:?}");
+        assert_eq!(added, 2, "{ids:?}");
+        assert!(ids.contains("evt-mod") && ids.contains("evt-del"), "{ids:?}");
+        let work = cached_pfcp_index(&root).unwrap().work();
+        assert_eq!(work.bytes_read, 0, "premier accès : aucun octet de shard lu ({work:?})");
+        assert_eq!(work.lines_parsed, 0, "premier accès : aucune ligne analysée ({work:?})");
+        assert_eq!(work.tables_loaded, 4, "{work:?}");
+        assert_eq!(work.files_served, 4, "la liste vient du manifeste, pas du répertoire ({work:?})");
+        // Ramassage de g1-b (fichier et table), entrée de g4-e.
+        std::fs::remove_file(root.join("event-shards/shard-g1-b.jsonl")).unwrap();
+        write_shard(&root, "shard-g4-e.jsonl", 2000, &[pfcp("evt-new", "0x00000000000000aa", "PFCP Session Modification Request")]);
+        publish_table(&root, "shard-g4-e.jsonl");
+        write_manifest(&root, &["shard-g1-a.jsonl", "shard-g2-c.jsonl", "shard-g3-d.jsonl", "shard-g4-e.jsonl"]);
+        let mut items = session_items();
+        let added = extend_items_with_pfcp_siblings_from_jsonl(&mut items, &root).unwrap();
+        assert_eq!(added, 2, "evt-del et evt-new");
+        let work = cached_pfcp_index(&root).unwrap().work();
+        assert_eq!((work.bytes_read, work.lines_parsed), (0, 0), "aucune reconstruction ({work:?})");
+        assert_eq!(work.tables_loaded, 1, "seule la table du shard neuf est chargée ({work:?})");
+        assert_eq!(work.files_reused, 3, "{work:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }
 
 #[cfg(test)]
