@@ -1,8 +1,12 @@
 # Changelog
 
-## oiran-api 2.21.183 — archive visibility and managed Cargo target expiry
+## oiran-api 2.21.184 — archive visibility and mount-bounded Cargo expiry
 
-Patch. Order #10 7175865262. The cached health snapshot exposes the retention archive's logical bytes, finalized segment count and oldest creation date. Archive inventory is read-only. The shared Cargo wrapper expires only its private build targets after seven days without use, at the next managed invocation or an explicit sweep.
+Patch. Order #10 7175865262 and review 7177285745. The cached health snapshot exposes the retention archive's logical bytes, finalized segment count and oldest creation date. Archive inventory is read-only. The shared Cargo wrapper expires private build targets after seven days without use and retains targets with a nested mount, including same-device bind mounts.
+
+## oiran-api 2.21.183 — N3 downlink coverage in session callflows
+
+Patch. Correlate an ambiguous downlink G-PDU aggregate through the unique uplink in its segment when the UE address and reversed endpoints agree and the uplink PFCP session owns the receiving downlink tunnel key. Newly emitted aggregates carry a consistency flag when all their packets agree on the UE address and endpoints.
 
 ## oiran-api 2.21.182 — périmètre PFCP du manifeste servi
 

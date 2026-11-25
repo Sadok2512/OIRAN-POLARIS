@@ -317,6 +317,7 @@ struct N3FlowAggregate {
     last_seen_ns: i128,
     last_packet: Option<event_schema::PacketReference>,
     qfi: Option<u8>,
+    duplex_consistent: bool,
 }
 
 #[derive(Default)]
@@ -341,6 +342,7 @@ impl N3FlowAggregator {
             .and_then(|item| item.value.as_deref())
             .and_then(parse_qfi);
         let teid = identifier("teid");
+        let duplex_consistent = event.interface == "N3" && !identifier("ue_ip").is_empty();
         let mut direction = event.direction.as_str().to_string();
         if direction == "UNKNOWN" {
             let known = self
@@ -377,6 +379,7 @@ impl N3FlowAggregator {
             last_seen_ns: timestamp_ns,
             last_packet,
             qfi,
+            duplex_consistent,
         };
         if key.direction != "UNKNOWN" {
             let unknown_key = N3FlowKey {
@@ -449,6 +452,16 @@ impl N3FlowAggregator {
                         status: DecodeStatus::Decoded,
                     });
                 }
+                if flow.duplex_consistent {
+                    flow.event.information_elements.push(InformationElement {
+                        id: None,
+                        name: "aggregate_duplex_consistent".into(),
+                        length: 0,
+                        value: Some("true".into()),
+                        raw_sha256: None,
+                        status: DecodeStatus::Decoded,
+                    });
+                }
                 let first_packet = flow
                     .event
                     .packet_references
@@ -505,6 +518,15 @@ fn set_tunnel_direction(event: &mut NormalizedEvent, direction: &str) {
 }
 
 fn merge_gtpu_aggregate(target: &mut N3FlowAggregate, source: N3FlowAggregate) {
+    fn ue_ip(event: &NormalizedEvent) -> Option<&str> {
+        event.session_identifiers.iter().find(|identifier| identifier.name == "ue_ip")
+            .map(|identifier| identifier.value.as_str())
+    }
+    target.duplex_consistent = target.duplex_consistent
+        && source.duplex_consistent
+        && target.event.source_endpoint.address == source.event.source_endpoint.address
+        && target.event.destination_endpoint.address == source.event.destination_endpoint.address
+        && ue_ip(&target.event) == ue_ip(&source.event);
     target.packet_count = target.packet_count.saturating_add(source.packet_count);
     target.wire_bytes = target.wire_bytes.saturating_add(source.wire_bytes);
     target.first_seen_ns = target.first_seen_ns.min(source.first_seen_ns);
@@ -21770,6 +21792,95 @@ Content-Length: 0\r\n\
             evidence_references: vec![],
             sbi: None,
         }
+    }
+
+    #[test]
+    fn published_n3_callflow_counts_both_directions_when_downlink_teid_is_reused() {
+        use event_schema::Direction;
+        let root = temporary_root("n3-duplex-published-counts");
+        let dataset_dir = root.join("dataset");
+        prepare_dataset_directory(&dataset_dir).unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(), false, root.join("key"),
+        ).unwrap();
+
+        manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
+        let identifier = |name: &str, value: &str| NamedValue {
+            name: name.into(), value: value.into(), pseudonymized: false,
+        };
+        let tunnel = |teid: &str, ip: &str| InformationElement {
+            id: None, name: "F-TEID".into(), length: 0,
+            value: Some(format!("teid={teid},ipv4={ip}")), raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        };
+        let ul_teid = "0x000064d3";
+        let dl_teid = "0x00000004";
+        let ran = "192.0.2.10";
+        let upf = "192.0.2.20";
+        let mut n2 = keepalive_event("n2", "N2", Protocol::Ngap,
+            "PDUSessionResourceSetupRequest", ran, "192.0.2.30", "n2-capture", 1);
+        n2.session_identifiers = vec![identifier("ran_ue_ngap_id", "1"), identifier("pdu_session_id", "1")];
+        n2.information_elements = vec![tunnel(ul_teid, upf)];
+        let mut events = vec![n2];
+        for (index, seid) in ["0x1", "0x2", "0x3"].into_iter().enumerate() {
+            let mut n4 = keepalive_event(seid, "N4", Protocol::Pfcp,
+                "PFCP Session Establishment Request", "192.0.2.30", upf, "n4-capture",
+                index as u64 + 1);
+            n4.session_identifiers = vec![
+                identifier("f_seid", seid), identifier("pfcp_sequence", seid),
+            ];
+            n4.information_elements.push(tunnel(dl_teid, ran));
+            if index == 0 {
+                n4.information_elements.push(tunnel(ul_teid, upf));
+            }
+            events.push(n4);
+        }
+
+        let capture = "n3-duplex-capture";
+        let mut aggregator = N3FlowAggregator::default();
+        let mut segment_gpdu_count = 0;
+        for (direction, teid, source, destination, count) in [
+            (Direction::Uplink, ul_teid, ran, upf, 3),
+            (Direction::Downlink, dl_teid, upf, ran, 4),
+        ] {
+            for _ in 0..count {
+                segment_gpdu_count += 1;
+                let mut packet = keepalive_event("gpdu", "N3", Protocol::Gtpu, "G-PDU",
+                    source, destination, capture, segment_gpdu_count);
+                packet.direction = direction.clone();
+                packet.message_type = 255;
+                packet.session_identifiers = vec![
+                    identifier("teid", teid), identifier("ue_ip", "198.51.100.4"),
+                ];
+                aggregator.observe(packet).unwrap();
+            }
+        }
+        events.extend(aggregator.finish());
+        for event in &mut events {
+            event.packet_references[0].source_file =
+                format!("/captures/fixture/{}.pcapng", event.capture_id);
+        }
+        write_jsonl(&dataset_dir.join("oiran_events.jsonl"),
+            &events.iter().map(NormalizedEvent::to_json).collect::<Vec<_>>());
+        let dataset = manager.publish_events_to_dataset_dir(
+            CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID.into(), &dataset_dir,
+            "dataset".into(), None, BTreeMap::new(), BTreeMap::new(), Vec::new(),
+            None, Vec::new(), 0, None,
+        ).unwrap();
+        let discovery = dataset.discovery.as_ref().unwrap();
+        let downlink = discovery.gtpu_tunnels.iter().find(|t| t.teid == dl_teid).unwrap();
+        assert!(downlink.related_pfcp_session.is_none(), "the DL TEID is ambiguous globally");
+        assert_eq!(dataset.session_ids.len(), 1);
+        let flow: CallFlow = serde_json::from_slice(&fs::read(
+            dataset_dir.join("callflows").join(format!("{}.json", dataset.session_ids[0])),
+        ).unwrap()).unwrap();
+        let represented: u64 = flow.events.iter()
+            .filter(|event| event.capture_id == capture && event.message_name == "G-PDU")
+            .flat_map(|event| event.decoded_ie_tree.as_array().into_iter().flatten())
+            .filter(|ie| ie["name"] == "aggregate_packet_count")
+            .map(|ie| ie["value"].as_str().unwrap().parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(represented, segment_gpdu_count, "callflow must account for every segment G-PDU");
     }
 
     #[test]

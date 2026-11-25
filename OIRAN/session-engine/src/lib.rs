@@ -1800,6 +1800,14 @@ fn compact_publication_event(event: &mut EventRecord) {
                 .any(|needle| name.contains(needle) || value.contains(needle))
             });
         }
+    } else if event.interface == "N3" && protocol_is(event, "GTP-U") && event.message_name == "G-PDU" {
+        if let Some(items) = event.information_elements.as_array_mut() {
+            items.retain(|item| matches!(
+                item.get("name").and_then(Value::as_str),
+                Some("aggregate_duplex_consistent" | "aggregate_packet_count" |
+                     "aggregate_wire_bytes" | "aggregate_first_seen_ns" | "aggregate_last_seen_ns")
+            ));
+        }
     } else {
         event.information_elements = Value::Array(Vec::new());
     }
@@ -3717,6 +3725,13 @@ fn duplicate_observation_keys(events: &[EventRecord]) -> Vec<String> {
         }
     }
     duplicates.into_iter().collect()
+}
+
+impl DiscoveredPfcpSession {
+    pub fn has_tunnel_endpoint(&self, teid: &str, endpoint: &str) -> bool {
+        let id = stable_id("pfcp-tunnel", &format!("{teid}|{:?}", Some(endpoint)));
+        self.tunnel_ids.contains(&id)
+    }
 }
 
 fn stable_id(prefix: &str, value: &str) -> String {

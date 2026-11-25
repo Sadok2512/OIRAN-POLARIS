@@ -36,8 +36,8 @@ def cache_root():
 
 
 @contextmanager
-def lock_file(path, operation):
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+def lock_file(path, operation, parent_fd=None):
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
     try:
         try:
             fcntl.flock(fd, operation)
@@ -106,11 +106,11 @@ def remove_open_directory(parent_fd, name, fd, cache_mount, preserve_stamp=False
 
 
 def expire(root):
-    with lock_file(root / ".lock", fcntl.LOCK_EX | fcntl.LOCK_NB):
-        with directory_fd(root.parent) as parent_fd, directory_fd(root.name, parent_fd) as root_fd:
-            cache_mount = mount_id(root_fd)
-            if cache_mount != mount_id(parent_fd):
-                raise OSError("refusing to expire a mounted Cargo cache root")
+    with directory_fd(root.parent) as parent_fd, directory_fd(root.name, parent_fd) as root_fd:
+        cache_mount = mount_id(root_fd)
+        if cache_mount != mount_id(parent_fd):
+            raise OSError("refusing to expire a mounted Cargo cache root")
+        with lock_file(".lock", fcntl.LOCK_EX | fcntl.LOCK_NB, root_fd):
             cutoff = time.time() - RETENTION_SECONDS
             for name in sorted(os.listdir(root_fd)):
                 if not KEY.fullmatch(name):
@@ -119,6 +119,9 @@ def expire(root):
                 if not stat.S_ISDIR(target.st_mode) or target.st_uid != os.getuid():
                     continue
                 with directory_fd(name, root_fd) as target_fd:
+                    opened = os.fstat(target_fd)
+                    if (target.st_dev, target.st_ino, target.st_uid) != (opened.st_dev, opened.st_ino, opened.st_uid):
+                        raise OSError(f"Cargo target replaced before expiry: {name}")
                     if mount_id(target_fd) != cache_mount:
                         print(f"cargo-target-expiry retained mounted target {name}", file=sys.stderr)
                         continue
