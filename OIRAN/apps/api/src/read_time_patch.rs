@@ -29,7 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use event_schema::Endpoint;
@@ -1549,6 +1549,31 @@ pub fn extend_items_with_pfcp_siblings_using_session_keys(
     dataset_root: &Path,
     session_keys: &PfcpSessionKeys,
 ) -> Result<usize, String> {
+    let shards = pfcp_manifest_shards(dataset_root)?;
+    extend_items_with_pfcp_siblings_for_shards(items, dataset_root, &shards, session_keys)
+}
+
+pub fn pfcp_manifest_shards(root: &Path) -> Result<Vec<live_probe::EventShard>, String> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        event_shards: Vec<live_probe::EventShard>,
+    }
+    match std::fs::read(root.join("dataset_manifest.json")) {
+        Ok(bytes) => serde_json::from_slice::<Manifest>(&bytes)
+            .map(|manifest| manifest.event_shards)
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn extend_items_with_pfcp_siblings_for_shards(
+    items: &mut Vec<Value>,
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+    session_keys: &PfcpSessionKeys,
+) -> Result<usize, String> {
     let known_sequences = &session_keys.known_sequences;
     let known_seids = &session_keys.known_seids;
     let known_interfaces = &session_keys.known_interfaces;
@@ -1563,14 +1588,9 @@ pub fn extend_items_with_pfcp_siblings_using_session_keys(
     if known_sequences.is_empty() && known_seids.is_empty() {
         return Ok(0);
     }
-    // 2.15.4 — index PFCP du dataset en cache (reconstruit seulement si
-    // les fichiers JSONL changent). 2.15.2/2.15.3 relisaient tous les
-    // shards à CHAQUE /events et /callflow : détail de session > 60 s en
-    // prod (ANR1 #10 6894872305).
-    let index = cached_pfcp_index(dataset_root)?;
     let mut keys: BTreeSet<String> = known_sequences.iter().map(|s| format!("seq:{s}")).collect();
     keys.extend(known_seids.iter().map(|s| format!("seid:{s}")));
-    let candidates = pfcp_events_for_keys(&index, &keys);
+    let candidates = pfcp_events_for_served_shards(dataset_root, shards, &keys)?;
     let mut added = 0usize;
     for value in candidates.iter() {
         let Some(event_id) = value.get("event_id").and_then(Value::as_str) else {
@@ -1615,9 +1635,19 @@ pub fn count_pfcp_siblings_for_persisted_events(
     events: &[Value],
     dataset_root: &Path,
 ) -> Result<usize, String> {
+    let shards = pfcp_manifest_shards(dataset_root)?;
+    count_pfcp_siblings_for_shards(events, dataset_root, &shards)
+}
+
+pub fn count_pfcp_siblings_for_shards(
+    events: &[Value],
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+) -> Result<usize, String> {
     let mut scratch = events.to_vec();
     let before = scratch.len();
-    extend_items_with_pfcp_siblings_from_jsonl(&mut scratch, dataset_root)?;
+    let keys = collect_pfcp_session_keys(&scratch);
+    extend_items_with_pfcp_siblings_for_shards(&mut scratch, dataset_root, shards, &keys)?;
     Ok(scratch.len().saturating_sub(before))
 }
 
@@ -1795,15 +1825,6 @@ fn dataset_jsonl_files(dataset_root: &Path) -> Vec<(PathBuf, u64, u128)> {
     if flat.is_file() {
         paths.push(flat);
     }
-    if let Ok(entries) = std::fs::read_dir(dataset_root.join("event-shards")) {
-        let mut shards: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("jsonl"))
-            .collect();
-        shards.sort();
-        paths.extend(shards);
-    }
     paths
         .into_iter()
         .map(|path| {
@@ -1819,33 +1840,56 @@ fn dataset_jsonl_files(dataset_root: &Path) -> Vec<(PathBuf, u64, u128)> {
         .collect()
 }
 
-/// Clés de jointure d'un event PFCP brut : `seq:<n>` et `seid:<0x..>`.
-fn pfcp_keys(value: &Value) -> Vec<String> {
-    let mut keys = Vec::new();
-    if let Some(seq) = value.get("pfcp_sequence").and_then(Value::as_str) {
-        if !seq.is_empty() {
-            keys.push(format!("seq:{seq}"));
-        }
+use live_probe::pfcp_index::{self, keys as pfcp_keys, Offsets};
+
+type ShardTables = std::collections::HashMap<String, (live_probe::EventShard, Arc<Offsets>)>;
+static PFCP_SHARD_TABLES: LazyLock<Mutex<std::collections::HashMap<PathBuf, ShardTables>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn pfcp_events_for_served_shards(
+    root: &Path,
+    shards: &[live_probe::EventShard],
+    keys: &BTreeSet<String>,
+) -> Result<Vec<Value>, String> {
+    if shards.is_empty() {
+        return Ok(pfcp_events_for_keys(cached_pfcp_index(root)?.as_ref(), keys));
     }
-    if let Some(ids) = value.get("session_identifiers").and_then(Value::as_array) {
-        for id in ids {
-            let name = id.get("name").and_then(Value::as_str).unwrap_or("");
-            let val = id.get("value").and_then(Value::as_str).unwrap_or("");
-            if val.is_empty() {
+
+    let tables = {
+        let mut cache = PFCP_SHARD_TABLES.lock().map_err(|_| "PFCP_INDEX_LOCK_POISONED")?;
+        let previous = cache.entry(root.to_path_buf()).or_default();
+        let mut current = ShardTables::new();
+        let mut tables = Vec::new();
+        for shard in shards {
+            if pfcp_index::path(root, shard).is_none() {
+                if shard.path != "oiran_events.jsonl" {
+                    return Err(format!("PFCP_INDEX_INVALID_SHARD_PATH: {}", shard.path));
+                }
+                tables.push(None);
                 continue;
             }
-            match name {
-                "pfcp_sequence" => keys.push(format!("seq:{val}")),
-                "seid" | "f_seid" if val != "0x0000000000000000" => {
-                    keys.push(format!("seid:{val}"))
-                }
-                _ => {}
-            }
+            let table = match previous.get(&shard.path) {
+                Some((source, table)) if source == shard => Arc::clone(table),
+                _ => Arc::new(pfcp_index::load_or_backfill(root, shard)?),
+            };
+            current.insert(shard.path.clone(), (shard.clone(), Arc::clone(&table)));
+            tables.push(Some(table));
+        }
+        *previous = current;
+        tables
+    };
+
+    let mut events = Vec::new();
+    for (shard, table) in shards.iter().zip(tables) {
+        if let Some(table) = table {
+            let positions: BTreeSet<_> = keys.iter().flat_map(|key| table.get(key)).copied().collect();
+            let path = root.join(&shard.path);
+            events.extend(positions.into_iter().filter_map(|offset| read_pfcp_at(&path, offset)));
+        } else {
+            events.extend(pfcp_events_for_keys(cached_pfcp_index(root)?.as_ref(), keys));
         }
     }
-    keys.sort();
-    keys.dedup();
-    keys
+    Ok(events)
 }
 
 pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex>, String> {
@@ -1996,32 +2040,24 @@ fn advise_read_range(_file: &std::fs::File, _offset: u64, _len: u64) {}
 
 /// Relit sur disque les events PFCP qui partagent une clé connue.
 fn pfcp_events_for_keys(index: &PfcpIndex, keys: &BTreeSet<String>) -> Vec<Value> {
-    use std::io::{Seek, SeekFrom};
     let mut positions: BTreeSet<(u32, u64)> = BTreeSet::new();
     for key in keys {
         if let Some(found) = index.by_key.get(key) {
             positions.extend(found.iter().copied());
         }
     }
-    let mut out = Vec::new();
-    for (file_idx, offset) in positions {
-        let Some(path) = index.files.get(file_idx as usize) else {
-            continue;
-        };
-        let Ok(mut file) = std::fs::File::open(path) else {
-            continue;
-        };
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            continue;
-        }
-        let mut line = String::new();
-        if std::io::BufRead::read_line(&mut BufReader::new(file), &mut line).is_ok() {
-            if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
-                out.push(value);
-            }
-        }
-    }
-    out
+    positions.into_iter().filter_map(|(file_index, offset)| {
+        read_pfcp_at(index.files.get(file_index as usize)?, offset)
+    }).collect()
+}
+
+fn read_pfcp_at(path: &Path, offset: u64) -> Option<Value> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut BufReader::new(file), &mut line).ok()?;
+    serde_json::from_str(line.trim_end()).ok()
 }
 
 #[allow(dead_code)]
@@ -2123,12 +2159,22 @@ pub fn insert_pfcp_siblings_into_callflow_using_session_keys(
     dataset_root: &Path,
     session_keys: &PfcpSessionKeys,
 ) -> Result<usize, String> {
+    let shards = pfcp_manifest_shards(dataset_root)?;
+    insert_pfcp_siblings_into_callflow_for_shards(events, dataset_root, &shards, session_keys)
+}
+
+pub fn insert_pfcp_siblings_into_callflow_for_shards(
+    events: &mut Vec<Value>,
+    dataset_root: &Path,
+    shards: &[live_probe::EventShard],
+    session_keys: &PfcpSessionKeys,
+) -> Result<usize, String> {
     let known: BTreeSet<String> = events
         .iter()
         .filter_map(|e| e.get("event_id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let mut scratch = events.clone();
-    extend_items_with_pfcp_siblings_using_session_keys(&mut scratch, dataset_root, session_keys)?;
+    extend_items_with_pfcp_siblings_for_shards(&mut scratch, dataset_root, shards, session_keys)?;
     let mut added = 0usize;
     for raw in scratch.into_iter().filter(|e| {
         e.get("event_id")
@@ -3567,6 +3613,47 @@ mod pfcp_cache_tests {
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(ids, BTreeSet::from(["first", "second", "response"]));
         assert_eq!(added, 2);
+    }
+
+    #[test]
+    fn pfcp_uses_registered_manifest_and_keeps_surviving_tables_2_21_182() {
+        let root = std::env::temp_dir().join(format!("rtp-served-pfcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("event-shards")).unwrap();
+        let mut shards = Vec::new();
+        for name in ["served", "next"] {
+            let event = json!({"event_id": name, "protocol": "PFCP", "pfcp_sequence": "7"});
+            let bytes = format!("{event}\n");
+            let shard = live_probe::EventShard {
+                path: format!("event-shards/{name}.jsonl"),
+                sha256: name.to_owned(),
+                bytes: bytes.len() as u64,
+                event_count: 1,
+                capture_ends: Default::default(),
+            };
+            std::fs::write(root.join(&shard.path), bytes).unwrap();
+            let mut table = Offsets::default();
+            table.add(&event, 0);
+            pfcp_index::write(&root, &shard, &table).unwrap();
+            shards.push(shard);
+        }
+        std::fs::write(
+            root.join("dataset_manifest.json"),
+            json!({"event_shards": [&shards[1]]}).to_string(),
+        ).unwrap();
+        let keys = BTreeSet::from(["seq:7".to_owned()]);
+        let start = std::time::Instant::now();
+        let first = pfcp_events_for_served_shards(&root, &shards[..1], &keys).unwrap();
+        eprintln!("cold_pfcp_with_published_table_ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["event_id"], "served");
+        let original = PFCP_SHARD_TABLES.lock().unwrap()[&root][&shards[0].path].1.clone();
+        assert_eq!(pfcp_events_for_served_shards(&root, &shards, &keys).unwrap().len(), 2);
+        assert_eq!(pfcp_events_for_served_shards(&root, &shards[..1], &keys).unwrap().len(), 1);
+        let cache = PFCP_SHARD_TABLES.lock().unwrap();
+        assert_eq!(cache[&root].len(), 1);
+        assert!(Arc::ptr_eq(&cache[&root][&shards[0].path].1, &original));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

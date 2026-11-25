@@ -5,6 +5,7 @@ pub mod capture_source;
 pub mod commit_seq;
 pub mod event_id_set;
 pub mod lte_evidence;
+pub mod pfcp_index;
 
 pub use event_id_set::{SpillingEventIdSet, DEFAULT_MEM_CAP as EVENT_ID_SET_DEFAULT_MEM_CAP};
 
@@ -2880,6 +2881,15 @@ impl CaptureManager {
             (dataset.dataset_id.clone(), dataset.capture_id.clone())
         };
         Some(self.dataset_root_for(&stored_dataset_id, &capture_id))
+    }
+
+    pub fn dataset_events_source(&self, dataset_id: &str) -> Option<(PathBuf, Vec<EventShard>)> {
+        let datasets = self.datasets.lock().unwrap();
+        let dataset = datasets.get(dataset_id)?;
+        Some((
+            self.dataset_root_for(&dataset.dataset_id, &dataset.capture_id),
+            dataset.event_shards.clone(),
+        ))
     }
 
     fn dataset_root_for(&self, stored_dataset_id: &str, capture_id: &str) -> PathBuf {
@@ -7525,18 +7535,20 @@ impl CaptureManager {
             let shard_bytes = fs::metadata(&shard_path).map_err(display_error)?.len();
             // 0.7.0 — le comptage qui avait déjà lieu relève aussi la fin de
             // chaque capture : même lecture du fichier, aucun passage de plus.
-            let (shard_events, shard_capture_ends) = count_valid_event_records_and_capture_ends(&shard_path)?;
+            let (shard_events, shard_capture_ends, pfcp_offsets) = count_valid_event_records_and_capture_ends(&shard_path)?;
             let shard_appended = shard_bytes != 0 || event_shards.is_empty();
             if !shard_appended {
                 fs::remove_file(&shard_path).map_err(display_error)?;
             } else {
-                event_shards.push(EventShard {
+                let shard = EventShard {
                     path: shard_name,
                     sha256: shard_sha,
                     bytes: shard_bytes,
                     event_count: shard_events,
                     capture_ends: shard_capture_ends,
-                });
+                };
+                pfcp_index::write(dataset_dir, &shard, &pfcp_offsets)?;
+                event_shards.push(shard);
                 publication_bytes_written = shard_bytes;
             }
             eprintln!("{}", serde_json::json!({
@@ -9166,6 +9178,23 @@ fn commit_incremental_publication(
         }
     }
 
+    let staged_tables = staging.join(pfcp_index::DIRECTORY);
+    if staged_tables.is_dir() {
+        let target = current.join(pfcp_index::DIRECTORY);
+        fs::create_dir_all(&target).map_err(display_error)?;
+        for entry in fs::read_dir(&staged_tables).map_err(display_error)? {
+            let entry = entry.map_err(display_error)?;
+            match fs::hard_link(entry.path(), target.join(entry.file_name())) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(display_error(error)),
+            }
+        }
+    }
+    if let Err(error) = pfcp_index::remove_orphan_tables(current) {
+        eprintln!("PFCP_INDEX_CLEANUP_FAILED: {error}");
+    }
+
     let generation_name = format!(
         "generation-{}-{}",
         epoch_ms(),
@@ -9649,22 +9678,33 @@ pub fn load_dataset_events(dataset_dir: &Path) -> Result<Vec<EventRecord>, Strin
 /// de chaque capture (`scan_capture_ends`) en UNE lecture du fichier : la
 /// validation reste celle de `session_engine::load_jsonl`, la fin de capture
 /// reste `max(timestamp.seconds)` par `capture_id` lu dans la ligne brute.
-fn count_valid_event_records_and_capture_ends(path: &Path) -> Result<(usize, BTreeMap<String, u64>), String> {
+fn count_valid_event_records_and_capture_ends(path: &Path) -> Result<(usize, BTreeMap<String, u64>, pfcp_index::Offsets), String> {
     let file = fs::File::open(path).map_err(display_error)?;
     let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
     let mut count = 0usize;
     let mut capture_ends: BTreeMap<String, u64> = BTreeMap::new();
-    for (line_number, line) in reader.lines().enumerate() {
-        let line = line.map_err(display_error)?;
+    let mut offsets = pfcp_index::Offsets::default();
+    let mut offset = 0;
+    let mut reader = reader;
+    let mut line = String::new();
+    let mut line_number = 0;
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).map_err(display_error)?;
+        if bytes == 0 { break; }
+        let start = offset;
+        offset += bytes as u64;
+        line_number += 1;
         if line.trim().is_empty() {
             continue;
         }
         let parsed = session_engine::load_jsonl(line.as_bytes())
-            .map_err(|error| format!("line {}: {error}", line_number + 1))?;
+            .map_err(|error| format!("line {}: {error}", line_number))?;
         if parsed.len() != 1 {
-            return Err(format!("DATASET_REGISTRATION_EVENT_INVALID line {}", line_number + 1));
+            return Err(format!("DATASET_REGISTRATION_EVENT_INVALID line {}", line_number));
         }
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        offsets.add(&value, start);
         if let Some(cid) = value.get("capture_id").and_then(serde_json::Value::as_str) {
             let ts = value
                 .get("timestamp")
@@ -9682,7 +9722,7 @@ fn count_valid_event_records_and_capture_ends(path: &Path) -> Result<(usize, BTr
         }
     }
     release_unused_heap_pages();
-    Ok((count, capture_ends))
+    Ok((count, capture_ends, offsets))
 }
 
 fn count_valid_event_records(path: &Path) -> Result<usize, String> {
@@ -11577,6 +11617,7 @@ fn apply_incremental_retention(
             let mut retained_bytes = 0u64;
             let mut retained_count = 0usize;
             let mut archived_count = 0usize;
+            let mut pfcp_offsets = pfcp_index::Offsets::default();
             let mut retained_ends: BTreeMap<String, u64> = BTreeMap::new();
             let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, fs::File::open(&source).map_err(display_error)?);
             for line in reader.lines() {
@@ -11599,6 +11640,7 @@ fn apply_incremental_retention(
                     retained_writer.write_all(line.as_bytes()).and_then(|_| retained_writer.write_all(b"\n")).map_err(display_error)?;
                     retained_hash.update(line.as_bytes());
                     retained_hash.update(b"\n");
+                    pfcp_offsets.add(&value, retained_bytes);
                     retained_bytes += line.len() as u64 + 1;
                     retained_count += 1;
                     let ts = value.get("timestamp").and_then(|ts| ts.get("seconds")).and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -11626,16 +11668,17 @@ fn apply_incremental_retention(
             }
             let sha = retained_hash.finish_hex();
             let name = format!("event-shards/shard-retained-{}.jsonl", &sha[..16]);
-            replacements.push((tmp, dataset_dir.join(&name)));
             outcome.shards_rewritten += 1;
             outcome.bytes_rewritten += retained_bytes;
-            kept.push(EventShard {
+            let shard = EventShard {
                 path: name,
                 sha256: sha,
                 bytes: retained_bytes,
                 event_count: retained_count,
                 capture_ends: retained_ends,
-            });
+            };
+            replacements.push((tmp, shard.clone(), pfcp_offsets));
+            kept.push(shard);
         }
         Ok(())
     })();
@@ -11647,8 +11690,9 @@ fn apply_incremental_retention(
         let _ = fs::remove_dir(&segment_dir);
         return Err(error);
     }
-    for (temporary, replacement) in replacements {
-        fs::rename(temporary, replacement).map_err(display_error)?;
+    for (temporary, shard, pfcp_offsets) in replacements {
+        fs::rename(temporary, dataset_dir.join(&shard.path)).map_err(display_error)?;
+        pfcp_index::write(dataset_dir, &shard, &pfcp_offsets)?;
     }
     if kept.is_empty() {
         // The rollback reader already accepts an empty shard. With no shard
@@ -11657,13 +11701,15 @@ fn apply_incremental_retention(
         let sha256 = sha256_hex(bytes);
         let path = format!("event-shards/shard-retained-{}.jsonl", &sha256[..16]);
         atomic_write(&dataset_dir.join(&path), bytes)?;
-        kept.push(EventShard {
+        let shard = EventShard {
             path,
             sha256,
             bytes: 0,
             event_count: 0,
             capture_ends: BTreeMap::new(),
-        });
+        };
+        pfcp_index::write(dataset_dir, &shard, &pfcp_index::Offsets::default())?;
+        kept.push(shard);
     }
     let archive_sha256 = archive_hash.finish_hex();
     if let Some(mut writer) = archive_writer {
@@ -24178,6 +24224,28 @@ Content-Length: 0\r\n\
         ).unwrap();
         assert!(resumed.event_count > 0);
         assert_eq!(load_dataset_events(&dataset_dir).unwrap().len(), resumed.event_count);
+    }
+
+    #[test]
+    fn pfcp_table_follows_physical_shard_removal_2_21_182() {
+        let bench = RetentionBench0_7_0::new("pfcp-table-lifetime");
+        let (five, registration, _) = corpus_0_7_0();
+        let first = bench.cycle(None, &[("N2.pcap-five.pcapng", five)]);
+        let shard = &first.event_shards[0];
+        let root = bench.base.join("dataset");
+        let table = pfcp_index::path(&root, shard).unwrap();
+        assert!(table.is_file(), "table published with the raw shard");
+
+        let retired = bench.cycle(Some(1), &[]);
+        assert!(retired.event_shards.iter().all(|entry| entry.path != shard.path));
+        assert!(table.is_file(), "retain the table while its raw shard can be served");
+        fs::remove_file(root.join(&shard.path)).unwrap();
+
+        let next = bench.cycle(None, &[("N2.pcap-registration.pcapng", registration)]);
+        assert!(!table.exists(), "publication sweeps the table of a physically removed shard");
+        for shard in next.event_shards {
+            assert!(pfcp_index::path(&root, &shard).unwrap().is_file());
+        }
     }
 
     fn corpus_0_7_0() -> (PathBuf, PathBuf, PathBuf) {

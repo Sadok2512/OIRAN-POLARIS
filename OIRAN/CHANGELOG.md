@@ -1,5 +1,13 @@
 # Changelog
 
+## oiran-api 2.21.182 — index PFCP par shard
+
+Montée patch. Ordre #10 7173770264, base `fb459e4`.
+
+- Les enrichissements PFCP d’une session publiée prennent les shards dans le registre des manifestes servis. Chaque table contient les offsets par séquence et SEID et est produite pendant le comptage du nouveau shard ou l’écriture d’un shard retenu.
+- Les tables vivent dans `pfcp-index/`. Le commit les publie avec les shards et retire les tables dont le shard est physiquement absent. Une sortie du manifeste laisse la table disponible tant que le shard est présent.
+- Un shard ancien est indexé et sa table inscrite au premier accès. `/health` expose les reprises et leurs échecs sous `pfcp_index`.
+
 ## live-probe 0.7.0 / oiran-api 2.21.181 — 2026-11-25 — rétention par shard : plus aucune réécriture du jeu quand rien n'est périmé ; ramassage de 0.6.49/0.6.50 retiré
 
 Ordres cœur #9 7161008626 (arbitrage, défaut 2 en tête) et 7161327955 (GO sur `capture_ends`, sous condition de compatibilité du retour arrière). Audit #9 7161092645. Base : `eaef7db` (descendant de la production `d8718cf`).
