@@ -2882,6 +2882,22 @@ impl CaptureManager {
         Some(self.dataset_root_for(&stored_dataset_id, &capture_id))
     }
 
+    /// Logical bytes and age of the finalized retention archive.
+    /// This reads metadata and manifests only. Call it off the async runtime.
+    pub fn archive_inventory(&self) -> Value {
+        let archive = self.root.join(CONTINUOUS_CAPTURE_ID).join("archive");
+        match archive_inventory(&archive) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                eprintln!("CONTINUOUS_ARCHIVE_INVENTORY_FAILED: {error}");
+                serde_json::json!({
+                    "status": "unavailable", "bytes": null, "segments": null,
+                    "oldest_created_epoch_s": null,
+                })
+            }
+        }
+    }
+
     pub fn dataset_events_source(&self, dataset_id: &str) -> Option<(PathBuf, Vec<EventShard>)> {
         let datasets = self.datasets.lock().unwrap();
         let dataset = datasets.get(dataset_id)?;
@@ -9519,6 +9535,68 @@ struct FragmentRestorePreflight {
 /// 2.21.149 — contrôle un segment d'archive : `events.jsonl` présent,
 /// et conforme à l'empreinte de son manifeste s'il en a un. Rend
 /// l'empreinte réelle des events. Lecture seule.
+fn archive_inventory(root: &Path) -> std::io::Result<Value> {
+    let mut bytes = 0_u64;
+    let mut segments = 0_u64;
+    let mut oldest: Option<u64> = None;
+    let mut unknown_date = false;
+    let mut incomplete_segment = false;
+    let entries = match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() => Some(fs::read_dir(root)?),
+        Ok(_) => return Err(std::io::Error::other("archive root is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    for entry in entries.into_iter().flatten() {
+        let entry = entry?;
+        let path = entry.path();
+        bytes = bytes.saturating_add(archive_file_bytes(&path)?);
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let manifest = path.join("manifest.json");
+        if !archive_regular_file(&manifest)? || !archive_regular_file(&path.join("events.jsonl"))? {
+            incomplete_segment = true;
+            continue;
+        }
+        segments += 1;
+        let created = serde_json::from_reader::<_, Value>(BufReader::new(fs::File::open(manifest)?))
+            .ok()
+            .and_then(|manifest| manifest.get("created_epoch_s")?.as_u64());
+        match created {
+            Some(created) => oldest = Some(oldest.map_or(created, |date| date.min(created))),
+            None => unknown_date = true,
+        }
+    }
+    Ok(serde_json::json!({
+        "status": if unknown_date || incomplete_segment { "partial" } else { "ready" },
+        "bytes": bytes,
+        "segments": segments,
+        "oldest_created_epoch_s": if unknown_date { None } else { oldest },
+    }))
+}
+
+fn archive_file_bytes(path: &Path) -> std::io::Result<u64> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    fs::read_dir(path)?.try_fold(0_u64, |bytes, entry| {
+        Ok(bytes.saturating_add(archive_file_bytes(&entry?.path())?))
+    })
+}
+
+fn archive_regular_file(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn verified_archive_segment(archive_segment_dir: &Path) -> Result<String, String> {
     let archive_events = archive_segment_dir.join("events.jsonl");
     if !archive_events.is_file() {

@@ -1682,6 +1682,7 @@ fn compute_health_counters(state: &AppState) -> Value {
     let queryable_session_count = queryable_session_ids(state).len();
     json!({
         "dataset":dataset,
+        "archive":state.inner.capture_manager.archive_inventory(),
         "source_events":source_events,
         // Same union as an unfiltered GET /sessions. The narrower continuous
         // manifest count is named explicitly instead of overloading this key.

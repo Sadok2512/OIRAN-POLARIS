@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.183 — archive visibility and managed Cargo target expiry
+
+Patch. Order #10 7175865262. The cached health snapshot exposes the retention archive's logical bytes, finalized segment count and oldest creation date. Archive inventory is read-only. The shared Cargo wrapper expires only its private build targets after seven days without use, at the next managed invocation or an explicit sweep.
+
 ## oiran-api 2.21.182 — périmètre PFCP du manifeste servi
 
 Montée patch. Ordre #10 7174690790, base `fb459e4`. L’enrichissement PFCP et son préchauffage choisissent les shards dans le manifeste servi. L’index reste en mémoire et conserve son mode incrémental. La reconstruction à froid reste ouverte.

@@ -54,6 +54,13 @@ class CargoTargetExpiry(unittest.TestCase):
         self.assertTrue((self.root / "linked").is_symlink())
         self.assertTrue(outside.is_dir())
 
+    def test_next_build_sweeps_expired_targets(self):
+        old = self.build("old")
+        self.age(old)
+        fresh = self.build("fresh")
+        self.assertFalse(old.exists())
+        self.assertTrue((fresh / "compiled").is_file())
+
     def test_running_build_protects_its_target(self):
         old = self.build("old")
         self.age(old)
