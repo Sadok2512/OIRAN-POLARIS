@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.185 / decoder-sbi 0.4.11 — N12 subscriber pseudonym
+
+Patch. The SBI decoder reads the authentication body's `supiOrSuci` and emits the existing subscriber pseudonym identifier. IMSI SUPIs and null-scheme SUCIs use the shared canonical subscriber domain. Protected SUCIs remain opaque. The existing SBI session association rules are reused.
+
 ## oiran-api 2.21.183 — N3 downlink coverage in session callflows
 
 Patch. Correlate an ambiguous downlink G-PDU aggregate through the unique uplink in its segment when the UE address and reversed endpoints agree and the uplink PFCP session owns the receiving downlink tunnel key. Newly emitted aggregates carry a consistency flag when all their packets agree on the UE address and endpoints.
