@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.201 / live-probe 0.7.8 — distinguish unreferenced and rollback-held shards
+
+Report unreferenced shards and rollback-held shards separately at the measured commit. Include deployment backup manifests in inventory and show per-backup disk usage without double-counting a shard in the total.
+
 ## oiran-api 2.21.200 / live-probe 0.7.7 — retained shard lineage
 
 Record retention predecessors, successors and archive references in the served manifest. Install only staged shards selected by the final manifest. Published shard files are left in place.

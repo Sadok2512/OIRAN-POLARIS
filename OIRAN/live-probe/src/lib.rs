@@ -24774,6 +24774,15 @@ Content-Length: 0\r\n\
         let (archive, members) = artifact.unwrap();
         fs::write(archive_fixture.join(members[0]), serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
         make_archive(&backups.join(name).join(archive), members);
+        let deployment = bench._root.join(".deployment-backups").join("release-A");
+        fs::create_dir_all(&deployment).unwrap();
+        let rollback_shard = fixture_shard("shard-deployment-only.jsonl");
+        let mut manifest = serde_json::to_value(&first).unwrap();
+        manifest["event_shards"][0]["path"] = serde_json::json!("event-shards/shard-deployment-only.jsonl");
+        fs::write(deployment.join("dataset_manifest.saved.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let second_deployment = deployment.with_file_name("release-B");
+        fs::create_dir_all(&second_deployment).unwrap();
+        fs::write(second_deployment.join("dataset_manifest.saved.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
         let unknown = shards.join("shard-missing-history.jsonl");
         fs::write(&unknown, b"{\"event_id\":\"missing-history\"}\n").unwrap();
         fs::File::open(&unknown).unwrap().set_modified(old).unwrap();
@@ -24821,9 +24830,15 @@ Content-Length: 0\r\n\
             assert_orphan_totals_unavailable(&snapshot);
         } else {
             assert_eq!(snapshot["status"], "available", "{snapshot}");
+            assert_eq!(snapshot["rollback_held"]["by_backup"]["release-A"]["count"], 1);
+            assert_eq!(snapshot["rollback_held"]["by_backup"]["release-A"]["bytes"], fs::metadata(&rollback_shard).unwrap().len());
+            assert_eq!(snapshot["rollback_held"]["by_backup"]["release-B"]["count"], 1);
+            assert_eq!(snapshot["rollback_held"]["count"], 3, "one deployment shard, one restore shard and one archive shard: {snapshot}");
             let served_seq = commit_seq::read(&dataset);
             assert!(served_seq > 0);
             assert_eq!(snapshot["commit_seq"], served_seq, "inventory must name the measured generation");
+            assert_eq!(snapshot["rollback_held"]["commit_seq"], served_seq);
+            assert_eq!(snapshot["unreferenced"]["commit_seq"], served_seq);
             if dangling {
                 assert_eq!(snapshot["broken_links"], 1);
             }
@@ -24875,6 +24890,13 @@ Content-Length: 0\r\n\
             assert!(unavailable["commit_seq"].is_null());
             assert_eq!(unavailable["error"]["commit_seq_before"], original_seq + 2);
             assert_eq!(unavailable["error"]["commit_seq_after"], original_seq + 3);
+
+            let damaged_manifest = deployment.join("dataset_manifest.saved.json");
+            fs::write(&damaged_manifest, b"{").unwrap();
+            bench.manager.measure_continuous_event_shards(&dataset);
+            let unavailable = bench.manager.event_shard_orphan_inventory();
+            assert_orphan_totals_unavailable(&unavailable);
+            assert_eq!(unavailable["error"]["path"], serde_json::json!(damaged_manifest));
         }
         for &phase in failures {
             FAIL_AT.with(|point| point.set(Some(phase)));
@@ -24891,7 +24913,7 @@ Content-Length: 0\r\n\
 
     fn assert_orphan_totals_unavailable(snapshot: &Value) {
         assert_eq!(snapshot["status"], "unavailable", "{snapshot}");
-        for key in ["count", "bytes", "trees_consulted", "archives_consulted", "broken_links"] {
+        for key in ["count", "bytes", "unreferenced", "rollback_held", "trees_consulted", "archives_consulted", "broken_links"] {
             assert!(snapshot[key].is_null(), "{key}: {snapshot}");
         }
     }
