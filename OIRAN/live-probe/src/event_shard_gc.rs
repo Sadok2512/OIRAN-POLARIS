@@ -221,11 +221,29 @@ fn roots(captures: &Path) -> Result<(Vec<PathBuf>, ExpectedArtifacts), String> {
     Ok((roots, expected))
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static LOCK_PROBE: std::cell::RefCell<Option<(PathBuf, Duration)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn inventory(
     captures: &Path,
     names: &mut HashSet<String>,
     report: &mut Report,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    LOCK_PROBE.with(|probe| {
+        if let Some((base, held)) = probe.borrow_mut().as_mut() {
+            let locked = super::PublicationLock::try_acquire(base).is_err();
+            let started = std::time::Instant::now();
+            std::thread::sleep(Duration::from_millis(120));
+            if locked {
+                assert!(super::PublicationLock::try_acquire(base).is_err());
+                *held += started.elapsed();
+            }
+        }
+    });
     let (mut pending, mut expected) = roots(captures)?;
     let mut seen = HashSet::new();
     while let Some(directory) = pending.pop() {

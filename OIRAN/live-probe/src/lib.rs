@@ -24439,25 +24439,30 @@ Content-Length: 0\r\n\
 
     #[test]
     fn shard_gc_removes_only_proven_unreferenced_history() {
-        assert_shard_gc_with_backup_inventory(None, false);
+        assert_shard_gc_with_backup_inventory(None, false, false);
     }
 
     #[test]
     fn shard_gc_refuses_missing_required_backup_even_with_an_extra_backup() {
-        assert_shard_gc_with_backup_inventory(None, true);
+        assert_shard_gc_with_backup_inventory(None, true, false);
     }
 
     #[test]
     fn shard_gc_refuses_missing_required_archive_in_present_backup() {
-        assert_shard_gc_with_backup_inventory(Some(0), false);
+        assert_shard_gc_with_backup_inventory(Some(0), false, false);
     }
 
     #[test]
     fn shard_gc_refuses_missing_required_manifest_in_present_backup() {
-        assert_shard_gc_with_backup_inventory(Some(6), false);
+        assert_shard_gc_with_backup_inventory(Some(6), false, false);
     }
 
-    fn assert_shard_gc_with_backup_inventory(missing_artifact: Option<usize>, missing_required: bool) {
+    #[test]
+    fn shard_gc_keeps_slow_inventory_outside_the_publication_lock() {
+        assert_shard_gc_with_backup_inventory(None, false, true);
+    }
+
+    fn assert_shard_gc_with_backup_inventory(missing_artifact: Option<usize>, missing_required: bool, measure_lock: bool) {
         use event_shard_gc::REQUIRED_BACKUPS;
 
         let bench = RetentionBench0_7_0::new("shard-gc-union");
@@ -24550,7 +24555,16 @@ Content-Length: 0\r\n\
             bench._root.to_path_buf(), false, bench._root.join(".oiran-pseudonym.key"),
         ).unwrap();
         bench.manager.recover_continuous_dataset_from_disk(&bench.base).unwrap();
+        if measure_lock {
+            event_shard_gc::LOCK_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some((bench.base.clone(), Duration::ZERO));
+            });
+        }
         bench.cycle(None, &[]);
+        if measure_lock {
+            let (_, held) = event_shard_gc::LOCK_PROBE.with(|probe| probe.replace(None)).unwrap();
+            assert!(held <= Duration::from_millis(50), "inventory occupied the publication lock for {held:?}");
+        }
         if missing_required || missing_artifact.is_some() {
             assert!(removable.is_file(), "missing required backup data must prevent unlink");
         } else {
