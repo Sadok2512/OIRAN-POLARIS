@@ -1,5 +1,9 @@
 # Changelog
 
+## Web 2.14.5 — session event count labels
+
+Name persisted session events and served events after enrichment and filtering. The existing counts and populations are preserved.
+
 ## oiran-api 2.21.191 / live-probe 0.7.3 — orphan shard visibility
 
 Expose the cached read-only shard inventory in health. Failed or incomplete reads omit the numerical totals and report the failing path and reason.

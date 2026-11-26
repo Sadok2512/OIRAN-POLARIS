@@ -174,10 +174,10 @@ describe('directional Call Flow viewer',()=>{
       throw new Error(`unexpected path ${path}`);
     });
     renderFlow();
-    expect(await screen.findByTestId('callflow-pagination')).toHaveTextContent('1–1 of 101 observed');
+    expect(await screen.findByTestId('callflow-pagination')).toHaveTextContent('1–1 of 101 Served events');
     await userEvent.click(screen.getByRole('button',{name:'Next'}));
     expect(await screen.findByLabelText('DownlinkNASTransport, NGAP, AMF to gNB')).toBeVisible();
-    expect(screen.getByTestId('callflow-pagination')).toHaveTextContent('101–101 of 101 observed');
+    expect(screen.getByTestId('callflow-pagination')).toHaveTextContent('101–101 of 101 Served events');
     await userEvent.click(screen.getByRole('button',{name:'Previous'}));
     expect(await screen.findByLabelText('InitialUEMessage, NGAP, gNB to AMF')).toBeVisible();
   });
