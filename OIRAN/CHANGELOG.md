@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.199 / session-engine 0.5.39 / Web 2.14.6 — N2 continuity evidence
+
+Expose a link on both PDU session details when the original rotation positions, directional SCTP endpoints, verification tag and wire TSNs prove continuity between setup and release. Historical references without original segment provenance remain unlinked. Session membership and accounting are preserved.
+
 ## oiran-api 2.21.198 / live-probe 0.7.6 — original SCTP segment provenance
 
 Record the original dumpcap basename and rotation index on newly imported SCTP packet references. Keep the published packet locator and historical references intact. Event-schema 1.13.2, oiran-decode 0.12.3 and session-engine 0.5.38 carry the optional provenance.

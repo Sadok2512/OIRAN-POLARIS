@@ -41,6 +41,25 @@ describe('capture dataset session context',()=>{
     expect(vi.mocked(api).mock.calls.some(([path])=>String(path).startsWith('/sessions?'))).toBe(false);
   });
 
+  it('links the next SCTP fragment outside the current page',async()=>{
+    const session={session_id:'session-a',dataset_id:dataset.dataset_id,interfaces:['N2'],
+      technology:'5G SA',state:'ACTIVE',correlation_status:'UNKNOWN',start_timestamp:'1.0Z',
+      end_timestamp:'1.0Z',duration_ns:'0',decode_completeness:{decoded:1},message_count:1};
+    vi.mocked(api).mockImplementation(async(path?:string)=>{
+      if(path===undefined)return {data:[],meta:{}} as never;
+      if(path==='/datasets?page_size=100')return {data:[{...dataset,session_count:2}],meta:{}} as never;
+      if(path==='/ues?page_size=100')return {data:[],meta:{}} as never;
+      if(path?.startsWith('/sessions?'))return {data:[session],meta:{page:1,total_pages:2,total:2}} as never;
+      if(path==='/sessions/session-a')return {data:{summary:session,procedures:[],accounting:{},capture_references:[],
+        sctp_continuity_links:[{predecessor_session_id:'session-a',successor_session_id:'session-b'}]},meta:{}} as never;
+      throw new Error(`unexpected path ${path}`);
+    });
+    renderExplorer('/investigation/sessions/session-a?dataset_id=dataset-zero');
+    await userEvent.click(await screen.findByRole('button',{name:'provenance'}));
+    expect(await screen.findByRole('link',{name:/SCTP continuation.*session-b/}))
+      .toHaveAttribute('href','/investigation/callflow/session-b?dataset_id=dataset-zero');
+  });
+
   it('keeps dataset categories explicit and queries the selected scope',async()=>{
     vi.mocked(api).mockImplementation(async(path?:string)=>{
       if(path===undefined)return {data:[],meta:{}} as never;

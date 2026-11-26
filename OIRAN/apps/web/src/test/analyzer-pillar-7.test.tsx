@@ -106,14 +106,14 @@ describe('OIRAN 2.8.0 analyzer pillar 7',()=>{
     it('walks the cursor in canonical order without loss or duplicate',async()=>{
       const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
       render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/paged?dataset_id=dataset-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>);
-      expect(await screen.findByText(/1–2 of 4 observed/)).toBeVisible();
+      expect(await screen.findByText(/1–2 of 4 Served events/)).toBeVisible();
       await userEvent.click(screen.getByRole('button',{name:'Next'}));
-      expect(await screen.findByText(/3–4 of 4 observed/)).toBeVisible();
+      expect(await screen.findByText(/3–4 of 4 Served events/)).toBeVisible();
       // No duplicate: page 2's first event is strictly after the cursor.
       expect(vi.mocked(api)).toHaveBeenCalledWith('/sessions/paged/callflow?limit=100&cursor=evt-A-002');
       // Previous returns to page 1, still ordered by (capture_id, packet, event_id).
       await userEvent.click(screen.getByRole('button',{name:'Previous'}));
-      expect(await screen.findByText(/1–2 of 4 observed/)).toBeVisible();
+      expect(await screen.findByText(/1–2 of 4 Served events/)).toBeVisible();
     });
   });
 });
