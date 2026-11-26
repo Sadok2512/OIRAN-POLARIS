@@ -18427,6 +18427,54 @@ Content-Length: 0\r\n\
     }
 
     #[test]
+    fn continuous_import_preserves_original_sctp_segment_provenance() {
+        let root = temporary_root("original-sctp-segment");
+        let source = temporary_root("original-sctp-source");
+        fs::create_dir(source.join("N2")).unwrap();
+        let name = "n2_20261119T231700Z_00019_20261120171703.pcapng";
+        let fixture = corpus_0_7_0().2.join("N2.pcapng");
+        fs::copy(fixture, source.join("N2").join(name)).unwrap();
+        write_rotation_closures(&source, "N2", 1);
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        manager.start_continuous_import(ContinuousImportConfig {
+            source_root: source.to_path_buf(),
+            scan_interval: Duration::from_millis(200),
+            stable_age: Duration::from_millis(200),
+            max_owned_bytes: 128 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_segments: 8,
+            native_segment_seconds: None,
+            historical_n2_bootstrap: None,
+            runtime_pdu_evidence: None,
+            vtap_out_dirs: Vec::new(),
+        }).unwrap();
+        wait_for(|| manager.dataset(CONTINUOUS_DATASET_ID).is_some_and(|dataset| dataset.event_count > 0));
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+
+        let dataset = manager.dataset(CONTINUOUS_DATASET_ID).unwrap();
+        let directory = root.join(CONTINUOUS_CAPTURE_ID).join("dataset");
+        let mut checked = 0;
+        for shard in dataset.event_shards {
+            for line in fs::read_to_string(directory.join(shard.path)).unwrap().lines() {
+                let event: Value = serde_json::from_str(line).unwrap();
+                if event["protocol"] != "NGAP" { continue; }
+                for packet in event["packet_references"].as_array().unwrap() {
+                    let copied = packet["source_file"].as_str().unwrap();
+                    assert!(copied.rsplit('/').next().unwrap().starts_with("N2.pcap-"), "{copied}");
+                    let association = &packet["sctp_association"];
+                    assert!(association["first_tsn"].is_u64());
+                    assert_eq!(association["original_segment_name"], name, "original segment lost during import");
+                    assert_eq!(association["rotation_index"], 19);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "fixture must produce NGAP packet references");
+    }
+
+    #[test]
     fn continuous_worker_ingests_three_rotations_during_and_after_publication() {
         if skip_if_disk_too_full(
             "continuous_worker_ingests_three_rotations_during_and_after_publication",
