@@ -1860,6 +1860,34 @@ const PEI_PSEUDO_DOMAIN: &str = "pei";
 /// MSISDN ne match pas celui d'un SUPI.
 const GPSI_MSISDN_PSEUDO_DOMAIN: &str = "gpsi-msisdn";
 
+/// Convert an IMSI or a null-scheme SUCI into the common subscriber
+/// pseudonym. Other SUCIs stay opaque and cannot imply a SUPI match.
+fn auth_subscriber_pseudonym(text: &str, key: &PseudonymKey) -> Option<String> {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if let Some(imsi) = text.strip_prefix("imsi-") {
+        return (digits(imsi) && imsi.len() <= 15)
+            .then(|| pseudonym_subscriber_text(key, text.as_bytes()));
+    }
+    let fields: Vec<_> = text.splitn(8, '-').collect();
+    let ["suci", "0", mcc, mnc, routing, scheme, key_id, output] = fields.as_slice() else {
+        return None;
+    };
+    if mcc.len() != 3 || !(2..=3).contains(&mnc.len()) || !(1..=4).contains(&routing.len())
+        || !digits(mcc) || !digits(mnc) || !digits(routing) || !digits(scheme)
+        || !digits(key_id) || output.is_empty()
+    {
+        return None;
+    }
+    if *scheme == "0" {
+        if *key_id != "0" || !digits(output) || mcc.len() + mnc.len() + output.len() > 15 {
+            return None;
+        }
+        let supi = format!("imsi-{mcc}{mnc}{output}");
+        return Some(pseudonym_subscriber_text(key, supi.as_bytes()));
+    }
+    Some(pseudonym_subscriber_text(key, text.as_bytes()))
+}
+
 fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key: &PseudonymKey) {
     let Value::Object(map) = value else { return };
     for (key, value) in map {
@@ -1873,6 +1901,11 @@ fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key
                         "subscriber_pseudonym".into(),
                         pseudonym_subscriber_text(pseudonym_key, text.as_bytes()),
                     ));
+                }
+            }
+            "supiOrSuci" => {
+                if let Some(pseudo) = value.as_str().and_then(|text| auth_subscriber_pseudonym(text, pseudonym_key)) {
+                    fields.push(("subscriber_pseudonym".into(), pseudo));
                 }
             }
             // 2.18.0 (ANR1 #10 E2E-5G — SBI identities) — PEI =
@@ -2632,6 +2665,66 @@ mod tests {
 
     /// 2.18.0 — Un message SBI sans `gpsi` ni `pei` n'émet aucun
     /// IE identité (invariant « jamais d'hypothèse »).
+    #[test]
+    fn nausf_request_identity_reaches_the_pdu_session() {
+        let key = test_key();
+        let fixture_supi = "imsi-001010000000001";
+        let expected = pseudonym_subscriber_text(&key, fixture_supi.as_bytes());
+        let client = TcpEndpoint { address: "192.0.2.1".into(), port: 51001 };
+        let server = TcpEndpoint { address: "192.0.2.2".into(), port: 7777 };
+        let mut request = PREFACE.to_vec();
+        let headers = Encoder::new().encode([
+            (b":method".as_slice(), b"POST".as_slice()),
+            (b":path".as_slice(), b"/nausf-auth/v1/ue-authentications".as_slice()),
+            (b"content-type".as_slice(), b"application/json".as_slice()),
+        ]);
+        let body = serde_json::json!({"supiOrSuci": fixture_supi}).to_string();
+        request.extend(frame(1, 4, 1, &headers));
+        request.extend(frame(0, 1, 1, body.as_bytes()));
+        let response = Encoder::new().encode([(b":status".as_slice(), b"201".as_slice())]);
+        let connection = ReassembledConnection {
+            key: TcpConnectionKey::new(client.clone(), server.clone()).0,
+            directions: [
+                direction(client.clone(), server.clone(), request, 1),
+                direction(server, client, frame(1, 5, 1, &response), 2),
+            ],
+        };
+        let (events, _) = decode_connections(&[connection], "fixture", "SBI", &HashMap::new(), &key);
+        let [event] = events.as_slice() else { panic!("expected a single SBI event") };
+        assert_eq!(event.message_name, "UeAuthenticate");
+        let wire = event.to_json();
+        let mut n2: Value = serde_json::from_str(&wire).unwrap();
+        n2["event_id"] = Value::String("fixture-n2".into());
+        n2["interface"] = Value::String("N2".into());
+        n2["protocol"] = Value::String("NGAP".into());
+        n2["message_name"] = Value::String("PDUSessionResourceSetupRequest".into());
+        n2["session_identifiers"] = serde_json::json!([
+            {"name":"ran_ue_ngap_id","value":"1"},
+            {"name":"pdu_session_id","value":"1"},
+            {"name":"subscriber_pseudonym","value":expected,"pseudonymized":true}
+        ]);
+        let mut records = session_engine::load_jsonl(format!("{wire}\n{n2}\n").as_bytes()).unwrap();
+        let discovery = session_engine::discover_sessions(&mut records);
+        let [session] = discovery.pdu_sessions.as_slice() else { panic!("expected one PDU session") };
+        assert!(session.event_ids.contains(&event.event_id), "N12 event absent from the PDU session");
+        assert!(event.session_identifiers.iter().any(|id|
+            id.name == "subscriber_pseudonym" && id.value == expected && id.pseudonymized
+        ));
+        assert!(!wire.contains(fixture_supi));
+    }
+
+    #[test]
+    fn nausf_body_canonicalizes_only_null_scheme_suci() {
+        let key = test_key();
+        let expected = pseudonym_subscriber_text(&key, b"imsi-001010000000001");
+        let null_scheme = json_fields(br#"{"supiOrSuci":"suci-0-001-01-0-0-0-0000000001"}"#, &key);
+        assert!(null_scheme.iter().any(|(name, value)| name == "subscriber_pseudonym" && *value == expected));
+        let protected = json_fields(br#"{"supiOrSuci":"suci-0-001-01-0-1-1-f00d"}"#, &key);
+        assert!(protected.iter().any(|(name, value)| name == "subscriber_pseudonym" && *value != expected));
+        let malformed = json_fields(br#"{"supiOrSuci":"suci-0-001-01-0-0-0-bad"}"#, &key);
+        assert!(malformed.is_empty());
+    }
+
     #[test]
     fn body_without_gpsi_or_pei_emits_no_identity_ie() {
         let fields = json_fields(
