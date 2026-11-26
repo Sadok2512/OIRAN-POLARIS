@@ -24569,6 +24569,12 @@ Content-Length: 0\r\n\
         let (archive, members) = artifact.unwrap();
         fs::write(archive_fixture.join(members[0]), serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
         make_archive(&backups.join(name).join(archive), members);
+        let deployment = bench._root.join(".deployment-backups").join("release-A");
+        fs::create_dir_all(&deployment).unwrap();
+        let rollback_shard = fixture_shard("shard-deployment-only.jsonl");
+        let mut manifest = serde_json::to_value(&first).unwrap();
+        manifest["event_shards"][0]["path"] = serde_json::json!("event-shards/shard-deployment-only.jsonl");
+        fs::write(deployment.join("dataset_manifest.saved.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
         let unknown = shards.join("shard-missing-history.jsonl");
         fs::write(&unknown, b"{\"event_id\":\"missing-history\"}\n").unwrap();
         fs::File::open(&unknown).unwrap().set_modified(old).unwrap();
@@ -24616,9 +24622,13 @@ Content-Length: 0\r\n\
             assert_orphan_totals_unavailable(&snapshot);
         } else {
             assert_eq!(snapshot["status"], "available", "{snapshot}");
+            assert_eq!(snapshot["rollback_held"]["by_backup"]["release-A"]["count"], 1);
+            assert_eq!(snapshot["rollback_held"]["by_backup"]["release-A"]["bytes"], fs::metadata(&rollback_shard).unwrap().len());
             let served_seq = commit_seq::read(&dataset);
             assert!(served_seq > 0);
             assert_eq!(snapshot["commit_seq"], served_seq, "inventory must name the measured generation");
+            assert_eq!(snapshot["rollback_held"]["commit_seq"], served_seq);
+            assert_eq!(snapshot["unreferenced"]["commit_seq"], served_seq);
             if dangling {
                 assert_eq!(snapshot["broken_links"], 1);
             }
