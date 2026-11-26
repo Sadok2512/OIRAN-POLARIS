@@ -24475,15 +24475,20 @@ Content-Length: 0\r\n\
 
     #[test]
     fn shard_inventory_reports_counts_without_holding_the_publication_lock() {
-        assert_shard_inventory(false);
+        assert_shard_inventory(None);
     }
 
     #[test]
     fn shard_inventory_hides_counts_when_a_tree_cannot_be_read() {
-        assert_shard_inventory(true);
+        assert_shard_inventory(Some("unreadable-tree"));
     }
 
-    fn assert_shard_inventory(unreadable: bool) {
+    #[test]
+    fn shard_inventory_hides_counts_when_shard_link_resolution_fails() {
+        assert_shard_inventory(Some("continuous-lab-import/.dataset-rollback.fixture/event-shards/broken-link"));
+    }
+
+    fn assert_shard_inventory(unreadable: Option<&str>) {
         use event_shard_inventory::REQUIRED_BACKUPS;
 
         let bench = RetentionBench0_7_0::new("shard-gc-union");
@@ -24570,10 +24575,12 @@ Content-Length: 0\r\n\
             bench._root.to_path_buf(), false, bench._root.join(".oiran-pseudonym.key"),
         ).unwrap();
         bench.manager.recover_continuous_dataset_from_disk(&bench.base).unwrap();
-        let bad_tree = bench._root.join("unreadable-tree");
-        if unreadable {
-            std::os::unix::fs::symlink(&bad_tree, &bad_tree).unwrap();
-        }
+        let bad_path = unreadable.map(|relative| {
+            let path = bench._root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&path, &path).unwrap();
+            path
+        });
         event_shard_inventory::LOCK_PROBE.with(|probe| {
             *probe.borrow_mut() = Some((bench.base.clone(), Duration::ZERO));
         });
@@ -24582,9 +24589,9 @@ Content-Length: 0\r\n\
         assert_eq!(held, Duration::ZERO);
         let snapshot = bench.manager.event_shard_orphan_inventory();
         assert_eq!(snapshot["publication_lock_held_ns"], 0);
-        if unreadable {
+        if let Some(path) = bad_path {
             assert_eq!(snapshot["status"], "unavailable", "{snapshot}");
-            assert_eq!(snapshot["error"]["path"], serde_json::json!(bad_tree));
+            assert_eq!(snapshot["error"]["path"], serde_json::json!(path));
             assert!(snapshot["error"]["reason"].is_string());
             assert!(snapshot["count"].is_null() && snapshot["bytes"].is_null());
         } else {
