@@ -24489,16 +24489,22 @@ Content-Length: 0\r\n\
         use event_shard_inventory::FailurePoint::*;
         assert_shard_inventory_with_failures(None, &[
             ActiveManifest, BackupRoots, Directory, Link, Manifest, Archive, Shard, Finish,
-        ]);
+        ], false);
     }
 
     fn assert_shard_inventory(unreadable: Option<&str>) {
-        assert_shard_inventory_with_failures(unreadable, &[]);
+        assert_shard_inventory_with_failures(unreadable, &[], false);
+    }
+
+    #[test]
+    fn shard_inventory_counts_dangling_entries_without_hiding_a_complete_walk() {
+        assert_shard_inventory_with_failures(None, &[], true);
     }
 
     fn assert_shard_inventory_with_failures(
         unreadable: Option<&str>,
         failures: &[event_shard_inventory::FailurePoint],
+        dangling: bool,
     ) {
         use event_shard_inventory::{FAIL_AT, REQUIRED_BACKUPS};
 
@@ -24591,6 +24597,11 @@ Content-Length: 0\r\n\
             fs::create_dir(&aliases).unwrap();
             std::os::unix::fs::symlink(&original, aliases.join("protected-link")).unwrap();
         }
+        if dangling {
+            let aliases = rollback.join("event-shards");
+            fs::create_dir(&aliases).unwrap();
+            std::os::unix::fs::symlink(aliases.join("absent-target"), aliases.join("dangling-link")).unwrap();
+        }
         let bad_path = unreadable.map(|relative| {
             let path = bench._root.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -24612,6 +24623,9 @@ Content-Length: 0\r\n\
             assert_orphan_totals_unavailable(&snapshot);
         } else {
             assert_eq!(snapshot["status"], "available", "{snapshot}");
+            if dangling {
+                assert_eq!(snapshot["broken_links"], 1);
+            }
             assert_eq!(snapshot["count"], 4);
             let bytes = [&removable, &unknown, &newest_a, &newest_b].into_iter()
                 .map(|path| fs::metadata(path).unwrap().len()).sum::<u64>();
