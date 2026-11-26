@@ -168,7 +168,7 @@ struct Inner {
     /// la suivante. Aucune 503 pendant une publication si une
     /// génération READY existait auparavant.
     generation_slot: std::sync::RwLock<Option<Arc<FilterGeneration>>>,
-    generation_counter: std::sync::atomic::AtomicU64,
+    filter_generation_root: PathBuf,
     /// 2.21.92 (défaut bloquant ANR1 #10 7035121536) — compteur et dernière
     /// occurrence d'un refus de bascule du double tampon. Un refus signifie
     /// qu'une génération candidate n'a pas pu remplacer la précédente car :
@@ -829,7 +829,7 @@ impl AppState {
                     SessionFilterCacheReadiness::default(),
                 ),
                 generation_slot: std::sync::RwLock::new(None),
-                generation_counter: std::sync::atomic::AtomicU64::new(0),
+                filter_generation_root: capture_root,
                 generation_swap_refused: std::sync::Mutex::new(
                     GenerationSwapRefusedState::default(),
                 ),
@@ -942,7 +942,7 @@ impl AppState {
                     SessionFilterCacheReadiness::default(),
                 ),
                 generation_slot: std::sync::RwLock::new(None),
-                generation_counter: std::sync::atomic::AtomicU64::new(0),
+                filter_generation_root: capture_root,
                 generation_swap_refused: std::sync::Mutex::new(
                     GenerationSwapRefusedState::default(),
                 ),
@@ -1975,6 +1975,7 @@ fn sessions_filter_generation_health(state: &AppState, now_ms: u64) -> Value {
             "ready": true,
             "generation": generation.generation,
             "commit_seq": generation.commit_seq,
+            "dataset_commit_seqs": generation.dataset_commit_seqs,
             "ready_since_ms": generation.ready_since_ms,
             "age_ms": generation.stale_since_ms(now_ms),
             "session_count": generation.session_count,
@@ -4120,6 +4121,7 @@ pub(crate) struct FilterGeneration {
     pub generation: u64,
     /// `commit_seq` max observé sur les datasets live au moment du swap.
     pub commit_seq: u64,
+    pub dataset_commit_seqs: BTreeMap<String, u64>,
     /// Signature des sources (= `journey_signature(state)`) au moment
     /// du build, pour diagnostic.
     pub signature: Vec<String>,
@@ -4587,6 +4589,39 @@ fn record_swap_accepted_with_mismatch(
     );
 }
 
+/// Persist the allocation before exposing a READY snapshot. The lock file stays
+/// stable across the atomic replacement of the counter, including across processes.
+fn next_filter_generation(root: &FsPath, first_commit_seq: u64) -> std::io::Result<u64> {
+    use std::io::{self, Write as _};
+    use std::os::fd::AsRawFd;
+
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".sessions-filter-generation.lock"))?;
+    // SAFETY: the descriptor belongs to this live File and is held until return.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = root.join(".sessions-filter-generation");
+    let previous = match fs::read_to_string(&path) {
+        Ok(text) => text.trim().parse::<u64>().map_err(io::Error::other)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => first_commit_seq,
+        Err(error) => return Err(error),
+    };
+    let next = previous
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("filter generation exhausted"))?;
+    let temp = root.join(".sessions-filter-generation.tmp");
+    let mut file = fs::File::create(&temp)?;
+    writeln!(file, "{next}")?;
+    file.sync_all()?;
+    fs::rename(temp, path)?;
+    fs::File::open(root)?.sync_all()?;
+    Ok(next)
+}
+
 fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
     trace_session_filter_prewarm_rss(trigger, "before_heap_release");
     live_probe::release_publication_heap_pages();
@@ -4813,27 +4848,47 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
                 return;
             }
         }
-        let commit_seq = state
+        // Match the registered datasets in this snapshot even if staging has
+        // already advanced a marker on disk before its registry update.
+        let dataset_commit_seqs: BTreeMap<_, _> = state
             .inner
             .capture_manager
             .datasets()
-            .iter()
-            .map(|d| state.inner.capture_manager.dataset_commit_seq(&d.dataset_id))
-            .max()
-            .unwrap_or(0);
+            .into_iter()
+            .map(|dataset| {
+                let seq = state
+                    .inner
+                    .capture_manager
+                    .dataset_commit_seq_in_memory(&dataset.dataset_id)
+                    .unwrap_or(0);
+                (dataset.dataset_id, seq)
+            })
+            .collect();
+        let commit_seq = dataset_commit_seqs.values().copied().max().unwrap_or(0);
         let signature_now = journey_signature(state);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let generation_id = state
-            .inner
-            .generation_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+        let generation_id = match next_filter_generation(&state.inner.filter_generation_root, commit_seq)
+        {
+            Ok(id) => id,
+            Err(error) => {
+                eprintln!("SESSIONS_FILTER_GENERATION_PERSIST_FAILED error={error}");
+                record_swap_refused(
+                    state,
+                    trigger,
+                    "generation_persist_failed",
+                    Some(session_count),
+                    Some(reference_session_count),
+                );
+                return;
+            }
+        };
         let generation = Arc::new(FilterGeneration {
             generation: generation_id,
             commit_seq,
+            dataset_commit_seqs,
             signature: signature_now,
             ready_since_ms: now_ms,
             filter_index: filter_index_arc,
@@ -6694,6 +6749,7 @@ fn build_filter_response(mut body: Value, generation: &FilterGeneration) -> Resp
     if let Some(meta) = body.get_mut("meta").and_then(Value::as_object_mut) {
         meta.insert("generation".into(), json!(generation.generation));
         meta.insert("commit_seq".into(), json!(generation.commit_seq));
+        meta.insert("dataset_commit_seqs".into(), json!(generation.dataset_commit_seqs));
         meta.insert("stale_since_ms".into(), json!(stale_since_ms));
     }
     let mut response = (StatusCode::OK, Json(body)).into_response();
@@ -20171,6 +20227,28 @@ mod tests {
         assert_eq!(body["meta"]["total"], 1);
         let expected: u64 = fs::read_to_string(&commit_seq_path).unwrap().trim().parse().unwrap();
         assert_eq!(body["meta"]["commit_seq"], json!(expected));
+        assert_eq!(
+            body["meta"]["dataset_commit_seqs"][live_probe::CONTINUOUS_DATASET_ID],
+            json!(expected),
+        );
+
+        // Recreate the API state while preserving the filesystem and dataset marker.
+        let previous_generation = body["meta"]["generation"].as_u64().unwrap();
+        drop(state);
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let mut config = test_config(workspace, "filter-versioned-commit-seq-restart");
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        let restarted = AppState::load(config).unwrap();
+        restarted.inner.capture_manager.recover_continuous_dataset_from_disk(
+            &capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID),
+        ).unwrap();
+        install_session_filter_cache_prewarm(&restarted);
+
+        let (status, body) = post_sessions_filter(&restarted, json!({"limit": 10}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["meta"]["commit_seq"], json!(expected));
+        assert!(body["meta"]["generation"].as_u64().unwrap() > previous_generation);
         fs::remove_dir_all(capture_root).unwrap();
     }
 

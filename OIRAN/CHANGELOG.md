@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.188 — filter snapshot publication markers
+
+Read dataset commit sequences at the published dataset root. Filter snapshots expose the marker for each live dataset alongside the existing maximum. Persist filter generation numbers before serving a new snapshot so they remain comparable after API restarts.
+
 ## oiran-api 2.21.186 — archive visibility and mount-bounded Cargo expiry
 
 Patch. Order #10 7175865262 and review 7177285745. The cached health snapshot exposes the retention archive's logical bytes, finalized segment count and oldest creation date. Archive inventory is read-only. The shared Cargo wrapper expires private build targets after seven days without use and retains targets with a nested mount, including same-device bind mounts.

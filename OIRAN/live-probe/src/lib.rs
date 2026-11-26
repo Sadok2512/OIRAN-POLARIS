@@ -2864,18 +2864,9 @@ impl CaptureManager {
     /// les caches API pour invalider sub-seconde quand la mtime du
     /// filesystem a un délai (tmpfs, NFS).
     pub fn dataset_commit_seq(&self, dataset_id: &str) -> u64 {
-        let Some(path) = self.callflow_path(dataset_id, "__sentinel__") else {
-            return 0;
-        };
-        // `callflow_path` renvoie `<dataset_root>/callflows/<id>.json` —
-        // on remonte au `dataset_root` pour chercher commit_seq.txt.
-        let Some(callflows_dir) = path.parent() else {
-            return 0;
-        };
-        let Some(dataset_root) = callflows_dir.parent() else {
-            return 0;
-        };
-        commit_seq::read(dataset_root)
+        self.dataset_root(dataset_id)
+            .map(|root| commit_seq::read(&root))
+            .unwrap_or(0)
     }
 
     fn callflow_path(&self, dataset_id: &str, session_id: &str) -> Option<PathBuf> {
