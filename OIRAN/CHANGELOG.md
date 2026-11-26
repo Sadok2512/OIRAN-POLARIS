@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.200 / live-probe 0.7.7 — retained shard lineage
+
+Record retention predecessors, successors and archive references in the served manifest. Install only staged shards selected by the final manifest. Published shard files are left in place.
+
 ## oiran-api 2.21.196 / oiran-decode 0.12.2 — SCTP message TSN bounds
 
 Persist the wire TSN of the first and last SCTP DATA chunks in packet-reference provenance. Historical references keep their original shape. Event-schema 1.13.1 and session-engine 0.5.36 carry the optional bounds.

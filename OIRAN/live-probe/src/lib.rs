@@ -1205,6 +1205,10 @@ pub struct LiveDataset {
     pub zero_event_captures: Vec<String>,
     #[serde(default)]
     pub event_shards: Vec<EventShard>,
+    /// Superseded published shards recorded by retention. These are lineage
+    /// records, separate from the live event_shards required by readers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retention_replacements: Vec<RetentionReplacement>,
     #[serde(default)]
     pub publication_bytes_written: u64,
     #[serde(default)]
@@ -1288,6 +1292,35 @@ pub struct EventShard {
     /// `LiveDataset` en `d8718cf`) : le retour arrière reste possible.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capture_ends: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetentionShardIdentity {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub event_count: usize,
+}
+
+impl From<&EventShard> for RetentionShardIdentity {
+    fn from(shard: &EventShard) -> Self {
+        Self {
+            path: shard.path.clone(),
+            sha256: shard.sha256.clone(),
+            bytes: shard.bytes,
+            event_count: shard.event_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetentionReplacement {
+    pub predecessor: RetentionShardIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor: Option<RetentionShardIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_id: Option<String>,
+    pub archived_event_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3293,6 +3326,7 @@ impl CaptureManager {
             active_pdu_contexts: Vec::new(),
             zero_event_captures: Vec::new(),
             event_shards: Vec::new(),
+            retention_replacements: Vec::new(),
             publication_bytes_written: 0,
             publication_files_created: 0,
             callflows_path: None,
@@ -5692,6 +5726,7 @@ impl CaptureManager {
             Vec::new(),
             0,
             None,
+            Vec::new(),
         )?;
         // Atomic swap next ↔ current via previous.
         // 2.21.146 — un jeu précédent déjà présent n'est plus supprimé :
@@ -5828,6 +5863,7 @@ impl CaptureManager {
             event_shards,
             restored.bytes,
             None,
+            Vec::new(),
         );
         let dataset = match published {
             Ok(dataset) => dataset,
@@ -6757,6 +6793,7 @@ impl CaptureManager {
             Vec::new(),
             0,
             None,
+            Vec::new(),
         )?;
         // 2.21.146 — un jeu précédent déjà présent n'est plus supprimé :
         // il est gardé sous un nom daté.
@@ -7664,6 +7701,7 @@ impl CaptureManager {
         let mut event_paths = (!event_shards.is_empty()).then(|| {
             event_shards.iter().map(|shard| dataset_dir.join(&shard.path)).collect::<Vec<_>>()
         });
+        let mut replacements = Vec::new();
         // Explicit retention is the sole exception to append-only growth. It
         // still never mutates an existing shard: a compacted replacement is
         // built in staging, archived capture-wise, and selected by the next
@@ -7678,6 +7716,13 @@ impl CaptureManager {
                 let archive_root = dataset_dir.join(STAGED_RETENTION_ARCHIVE);
                 let outcome = apply_incremental_retention(dataset_dir, &mut event_shards, &archive_root, cutoff)?;
                 publication_bytes_written = publication_bytes_written.saturating_add(outcome.bytes_rewritten);
+                if let Some((_, prior)) = &prior_continuous {
+                    let published_paths: BTreeSet<_> = prior.event_shards.iter()
+                        .map(|shard| shard.path.as_str()).collect();
+                    replacements.extend(outcome.replacements.into_iter().filter(|replacement| {
+                        published_paths.contains(replacement.predecessor.path.as_str())
+                    }));
+                }
                 event_paths = Some(event_shards.iter().map(|shard| dataset_dir.join(&shard.path)).collect());
             }
         }
@@ -7694,6 +7739,7 @@ impl CaptureManager {
             event_shards,
             publication_bytes_written,
             publication_started_epoch_ms,
+            replacements,
         )
     }
 
@@ -7720,6 +7766,7 @@ impl CaptureManager {
         event_shards: Vec<EventShard>,
         publication_bytes_written: u64,
         publication_started_epoch_ms: Option<u64>,
+        replacements: Vec<RetentionReplacement>,
     ) -> Result<LiveDataset, String> {
         // 0.6.7 — un seul travail lourd en mémoire à la fois (voir HEAVY_MEMORY_GATE).
         let _heavy_memory_gate = self.heavy_memory_enter();
@@ -8481,6 +8528,9 @@ impl CaptureManager {
                 })
             );
         }
+        let mut retention_replacements = prior_continuous.as_ref()
+            .map(|(_, prior)| prior.retention_replacements.clone()).unwrap_or_default();
+        retention_replacements.extend(replacements);
         let dataset = LiveDataset {
             dataset_id,
             capture_id: capture_id.into(),
@@ -8498,6 +8548,7 @@ impl CaptureManager {
             active_pdu_contexts,
             zero_event_captures,
             event_shards,
+            retention_replacements,
             publication_bytes_written,
             publication_files_created: 0,
             callflows_path: None,
@@ -9254,10 +9305,16 @@ fn commit_incremental_publication(
     fs::create_dir_all(&shard_target).map_err(display_error)?;
 
     let staged_shards = staging.join("event-shards");
-    let new_shard_count = count_regular_files(&staged_shards);
+    let selected: BTreeSet<_> = dataset.event_shards.iter()
+        .filter_map(|shard| Path::new(&shard.path).strip_prefix("event-shards").ok())
+        .collect();
+    let mut new_shard_count = 0u64;
     if staged_shards.is_dir() {
         for entry in fs::read_dir(&staged_shards).map_err(display_error)? {
             let entry = entry.map_err(display_error)?;
+            if !selected.contains(Path::new(&entry.file_name())) {
+                continue;
+            }
             let metadata = fs::symlink_metadata(entry.path()).map_err(display_error)?;
             if !metadata.file_type().is_file() {
                 continue;
@@ -9271,6 +9328,7 @@ fn commit_incremental_publication(
                 return Err(format!("CONTINUOUS_SHARD_ALREADY_EXISTS: {}", target.display()));
             }
             fs::rename(entry.path(), &target).map_err(display_error)?;
+            new_shard_count += 1;
         }
     }
 
@@ -11652,6 +11710,7 @@ struct IncrementalRetentionOutcome {
     bytes_rewritten: u64,
     events_archived: u64,
     capture_end_scans: usize,
+    replacements: Vec<RetentionReplacement>,
 }
 
 /// 0.7.0 (ordre cœur #9 7161327955, défaut 2) — rétention PAR SHARD sur la
@@ -11789,9 +11848,16 @@ fn apply_incremental_retention(
             retained_writer.flush().map_err(display_error)?;
             retained_writer.get_ref().sync_all().map_err(display_error)?;
             drop(retained_writer);
+            let mut lineage = RetentionReplacement {
+                predecessor: shard.into(),
+                successor: None,
+                archive_id: archive_enabled.then(|| archive_id.clone()),
+                archived_event_count: if archive_enabled { archived_count } else { 0 },
+            };
             if retained_count == 0 {
                 fs::remove_file(&tmp).map_err(display_error)?;
                 outcome.shards_dropped += 1;
+                outcome.replacements.push(lineage);
                 continue;
             }
             let sha = retained_hash.finish_hex();
@@ -11799,13 +11865,16 @@ fn apply_incremental_retention(
             replacements.push((tmp, dataset_dir.join(&name)));
             outcome.shards_rewritten += 1;
             outcome.bytes_rewritten += retained_bytes;
-            kept.push(EventShard {
+            let successor = EventShard {
                 path: name,
                 sha256: sha,
                 bytes: retained_bytes,
                 event_count: retained_count,
                 capture_ends: retained_ends,
-            });
+            };
+            lineage.successor = Some((&successor).into());
+            outcome.replacements.push(lineage);
+            kept.push(successor);
         }
         Ok(())
     })();
@@ -17452,6 +17521,7 @@ mod tests {
                 active_pdu_contexts: contexts,
                 zero_event_captures: Vec::new(),
                 event_shards: Vec::new(),
+                retention_replacements: Vec::new(),
                 publication_bytes_written: 0,
                 publication_files_created: 0,
                 callflows_path: None,
@@ -19626,6 +19696,7 @@ Content-Length: 0\r\n\
             active_pdu_contexts: Vec::new(),
             zero_event_captures: Vec::new(),
             event_shards: Vec::new(),
+            retention_replacements: Vec::new(),
             publication_bytes_written: 0,
             publication_files_created: 0,
             callflows_path: None,
@@ -21949,7 +22020,7 @@ Content-Length: 0\r\n\
         let dataset = manager.publish_events_to_dataset_dir(
             CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID.into(), &dataset_dir,
             "dataset".into(), None, BTreeMap::new(), BTreeMap::new(), Vec::new(),
-            None, Vec::new(), 0, None,
+            None, Vec::new(), 0, None, Vec::new(),
         ).unwrap();
         let discovery = dataset.discovery.as_ref().unwrap();
         let downlink = discovery.gtpu_tunnels.iter().find(|t| t.teid == dl_teid).unwrap();
@@ -24381,6 +24452,61 @@ Content-Length: 0\r\n\
         fn shard_file(&self, shard: &EventShard) -> PathBuf {
             self.base.join("dataset").join(&shard.path)
         }
+    }
+
+    #[test]
+    fn publication_records_retention_replacement_and_never_installs_an_unselected_shard() {
+        let bench = RetentionBench0_7_0::new("retention-replacement-manifest");
+        let (old, another_old, _) = corpus_0_7_0();
+        let first = bench.cycle(None, &[("N2.pcap-old.pcapng", old)]);
+        let mut original = first.event_shards[0].clone();
+        let path = bench.shard_file(&original);
+        let payload = fs::read_to_string(&path).unwrap();
+        let mut hot: Value = serde_json::from_str(payload.lines().next().unwrap()).unwrap();
+        let fresh_epoch = epoch_ms() / 1000;
+        let fresh_capture = "sha256:hot-retention-fixture";
+        hot["capture_id"] = serde_json::json!(fresh_capture);
+        hot["event_id"] = serde_json::json!("evt-hot-retention-fixture");
+        hot["stable_event_key"] = serde_json::json!("stable-hot-retention-fixture");
+        hot["timestamp"]["seconds"] = serde_json::json!(fresh_epoch);
+        let mixed = format!("{payload}{hot}\n");
+        fs::write(&path, &mixed).unwrap();
+        original.sha256 = sha256_hex(mixed.as_bytes());
+        original.bytes = mixed.len() as u64;
+        original.event_count += 1;
+        original.capture_ends.insert(fresh_capture.into(), fresh_epoch);
+        let mut prior = bench.manifest();
+        prior.event_count = original.event_count;
+        prior.event_shards = vec![original.clone()];
+        let manifest_path = bench.base.join("dataset/dataset_manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&prior).unwrap()).unwrap();
+        TEST_RETENTION_ARCHIVE.with(|enabled| enabled.set(Some(true)));
+        let published = bench.cycle(Some(1), &[("N2.pcap-another-old.pcapng", another_old)]);
+        TEST_RETENTION_ARCHIVE.with(|enabled| enabled.set(None));
+        assert_eq!(published.event_count, 1);
+        let successor = &published.event_shards[0];
+        assert_ne!(successor.path, original.path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), mixed);
+        let active = bench.base.join("dataset");
+        let actual: BTreeSet<_> = fs::read_dir(active.join("event-shards")).unwrap()
+            .map(|entry| entry.unwrap().path()).collect();
+        let expected_installation = BTreeSet::from([path, active.join(&successor.path)]);
+        let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let receipt = &manifest["retention_replacements"][0];
+        assert_eq!(
+            (receipt["predecessor"]["path"].as_str(), actual == expected_installation),
+            (Some(original.path.as_str()), true),
+            "publication must name the displaced file and omit staged files the final manifest does not select",
+        );
+        assert_eq!(receipt["predecessor"]["sha256"], original.sha256);
+        assert_eq!(receipt["predecessor"]["event_count"], original.event_count);
+        assert_eq!(receipt["successor"]["path"], successor.path);
+        assert_eq!(receipt["successor"]["sha256"], successor.sha256);
+        let archive = receipt["archive_id"].as_str().unwrap();
+        assert!(bench.base.join("archive").join(archive).join("manifest.json").is_file());
+        assert_eq!(receipt["archived_event_count"], original.event_count - 1);
+        let later = bench.cycle(None, &[]);
+        assert_eq!(serde_json::to_value(later).unwrap()["retention_replacements"], manifest["retention_replacements"]);
     }
 
     #[test]
