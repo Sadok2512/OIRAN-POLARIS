@@ -1,5 +1,5 @@
 //! Read-only inventory of continuous shards and their manifest references.
-use super::LiveDataset;
+use super::{commit_seq, LiveDataset, PublicationLock};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -9,11 +9,13 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(super) const INTERVAL: Duration = Duration::from_secs(30 * 60);
 pub(super) struct Totals {
+    commit_seq: u64,
+    publication_lock_held_ns: u64,
     count: usize,
     bytes: u64,
     trees_consulted: usize,
@@ -24,6 +26,7 @@ pub(super) struct Totals {
 pub(super) struct InventoryError {
     path: Option<PathBuf>,
     reason: String,
+    commit_seq_change: Option<(u64, u64)>,
 }
 
 impl InventoryError {
@@ -31,6 +34,7 @@ impl InventoryError {
         Self {
             path: None,
             reason: reason.into(),
+            commit_seq_change: None,
         }
     }
 }
@@ -43,6 +47,8 @@ pub(super) fn snapshot(result: Result<&Totals, &InventoryError>) -> Value {
             Some(json!({
                 "path": error.path.as_deref().map(Path::to_string_lossy),
                 "reason": error.reason,
+                "commit_seq_before": error.commit_seq_change.map(|(before, _)| before),
+                "commit_seq_after": error.commit_seq_change.map(|(_, after)| after),
             })),
         ),
     };
@@ -53,7 +59,8 @@ pub(super) fn snapshot(result: Result<&Totals, &InventoryError>) -> Value {
         "trees_consulted": totals.map(|totals| totals.trees_consulted),
         "archives_consulted": totals.map(|totals| totals.archives_consulted),
         "broken_links": totals.map(|totals| totals.broken_links),
-        "publication_lock_held_ns": 0,
+        "commit_seq": totals.map(|totals| totals.commit_seq),
+        "publication_lock_held_ns": totals.map(|totals| totals.publication_lock_held_ns),
         "error": error,
     })
 }
@@ -120,43 +127,22 @@ impl InventoryWatch {
         Ok(Self { fd, mounts })
     }
 
-    fn add(&self, path: &Path, directory: bool) -> Result<(), InventoryError> {
-        let changes = if directory {
-            libc::IN_ONLYDIR
-                | libc::IN_CREATE
-                | libc::IN_DELETE
-                | libc::IN_MOVED_FROM
-                | libc::IN_MOVED_TO
-        } else {
-            libc::IN_MODIFY | libc::IN_CLOSE_WRITE
-        };
-        self.add_mask(path, changes)
-    }
-
-    fn add_mask(&self, path: &Path, changes: u32) -> Result<(), InventoryError> {
+    fn add(&self, path: &Path) -> Result<(), InventoryError> {
         let name =
             CString::new(path.as_os_str().as_bytes()).map_err(|error| unavailable(path, error))?;
-        let common = libc::IN_ATTRIB
+        let changes = libc::IN_ATTRIB
             | libc::IN_DELETE_SELF
             | libc::IN_MOVE_SELF
             | libc::IN_UNMOUNT
-            | libc::IN_MASK_ADD;
-        if unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), common | changes) }
-            < 0
-        {
+            | libc::IN_MODIFY
+            | libc::IN_CLOSE_WRITE;
+        if unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), changes) } < 0 {
             return Err(unavailable(path, std::io::Error::last_os_error()));
         }
         Ok(())
     }
 
-    fn add_ancestors(&self, path: &Path) -> Result<(), InventoryError> {
-        for directory in path.ancestors().skip(1) {
-            self.add_mask(directory, libc::IN_ONLYDIR)?;
-        }
-        Ok(())
-    }
-
-    fn unchanged(&self) -> Result<(), InventoryError> {
+    fn unchanged(&self, path: &Path) -> Result<(), InventoryError> {
         let mut poll = libc::pollfd {
             fd: self.fd.as_raw_fd(),
             events: libc::POLLIN,
@@ -164,8 +150,9 @@ impl InventoryWatch {
         };
         match unsafe { libc::poll(&mut poll, 1, 0) } {
             0 => Ok(()),
-            1 => Err(InventoryError::general(
-                "shard inventory changed during measurement",
+            1 => Err(unavailable(
+                path,
+                "served manifest or commit marker changed without advancing commit_seq",
             )),
             _ => Err(InventoryError::general(
                 std::io::Error::last_os_error().to_string(),
@@ -190,6 +177,7 @@ fn unavailable(path: &Path, error: impl std::fmt::Display) -> InventoryError {
     InventoryError {
         path: Some(path.to_owned()),
         reason: error.to_string(),
+        commit_seq_change: None,
     }
 }
 
@@ -344,10 +332,7 @@ pub(super) const REQUIRED_BACKUPS: [(&str, Option<Artifact>); 9] = [
 
 type ExpectedArtifacts = BTreeMap<PathBuf, &'static [&'static str]>;
 
-fn roots(
-    captures: &Path,
-    watch: &InventoryWatch,
-) -> Result<(Vec<PathBuf>, ExpectedArtifacts), InventoryError> {
+fn roots(captures: &Path) -> Result<(Vec<PathBuf>, ExpectedArtifacts), InventoryError> {
     let (mut roots, backup_root) = if cfg!(test) {
         (vec![captures.to_owned()], captures.join(".gc-backups"))
     } else {
@@ -362,8 +347,6 @@ fn roots(
     };
     #[cfg(test)]
     inject_failure(FailurePoint::BackupRoots, &backup_root)?;
-    watch.add_ancestors(&backup_root)?;
-    watch.add(&backup_root, true)?;
     let mut identities = HashSet::new();
     let mut expected = BTreeMap::new();
     for (name, artifact) in REQUIRED_BACKUPS {
@@ -405,9 +388,13 @@ thread_local! {
 
 fn inventory(
     captures: &Path,
-    watch: &InventoryWatch,
+    active_shards: &Path,
+    current: &Path,
+    population: &[PathBuf],
+    mut names: HashSet<String>,
 ) -> Result<(HashSet<String>, usize, usize, usize), InventoryError> {
-    let mut names = HashSet::new();
+    let active_manifest = current.join("dataset_manifest.json");
+    let staging = current.with_file_name(".dataset-next");
     let (mut trees, mut archives, mut broken_links) = (0usize, 0usize, 0usize);
     #[cfg(test)]
     LOCK_PROBE.with(|probe| {
@@ -421,12 +408,10 @@ fn inventory(
             }
         }
     });
-    let (mut pending, mut expected) = roots(captures, watch)?;
-    for root in &pending {
-        watch.add_ancestors(root)?;
-    }
+    let (roots, mut expected) = roots(captures)?;
+    let mut pending: Vec<_> = roots.into_iter().map(|path| (path, Vec::new())).collect();
     let mut seen = HashSet::new();
-    while let Some(directory) = pending.pop() {
+    while let Some((directory, mut ancestors)) = pending.pop() {
         if excluded_opt_tree(&directory) {
             continue;
         }
@@ -436,26 +421,44 @@ fn inventory(
         if excluded_opt_tree(&physical) {
             continue;
         }
-        watch.add(&physical, true)?;
         let metadata = fs::metadata(&directory).map_err(|error| unavailable(&directory, error))?;
         if !metadata.is_dir() {
             return Err(unavailable(&directory, "inventory root is not a directory"));
         }
-        if !seen.insert((metadata.dev(), metadata.ino())) {
+        let identity = (metadata.dev(), metadata.ino());
+        if ancestors.contains(&identity) {
+            return Err(unavailable(&directory, "inventory directory symlink loop"));
+        }
+        if !seen.insert(identity) {
             continue;
         }
+        ancestors.push(identity);
         #[cfg(test)]
         inject_failure(FailurePoint::Directory, &directory)?;
         let mut found_manifest = false;
-        for entry in fs::read_dir(&directory).map_err(|error| unavailable(&directory, error))? {
-            let entry = entry.map_err(|error| unavailable(&directory, error))?;
-            let path = entry.path();
-            if excluded_opt_tree(&path) {
+        let paths = if physical == active_shards {
+            population.to_vec()
+        } else {
+            fs::read_dir(&directory)
+                .map_err(|error| unavailable(&directory, error))?
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.path())
+                        .map_err(|error| unavailable(&directory, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for path in paths {
+            if path == active_manifest {
+                found_manifest = true;
                 continue;
             }
-            let kind = entry
-                .file_type()
-                .map_err(|error| unavailable(&path, error))?;
+            if path == staging || excluded_opt_tree(&path) {
+                continue;
+            }
+            let kind = fs::symlink_metadata(&path)
+                .map_err(|error| unavailable(&path, error))?
+                .file_type();
             let required = expected.get(&path).copied();
             if required.is_some() && !kind.is_file() {
                 return Err(unavailable(
@@ -464,12 +467,12 @@ fn inventory(
                 ));
             }
             if kind.is_dir() {
-                pending.push(path);
+                pending.push((path, ancestors.clone()));
                 continue;
             }
-            let entry_name = entry.file_name();
-            let name = entry_name
-                .to_str()
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
                 .ok_or_else(|| unavailable(&path, "inventory entry has a non-UTF-8 name"))?;
             if kind.is_symlink() {
                 #[cfg(test)]
@@ -491,7 +494,6 @@ fn inventory(
                         .file_name()
                         .and_then(|name| name.to_str())
                         .ok_or_else(|| unavailable(&path, "invalid shard link target name"))?;
-                    watch.add_ancestors(&physical)?;
                     names.insert(name.into());
                     names.insert(target.into());
                     continue;
@@ -507,18 +509,13 @@ fn inventory(
                 }
                 let target = fs::metadata(&physical).map_err(|error| unavailable(&path, error))?;
                 if target.is_dir() {
-                    watch.add_ancestors(&physical)?;
-                    pending.push(path);
+                    pending.push((path, ancestors.clone()));
                     continue;
-                }
-                if manifest_name(name) || name.ends_with(".tar.zst") {
-                    watch.add_ancestors(&physical)?;
                 }
             }
             if manifest_name(name) {
                 #[cfg(test)]
                 inject_failure(FailurePoint::Manifest, &path)?;
-                watch.add(&path, false)?;
                 let bytes = fs::read(&path).map_err(|error| unavailable(&path, error))?;
                 let value: Value =
                     serde_json::from_slice(&bytes).map_err(|error| unavailable(&path, error))?;
@@ -530,7 +527,6 @@ fn inventory(
             } else if name.ends_with(".tar.zst") {
                 #[cfg(test)]
                 inject_failure(FailurePoint::Archive, &path)?;
-                watch.add(&path, false)?;
                 archive_manifest(&path, required.unwrap_or_default(), &mut names)
                     .map_err(|error| unavailable(&path, error))?;
                 archives += 1;
@@ -549,43 +545,29 @@ fn inventory(
     Ok((names, trees, archives, broken_links))
 }
 
-pub(super) fn measure(
-    captures: &Path,
-    current: &Path,
-    served: &LiveDataset,
-    served_is_current: impl FnOnce() -> bool,
-) -> Result<Totals, InventoryError> {
-    let watch = InventoryWatch::new()?;
-    let base = current
-        .parent()
-        .ok_or_else(|| unavailable(current, "dataset has no parent"))?;
-    watch.add(base, true)?;
-    watch.add(current, true)?;
-    let manifest_path = current.join("dataset_manifest.json");
-    #[cfg(test)]
-    inject_failure(FailurePoint::ActiveManifest, &manifest_path)?;
-    watch.add(&manifest_path, false)?;
-    let bytes = fs::read(&manifest_path).map_err(|error| unavailable(&manifest_path, error))?;
-    let active: LiveDataset =
-        serde_json::from_slice(&bytes).map_err(|error| unavailable(&manifest_path, error))?;
-    if active.callflows_path.is_none()
-        || served.callflows_path != active.callflows_path
-        || served.event_count != active.event_count
-        || served
+fn read_sequence(path: &Path) -> Result<u64, InventoryError> {
+    let text = fs::read_to_string(path).map_err(|error| unavailable(path, error))?;
+    text.trim()
+        .parse()
+        .map_err(|error| unavailable(path, error))
+}
+
+fn same_manifest(served: &LiveDataset, active: &LiveDataset) -> bool {
+    active.callflows_path.is_some()
+        && served.callflows_path == active.callflows_path
+        && served.event_count == active.event_count
+        && !active.event_shards.is_empty()
+        && served
             .event_shards
             .iter()
             .map(|shard| (&shard.path, &shard.sha256))
-            .ne(active
+            .eq(active
                 .event_shards
                 .iter()
                 .map(|shard| (&shard.path, &shard.sha256)))
-        || active.event_shards.is_empty()
-    {
-        return Err(unavailable(
-            &manifest_path,
-            "served and disk generations disagree or are not sharded",
-        ));
-    }
+}
+
+fn shard_population(current: &Path) -> Result<Vec<PathBuf>, InventoryError> {
     let shards = current.join("event-shards");
     for path in [current, shards.as_path()] {
         if !fs::symlink_metadata(path)
@@ -598,44 +580,150 @@ pub(super) fn measure(
             ));
         }
     }
-    let (names, trees_consulted, archives_consulted, broken_links) = inventory(captures, &watch)?;
+    fs::read_dir(&shards)
+        .map_err(|error| unavailable(&shards, error))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| unavailable(&shards, error))
+        })
+        .collect()
+}
 
-    let (mut count, mut bytes) = (0usize, 0u64);
-    for entry in fs::read_dir(&shards).map_err(|error| unavailable(&shards, error))? {
-        let entry = entry.map_err(|error| unavailable(&shards, error))?;
-        let path = entry.path();
-        let entry_name = entry.file_name();
-        let name = entry_name
-            .to_str()
-            .ok_or_else(|| unavailable(&path, "shard entry has a non-UTF-8 name"))?;
-        if !name.starts_with("shard-") || !name.ends_with(".jsonl") || names.contains(name) {
+pub(super) fn measure(
+    captures: &Path,
+    current: &Path,
+    served: impl Fn() -> Option<LiveDataset>,
+) -> Result<Totals, InventoryError> {
+    let base = current
+        .parent()
+        .ok_or_else(|| unavailable(current, "dataset has no parent"))?;
+    let manifest_path = current.join("dataset_manifest.json");
+    let sequence_path = current.join(commit_seq::COMMIT_SEQ_FILENAME);
+    let mut publication_lock_held_ns = 0u64;
+    for retry in [false, true] {
+        let watch = InventoryWatch::new()?;
+        // Freeze membership against the collector. Stat, archive and manifest
+        // traversal stay outside the lock. No directory events are subscribed to.
+        let (commit_seq, population) = {
+            let lock = PublicationLock::acquire_blocking(base)
+                .map_err(|error| unavailable(base, error))?;
+            let started = Instant::now();
+            let commit_seq = read_sequence(&sequence_path)?;
+            watch.add(&manifest_path)?;
+            watch.add(&sequence_path)?;
+            let population = shard_population(current)?;
+            drop(lock);
+            publication_lock_held_ns += started.elapsed().as_nanos() as u64;
+            (commit_seq, population)
+        };
+
+        let scanned = (|| {
+            #[cfg(test)]
+            inject_failure(FailurePoint::ActiveManifest, &manifest_path)?;
+            let manifest: Value = serde_json::from_slice(
+                &fs::read(&manifest_path).map_err(|error| unavailable(&manifest_path, error))?,
+            )
+            .map_err(|error| unavailable(&manifest_path, error))?;
+            let mut names = HashSet::new();
+            protect_manifest(&manifest, &mut names)
+                .map_err(|error| unavailable(&manifest_path, error))?;
+            let active: LiveDataset = serde_json::from_value(manifest)
+                .map_err(|error| unavailable(&manifest_path, error))?;
+            if !served()
+                .as_ref()
+                .is_some_and(|published| same_manifest(published, &active))
+            {
+                return Err(unavailable(
+                    &manifest_path,
+                    "served and disk generations disagree or are not sharded",
+                ));
+            }
+            let shards = current.join("event-shards");
+            let physical_shards = shards
+                .canonicalize()
+                .map_err(|error| unavailable(&shards, error))?;
+            let (names, trees_consulted, archives_consulted, broken_links) =
+                inventory(captures, &physical_shards, current, &population, names)?;
+            #[cfg(test)]
+            AFTER_TRAVERSAL.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(current);
+                }
+            });
+            let (mut count, mut bytes) = (0usize, 0u64);
+            for path in population {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| unavailable(&path, "shard entry has a non-UTF-8 name"))?;
+                if !name.starts_with("shard-") || !name.ends_with(".jsonl") || names.contains(name)
+                {
+                    continue;
+                }
+                #[cfg(test)]
+                inject_failure(FailurePoint::Shard, &path)?;
+                let metadata =
+                    fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
+                if metadata.is_file() {
+                    count += 1;
+                    bytes += metadata.len();
+                }
+            }
+            #[cfg(test)]
+            inject_failure(FailurePoint::Finish, current)?;
+            watch.check_mounts()?;
+            Ok((
+                active,
+                count,
+                bytes,
+                trees_consulted,
+                archives_consulted,
+                broken_links,
+            ))
+        })();
+        let watch_result = watch.unchanged(&manifest_path);
+        let latest_seq = read_sequence(&sequence_path)?;
+        if latest_seq != commit_seq {
+            if retry {
+                let mut error = unavailable(
+                    &sequence_path,
+                    "commit_seq changed during both inventory attempts",
+                );
+                error.commit_seq_change = Some((commit_seq, latest_seq));
+                return Err(error);
+            }
             continue;
         }
-        #[cfg(test)]
-        inject_failure(FailurePoint::Shard, &path)?;
-        let metadata = fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
-        if metadata.is_file() {
-            watch.add(&path, false)?;
-            count += 1;
-            bytes += metadata.len();
+        let (active, count, bytes, trees_consulted, archives_consulted, broken_links) = scanned?;
+        if !served()
+            .as_ref()
+            .is_some_and(|latest| same_manifest(latest, &active))
+        {
+            return Err(unavailable(
+                &manifest_path,
+                "served generation changed during measurement",
+            ));
         }
+        watch_result?;
+        return Ok(Totals {
+            commit_seq,
+            publication_lock_held_ns,
+            count,
+            bytes,
+            trees_consulted,
+            archives_consulted,
+            broken_links,
+        });
     }
-    #[cfg(test)]
-    inject_failure(FailurePoint::Finish, current)?;
-    watch.check_mounts()?;
-    if !served_is_current() {
-        return Err(unavailable(
-            &manifest_path,
-            "served generation changed during measurement",
-        ));
-    }
-    watch.unchanged()?;
-    // The sole construction of publishable totals follows every fallible read and validation.
-    Ok(Totals {
-        count,
-        bytes,
-        trees_consulted,
-        archives_consulted,
-        broken_links,
-    })
+    unreachable!("inventory returns on its second attempt")
+}
+
+#[cfg(test)]
+type TraversalHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_TRAVERSAL: std::cell::RefCell<Option<TraversalHook>> =
+        const { std::cell::RefCell::new(None) };
 }

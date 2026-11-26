@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.195 / live-probe 0.7.5 — generation-scoped orphan inventory
+
+Report the commit measured by the read-only orphan inventory. Pin the shard population before the walk and retry once if a publication advances the commit. Report both commit sequences if the retry also becomes obsolete.
+
 ## oiran-api 2.21.194 / oiran-decode 0.12.1 — SCTP association provenance
 
 Preserve the SCTP association identifier, generation and verification tag on decoded packet references through JSONL and callflow publication. Older packet references remain readable. Event populations and attachment rules are unchanged. Event-schema 1.13.0 and session-engine 0.5.35 carry the optional provenance.

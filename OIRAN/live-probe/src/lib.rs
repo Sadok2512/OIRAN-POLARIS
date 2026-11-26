@@ -5467,17 +5467,9 @@ impl CaptureManager {
     }
 
     fn measure_continuous_event_shards(&self, current: &Path) {
-        let served = self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned();
-        let result = served
-            .as_ref()
-            .ok_or_else(|| event_shard_inventory::InventoryError::general("no continuous generation is currently served"))
-            .and_then(|served| {
-                event_shard_inventory::measure(&self.root, current, served, || {
-                    self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID)
-                        .is_some_and(|latest| latest.callflows_path == served.callflows_path
-                            && latest.event_count == served.event_count)
-                })
-            });
+        let result = event_shard_inventory::measure(&self.root, current, || {
+            self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned()
+        });
         *self.shard_inventory_snapshot.lock().unwrap() = Some(result);
     }
 
@@ -24471,7 +24463,7 @@ Content-Length: 0\r\n\
     }
 
     #[test]
-    fn shard_inventory_reports_counts_without_holding_the_publication_lock() {
+    fn shard_inventory_pins_population_and_retries_once_outside_publication_lock() {
         assert_shard_inventory(None);
     }
 
@@ -24616,14 +24608,17 @@ Content-Length: 0\r\n\
         let (_, held) = event_shard_inventory::LOCK_PROBE.with(|probe| probe.replace(None)).unwrap();
         assert_eq!(held, Duration::ZERO);
         let snapshot = bench.manager.event_shard_orphan_inventory();
-        assert_eq!(snapshot["publication_lock_held_ns"], 0);
-        if let Some(path) = bad_path {
+        assert!(snapshot["publication_lock_held_ns"].as_u64().unwrap_or_default() < 50_000_000);
+        if let Some(path) = &bad_path {
             assert_eq!(snapshot["status"], "unavailable", "{snapshot}");
             assert_eq!(snapshot["error"]["path"], serde_json::json!(path));
             assert!(snapshot["error"]["reason"].is_string());
             assert_orphan_totals_unavailable(&snapshot);
         } else {
             assert_eq!(snapshot["status"], "available", "{snapshot}");
+            let served_seq = commit_seq::read(&dataset);
+            assert!(served_seq > 0);
+            assert_eq!(snapshot["commit_seq"], served_seq, "inventory must name the measured generation");
             if dangling {
                 assert_eq!(snapshot["broken_links"], 1);
             }
@@ -24632,6 +24627,49 @@ Content-Length: 0\r\n\
                 .map(|path| fs::metadata(path).unwrap().len()).sum::<u64>();
             assert_eq!(snapshot["bytes"], bytes);
             assert!(snapshot["error"].is_null());
+        }
+        if bad_path.is_none() && failures.is_empty() && !dangling {
+            use event_shard_inventory::AFTER_TRAVERSAL;
+
+            let late = dataset.join("event-shards/shard-arrived-during-traversal.jsonl");
+            let late_file = late.clone();
+            let original_seq = commit_seq::read(&dataset);
+            AFTER_TRAVERSAL.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| fs::write(&late_file, b"late").unwrap()));
+            });
+            bench.manager.measure_continuous_event_shards(&dataset);
+            let pinned = bench.manager.event_shard_orphan_inventory();
+            assert_eq!(pinned["commit_seq"], original_seq, "{pinned}");
+            assert_eq!(pinned["count"], snapshot["count"], "{pinned}");
+            assert_eq!(pinned["bytes"], snapshot["bytes"], "{pinned}");
+
+            let mut advanced = false;
+            AFTER_TRAVERSAL.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |current| {
+                    if !advanced {
+                        commit_seq::bump_and_write(current).unwrap();
+                        advanced = true;
+                    }
+                }));
+            });
+            bench.manager.measure_continuous_event_shards(&dataset);
+            let retried = bench.manager.event_shard_orphan_inventory();
+            assert_eq!(retried["commit_seq"], original_seq + 1, "{retried}");
+            assert_eq!(retried["count"], snapshot["count"].as_u64().unwrap() + 1, "{retried}");
+            assert_eq!(retried["bytes"], snapshot["bytes"].as_u64().unwrap() + fs::metadata(late).unwrap().len());
+
+            AFTER_TRAVERSAL.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|current| {
+                    commit_seq::bump_and_write(current).unwrap();
+                }));
+            });
+            bench.manager.measure_continuous_event_shards(&dataset);
+            AFTER_TRAVERSAL.with(|hook| hook.replace(None));
+            let unavailable = bench.manager.event_shard_orphan_inventory();
+            assert_orphan_totals_unavailable(&unavailable);
+            assert!(unavailable["commit_seq"].is_null());
+            assert_eq!(unavailable["error"]["commit_seq_before"], original_seq + 2);
+            assert_eq!(unavailable["error"]["commit_seq_after"], original_seq + 3);
         }
         for &phase in failures {
             FAIL_AT.with(|point| point.set(Some(phase)));
