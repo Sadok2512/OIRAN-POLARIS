@@ -23764,6 +23764,42 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         }
     }
 
+    #[tokio::test]
+    async fn ue_inventory_only_exposes_references_for_assigned_nr_and_lte_addresses() {
+        let mut test_state = state();
+        {
+            let mut registry = test_state.multi_ue.lock().unwrap();
+            registry.configure_count(2).unwrap();
+            registry.start_offline("UE-02").unwrap();
+            registry.apply_observation("UE-02", "RUNNING", "REGISTERED", "ACTIVE", Some("192.0.2.10")).unwrap();
+            assert_eq!(registry.snapshot().iter().find(|job| job.ue_id == "UE-02").unwrap().ue_ip.as_deref(), Some("192.0.2.10"));
+        }
+        let runtime = srsran_controller::MockSrsranRuntime::default();
+        let mut lte = srsran_controller::SrsranRuntime::status(&runtime, false, false).unwrap();
+        lte.ue.observed = true;
+        lte.ue.process_state = "running".into();
+        lte.attach_state = "ATTACHED".into();
+        lte.active_sessions = 1;
+        lte.ue_ip = Some("2001:db8::10".into());
+        *runtime.status_override.lock().unwrap() = Some(lte);
+        test_state.srsran_runtime = Arc::new(runtime);
+        let application = app(test_state);
+        let (cookie, _) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application.oneshot(Request::builder().uri("/api/v1/ues")
+            .header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        for id in ["UE-02", srsran_controller::LTE_UE_ID] {
+            let row = payload["items"].as_array().unwrap().iter()
+                .find(|row| row["internal_ue_id"] == id).unwrap();
+            assert_eq!(row["pdu_session"], "ACTIVE");
+            assert!(row["ue_ip"].as_str().is_some_and(|value| value.starts_with("addr-")),
+                "the assigned address must be represented by a server reference for {id}");
+        }
+        let encoded = payload.to_string();
+        assert!(!encoded.contains("192.0.2.10") && !encoded.contains("2001:db8::10"));
+    }
+
     /// 0.36.31 (ordre cœur #9 7133029202) — interrupteur
     /// `POLARIS_IDENTITIES_IN_CLEAR`, famille B (télémétrie, ligne
     /// `POLARIS_CONTROL_JOB`, History), les deux côtés. Fermé : masqué comme
