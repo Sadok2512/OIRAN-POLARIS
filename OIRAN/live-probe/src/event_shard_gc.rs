@@ -4,18 +4,21 @@ use super::{sha256_hex, sha256_hex_file, LiveDataset};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
+    ffi::CString,
     fs,
     io::{BufRead, BufReader},
-    os::unix::fs::MetadataExt,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub(super) const INTERVAL: Duration = Duration::from_secs(30 * 60);
 const GRACE: Duration = Duration::from_secs(60 * 60);
 const SAFETY_BAND: usize = 2;
 const MAX_CANDIDATES: usize = 8;
+const LOCK_BUDGET: Duration = Duration::from_millis(50);
 const MAX_EVENT_HASHES: usize = 1_000_000;
 
 #[derive(Default)]
@@ -28,6 +31,96 @@ pub(super) struct Report {
     pub directories_read: usize,
     pub candidate_stats: usize,
     pub history_unproven: usize,
+    pub lock_held: Duration,
+}
+
+// The watch is armed before reading inputs. Any pending notification, including
+// queue overflow or invalidation, discards the plan; no event is drained.
+struct InventoryWatch {
+    fd: OwnedFd,
+    mounts: Vec<u8>,
+}
+
+impl InventoryWatch {
+    fn new() -> Result<Self, String> {
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mounts = fs::read("/proc/self/mountinfo").map_err(|error| error.to_string())?;
+        Ok(Self { fd, mounts })
+    }
+
+    fn add(&self, path: &Path, directory: bool) -> Result<(), String> {
+        let changes = if directory {
+            libc::IN_ONLYDIR
+                | libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_FROM
+                | libc::IN_MOVED_TO
+        } else {
+            libc::IN_MODIFY | libc::IN_CLOSE_WRITE
+        };
+        self.add_mask(path, changes)
+    }
+
+    fn add_mask(&self, path: &Path, changes: u32) -> Result<(), String> {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|error| format!("watch {}: {error}", path.display()))?;
+        let common = libc::IN_ATTRIB
+            | libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF
+            | libc::IN_UNMOUNT
+            | libc::IN_MASK_ADD;
+        if unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), common | changes) }
+            < 0
+        {
+            return Err(format!(
+                "watch {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_ancestors(&self, path: &Path) -> Result<(), String> {
+        for directory in path.ancestors().skip(1) {
+            self.add_mask(directory, libc::IN_ONLYDIR)?;
+        }
+        Ok(())
+    }
+
+    fn unchanged(&self) -> Result<(), String> {
+        let mut poll = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut poll, 1, 0) } {
+            0 => Ok(()),
+            1 => Err("shard inventory changed; sweep deferred".into()),
+            _ => Err(std::io::Error::last_os_error().to_string()),
+        }
+    }
+
+    fn check_mounts(&self) -> Result<(), String> {
+        if fs::read("/proc/self/mountinfo").map_err(|error| error.to_string())? != self.mounts {
+            return Err("mount topology changed; sweep deferred".into());
+        }
+        Ok(())
+    }
+}
+
+fn unavailable(path: &Path, error: std::io::Error) -> String {
+    format!("{}: {error}", path.display())
+}
+
+fn excluded_ui_tree(path: &Path) -> bool {
+    // These are the frontend build account's cache/home and secret store.
+    // Neither is an Analyzer dataset or rollback tree.
+    path.starts_with("/opt/polaris-ui/.home") || path.starts_with("/opt/polaris-ui/secrets")
 }
 
 fn manifest_name(name: &str) -> bool {
@@ -175,7 +268,10 @@ pub(super) const REQUIRED_BACKUPS: [(&str, Option<Artifact>); 9] = [
 
 type ExpectedArtifacts = BTreeMap<PathBuf, &'static [&'static str]>;
 
-fn roots(captures: &Path) -> Result<(Vec<PathBuf>, ExpectedArtifacts), String> {
+fn roots(
+    captures: &Path,
+    watch: &InventoryWatch,
+) -> Result<(Vec<PathBuf>, ExpectedArtifacts), String> {
     let (mut roots, backup_root) = if cfg!(test) {
         (vec![captures.to_owned()], captures.join(".gc-backups"))
     } else {
@@ -188,6 +284,8 @@ fn roots(captures: &Path) -> Result<(Vec<PathBuf>, ExpectedArtifacts), String> {
             PathBuf::from("/root"),
         )
     };
+    watch.add_ancestors(&backup_root)?;
+    watch.add(&backup_root, true)?;
     let mut identities = HashSet::new();
     let mut expected = BTreeMap::new();
     for (name, artifact) in REQUIRED_BACKUPS {
@@ -231,6 +329,7 @@ fn inventory(
     captures: &Path,
     names: &mut HashSet<String>,
     report: &mut Report,
+    watch: &InventoryWatch,
 ) -> Result<(), String> {
     #[cfg(test)]
     LOCK_PROBE.with(|probe| {
@@ -244,10 +343,23 @@ fn inventory(
             }
         }
     });
-    let (mut pending, mut expected) = roots(captures)?;
+    let (mut pending, mut expected) = roots(captures, watch)?;
+    for root in &pending {
+        watch.add_ancestors(root)?;
+    }
     let mut seen = HashSet::new();
     while let Some(directory) = pending.pop() {
-        let metadata = fs::metadata(&directory).map_err(|error| error.to_string())?;
+        if excluded_ui_tree(&directory) {
+            continue;
+        }
+        let physical = directory
+            .canonicalize()
+            .map_err(|error| unavailable(&directory, error))?;
+        if excluded_ui_tree(&physical) {
+            continue;
+        }
+        watch.add(&physical, true)?;
+        let metadata = fs::metadata(&directory).map_err(|error| unavailable(&directory, error))?;
         if !metadata.is_dir() {
             return Err("inventory root is not a directory".into());
         }
@@ -256,9 +368,12 @@ fn inventory(
         }
         report.directories_read += 1;
         let mut found_manifest = false;
-        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+        for entry in fs::read_dir(&directory).map_err(|error| unavailable(&directory, error))? {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
+            if excluded_ui_tree(&path) {
+                continue;
+            }
             let kind = entry.file_type().map_err(|error| error.to_string())?;
             let required = expected.get(&path).copied();
             if required.is_some() && !kind.is_file() {
@@ -290,8 +405,30 @@ fn inventory(
                 }
                 match fs::metadata(&path) {
                     Ok(metadata) if metadata.is_dir() => {
-                        pending.push(path);
+                        let physical = path
+                            .canonicalize()
+                            .map_err(|error| unavailable(&path, error))?;
+                        if !excluded_ui_tree(&physical) {
+                            watch.add_ancestors(&physical)?;
+                            pending.push(path);
+                        }
                         continue;
+                    }
+                    Ok(_)
+                        if entry.file_name().to_str().is_some_and(|name| {
+                            manifest_name(name) || name.ends_with(".tar.zst")
+                        }) =>
+                    {
+                        let physical = path
+                            .canonicalize()
+                            .map_err(|error| unavailable(&path, error))?;
+                        if excluded_ui_tree(&physical) {
+                            return Err(format!(
+                                "inventory artifact resolves outside Analyzer data trees: {}",
+                                path.display()
+                            ));
+                        }
+                        watch.add_ancestors(&physical)?;
                     }
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -305,7 +442,8 @@ fn inventory(
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if manifest_name(name) {
-                let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+                watch.add(&path, false)?;
+                let bytes = fs::read(&path).map_err(|error| unavailable(&path, error))?;
                 let value: Value =
                     serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
                 if required.is_some() && value.get("dataset_id").and_then(Value::as_str).is_none() {
@@ -317,6 +455,7 @@ fn inventory(
                 protect_manifest(&value, names)?;
                 found_manifest = true;
             } else if name.ends_with(".tar.zst") {
+                watch.add(&path, false)?;
                 archive_manifest(&path, required.unwrap_or_default(), names)
                     .map_err(|error| format!("{}: {error}", path.display()))?;
                 report.archives_consulted += 1;
@@ -356,7 +495,9 @@ fn history_is_preserved(
     candidate: &Path,
     current: &Path,
     active: &LiveDataset,
+    watch: &InventoryWatch,
 ) -> Result<bool, String> {
+    watch.add(candidate, false)?;
     let mut remaining = HashSet::new();
     let mut valid = true;
     visit_event_lines(candidate, |line| {
@@ -371,6 +512,7 @@ fn history_is_preserved(
         return Ok(false);
     }
     let mut match_file = |path: &Path, sha: &str| -> Result<bool, String> {
+        watch.add(path, false)?;
         if sha256_hex_file(path)? != sha {
             return Err("history source checksum mismatch".into());
         }
@@ -415,6 +557,7 @@ fn history_is_preserved(
             continue;
         }
         let directory = entry.path();
+        watch.add(&directory.join("manifest.json"), false)?;
         let manifest: Value = serde_json::from_slice(
             &fs::read(directory.join("manifest.json")).map_err(|error| error.to_string())?,
         )
@@ -440,15 +583,21 @@ fn identity(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64) {
     )
 }
 
-// Called with the publication lock held. In a disagreement between RAM and
-// disk, keep every shard, including ones from the next on-disk generation.
+// Prepare with no publication lock. Refuse when the served or on-disk
+// generation changes before the bounded commit section.
 pub(super) fn sweep(
     captures: &Path,
     current: &Path,
     served: &LiveDataset,
+    served_is_current: impl FnOnce() -> bool,
     report: &mut Report,
 ) -> Result<(), String> {
+    let watch = InventoryWatch::new()?;
+    let base = current.parent().ok_or("continuous dataset has no parent")?;
+    watch.add(base, true)?;
+    watch.add(current, true)?;
     let manifest_path = current.join("dataset_manifest.json");
+    watch.add(&manifest_path, false)?;
     let active_bytes = fs::read(&manifest_path).map_err(|error| error.to_string())?;
     let active: LiveDataset =
         serde_json::from_slice(&active_bytes).map_err(|error| error.to_string())?;
@@ -479,7 +628,7 @@ pub(super) fn sweep(
         return Err("dataset and shard paths must be real directories".into());
     }
     let mut names = HashSet::new();
-    inventory(captures, &mut names, report)?;
+    inventory(captures, &mut names, report, &watch)?;
     if report.trees_consulted == 0 {
         return Err("no manifest tree was consulted".into());
     }
@@ -515,7 +664,7 @@ pub(super) fn sweep(
                 && now.duration_since(*modified).unwrap_or_default() >= GRACE
         });
     for (_, path, metadata) in eligible.take(MAX_CANDIDATES) {
-        if history_is_preserved(&path, current, &active)? {
+        if history_is_preserved(&path, current, &active, &watch)? {
             confirmed.push((path, metadata));
         } else {
             report.history_unproven += 1;
@@ -526,26 +675,59 @@ pub(super) fn sweep(
     }
     // Backups can be prepared independently of the publisher. Refresh the
     // entire union after the potentially long content proof.
-    inventory(captures, &mut names, report)?;
-    if fs::read(&manifest_path).map_err(|error| error.to_string())? != active_bytes {
-        return Err("active manifest changed during sweep".into());
-    }
-    for (path, before) in confirmed {
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| names.contains(name))
+    inventory(captures, &mut names, report, &watch)?;
+    watch.unchanged()?;
+    let lock = super::PublicationLock::try_acquire(base)?;
+    let started = Instant::now();
+    let result = (|| {
+        watch.check_mounts()?;
+        if !served_is_current()
+            || identity(
+                &fs::symlink_metadata(&manifest_path)
+                    .map_err(|error| unavailable(&manifest_path, error))?,
+            ) != identity(&manifest)
         {
-            continue;
+            return Err("active or served generation changed during sweep".into());
         }
-        report.candidate_stats += 1;
-        let after = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if after.is_file() && identity(&before) == identity(&after) {
-            fs::remove_file(path).map_err(|error| error.to_string())?;
+        watch.unchanged()?;
+        // Validate the entire deletion batch first. Unlink generates its own
+        // inotify events, so validate again just before the first unlink.
+        let mut remove = Vec::new();
+        for (path, before) in confirmed {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| names.contains(name))
+            {
+                continue;
+            }
+            report.candidate_stats += 1;
+            let after = fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
+            if after.is_file() && identity(&before) == identity(&after) {
+                remove.push((path, after.len()));
+            }
+        }
+        watch.unchanged()?;
+        if started.elapsed() >= LOCK_BUDGET {
+            return Err("publication lock budget exceeded before unlink".into());
+        }
+        // One unlink per fresh inventory keeps the checked batch and its
+        // notification boundary indivisible from the publisher's perspective.
+        if let Some((path, bytes)) = remove.into_iter().next() {
+            fs::remove_file(&path).map_err(|error| unavailable(&path, error))?;
             report.count += 1;
-            report.bytes += after.len();
+            report.bytes += bytes;
             report.kept -= 1;
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    drop(lock);
+    report.lock_held = started.elapsed();
+    #[cfg(test)]
+    LOCK_PROBE.with(|probe| {
+        if let Some((_, held)) = probe.borrow_mut().as_mut() {
+            *held += report.lock_held;
+        }
+    });
+    result
 }

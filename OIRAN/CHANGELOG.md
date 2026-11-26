@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.190 / live-probe 0.7.2 — bounded shard sweep commit
+
+Prepare event shard sweeps off the publication path. Recheck the watched inventory and served generation before one unlink under the publication lock. Exclude the frontend build home and secret store from the Analyzer inventory.
+
 ## oiran-api 2.21.189 / live-probe 0.7.1 — event shard garbage collection
 
 Reclaim old event shards periodically after consulting capture and rollback manifests, including compressed backups. Protect the served generation and require independently verified copies of the candidate events before unlinking.

@@ -1819,6 +1819,8 @@ pub struct CaptureManager {
     sequence: Arc<AtomicU64>,
     continuous_stop: Arc<AtomicBool>,
     last_event_shard_sweep: Arc<Mutex<Option<Instant>>>,
+    #[cfg(not(test))]
+    shard_sweep_running: Arc<AtomicBool>,
     continuous_runtime_evidence: Arc<Mutex<Option<PathBuf>>>,
     /// 2.21.9 — répertoires vTAP de l'import continu en cours (vide par
     /// défaut et en test ; posé par `start_continuous_import`).
@@ -2348,6 +2350,8 @@ impl CaptureManager {
             sequence: Arc::new(AtomicU64::new(1)),
             continuous_stop: Arc::new(AtomicBool::new(false)),
             last_event_shard_sweep: Arc::new(Mutex::new(None)),
+            #[cfg(not(test))]
+            shard_sweep_running: Arc::new(AtomicBool::new(false)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(std::sync::RwLock::new(())),
@@ -5090,6 +5094,9 @@ impl CaptureManager {
                     "seen_checksums": state.seen_checksums.len(),
                 })
             );
+            if published {
+                self.schedule_shard_sweep(&base);
+            }
             thread::sleep(sleep_for);
         }
     }
@@ -5386,6 +5393,7 @@ impl CaptureManager {
         selected_segments: usize,
     ) -> Result<(), String> {
         self.upsert_dataset(dataset.clone(), &base.join("dataset"))?;
+        self.schedule_shard_sweep(base);
         eprintln!(
             "{}",
             serde_json::json!({
@@ -5417,13 +5425,50 @@ impl CaptureManager {
         )
     }
 
+    fn schedule_shard_sweep(&self, base: &Path) {
+        if base != self.root.join(CONTINUOUS_CAPTURE_ID) {
+            return;
+        }
+        let mut last = self.last_event_shard_sweep.lock().unwrap();
+        if last.is_some_and(|started| started.elapsed() < event_shard_gc::INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+        drop(last);
+        let current = base.join("dataset");
+        #[cfg(test)]
+        self.sweep_continuous_event_shards(&current);
+        #[cfg(not(test))]
+        {
+            if self.shard_sweep_running.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let manager = self.clone();
+            if let Err(error) = thread::Builder::new().name("oiran-shard-sweep".into())
+                .spawn(move || {
+                    manager.sweep_continuous_event_shards(&current);
+                    manager.shard_sweep_running.store(false, Ordering::Release);
+                })
+            {
+                self.shard_sweep_running.store(false, Ordering::Release);
+                eprintln!("EVENT_SHARD_ORPHANS_SWEEP_START_FAILED: {error}");
+            }
+        }
+    }
+
     fn sweep_continuous_event_shards(&self, current: &Path) {
         let served = self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned();
         let mut report = event_shard_gc::Report::default();
         let result = served
             .as_ref()
             .ok_or_else(|| "no continuous generation is currently served".to_string())
-            .and_then(|served| event_shard_gc::sweep(&self.root, current, served, &mut report));
+            .and_then(|served| {
+                event_shard_gc::sweep(&self.root, current, served, || {
+                    self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID)
+                        .is_some_and(|latest| latest.callflows_path == served.callflows_path
+                            && latest.event_count == served.event_count)
+                }, &mut report)
+            });
         eprintln!(
             "{}",
             serde_json::json!({
@@ -5436,6 +5481,7 @@ impl CaptureManager {
                 "directories_read": report.directories_read,
                 "candidate_stats": report.candidate_stats,
                 "history_unproven": report.history_unproven,
+                "publication_lock_held_ns": report.lock_held.as_nanos(),
                 "error": result.err(),
             })
         );
@@ -5455,14 +5501,6 @@ impl CaptureManager {
         // `RESTORE_REQUIRES_PUBLICATION_LOCK` when the worker holds it.
         let _publication_lock = PublicationLock::acquire_blocking(base)?;
         let current = base.join("dataset");
-        if base == self.root.join(CONTINUOUS_CAPTURE_ID) {
-            let mut last = self.last_event_shard_sweep.lock().unwrap();
-            if last.map_or(true, |started| started.elapsed() >= event_shard_gc::INTERVAL) {
-                *last = Some(Instant::now());
-                drop(last);
-                self.sweep_continuous_event_shards(&current);
-            }
-        }
         let next = base.join(".dataset-next");
         if next.exists() {
             fs::remove_dir_all(&next).map_err(display_error)?;
