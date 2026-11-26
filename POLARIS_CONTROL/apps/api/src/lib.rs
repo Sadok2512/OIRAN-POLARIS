@@ -17799,6 +17799,74 @@ mod p0_tests {
         }
     }
 
+    struct ExitObservedDuringStop {
+        inner: FakeLiveUeRuntime,
+        controller: Arc<Mutex<MultiUeController>>,
+    }
+
+    impl UeRuntime for ExitObservedDuringStop {
+        fn verify_provisioning(&self, profiles: &[UeProfileSpec]) -> Result<BTreeMap<String, String>, String> {
+            self.inner.verify_provisioning(profiles)
+        }
+
+        fn approve_launch(&self, profile: &UeProfileSpec, profile_sha256: &str) -> Result<LiveLaunchSpec, String> {
+            self.inner.approve_launch(profile, profile_sha256)
+        }
+
+        fn launch(&self, spec: &LiveLaunchSpec) -> Result<String, UeLaunchFailure> {
+            self.inner.launch(spec)
+        }
+
+        fn discover(&self, spec: &LiveLaunchSpec) -> Result<Option<String>, String> {
+            self.inner.discover(spec)
+        }
+
+        fn observe_owned(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<UeObservation, String> {
+            self.inner.observe_owned(spec, handle)
+        }
+
+        fn observe_shared(&self) -> Result<UeObservation, String> {
+            self.inner.observe_shared()
+        }
+
+        fn owns(&self, spec: &LiveLaunchSpec, handle: &str) -> bool {
+            self.inner.owns(spec, handle)
+        }
+
+        fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String> {
+            self.inner.stop(spec, handle)?;
+            let mut controller = self.controller.lock().unwrap();
+            let job = controller.snapshot().into_iter()
+                .find(|job| job.ue_id == spec.ue_id).unwrap();
+            controller.apply_observation_if_current(
+                &spec.ue_id, handle, job.operation_id.as_deref(), job.generation,
+                &UeObservation {
+                    process_state: "EXITED".into(),
+                    registration_state: "NOT_OBSERVED".into(),
+                    pdu_session_state: "INACTIVE".into(),
+                    ue_ip: None,
+                },
+            )?;
+            Ok(())
+        }
+
+        fn snapshot_gnb_contexts(&self) -> Result<Vec<GnbUeContext>, String> {
+            self.inner.snapshot_gnb_contexts()
+        }
+
+        fn request_pdu_release_for_detach(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
+            self.inner.request_pdu_release_for_detach(job)
+        }
+
+        fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
+            self.inner.deregister_switch_off(job)
+        }
+
+        fn resolve_traffic_target(&self, job: &simulator_controller::UeJob, destination: &str) -> Result<VerifiedTrafficTarget, String> {
+            self.inner.resolve_traffic_target(job, destination)
+        }
+    }
+
     struct GnbCleanupFailureRuntime(FakeLiveUeRuntime);
 
     impl UeRuntime for GnbCleanupFailureRuntime {
@@ -24820,6 +24888,49 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert!(!actions.contains(&"UE-05".into()));
         assert!(actions.contains(&"DEREGISTERED:UE-06".into()));
         assert!(actions.contains(&"UE-06".into()));
+    }
+
+    #[test]
+    fn detach_finalizes_an_exit_observed_during_the_stop_operation() {
+        let mut state = state();
+        state.multi_ue.lock().unwrap().configure_count(6).unwrap();
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        state.ue_runtime = Arc::new(ExitObservedDuringStop {
+            inner: FakeLiveUeRuntime {
+                stopped: stopped.clone(),
+                launched: Arc::new(Mutex::new(Vec::new())),
+                fail_observation: false,
+                fail_verification: false,
+                fail_stop: false,
+                fail_policy_route_cleanup: None,
+            },
+            controller: state.multi_ue.clone(),
+        });
+        let ue_ids = ["UE-06".to_string()];
+        let control = DefinitionJobControl {
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+            established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
+            ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
+            started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(&ue_ids, "test")),
+        };
+        let step = |index, step_type: &str| ResolvedStep {
+            index,
+            step_type: step_type.into(),
+            scenario_loop_iteration: 1,
+            scenario_loop_count: 1,
+            step_loop_iteration: 1,
+            step_loop_count: 1,
+            parameters: BTreeMap::new(),
+        };
+        execute_live_definition_step(&state, &step(0, "ue_start"), &ue_ids, &control).unwrap();
+        let result = execute_live_definition_step(&state, &step(1, "detach"), &ue_ids, &control);
+        assert!(stopped.lock().unwrap().contains(&ue_ids[0]), "runtime stop completed");
+        let measurements = result.expect("detach must recognize the completed stop");
+        assert_eq!(measurements["ues"][0]["process_state"], "STOPPED");
+        assert_eq!(measurements["ues"][0]["pdu_session_state"], "INACTIVE");
+        assert_eq!(measurements["ues"][0]["completion_evidence"], "CONTROLLER_TERMINAL_STATE_OBSERVED");
     }
 
     #[test]
