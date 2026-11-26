@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.34 — Affichage IMSI piloté par l’API
+
+Expose le réglage dans `/ues` et affiche la valeur projetée par le serveur dans la table UE. Le réglage d’affichage ne change ni le masquage des adresses ni les protections de journalisation.
+
 ## 0.36.33 — Finalisation du detach après observation de la sortie du processus
 
 Après un arrêt vérifié et la réconciliation gNB, le registre finalise aussi les jobs que l’observateur avait déjà classés `Stopped`. Le detach conserve son exigence `STOPPED/INACTIVE` et journalise le couple observé en cas de rejet. Simulator-controller passe à 0.3.1.

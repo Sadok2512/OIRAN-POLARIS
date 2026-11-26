@@ -801,9 +801,8 @@ pub enum SubscriberIdentityVisibility {
 }
 
 /// 0.36.31 (ordre cœur #9 7133029202) — interrupteur unique des identités
-/// d'abonné de Control. `POLARIS_IDENTITIES_IN_CLEAR=1` : l'IMSI et le
-/// MSISDN provisionnés sont rendus en clair dans toutes les sorties de
-/// Control (API, History, journal, télémétrie). Absent, `0` ou toute autre
+/// d'abonné de Control. `POLARIS_IDENTITIES_IN_CLEAR=1` rend l'IMSI
+/// provisionné en clair dans les champs d'affichage de l'API. Absent, `0` ou toute autre
 /// valeur : comportement 0.36.30, masqué. Lu une fois par processus. Ne
 /// touche jamais le matériel d'authentification (K, OPc), les clés HMAC ni
 /// les adresses IP, qui restent pseudonymisées.
@@ -815,7 +814,7 @@ pub fn identities_in_clear() -> bool {
         let clear = value == Some("1");
         match value {
             Some("1") => eprintln!(
-                "POLARIS_IDENTITIES_IN_CLEAR=1 : identités d'abonné (IMSI, MSISDN) rendues en clair par Control"
+                "POLARIS_IDENTITIES_IN_CLEAR=1 : IMSI rendu en clair dans les champs d’affichage Control"
             ),
             None | Some("") | Some("0") => {}
             Some(_) => eprintln!(
@@ -830,7 +829,7 @@ impl SubscriberIdentityVisibility {
     /// Convenience helper: operators and administrators see the IMSI;
     /// anyone else (viewers, unknown roles) stays `Protected`.
     pub fn for_role(role: &str) -> Self {
-        Self::for_role_with(role, identities_in_clear())
+        Self::for_role_with(role, false)
     }
 
     /// 0.36.31 — à l'interrupteur ouvert, tout rôle authentifié voit l'IMSI.
@@ -860,8 +859,8 @@ pub fn sanitize_for_role_with(
     visibility: SubscriberIdentityVisibility,
     clear: bool,
 ) -> SanitizedSubscriber {
-    let visibility = if clear { SubscriberIdentityVisibility::Imsi } else { visibility };
-    let identity = match visibility {
+    let identity_visibility = if clear { SubscriberIdentityVisibility::Imsi } else { visibility };
+    let identity = match identity_visibility {
         SubscriberIdentityVisibility::Imsi => record.imsi.clone(),
         SubscriberIdentityVisibility::Masked => mask_subscriber_identity_with(&record.imsi, clear),
         SubscriberIdentityVisibility::Protected => "PROTECTED".into(),
@@ -1850,7 +1849,10 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         ] {
             let open = sanitize_for_role_with(&record, visibility, true);
             assert_eq!(open.subscriber_identity, "001010000000201");
-            assert_eq!(open.msisdn.as_deref(), Some("15550000201"));
+            assert_eq!(
+                open.msisdn.as_deref(),
+                matches!(visibility, SubscriberIdentityVisibility::Imsi).then_some("15550000201"),
+            );
             assert_eq!(open.authentication_material, "PROTECTED");
             let json = serde_json::to_string(&open).unwrap();
             assert!(!json.contains(&"aa".repeat(16)) && !json.contains(&"bb".repeat(16)), "K/OPc jamais : {json}");

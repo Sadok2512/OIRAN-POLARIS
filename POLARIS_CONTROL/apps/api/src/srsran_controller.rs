@@ -2861,7 +2861,7 @@ impl SrsranRuntime for DockerSrsranRuntime {
 }
 
 fn sanitize_log_line_unbounded(line: &str) -> Option<String> {
-    sanitize_log_line_unbounded_with(line, crate::subscriber_provisioning::identities_in_clear())
+    sanitize_log_line_unbounded_with(line, false)
 }
 
 /// 0.36.31 — `clear` (interrupteur `POLARIS_IDENTITIES_IN_CLEAR`) laisse
@@ -2911,12 +2911,15 @@ fn sanitize_log_line_unbounded_with(line: &str, clear: bool) -> Option<String> {
 /// commençant par `k_`/`k-` (`k_asme`, `k_enb`, `k_nas_enc`…) ou contenant
 /// `secret`. Fermé par défaut : un faux positif retire une ligne, jamais
 /// l'inverse.
-fn is_authentication_field_name(name: &str) -> bool {
+pub(super) fn is_authentication_field_name(name: &str) -> bool {
     let name = name.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == '{' || c == '[' || c == ',');
     if name.is_empty() {
         return false;
     }
-    matches!(name, "k" | "ki" | "key" | "op" | "opc" | "op_c" | "op-c" | "sqn")
+    matches!(name, "k" | "ki" | "key" | "op" | "opc" | "op_c" | "op-c" | "sqn"
+        | "hmac" | "xres" | "xres*" | "xres_star" | "hxres" | "hxres*" | "hxres_star"
+        | "ck" | "ik" | "kasme" | "kamf" | "kausf" | "kseaf" | "kgnb" | "kenb"
+        | "knasenc" | "knasint")
         || name.ends_with("key")
         || name.starts_with("k_")
         || name.starts_with("k-")
@@ -2927,7 +2930,7 @@ fn is_authentication_field_name(name: &str) -> bool {
 /// d'authentification, sous la forme `nom=…`, `nom = …`, `nom: …`,
 /// `"nom": …`, `{nom:…}` ? On examine le nom qui précède chaque séparateur,
 /// y compris un nom en deux mots (`auth key`, `subscriber key`).
-fn line_carries_authentication_material(lower: &str) -> bool {
+pub(super) fn line_carries_authentication_material(lower: &str) -> bool {
     let bytes = lower.as_bytes();
     for (index, byte) in bytes.iter().enumerate() {
         if *byte != b'=' && *byte != b':' {

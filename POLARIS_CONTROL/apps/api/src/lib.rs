@@ -7756,12 +7756,10 @@ fn certified_target_pseudonym(
 }
 
 fn telemetry_reference_is_sensitive(value: &str) -> bool {
-    telemetry_reference_is_sensitive_with(value, subscriber_provisioning::identities_in_clear())
+    telemetry_reference_is_sensitive_with(value, false)
 }
 
-/// 0.36.31 — `clear` (interrupteur `POLARIS_IDENTITIES_IN_CLEAR`, ordre
-/// cœur #9 7135266817) lève les identités d'abonné (marqueurs
-/// imsi/supi/msisdn/imei, suites de chiffres) ET les adresses IPv4/IPv6.
+/// The IMSI display setting never disables IP or authentication-material protection.
 fn telemetry_reference_is_sensitive_with(value: &str, clear: bool) -> bool {
     const MAX_SAFE_CONSECUTIVE_DIGITS: usize = 4;
 
@@ -7790,7 +7788,8 @@ fn telemetry_reference_is_sensitive_with(value: &str, clear: bool) -> bool {
             !(character.is_ascii_hexdigit() || character == ':')
         })
         .any(|candidate| candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok());
-    !clear && (looks_like_identity || looks_like_ipv4 || looks_like_ipv6)
+    looks_like_ipv4 || looks_like_ipv6 || (!clear && looks_like_identity)
+        || srsran_controller::line_carries_authentication_material(&lower)
 }
 
 fn safe_telemetry_reference(prefix: &str, value: &str) -> String {
@@ -7880,7 +7879,7 @@ fn telemetry_pseudonym_key() -> Option<&'static [u8]> {
 }
 
 fn safe_telemetry_code(value: &str) -> String {
-    safe_telemetry_code_with(value, subscriber_provisioning::identities_in_clear())
+    safe_telemetry_code_with(value, false)
 }
 
 fn safe_telemetry_code_with(value: &str, clear: bool) -> String {
@@ -10492,7 +10491,7 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 fn sanitize_history_record(record: &Value) -> Value {
-    sanitize_history_record_with(record, subscriber_provisioning::identities_in_clear())
+    sanitize_history_record_with(record, false)
 }
 
 fn sanitize_history_record_with(record: &Value, clear: bool) -> Value {
@@ -10505,6 +10504,10 @@ fn sanitize_history_value(value: &mut Value, clear: bool) {
     match value {
         Value::Object(fields) => {
             for (field, value) in fields {
+                if srsran_controller::is_authentication_field_name(&field.to_ascii_lowercase()) {
+                    *value = json!("PROTECTED");
+                    continue;
+                }
                 if matches!(field.as_str(), "error_code" | "cause" | "terminal_result") {
                     if let Some(text) = value.as_str() {
                         let sanitized_text =
@@ -10536,14 +10539,12 @@ fn sanitize_history_text(value: &str) -> String {
 }
 
 fn sanitize_history_text_with_key(value: &str, key: Option<&[u8]>) -> String {
-    sanitize_history_text_with(value, key, subscriber_provisioning::identities_in_clear())
+    sanitize_history_text_with(value, key, false)
 }
 
-/// 0.36.31 — `clear` lève le remplacement des identités d'abonné ET des
-/// adresses (`addr-…`) : le texte est rendu tel quel.
 fn sanitize_history_text_with(value: &str, key: Option<&[u8]>, clear: bool) -> String {
-    if clear {
-        return value.to_string();
+    if srsran_controller::line_carries_authentication_material(&value.to_ascii_lowercase()) {
+        return "PROTECTED".into();
     }
     let without_v4 = replace_address_tokens(value, key, |candidate| {
         candidate.contains('.') && candidate.parse::<Ipv4Addr>().is_ok()
@@ -10551,6 +10552,9 @@ fn sanitize_history_text_with(value: &str, key: Option<&[u8]>, clear: bool) -> S
     let without_addresses = replace_address_tokens(&without_v4, key, |candidate| {
         candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok()
     });
+    if clear {
+        return without_addresses;
+    }
     let lower = without_addresses.to_ascii_lowercase();
     let identity_marker = ["imsi", "supi", "msisdn", "imei"]
         .iter()
@@ -11328,10 +11332,9 @@ async fn ues(
             })
             .unwrap_or_default()
     };
-    // Identity projection is role-independent: the UI receives only a
-    // four-digit suffix. Raw IMSI/MSISDN lookup remains outside this GET.
-    let identity_exposed = false;
-    let masked_identity_by_ue_id: BTreeMap<String, String> = managed_profiles
+    // The server projects the IMSI according to the display setting.
+    let identity_exposed = subscriber_provisioning::identities_in_clear();
+    let identity_by_ue_id: BTreeMap<String, String> = managed_profiles
         .iter()
         .filter_map(|(ue_id, record)| {
             state
@@ -11341,7 +11344,7 @@ async fn ues(
                 .map(|imsi| {
                     (
                         ue_id.clone(),
-                        subscriber_provisioning::mask_subscriber_identity(&imsi),
+                        subscriber_provisioning::mask_subscriber_identity_with(&imsi, identity_exposed),
                     )
                 })
         })
@@ -11443,7 +11446,7 @@ async fn ues(
             } else {
                 "UE_NOT_RUNNING"
             };
-            let subscriber_identity = masked_identity_by_ue_id
+            let subscriber_identity = identity_by_ue_id
                 .get(&profile.ue_id)
                 .cloned()
                 .map(Value::String)
@@ -11504,7 +11507,7 @@ async fn ues(
             "last_event":lte.ue.last_error,
             "controller_owned":lte.ue.controller_owned,
             "ownership":if lte.ue.controller_owned {"POLARIS_CONTROLLER"}else{"UNVERIFIED"},
-            "subscriber_identity":if identity_exposed {"PROTECTED"}else{"PROTECTED"},
+            "subscriber_identity":"PROTECTED",
             "authentication_material":"PROTECTED",
             "control_authorized":lte_granted,
             "traffic_target_verified":lte.traffic_ready && lte_granted,
@@ -11540,7 +11543,7 @@ async fn ues(
         // actions.start computed above and the Start / Run handlers.
         let control_authorized = control_authorized_ids.contains(&profile.ue_id)
             || grant_covered_ids.contains(&profile.ue_id);
-        let profile_identity = masked_identity_by_ue_id
+        let profile_identity = identity_by_ue_id
             .get(&profile.ue_id)
             .cloned()
             .map(Value::String)
@@ -11601,7 +11604,7 @@ async fn ues(
         .filter(|job| job.pdu_session_state == "ACTIVE")
         .count();
     Json(
-        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count()+usize::from(lte_snapshot.is_some()),"planned_count":controller_inventory.len()+usize::from(lte_snapshot.is_some()),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES+usize::from(lte_snapshot.is_some()),"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.ue.process_state=="running")),"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.attach_state=="ATTACHED")),"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu+lte_snapshot.as_ref().map(|lte|usize::from(lte.active_sessions)).unwrap_or(0),"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY","subscriber_identity_exposed":identity_exposed,"provisioning_attestation":state.provisioning_attestation}),
+        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count()+usize::from(lte_snapshot.is_some()),"planned_count":controller_inventory.len()+usize::from(lte_snapshot.is_some()),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES+usize::from(lte_snapshot.is_some()),"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.ue.process_state=="running")),"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.attach_state=="ATTACHED")),"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu+lte_snapshot.as_ref().map(|lte|usize::from(lte.active_sessions)).unwrap_or(0),"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY","subscriber_identity_exposed":identity_exposed,"meta":{"identities_in_clear":identity_exposed},"provisioning_attestation":state.provisioning_attestation}),
     )
 }
 
@@ -13454,7 +13457,7 @@ fn update_definition_record(
     // 0.36.31 — l'History est assainie à l'ÉCRITURE : une entrée écrite
     // interrupteur fermé est stockée masquée (référence HMAC irréversible)
     // et le reste même si l'interrupteur s'ouvre ensuite.
-    sanitize_history_value(&mut runtime.history[index], subscriber_provisioning::identities_in_clear());
+    sanitize_history_value(&mut runtime.history[index], false);
     let value = runtime.history[index].clone();
     persist_runtime(state, &runtime);
     Ok(value)
@@ -23793,9 +23796,9 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         };
         assert!(!journal(false).contains(IMSI), "fermé : {}", journal(false));
         assert!(journal(true).contains(IMSI), "ouvert : {}", journal(true));
-        // Les adresses : masquées fermé, en clair ouvert.
+        // Address policy is independent of the identity display setting.
         assert!(!safe_telemetry_code_with("UE_START_FAILED from 10.45.0.2", false).contains("10.45.0.2"));
-        assert!(safe_telemetry_code_with("UE_START_FAILED from 10.45.0.2", true).contains("10.45.0.2"));
+        assert!(!safe_telemetry_code_with("UE_START_FAILED from 10.45.0.2", true).contains("10.45.0.2"));
 
         let record = json!({
             "job_id": "history-imsi-03631",
@@ -23809,7 +23812,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         let open = sanitize_history_record_with(&record, true).to_string();
         assert!(open.contains(IMSI) && open.contains(MSISDN), "History ouverte : {open}");
         assert!(!closed.contains("10.45.0.2"), "adresse fermée : {closed}");
-        assert!(open.contains("10.45.0.2"), "adresse ouverte : {open}");
+        assert!(!open.contains("10.45.0.2"));
     }
 
     /// 0.36.31 — côté fermé, par les vraies routes : sans la variable
@@ -23844,6 +23847,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert!(!sheet.to_string().contains(IMSI), "fiche : {sheet}");
         assert!(sheet.get("identities_in_clear").is_none(), "aucun signal à 0 : {sheet}");
         let inventory = ues(State(shared.clone()), operator()).await.0;
+        assert_eq!(inventory["meta"]["identities_in_clear"], false);
         assert!(!inventory.to_string().contains(IMSI), "inventaire : {inventory}");
         shared.runtime.lock().unwrap().history.push(json!({
             "job_id": "history-imsi-03631", "state": "FAILED",
