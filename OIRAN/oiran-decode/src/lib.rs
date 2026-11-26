@@ -1905,6 +1905,37 @@ Content-Length: 0\r\n\
         classic_pcap(&frames)
     }
 
+    #[test]
+    fn decoded_ngap_packets_preserve_sctp_association_provenance() {
+        let path = std::env::temp_dir().join(format!("oiran-sctp-provenance-{}.pcap", std::process::id()));
+        std::fs::write(&path, synthetic_n2_fragmented_capture()).unwrap();
+        let config = DecodeConfig {
+            input: path.clone(),
+            capture_id: format!("sha256:{}", "f".repeat(64)),
+            interface: "N2".into(),
+            endpoints: HashMap::new(),
+            stable_source_file: "n2-sctp-provenance.pcap".into(),
+        };
+        let mut events = Vec::new();
+        decode_capture_streaming(&config, &PseudonymKey::from_bytes([3; 32]), |event| {
+            if matches!(event.protocol, event_schema::Protocol::Ngap) {
+                events.push(serde_json::from_str::<serde_json::Value>(&event.to_json()).unwrap());
+            }
+            Ok(())
+        }).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(events.len(), 5);
+        let expected = &events[0]["packet_references"][0]["sctp_association"];
+        assert_eq!(expected["verification_tag"], 1);
+        assert_eq!(expected["association_generation"], 0);
+        assert!(expected["association_id"].as_str().unwrap().starts_with("sctp-"));
+        for event in &events {
+            for packet in event["packet_references"].as_array().unwrap() {
+                assert_eq!(&packet["sctp_association"], expected);
+            }
+        }
+    }
+
     /// 0.11.0 (oiran-api 2.21.120, lot B1, ordre #9 7050925249) — gate :
     /// sur les plans SCTP, décodage incrémental = décodage intégral pour
     /// tout découpage, y compris entre deux fragments d'un message et au
