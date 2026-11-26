@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.202 / session-engine 0.5.39 / Web 2.14.6 — N2 continuity evidence
+
+Expose a link on both PDU session details when the original rotation positions, directional SCTP endpoints, verification tag and wire TSNs prove continuity between setup and release. Historical references without original segment provenance remain unlinked. Session membership and accounting are preserved.
+
 ## oiran-api 2.21.201 / live-probe 0.7.8 — distinguish unreferenced and rollback-held shards
 
 Report unreferenced shards and rollback-held shards separately at the measured commit. Include deployment backup manifests in inventory and show per-backup disk usage without double-counting a shard in the total.

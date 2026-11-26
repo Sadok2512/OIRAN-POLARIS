@@ -7364,7 +7364,16 @@ fn session_blocking(state: &AppState, id: &str) -> Response {
         // index encore construit (démarrage), il est construit comme avant.
         let journey_index = journey_index_for_detail(state).unwrap_or_else(|| cached_journey_index(state));
         decorate_subscriber_summary(&mut summary, &flow, &journey_index);
-        return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
+        let mut detail = json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references});
+        if let Some(discovery) = &dataset.discovery {
+            let links: Vec<_> = discovery.sctp_continuity_links.iter().filter(|link| {
+                link.predecessor_session_id == id || link.successor_session_id == id
+            }).collect();
+            if !links.is_empty() {
+                detail["sctp_continuity_links"] = json!(links);
+            }
+        }
+        return ok(detail).into_response();
     }
     if let Ok(Some((manifest, lte))) = state.inner.lte_evidence_store.find_session(id) {
         let procedures = lte.procedures.iter().enumerate().map(|(index, name)| json!({
@@ -10965,12 +10974,19 @@ mod tests {
             })).unwrap();
         }
         drop(events);
+        let link = json!({
+            "predecessor_session_id": session_ids[SESSIONS / 2],
+            "successor_session_id": session_ids[SESSIONS / 2 + 1],
+            "setup_event_id": "evt-0002",
+            "release_event_id": "evt-0003"
+        });
         let manifest = serde_json::json!({
             "dataset_id": CONTINUOUS_DATASET_ID, "capture_id": CONTINUOUS_CAPTURE_ID,
             "path": format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
             "event_count": 8, "session_ids": session_ids, "decode_reports": {}, "checksums": {},
             "state": "PUBLISHED",
             "discovery": {
+                "sctp_continuity_links": [link.clone()],
                 "ue_contexts": [], "pfcp_sessions": [], "gtpu_tunnels": [], "procedures": [],
                 "pdu_sessions": session_ids.iter().map(|id| serde_json::json!({
                     "session_id": id, "ue_context_id": "uectx-bench", "pdu_session_id": "1", "dnn": null, "snssai": null,
@@ -11009,6 +11025,19 @@ mod tests {
         // Démarrage : un premier index des parcours, comme le préchauffage
         // le construit (hors mesure).
         let _ = cached_journey_index(&state);
+        for (index, linked) in [(SESSIONS / 2, true), (SESSIONS / 2 + 1, true), (0, false)] {
+            let route = format!("/api/v1/sessions/{}", session_ids[index]);
+            let response = app.clone().oneshot(req(&route, false)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let detail: Value = serde_json::from_slice(&bytes).unwrap();
+            let links = detail["data"].get("sctp_continuity_links");
+            if linked {
+                assert_eq!(links, Some(&json!([link.clone()])));
+            } else {
+                assert!(links.is_none());
+            }
+        }
         for round in 0..3 {
             for route in [format!("/api/v1/sessions/{target}"), format!("/api/v1/sessions/{target}/events"), format!("/api/v1/sessions/{target}/procedures")] {
                 let started = std::time::Instant::now();
