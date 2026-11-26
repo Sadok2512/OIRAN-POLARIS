@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.198 / live-probe 0.7.6 — original SCTP segment provenance
+
+Record the original dumpcap basename and rotation index on newly imported SCTP packet references. Keep the published packet locator and historical references intact. Event-schema 1.13.2, oiran-decode 0.12.3 and session-engine 0.5.38 carry the optional provenance.
+
 ## oiran-api 2.21.196 / oiran-decode 0.12.2 — SCTP message TSN bounds
 
 Persist the wire TSN of the first and last SCTP DATA chunks in packet-reference provenance. Historical references keep their original shape. Event-schema 1.13.1 and session-engine 0.5.36 carry the optional bounds.

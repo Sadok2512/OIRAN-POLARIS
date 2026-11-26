@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "event-schema"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -579,7 +579,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.196"
+version = "2.21.198"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.36"
+version = "0.5.38"
 dependencies = [
  "event-schema",
  "libc",

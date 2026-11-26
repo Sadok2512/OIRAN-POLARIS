@@ -703,6 +703,8 @@ where
                         verification_tag: message.verification_tag,
                         first_tsn: Some(message.first_tsn),
                         last_tsn: Some(message.last_tsn),
+                        original_segment_name: None,
+                        rotation_index: None,
                     });
                     for reference in &mut message.packet_references {
                         reference.sctp_association = Some(association.clone());
