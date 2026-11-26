@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.35 — Références d’adresses dans l’inventaire UE
+
+- Corrige une exposition antérieure au lot IMSI. L’API de l’inventaire renvoie une référence protégée pour les adresses NR, LTE et PDU attribuées. La table UE affiche cette référence.
+
 ## 0.36.34 — Affichage IMSI piloté par l’API
 
 Expose le réglage dans `/ues` et affiche la valeur projetée par le serveur dans la table UE. Le réglage d’affichage ne change ni le masquage des adresses ni les protections de journalisation.

@@ -11185,6 +11185,10 @@ fn pdu_snapshots_for_job(job: &simulator_controller::UeJob) -> Vec<activity::Pdu
     .unwrap_or_default()
 }
 
+fn ue_inventory_address(address: Option<&str>) -> Option<String> {
+    address.map(|address| safe_telemetry_reference("addr", address))
+}
+
 async fn ues(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -11306,7 +11310,13 @@ async fn ues(
     let controller_jobs = controller.snapshot();
     let pdu_sessions_by_ue = controller_jobs
         .iter()
-        .map(|job| (job.ue_id.clone(), pdu_snapshots_for_job(job)))
+        .map(|job| {
+            let mut sessions = pdu_snapshots_for_job(job);
+            for session in &mut sessions {
+                session.address = ue_inventory_address(session.address.as_deref());
+            }
+            (job.ue_id.clone(), sessions)
+        })
         .collect::<BTreeMap<_, _>>();
     let profile_specs = controller.profiles();
     let control_authorized_ids = authorized_ue_control_ids(&state, &identity);
@@ -11457,7 +11467,11 @@ async fn ues(
                 "serving_node":profile.serving_gnb,"process_state":process_state,
                 "registration_state":registration_state,"rrc_state":"UNKNOWN","pdu_session":pdu_session,
                 "pdu_sessions":pdu_sessions_by_ue.get(&profile.ue_id).cloned().unwrap_or_default(),
-                "ue_ip":if shared {shared_observation.ue_ip.clone().map_or(Value::Null,Value::from)} else {job.and_then(|value|value.ue_ip.clone()).map_or(Value::Null,Value::from)},
+                "ue_ip":ue_inventory_address(if shared {
+                    shared_observation.ue_ip.as_deref()
+                } else {
+                    job.and_then(|job| job.ue_ip.as_deref())
+                }),
                 "traffic_state":traffic_state,
                 "uptime_seconds":if shared {Value::Null} else {job.and_then(|value|value.started_at_epoch_s).map(|started|epoch_seconds().saturating_sub(started)).map_or(Value::Null,Value::from)},
                 "last_event":job.and_then(|value|value.last_error.clone()).map_or(Value::Null,Value::from),
@@ -11501,7 +11515,7 @@ async fn ues(
             "active_sessions":lte.active_sessions,
             "access_point_name":lte.apn,
             "dnn":Value::Null,
-            "ue_ip":lte.ue_ip,
+            "ue_ip":ue_inventory_address(lte.ue_ip.as_deref()),
             "traffic_state":if running {"IDLE"}else{"STOPPED"},
             "uptime_seconds":Value::Null,
             "last_event":lte.ue.last_error,
