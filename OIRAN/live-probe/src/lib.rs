@@ -24402,6 +24402,50 @@ Content-Length: 0\r\n\
         assert_eq!(load_dataset_events(&dataset_dir).unwrap().len(), resumed.event_count);
     }
 
+    #[test]
+    fn shard_gc_removes_only_proven_unreferenced_history() {
+        let bench = RetentionBench0_7_0::new("shard-gc-union");
+        let (source, _, _) = corpus_0_7_0();
+        let first = bench.cycle(None, &[("N2.pcap-source.pcapng", source)]);
+        assert!(first.event_count > 0);
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(Some(true)));
+        let current = bench.cycle(Some(1), &[]);
+        TEST_RETENTION_ARCHIVE.with(|value| value.set(None));
+        assert_eq!(current.event_count, 0);
+        let dataset = bench.base.join("dataset");
+        let shards = dataset.join("event-shards");
+        let original = bench.shard_file(&first.event_shards[0]);
+        assert!(original.is_file(), "the two previous publications must leave the previous shard");
+        let old = UNIX_EPOCH + Duration::from_secs(10);
+        fs::File::open(&original).unwrap().set_modified(old).unwrap();
+        let fixture_shard = |name: &str| {
+            let path = shards.join(name);
+            fs::copy(&original, &path).unwrap();
+            fs::File::open(&path).unwrap().set_modified(old).unwrap();
+            path
+        };
+        let rollback = bench.base.join(".dataset-rollback.fixture");
+        fs::create_dir(&rollback).unwrap();
+        fs::write(rollback.join("dataset_manifest.json"), serde_json::to_vec(&first).unwrap()).unwrap();
+        let removable = fixture_shard("shard-000-gc-orphan.jsonl");
+        let newest_a = fixture_shard("shard-new-gc-a.jsonl");
+        let newest_b = fixture_shard("shard-new-gc-b.jsonl");
+        for path in [&newest_a, &newest_b] {
+            fs::File::open(path).unwrap().set_modified(SystemTime::now()).unwrap();
+        }
+
+        // A fresh worker can sweep while the current checkpoint is empty of events.
+        let mut bench = bench;
+        bench.manager = CaptureManager::with_pseudonym_key_path(
+            bench._root.to_path_buf(), false, bench._root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        bench.manager.recover_continuous_dataset_from_disk(&bench.base).unwrap();
+        bench.cycle(None, &[]);
+        assert!(!removable.exists(), "a covered orphan must be removed");
+        assert!(original.is_file(), "the rollback still needs the original shard");
+        assert!(newest_a.is_file() && newest_b.is_file(), "the safety band survives");
+    }
+
     fn corpus_0_7_0() -> (PathBuf, PathBuf, PathBuf) {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         (
