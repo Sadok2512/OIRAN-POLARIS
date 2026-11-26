@@ -104,6 +104,25 @@ pub(super) const REQUIRED_BACKUPS: [&str; 9] = [
     "ANR2_oiran_2.9.0_backup_20261107T142417Z",
 ];
 
+#[cfg(test)]
+pub(super) const CONTINUOUS_BACKUP_MEMBER: &str =
+    "var/lib/oiran/captures/continuous-lab-import/dataset/dataset_manifest.json";
+#[cfg(test)]
+pub(super) const LTE_BACKUP_MEMBER: &str =
+    "var/lib/oiran/lte-evidence/datasets/dataset-lte-run-09913806240271269bd9d7e0d4d07eb2/dataset_manifest.json";
+#[cfg(test)]
+pub(super) const REQUIRED_BACKUP_ARTIFACTS: [Option<(&str, &[&str])>; 9] = [
+    Some(("oiran-production-complete.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
+    Some(("oiran-production-complete.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
+    Some(("oiran-production-complete.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
+    Some(("oiran-2.7.28-full.tar.zst", &[CONTINUOUS_BACKUP_MEMBER, LTE_BACKUP_MEMBER])),
+    Some(("oiran-2.8.0-full.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
+    Some(("dataset-config-unit-watcher.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
+    Some(("data/continuous-lab-import/dataset/dataset_manifest.json", &[])),
+    None, // Executable and service configuration only.
+    Some(("state/continuous-lab-import/dataset/dataset_manifest.json", &[])),
+];
+
 fn roots(captures: &Path) -> Result<Vec<PathBuf>, String> {
     let (mut roots, backup_root) = if cfg!(test) {
         (vec![captures.to_owned()], captures.join(".gc-backups"))

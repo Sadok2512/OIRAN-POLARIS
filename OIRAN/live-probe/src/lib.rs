@@ -24439,29 +24439,63 @@ Content-Length: 0\r\n\
 
     #[test]
     fn shard_gc_removes_only_proven_unreferenced_history() {
-        assert_shard_gc_with_backup_inventory(false);
+        assert_shard_gc_with_backup_inventory(None, false);
     }
 
     #[test]
     fn shard_gc_refuses_missing_required_backup_even_with_an_extra_backup() {
-        assert_shard_gc_with_backup_inventory(true);
+        assert_shard_gc_with_backup_inventory(None, true);
     }
 
-    fn assert_shard_gc_with_backup_inventory(missing_required: bool) {
+    #[test]
+    fn shard_gc_refuses_missing_required_archive_in_present_backup() {
+        assert_shard_gc_with_backup_inventory(Some(0), false);
+    }
+
+    #[test]
+    fn shard_gc_refuses_missing_required_manifest_in_present_backup() {
+        assert_shard_gc_with_backup_inventory(Some(6), false);
+    }
+
+    fn assert_shard_gc_with_backup_inventory(missing_artifact: Option<usize>, missing_required: bool) {
+        use event_shard_gc::{REQUIRED_BACKUPS, REQUIRED_BACKUP_ARTIFACTS};
+
         let bench = RetentionBench0_7_0::new("shard-gc-union");
         let backups = bench._root.join(".gc-backups");
-        for name in event_shard_gc::REQUIRED_BACKUPS {
+        let archive_fixture = temporary_root("shard-gc-backup-source");
+        let make_archive = |path: &Path, members: &[&str]| {
+            assert!(std::process::Command::new("/usr/bin/tar")
+                .args(["--zstd", "-cf"])
+                .arg(path)
+                .arg("-C").arg(archive_fixture.as_ref()).args(members)
+                .status().unwrap().success());
+        };
+        for (index, (name, expected)) in REQUIRED_BACKUPS.iter().zip(REQUIRED_BACKUP_ARTIFACTS).enumerate() {
             let directory = backups.join(name);
             fs::create_dir_all(&directory).unwrap();
-            fs::write(directory.join("dataset_manifest.json"), b"{}").unwrap();
+            if missing_artifact == Some(index) || (index == 0 && missing_required) {
+                continue;
+            }
+            if let Some((path, members)) = expected {
+                let artifact = directory.join(path);
+                if members.is_empty() {
+                    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+                    fs::write(artifact, br#"{"dataset_id":"fixture"}"#).unwrap();
+                } else {
+                    for member in members {
+                        let manifest = archive_fixture.join(member);
+                        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+                        fs::write(manifest, br#"{"dataset_id":"fixture"}"#).unwrap();
+                    }
+                    make_archive(&artifact, members);
+                }
+            }
         }
         let extra = backups.join("ANR2_oiran_2.21.166_predeploy_backup_20261124T2258Z");
         fs::create_dir(&extra).unwrap();
         fs::write(extra.join("dataset_manifest.json"), b"{}").unwrap();
         if missing_required {
-            let missing = backups.join(event_shard_gc::REQUIRED_BACKUPS[0]);
-            fs::remove_file(missing.join("dataset_manifest.json")).unwrap();
-            fs::remove_dir(missing).unwrap();
+            fs::remove_dir(backups.join(REQUIRED_BACKUPS[0])).unwrap();
         }
         let (source, _, _) = corpus_0_7_0();
         let first = bench.cycle(None, &[("N2.pcap-source.pcapng", source)]);
@@ -24496,14 +24530,9 @@ Content-Length: 0\r\n\
         let mut archived_manifest = serde_json::to_value(&first).unwrap();
         archived_manifest["event_shards"][0]["path"] =
             serde_json::json!("event-shards/shard-archive-reference.jsonl");
-        let archive_fixture = temporary_root("shard-gc-backup-source");
-        fs::write(archive_fixture.join("dataset_manifest.json"),
-            serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
-        assert!(std::process::Command::new("/usr/bin/tar")
-            .args(["--zstd", "-cf"])
-            .arg(backups.join(event_shard_gc::REQUIRED_BACKUPS[1]).join("fixture-backup.tar.zst"))
-            .arg("-C").arg(archive_fixture.as_ref()).arg("dataset_manifest.json")
-            .status().unwrap().success());
+        let (archive, members) = REQUIRED_BACKUP_ARTIFACTS[1].unwrap();
+        fs::write(archive_fixture.join(members[0]), serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
+        make_archive(&backups.join(REQUIRED_BACKUPS[1]).join(archive), members);
         let unknown = shards.join("shard-missing-history.jsonl");
         fs::write(&unknown, b"{\"event_id\":\"missing-history\"}\n").unwrap();
         fs::File::open(&unknown).unwrap().set_modified(old).unwrap();
@@ -24521,8 +24550,8 @@ Content-Length: 0\r\n\
         ).unwrap();
         bench.manager.recover_continuous_dataset_from_disk(&bench.base).unwrap();
         bench.cycle(None, &[]);
-        if missing_required {
-            assert!(removable.is_file(), "a missing required backup must prevent unlink");
+        if missing_required || missing_artifact.is_some() {
+            assert!(removable.is_file(), "missing required backup data must prevent unlink");
         } else {
             assert!(!removable.exists(), "a covered orphan must be removed");
         }
