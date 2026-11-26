@@ -1,6 +1,7 @@
 //! Strictly owned, allowlisted live capture jobs for the OIRAN local vProbe.
 
 mod callflow_page;
+mod event_shard_gc;
 pub mod capture_source;
 pub mod commit_seq;
 pub mod event_id_set;
@@ -1817,6 +1818,7 @@ pub struct CaptureManager {
     commit_seqs: Arc<Mutex<HashMap<String, u64>>>,
     sequence: Arc<AtomicU64>,
     continuous_stop: Arc<AtomicBool>,
+    last_event_shard_sweep: Arc<Mutex<Option<Instant>>>,
     continuous_runtime_evidence: Arc<Mutex<Option<PathBuf>>>,
     /// 2.21.9 — répertoires vTAP de l'import continu en cours (vide par
     /// défaut et en test ; posé par `start_continuous_import`).
@@ -2345,6 +2347,7 @@ impl CaptureManager {
             commit_seqs: Arc::new(Mutex::new(HashMap::new())),
             sequence: Arc::new(AtomicU64::new(1)),
             continuous_stop: Arc::new(AtomicBool::new(false)),
+            last_event_shard_sweep: Arc::new(Mutex::new(None)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(std::sync::RwLock::new(())),
@@ -5414,6 +5417,30 @@ impl CaptureManager {
         )
     }
 
+    fn sweep_continuous_event_shards(&self, current: &Path) {
+        let served = self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned();
+        let mut report = event_shard_gc::Report::default();
+        let result = served
+            .as_ref()
+            .ok_or_else(|| "no continuous generation is currently served".to_string())
+            .and_then(|served| event_shard_gc::sweep(&self.root, current, served, &mut report));
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "EVENT_SHARD_ORPHANS_REMOVED",
+                "count": report.count,
+                "bytes": report.bytes,
+                "kept": report.kept,
+                "trees_consulted": report.trees_consulted,
+                "archives_consulted": report.archives_consulted,
+                "directories_read": report.directories_read,
+                "candidate_stats": report.candidate_stats,
+                "history_unproven": report.history_unproven,
+                "error": result.err(),
+            })
+        );
+    }
+
     fn process_continuous_capture_inner(
         &self,
         base: &Path,
@@ -5428,6 +5455,14 @@ impl CaptureManager {
         // `RESTORE_REQUIRES_PUBLICATION_LOCK` when the worker holds it.
         let _publication_lock = PublicationLock::acquire_blocking(base)?;
         let current = base.join("dataset");
+        if base == self.root.join(CONTINUOUS_CAPTURE_ID) {
+            let mut last = self.last_event_shard_sweep.lock().unwrap();
+            if last.map_or(true, |started| started.elapsed() >= event_shard_gc::INTERVAL) {
+                *last = Some(Instant::now());
+                drop(last);
+                self.sweep_continuous_event_shards(&current);
+            }
+        }
         let next = base.join(".dataset-next");
         if next.exists() {
             fs::remove_dir_all(&next).map_err(display_error)?;
@@ -24434,6 +24469,28 @@ Content-Length: 0\r\n\
             fs::File::open(path).unwrap().set_modified(SystemTime::now()).unwrap();
         }
 
+        let archived_reference = fixture_shard("shard-archive-reference.jsonl");
+        let mut archived_manifest = serde_json::to_value(&first).unwrap();
+        archived_manifest["event_shards"][0]["path"] =
+            serde_json::json!("event-shards/shard-archive-reference.jsonl");
+        let archive_fixture = temporary_root("shard-gc-backup-source");
+        fs::write(archive_fixture.join("dataset_manifest.json"),
+            serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
+        assert!(std::process::Command::new("/usr/bin/tar")
+            .args(["--zstd", "-cf"])
+            .arg(bench._root.join("fixture-backup.tar.zst"))
+            .arg("-C").arg(archive_fixture.as_ref()).arg("dataset_manifest.json")
+            .status().unwrap().success());
+        let unknown = shards.join("shard-missing-history.jsonl");
+        fs::write(&unknown, b"{\"event_id\":\"missing-history\"}\n").unwrap();
+        fs::File::open(&unknown).unwrap().set_modified(old).unwrap();
+        // All old fixtures predate the visible manifest. The newest two
+        // remain protected by their mtime and the safety band.
+        thread::sleep(Duration::from_millis(10));
+        let manifest_path = dataset.join("dataset_manifest.json");
+        let bytes = fs::read(&manifest_path).unwrap();
+        fs::write(&manifest_path, bytes).unwrap();
+
         // A fresh worker can sweep while the current checkpoint is empty of events.
         let mut bench = bench;
         bench.manager = CaptureManager::with_pseudonym_key_path(
@@ -24443,6 +24500,8 @@ Content-Length: 0\r\n\
         bench.cycle(None, &[]);
         assert!(!removable.exists(), "a covered orphan must be removed");
         assert!(original.is_file(), "the rollback still needs the original shard");
+        assert!(archived_reference.is_file(), "an archived manifest still needs this shard");
+        assert!(unknown.is_file(), "unproven history must survive");
         assert!(newest_a.is_file() && newest_b.is_file(), "the safety band survives");
     }
 

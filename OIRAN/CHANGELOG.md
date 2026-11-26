@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.189 / live-probe 0.7.1 — event shard garbage collection
+
+Reclaim old event shards periodically after consulting capture and rollback manifests, including compressed backups. Protect the served generation and require independently verified copies of the candidate events before unlinking.
+
 ## oiran-api 2.21.188 — filter snapshot publication markers
 
 Read dataset commit sequences at the published dataset root. Filter snapshots expose the marker for each live dataset alongside the existing maximum. Persist filter generation numbers before serving a new snapshot so they remain comparable after API restarts.
