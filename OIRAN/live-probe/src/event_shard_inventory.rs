@@ -1,37 +1,58 @@
-//! Continuous event shards are reclaimed only when the manifest inventory and
-//! independent evidence for the contents both permit it.
-use super::{sha256_hex, sha256_hex_file, LiveDataset};
-use serde_json::Value;
+//! Read-only inventory of continuous shards and their manifest references.
+use super::LiveDataset;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::CString,
     fs,
-    io::{BufRead, BufReader},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant, SystemTime},
+    time::Duration,
 };
 
 pub(super) const INTERVAL: Duration = Duration::from_secs(30 * 60);
-const GRACE: Duration = Duration::from_secs(60 * 60);
-const SAFETY_BAND: usize = 2;
-const MAX_CANDIDATES: usize = 8;
-const LOCK_BUDGET: Duration = Duration::from_millis(50);
-const MAX_EVENT_HASHES: usize = 1_000_000;
-
 #[derive(Default)]
 pub(super) struct Report {
-    pub count: usize,
-    pub bytes: u64,
-    pub kept: usize,
-    pub trees_consulted: usize,
-    pub archives_consulted: usize,
-    pub directories_read: usize,
-    pub candidate_stats: usize,
-    pub history_unproven: usize,
-    pub lock_held: Duration,
+    trees_consulted: usize,
+    archives_consulted: usize,
+}
+
+pub(super) struct InventoryError {
+    path: Option<PathBuf>,
+    reason: String,
+}
+
+impl InventoryError {
+    pub(super) fn general(reason: impl Into<String>) -> Self {
+        Self {
+            path: None,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl Report {
+    pub(super) fn snapshot(self, result: Result<(usize, u64), InventoryError>) -> Value {
+        let (count, bytes, error) = match result {
+            Ok((count, bytes)) => (Some(count), Some(bytes), None),
+            Err(error) => (
+                None,
+                None,
+                Some(json!({"path": error.path, "reason": error.reason})),
+            ),
+        };
+        json!({
+            "status": if error.is_some() { "unavailable" } else { "available" },
+            "count": count,
+            "bytes": bytes,
+            "trees_consulted": self.trees_consulted,
+            "archives_consulted": self.archives_consulted,
+            "publication_lock_held_ns": 0,
+            "error": error,
+        })
+    }
 }
 
 // The watch is armed before reading inputs. Any pending notification, including
@@ -42,17 +63,20 @@ struct InventoryWatch {
 }
 
 impl InventoryWatch {
-    fn new() -> Result<Self, String> {
+    fn new() -> Result<Self, InventoryError> {
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+            return Err(InventoryError::general(
+                std::io::Error::last_os_error().to_string(),
+            ));
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mounts = fs::read("/proc/self/mountinfo").map_err(|error| error.to_string())?;
+        let mounts = fs::read("/proc/self/mountinfo")
+            .map_err(|error| unavailable(Path::new("/proc/self/mountinfo"), error))?;
         Ok(Self { fd, mounts })
     }
 
-    fn add(&self, path: &Path, directory: bool) -> Result<(), String> {
+    fn add(&self, path: &Path, directory: bool) -> Result<(), InventoryError> {
         let changes = if directory {
             libc::IN_ONLYDIR
                 | libc::IN_CREATE
@@ -65,9 +89,9 @@ impl InventoryWatch {
         self.add_mask(path, changes)
     }
 
-    fn add_mask(&self, path: &Path, changes: u32) -> Result<(), String> {
-        let name = CString::new(path.as_os_str().as_bytes())
-            .map_err(|error| format!("watch {}: {error}", path.display()))?;
+    fn add_mask(&self, path: &Path, changes: u32) -> Result<(), InventoryError> {
+        let name =
+            CString::new(path.as_os_str().as_bytes()).map_err(|error| unavailable(path, error))?;
         let common = libc::IN_ATTRIB
             | libc::IN_DELETE_SELF
             | libc::IN_MOVE_SELF
@@ -76,23 +100,19 @@ impl InventoryWatch {
         if unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), common | changes) }
             < 0
         {
-            return Err(format!(
-                "watch {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
+            return Err(unavailable(path, std::io::Error::last_os_error()));
         }
         Ok(())
     }
 
-    fn add_ancestors(&self, path: &Path) -> Result<(), String> {
+    fn add_ancestors(&self, path: &Path) -> Result<(), InventoryError> {
         for directory in path.ancestors().skip(1) {
             self.add_mask(directory, libc::IN_ONLYDIR)?;
         }
         Ok(())
     }
 
-    fn unchanged(&self) -> Result<(), String> {
+    fn unchanged(&self) -> Result<(), InventoryError> {
         let mut poll = libc::pollfd {
             fd: self.fd.as_raw_fd(),
             events: libc::POLLIN,
@@ -100,21 +120,33 @@ impl InventoryWatch {
         };
         match unsafe { libc::poll(&mut poll, 1, 0) } {
             0 => Ok(()),
-            1 => Err("shard inventory changed; sweep deferred".into()),
-            _ => Err(std::io::Error::last_os_error().to_string()),
+            1 => Err(InventoryError::general(
+                "shard inventory changed during measurement",
+            )),
+            _ => Err(InventoryError::general(
+                std::io::Error::last_os_error().to_string(),
+            )),
         }
     }
 
-    fn check_mounts(&self) -> Result<(), String> {
-        if fs::read("/proc/self/mountinfo").map_err(|error| error.to_string())? != self.mounts {
-            return Err("mount topology changed; sweep deferred".into());
+    fn check_mounts(&self) -> Result<(), InventoryError> {
+        if fs::read("/proc/self/mountinfo")
+            .map_err(|error| unavailable(Path::new("/proc/self/mountinfo"), error))?
+            != self.mounts
+        {
+            return Err(InventoryError::general(
+                "mount topology changed during measurement",
+            ));
         }
         Ok(())
     }
 }
 
-fn unavailable(path: &Path, error: std::io::Error) -> String {
-    format!("{}: {error}", path.display())
+fn unavailable(path: &Path, error: impl std::fmt::Display) -> InventoryError {
+    InventoryError {
+        path: Some(path.to_owned()),
+        reason: error.to_string(),
+    }
 }
 
 fn excluded_ui_tree(path: &Path) -> bool {
@@ -271,7 +303,7 @@ type ExpectedArtifacts = BTreeMap<PathBuf, &'static [&'static str]>;
 fn roots(
     captures: &Path,
     watch: &InventoryWatch,
-) -> Result<(Vec<PathBuf>, ExpectedArtifacts), String> {
+) -> Result<(Vec<PathBuf>, ExpectedArtifacts), InventoryError> {
     let (mut roots, backup_root) = if cfg!(test) {
         (vec![captures.to_owned()], captures.join(".gc-backups"))
     } else {
@@ -290,11 +322,11 @@ fn roots(
     let mut expected = BTreeMap::new();
     for (name, artifact) in REQUIRED_BACKUPS {
         let path = backup_root.join(name);
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("required backup {name} unavailable: {error}"))?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
         if !metadata.is_dir() || !identities.insert((metadata.dev(), metadata.ino())) {
-            return Err(format!(
-                "required backup {name} must be a distinct directory"
+            return Err(unavailable(
+                &path,
+                "required backup must be a distinct directory",
             ));
         }
         if let Some((relative, members)) = artifact {
@@ -303,8 +335,8 @@ fn roots(
         roots.push(path);
     }
     // Extra backups expand the manifest union without satisfying a required identity.
-    for entry in fs::read_dir(&backup_root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(&backup_root).map_err(|error| unavailable(&backup_root, error))? {
+        let entry = entry.map_err(|error| unavailable(&backup_root, error))?;
         let name = entry.file_name();
         if name.to_str().is_some_and(|name| {
             name.starts_with("ANR2_oiran_")
@@ -330,7 +362,7 @@ fn inventory(
     names: &mut HashSet<String>,
     report: &mut Report,
     watch: &InventoryWatch,
-) -> Result<(), String> {
+) -> Result<(), InventoryError> {
     #[cfg(test)]
     LOCK_PROBE.with(|probe| {
         if let Some((base, held)) = probe.borrow_mut().as_mut() {
@@ -361,25 +393,26 @@ fn inventory(
         watch.add(&physical, true)?;
         let metadata = fs::metadata(&directory).map_err(|error| unavailable(&directory, error))?;
         if !metadata.is_dir() {
-            return Err("inventory root is not a directory".into());
+            return Err(unavailable(&directory, "inventory root is not a directory"));
         }
         if !seen.insert((metadata.dev(), metadata.ino())) {
             continue;
         }
-        report.directories_read += 1;
         let mut found_manifest = false;
         for entry in fs::read_dir(&directory).map_err(|error| unavailable(&directory, error))? {
-            let entry = entry.map_err(|error| error.to_string())?;
+            let entry = entry.map_err(|error| unavailable(&directory, error))?;
             let path = entry.path();
             if excluded_ui_tree(&path) {
                 continue;
             }
-            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| unavailable(&path, error))?;
             let required = expected.get(&path).copied();
             if required.is_some() && !kind.is_file() {
-                return Err(format!(
-                    "required backup artifact is not a regular file: {}",
-                    path.display()
+                return Err(unavailable(
+                    &path,
+                    "required backup artifact is not a regular file",
                 ));
             }
             if kind.is_dir() {
@@ -423,20 +456,24 @@ fn inventory(
                             .canonicalize()
                             .map_err(|error| unavailable(&path, error))?;
                         if excluded_ui_tree(&physical) {
-                            return Err(format!(
-                                "inventory artifact resolves outside Analyzer data trees: {}",
-                                path.display()
+                            return Err(unavailable(
+                                &path,
+                                "inventory artifact resolves outside Analyzer data trees",
                             ));
                         }
                         watch.add_ancestors(&physical)?;
                     }
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        if !entry.file_name().to_str().is_some_and(manifest_name) {
+                        if !entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| manifest_name(name) || name.ends_with(".tar.zst"))
+                        {
                             continue;
                         }
                     }
-                    Err(error) => return Err(error.to_string()),
+                    Err(error) => return Err(unavailable(&path, error)),
                 }
             }
             let name = entry.file_name();
@@ -445,25 +482,19 @@ fn inventory(
                 watch.add(&path, false)?;
                 let bytes = fs::read(&path).map_err(|error| unavailable(&path, error))?;
                 let value: Value =
-                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                    serde_json::from_slice(&bytes).map_err(|error| unavailable(&path, error))?;
                 if required.is_some() && value.get("dataset_id").and_then(Value::as_str).is_none() {
-                    return Err(format!(
-                        "required backup manifest is invalid: {}",
-                        path.display()
-                    ));
+                    return Err(unavailable(&path, "required backup manifest is invalid"));
                 }
-                protect_manifest(&value, names)?;
+                protect_manifest(&value, names).map_err(|error| unavailable(&path, error))?;
                 found_manifest = true;
             } else if name.ends_with(".tar.zst") {
                 watch.add(&path, false)?;
                 archive_manifest(&path, required.unwrap_or_default(), names)
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                    .map_err(|error| unavailable(&path, error))?;
                 report.archives_consulted += 1;
             } else if required.is_some() {
-                return Err(format!(
-                    "unknown required backup artifact: {}",
-                    path.display()
-                ));
+                return Err(unavailable(&path, "unknown required backup artifact"));
             }
             if required.is_some() {
                 expected.remove(&path);
@@ -472,135 +503,29 @@ fn inventory(
         report.trees_consulted += usize::from(found_manifest);
     }
     if let Some((path, _)) = expected.first_key_value() {
-        return Err(format!(
-            "required backup artifact missing: {}",
-            path.display()
-        ));
+        return Err(unavailable(&path, "required backup artifact missing"));
     }
     Ok(())
 }
 
-fn visit_event_lines(path: &Path, mut visit: impl FnMut(&str) -> bool) -> Result<(), String> {
-    let reader = BufReader::new(fs::File::open(path).map_err(|error| error.to_string())?);
-    for line in reader.lines() {
-        let line = line.map_err(|error| error.to_string())?;
-        if !line.trim().is_empty() && !visit(&line) {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn history_is_preserved(
-    candidate: &Path,
-    current: &Path,
-    active: &LiveDataset,
-    watch: &InventoryWatch,
-) -> Result<bool, String> {
-    watch.add(candidate, false)?;
-    let mut remaining = HashSet::new();
-    let mut valid = true;
-    visit_event_lines(candidate, |line| {
-        valid = remaining.len() < MAX_EVENT_HASHES
-            && serde_json::from_str::<Value>(line)
-                .ok()
-                .is_some_and(|event| event.get("event_id").and_then(Value::as_str).is_some())
-            && remaining.insert(sha256_hex(line.as_bytes()));
-        valid
-    })?;
-    if !valid || remaining.is_empty() {
-        return Ok(false);
-    }
-    let mut match_file = |path: &Path, sha: &str| -> Result<bool, String> {
-        watch.add(path, false)?;
-        if sha256_hex_file(path)? != sha {
-            return Err("history source checksum mismatch".into());
-        }
-        visit_event_lines(path, |line| {
-            remaining.remove(&sha256_hex(line.as_bytes()));
-            !remaining.is_empty()
-        })?;
-        Ok(remaining.is_empty())
-    };
-    for shard in &active.event_shards {
-        let mut components = Path::new(&shard.path).components();
-        use std::path::Component::Normal;
-        match (components.next(), components.next(), components.next()) {
-            (Some(Normal(name)), None, None) if name == "oiran_events.jsonl" => {}
-            (Some(Normal(directory)), Some(Normal(_)), None) if directory == "event-shards" => {}
-            _ => return Err("active shard path escapes its dataset".into()),
-        }
-        let path = current.join(&shard.path);
-        if !fs::symlink_metadata(&path)
-            .map_err(|error| error.to_string())?
-            .is_file()
-        {
-            return Err("active shard must be a regular file".into());
-        }
-        if match_file(&path, &shard.sha256)? {
-            return Ok(true);
-        }
-    }
-    let archive_root = current.with_file_name("archive");
-    let archives = match fs::read_dir(archive_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.to_string()),
-    };
-    for entry in archives {
-        let entry = entry.map_err(|error| error.to_string())?;
-        if !entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_dir()
-        {
-            continue;
-        }
-        let directory = entry.path();
-        watch.add(&directory.join("manifest.json"), false)?;
-        let manifest: Value = serde_json::from_slice(
-            &fs::read(directory.join("manifest.json")).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        let sha = manifest
-            .get("events_sha256")
-            .and_then(Value::as_str)
-            .ok_or("archive checksum absent")?;
-        if match_file(&directory.join("events.jsonl"), sha)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn identity(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64) {
-    (
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-    )
-}
-
-// Prepare with no publication lock. Refuse when the served or on-disk
-// generation changes before the bounded commit section.
-pub(super) fn sweep(
+pub(super) fn measure(
     captures: &Path,
     current: &Path,
     served: &LiveDataset,
     served_is_current: impl FnOnce() -> bool,
     report: &mut Report,
-) -> Result<(), String> {
+) -> Result<(usize, u64), InventoryError> {
     let watch = InventoryWatch::new()?;
-    let base = current.parent().ok_or("continuous dataset has no parent")?;
+    let base = current
+        .parent()
+        .ok_or_else(|| unavailable(current, "dataset has no parent"))?;
     watch.add(base, true)?;
     watch.add(current, true)?;
     let manifest_path = current.join("dataset_manifest.json");
     watch.add(&manifest_path, false)?;
-    let active_bytes = fs::read(&manifest_path).map_err(|error| error.to_string())?;
+    let bytes = fs::read(&manifest_path).map_err(|error| unavailable(&manifest_path, error))?;
     let active: LiveDataset =
-        serde_json::from_slice(&active_bytes).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&bytes).map_err(|error| unavailable(&manifest_path, error))?;
     if active.callflows_path.is_none()
         || served.callflows_path != active.callflows_path
         || served.event_count != active.event_count
@@ -614,120 +539,49 @@ pub(super) fn sweep(
                 .map(|shard| (&shard.path, &shard.sha256)))
         || active.event_shards.is_empty()
     {
-        return Err("served and disk generations disagree or are not sharded".into());
+        return Err(unavailable(
+            &manifest_path,
+            "served and disk generations disagree or are not sharded",
+        ));
     }
-    let manifest = fs::metadata(&manifest_path).map_err(|error| error.to_string())?;
     let shards = current.join("event-shards");
-    if !fs::symlink_metadata(current)
-        .map_err(|error| error.to_string())?
-        .is_dir()
-        || !fs::symlink_metadata(&shards)
-            .map_err(|error| error.to_string())?
+    for path in [current, shards.as_path()] {
+        if !fs::symlink_metadata(path)
+            .map_err(|error| unavailable(path, error))?
             .is_dir()
-    {
-        return Err("dataset and shard paths must be real directories".into());
+        {
+            return Err(unavailable(
+                path,
+                "shard inventory requires a real directory",
+            ));
+        }
     }
     let mut names = HashSet::new();
     inventory(captures, &mut names, report, &watch)?;
-    if report.trees_consulted == 0 {
-        return Err("no manifest tree was consulted".into());
-    }
 
-    let mut orphans = Vec::new();
-    report.directories_read += 1;
-    for entry in fs::read_dir(shards).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
+    let (mut count, mut bytes) = (0usize, 0u64);
+    for entry in fs::read_dir(&shards).map_err(|error| unavailable(&shards, error))? {
+        let entry = entry.map_err(|error| unavailable(&shards, error))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("shard-") || !name.ends_with(".jsonl") {
+        if !name.starts_with("shard-") || !name.ends_with(".jsonl") || names.contains(name) {
             continue;
         }
-        report.kept += 1;
-        if names.contains(name) {
-            continue;
-        }
-        report.candidate_stats += 1;
-        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        let path = entry.path();
+        watch.add(&path, false)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
         if metadata.is_file() {
-            let modified = metadata.modified().map_err(|error| error.to_string())?;
-            orphans.push((modified, entry.path(), metadata));
+            count += 1;
+            bytes += metadata.len();
         }
     }
-    orphans.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
-    let now = SystemTime::now();
-    let mut confirmed = Vec::new();
-    let eligible = orphans
-        .into_iter()
-        .skip(SAFETY_BAND)
-        .filter(|(modified, _, metadata)| {
-            (metadata.ctime(), metadata.ctime_nsec()) < (manifest.ctime(), manifest.ctime_nsec())
-                && now.duration_since(*modified).unwrap_or_default() >= GRACE
-        });
-    for (_, path, metadata) in eligible.take(MAX_CANDIDATES) {
-        if history_is_preserved(&path, current, &active, &watch)? {
-            confirmed.push((path, metadata));
-        } else {
-            report.history_unproven += 1;
-        }
+    watch.check_mounts()?;
+    if !served_is_current() {
+        return Err(unavailable(
+            &manifest_path,
+            "served generation changed during measurement",
+        ));
     }
-    if confirmed.is_empty() {
-        return Ok(());
-    }
-    // Backups can be prepared independently of the publisher. Refresh the
-    // entire union after the potentially long content proof.
-    inventory(captures, &mut names, report, &watch)?;
     watch.unchanged()?;
-    let lock = super::PublicationLock::try_acquire(base)?;
-    let started = Instant::now();
-    let result = (|| {
-        watch.check_mounts()?;
-        if !served_is_current()
-            || identity(
-                &fs::symlink_metadata(&manifest_path)
-                    .map_err(|error| unavailable(&manifest_path, error))?,
-            ) != identity(&manifest)
-        {
-            return Err("active or served generation changed during sweep".into());
-        }
-        watch.unchanged()?;
-        // Validate the entire deletion batch first. Unlink generates its own
-        // inotify events, so validate again just before the first unlink.
-        let mut remove = Vec::new();
-        for (path, before) in confirmed {
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| names.contains(name))
-            {
-                continue;
-            }
-            report.candidate_stats += 1;
-            let after = fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
-            if after.is_file() && identity(&before) == identity(&after) {
-                remove.push((path, after.len()));
-            }
-        }
-        watch.unchanged()?;
-        if started.elapsed() >= LOCK_BUDGET {
-            return Err("publication lock budget exceeded before unlink".into());
-        }
-        // One unlink per fresh inventory keeps the checked batch and its
-        // notification boundary indivisible from the publisher's perspective.
-        if let Some((path, bytes)) = remove.into_iter().next() {
-            fs::remove_file(&path).map_err(|error| unavailable(&path, error))?;
-            report.count += 1;
-            report.bytes += bytes;
-            report.kept -= 1;
-        }
-        Ok(())
-    })();
-    drop(lock);
-    report.lock_held = started.elapsed();
-    #[cfg(test)]
-    LOCK_PROBE.with(|probe| {
-        if let Some((_, held)) = probe.borrow_mut().as_mut() {
-            *held += report.lock_held;
-        }
-    });
-    result
+    Ok((count, bytes))
 }

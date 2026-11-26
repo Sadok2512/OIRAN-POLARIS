@@ -1917,6 +1917,7 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     data["continuous_import"] = continuous_import_health(&state, now_ms);
+    data["event_shard_orphans"] = state.inner.capture_manager.event_shard_orphan_inventory();
     data["sessions_filter_generation"] = sessions_filter_generation_health(&state, now_ms);
     ok(data)
 }

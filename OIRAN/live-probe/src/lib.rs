@@ -1,7 +1,7 @@
 //! Strictly owned, allowlisted live capture jobs for the OIRAN local vProbe.
 
 mod callflow_page;
-mod event_shard_gc;
+mod event_shard_inventory;
 pub mod capture_source;
 pub mod commit_seq;
 pub mod event_id_set;
@@ -1818,9 +1818,10 @@ pub struct CaptureManager {
     commit_seqs: Arc<Mutex<HashMap<String, u64>>>,
     sequence: Arc<AtomicU64>,
     continuous_stop: Arc<AtomicBool>,
-    last_event_shard_sweep: Arc<Mutex<Option<Instant>>>,
+    last_event_shard_inventory: Arc<Mutex<Option<Instant>>>,
+    shard_inventory_snapshot: Arc<Mutex<Option<Value>>>,
     #[cfg(not(test))]
-    shard_sweep_running: Arc<AtomicBool>,
+    shard_inventory_running: Arc<AtomicBool>,
     continuous_runtime_evidence: Arc<Mutex<Option<PathBuf>>>,
     /// 2.21.9 — répertoires vTAP de l'import continu en cours (vide par
     /// défaut et en test ; posé par `start_continuous_import`).
@@ -2349,9 +2350,10 @@ impl CaptureManager {
             commit_seqs: Arc::new(Mutex::new(HashMap::new())),
             sequence: Arc::new(AtomicU64::new(1)),
             continuous_stop: Arc::new(AtomicBool::new(false)),
-            last_event_shard_sweep: Arc::new(Mutex::new(None)),
+            last_event_shard_inventory: Arc::new(Mutex::new(None)),
+            shard_inventory_snapshot: Arc::new(Mutex::new(None)),
             #[cfg(not(test))]
-            shard_sweep_running: Arc::new(AtomicBool::new(false)),
+            shard_inventory_running: Arc::new(AtomicBool::new(false)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(std::sync::RwLock::new(())),
@@ -2927,6 +2929,15 @@ impl CaptureManager {
                 })
             }
         }
+    }
+
+    /// Latest complete or explicitly unavailable inventory. No filesystem work.
+    pub fn event_shard_orphan_inventory(&self) -> Value {
+        self.shard_inventory_snapshot.lock().unwrap().clone().unwrap_or_else(|| {
+            event_shard_inventory::Report::default().snapshot(Err(
+                event_shard_inventory::InventoryError::general("inventory not measured yet"),
+            ))
+        })
     }
 
     pub fn dataset_events_source(&self, dataset_id: &str) -> Option<(PathBuf, Vec<EventShard>)> {
@@ -5095,7 +5106,7 @@ impl CaptureManager {
                 })
             );
             if published {
-                self.schedule_shard_sweep(&base);
+                self.schedule_shard_inventory(&base);
             }
             thread::sleep(sleep_for);
         }
@@ -5393,7 +5404,7 @@ impl CaptureManager {
         selected_segments: usize,
     ) -> Result<(), String> {
         self.upsert_dataset(dataset.clone(), &base.join("dataset"))?;
-        self.schedule_shard_sweep(base);
+        self.schedule_shard_inventory(base);
         eprintln!(
             "{}",
             serde_json::json!({
@@ -5425,66 +5436,53 @@ impl CaptureManager {
         )
     }
 
-    fn schedule_shard_sweep(&self, base: &Path) {
+    fn schedule_shard_inventory(&self, base: &Path) {
         if base != self.root.join(CONTINUOUS_CAPTURE_ID) {
             return;
         }
-        let mut last = self.last_event_shard_sweep.lock().unwrap();
-        if last.is_some_and(|started| started.elapsed() < event_shard_gc::INTERVAL) {
+        let mut last = self.last_event_shard_inventory.lock().unwrap();
+        if last.is_some_and(|started| started.elapsed() < event_shard_inventory::INTERVAL) {
             return;
         }
         *last = Some(Instant::now());
         drop(last);
         let current = base.join("dataset");
         #[cfg(test)]
-        self.sweep_continuous_event_shards(&current);
+        self.measure_continuous_event_shards(&current);
         #[cfg(not(test))]
         {
-            if self.shard_sweep_running.swap(true, Ordering::AcqRel) {
+            if self.shard_inventory_running.swap(true, Ordering::AcqRel) {
                 return;
             }
             let manager = self.clone();
-            if let Err(error) = thread::Builder::new().name("oiran-shard-sweep".into())
+            if let Err(error) = thread::Builder::new().name("oiran-shard-inventory".into())
                 .spawn(move || {
-                    manager.sweep_continuous_event_shards(&current);
-                    manager.shard_sweep_running.store(false, Ordering::Release);
+                    manager.measure_continuous_event_shards(&current);
+                    manager.shard_inventory_running.store(false, Ordering::Release);
                 })
             {
-                self.shard_sweep_running.store(false, Ordering::Release);
-                eprintln!("EVENT_SHARD_ORPHANS_SWEEP_START_FAILED: {error}");
+                self.shard_inventory_running.store(false, Ordering::Release);
+                let result = Err(event_shard_inventory::InventoryError::general(error.to_string()));
+                *self.shard_inventory_snapshot.lock().unwrap() =
+                    Some(event_shard_inventory::Report::default().snapshot(result));
             }
         }
     }
 
-    fn sweep_continuous_event_shards(&self, current: &Path) {
+    fn measure_continuous_event_shards(&self, current: &Path) {
         let served = self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned();
-        let mut report = event_shard_gc::Report::default();
+        let mut report = event_shard_inventory::Report::default();
         let result = served
             .as_ref()
-            .ok_or_else(|| "no continuous generation is currently served".to_string())
+            .ok_or_else(|| event_shard_inventory::InventoryError::general("no continuous generation is currently served"))
             .and_then(|served| {
-                event_shard_gc::sweep(&self.root, current, served, || {
+                event_shard_inventory::measure(&self.root, current, served, || {
                     self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID)
                         .is_some_and(|latest| latest.callflows_path == served.callflows_path
                             && latest.event_count == served.event_count)
                 }, &mut report)
             });
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "event": "EVENT_SHARD_ORPHANS_REMOVED",
-                "count": report.count,
-                "bytes": report.bytes,
-                "kept": report.kept,
-                "trees_consulted": report.trees_consulted,
-                "archives_consulted": report.archives_consulted,
-                "directories_read": report.directories_read,
-                "candidate_stats": report.candidate_stats,
-                "history_unproven": report.history_unproven,
-                "publication_lock_held_ns": report.lock_held.as_nanos(),
-                "error": result.err(),
-            })
-        );
+        *self.shard_inventory_snapshot.lock().unwrap() = Some(report.snapshot(result));
     }
 
     fn process_continuous_capture_inner(
@@ -24476,32 +24474,17 @@ Content-Length: 0\r\n\
     }
 
     #[test]
-    fn shard_gc_removes_only_proven_unreferenced_history() {
-        assert_shard_gc_with_backup_inventory(None, false, false);
+    fn shard_inventory_reports_counts_without_holding_the_publication_lock() {
+        assert_shard_inventory(false);
     }
 
     #[test]
-    fn shard_gc_refuses_missing_required_backup_even_with_an_extra_backup() {
-        assert_shard_gc_with_backup_inventory(None, true, false);
+    fn shard_inventory_hides_counts_when_a_tree_cannot_be_read() {
+        assert_shard_inventory(true);
     }
 
-    #[test]
-    fn shard_gc_refuses_missing_required_archive_in_present_backup() {
-        assert_shard_gc_with_backup_inventory(Some(0), false, false);
-    }
-
-    #[test]
-    fn shard_gc_refuses_missing_required_manifest_in_present_backup() {
-        assert_shard_gc_with_backup_inventory(Some(6), false, false);
-    }
-
-    #[test]
-    fn shard_gc_keeps_slow_inventory_outside_the_publication_lock() {
-        assert_shard_gc_with_backup_inventory(None, false, true);
-    }
-
-    fn assert_shard_gc_with_backup_inventory(missing_artifact: Option<usize>, missing_required: bool, measure_lock: bool) {
-        use event_shard_gc::REQUIRED_BACKUPS;
+    fn assert_shard_inventory(unreadable: bool) {
+        use event_shard_inventory::REQUIRED_BACKUPS;
 
         let bench = RetentionBench0_7_0::new("shard-gc-union");
         let backups = bench._root.join(".gc-backups");
@@ -24513,12 +24496,9 @@ Content-Length: 0\r\n\
                 .arg("-C").arg(archive_fixture.as_ref()).args(members)
                 .status().unwrap().success());
         };
-        for (index, (name, expected)) in REQUIRED_BACKUPS.into_iter().enumerate() {
+        for (name, expected) in REQUIRED_BACKUPS {
             let directory = backups.join(name);
             fs::create_dir_all(&directory).unwrap();
-            if missing_artifact == Some(index) || (index == 0 && missing_required) {
-                continue;
-            }
             if let Some((path, members)) = expected {
                 let artifact = directory.join(path);
                 if members.is_empty() {
@@ -24537,9 +24517,6 @@ Content-Length: 0\r\n\
         let extra = backups.join("ANR2_oiran_2.21.166_predeploy_backup_20261124T2258Z");
         fs::create_dir(&extra).unwrap();
         fs::write(extra.join("dataset_manifest.json"), b"{}").unwrap();
-        if missing_required {
-            fs::remove_dir(backups.join(REQUIRED_BACKUPS[0].0)).unwrap();
-        }
         let (source, _, _) = corpus_0_7_0();
         let first = bench.cycle(None, &[("N2.pcap-source.pcapng", source)]);
         assert!(first.event_count > 0);
@@ -24593,25 +24570,33 @@ Content-Length: 0\r\n\
             bench._root.to_path_buf(), false, bench._root.join(".oiran-pseudonym.key"),
         ).unwrap();
         bench.manager.recover_continuous_dataset_from_disk(&bench.base).unwrap();
-        if measure_lock {
-            event_shard_gc::LOCK_PROBE.with(|probe| {
-                *probe.borrow_mut() = Some((bench.base.clone(), Duration::ZERO));
-            });
+        let bad_tree = bench._root.join("unreadable-tree");
+        if unreadable {
+            std::os::unix::fs::symlink(&bad_tree, &bad_tree).unwrap();
         }
+        event_shard_inventory::LOCK_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some((bench.base.clone(), Duration::ZERO));
+        });
         bench.cycle(None, &[]);
-        if measure_lock {
-            let (_, held) = event_shard_gc::LOCK_PROBE.with(|probe| probe.replace(None)).unwrap();
-            assert!(held <= Duration::from_millis(50), "inventory occupied the publication lock for {held:?}");
-        }
-        if missing_required || missing_artifact.is_some() {
-            assert!(removable.is_file(), "missing required backup data must prevent unlink");
+        let (_, held) = event_shard_inventory::LOCK_PROBE.with(|probe| probe.replace(None)).unwrap();
+        assert_eq!(held, Duration::ZERO);
+        let snapshot = bench.manager.event_shard_orphan_inventory();
+        assert_eq!(snapshot["publication_lock_held_ns"], 0);
+        if unreadable {
+            assert_eq!(snapshot["status"], "unavailable", "{snapshot}");
+            assert_eq!(snapshot["error"]["path"], serde_json::json!(bad_tree));
+            assert!(snapshot["error"]["reason"].is_string());
+            assert!(snapshot["count"].is_null() && snapshot["bytes"].is_null());
         } else {
-            assert!(!removable.exists(), "a covered orphan must be removed");
+            assert_eq!(snapshot["status"], "available", "{snapshot}");
+            assert_eq!(snapshot["count"], 4);
+            let bytes = [&removable, &unknown, &newest_a, &newest_b].into_iter()
+                .map(|path| fs::metadata(path).unwrap().len()).sum::<u64>();
+            assert_eq!(snapshot["bytes"], bytes);
+            assert!(snapshot["error"].is_null());
         }
-        assert!(original.is_file(), "the rollback still needs the original shard");
-        assert!(archived_reference.is_file(), "an archived manifest still needs this shard");
-        assert!(unknown.is_file(), "unproven history must survive");
-        assert!(newest_a.is_file() && newest_b.is_file(), "the safety band survives");
+        assert!([original, archived_reference, removable, unknown, newest_a, newest_b]
+            .iter().all(|path| path.is_file()));
     }
 
     fn corpus_0_7_0() -> (PathBuf, PathBuf, PathBuf) {

@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.191 / live-probe 0.7.3 — orphan shard visibility
+
+Expose the cached read-only shard inventory in health. Failed or incomplete reads omit the numerical totals and report the failing path and reason.
+
 ## oiran-api 2.21.190 / live-probe 0.7.2 — bounded shard sweep commit
 
 Prepare event shard sweeps off the publication path. Recheck the watched inventory and served generation before one unlink under the publication lock. Exclude the frontend build home and secret store from the Analyzer inventory.
