@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "event-schema"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.36"
+version = "0.5.38"
 dependencies = [
  "event-schema",
  "libc",

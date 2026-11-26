@@ -98,6 +98,10 @@ fn persisted_packet_refs_accept_legacy_rows_and_round_trip_sctp_provenance() {
     let provenance = packet.sctp_association.as_ref().unwrap();
     assert_eq!((provenance.first_tsn, provenance.last_tsn), (Some(u32::MAX), Some(0)));
     assert_eq!(serde_json::to_value(packet).unwrap(), current);
+    current["sctp_association"]["original_segment_name"] = serde_json::json!("n2_20261119T231700Z_00019_20261120171703.pcapng");
+    current["sctp_association"]["rotation_index"] = serde_json::json!(19);
+    let packet: PacketRef = serde_json::from_value(current.clone()).unwrap();
+    assert_eq!(serde_json::to_value(packet).unwrap(), current);
 }
 
 impl EventRecord {
