@@ -24384,6 +24384,61 @@ Content-Length: 0\r\n\
     }
 
     #[test]
+    fn publication_records_retention_replacement_and_never_installs_an_unselected_shard() {
+        let bench = RetentionBench0_7_0::new("retention-replacement-manifest");
+        let (old, another_old, _) = corpus_0_7_0();
+        let first = bench.cycle(None, &[("N2.pcap-old.pcapng", old)]);
+        let mut original = first.event_shards[0].clone();
+        let path = bench.shard_file(&original);
+        let payload = fs::read_to_string(&path).unwrap();
+        let mut hot: Value = serde_json::from_str(payload.lines().next().unwrap()).unwrap();
+        let fresh_epoch = epoch_ms() / 1000;
+        let fresh_capture = "sha256:hot-retention-fixture";
+        hot["capture_id"] = serde_json::json!(fresh_capture);
+        hot["event_id"] = serde_json::json!("evt-hot-retention-fixture");
+        hot["stable_event_key"] = serde_json::json!("stable-hot-retention-fixture");
+        hot["timestamp"]["seconds"] = serde_json::json!(fresh_epoch);
+        let mixed = format!("{payload}{hot}\n");
+        fs::write(&path, &mixed).unwrap();
+        original.sha256 = sha256_hex(mixed.as_bytes());
+        original.bytes = mixed.len() as u64;
+        original.event_count += 1;
+        original.capture_ends.insert(fresh_capture.into(), fresh_epoch);
+        let mut prior = bench.manifest();
+        prior.event_count = original.event_count;
+        prior.event_shards = vec![original.clone()];
+        let manifest_path = bench.base.join("dataset/dataset_manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&prior).unwrap()).unwrap();
+        TEST_RETENTION_ARCHIVE.with(|enabled| enabled.set(Some(true)));
+        let published = bench.cycle(Some(1), &[("N2.pcap-another-old.pcapng", another_old)]);
+        TEST_RETENTION_ARCHIVE.with(|enabled| enabled.set(None));
+        assert_eq!(published.event_count, 1);
+        let successor = &published.event_shards[0];
+        assert_ne!(successor.path, original.path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), mixed);
+        let active = bench.base.join("dataset");
+        let actual: BTreeSet<_> = fs::read_dir(active.join("event-shards")).unwrap()
+            .map(|entry| entry.unwrap().path()).collect();
+        let expected_installation = BTreeSet::from([path, active.join(&successor.path)]);
+        let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let receipt = &manifest["retention_replacements"][0];
+        assert_eq!(
+            (receipt["predecessor"]["path"].as_str(), actual == expected_installation),
+            (Some(original.path.as_str()), true),
+            "publication must name the displaced file and omit staged files the final manifest does not select",
+        );
+        assert_eq!(receipt["predecessor"]["sha256"], original.sha256);
+        assert_eq!(receipt["predecessor"]["event_count"], original.event_count);
+        assert_eq!(receipt["successor"]["path"], successor.path);
+        assert_eq!(receipt["successor"]["sha256"], successor.sha256);
+        let archive = receipt["archive_id"].as_str().unwrap();
+        assert!(bench.base.join("archive").join(archive).join("manifest.json").is_file());
+        assert_eq!(receipt["archived_event_count"], original.event_count - 1);
+        let later = bench.cycle(None, &[]);
+        assert_eq!(serde_json::to_value(later).unwrap()["retention_replacements"], manifest["retention_replacements"]);
+    }
+
+    #[test]
     fn retention_rejects_manifest_count_mismatch_at_publication_0_7_0() {
         let bench = RetentionBench0_7_0::new("retention-count-mismatch");
         let (five, _, one) = corpus_0_7_0();
