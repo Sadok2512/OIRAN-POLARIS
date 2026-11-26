@@ -24612,6 +24612,9 @@ Content-Length: 0\r\n\
             assert_orphan_totals_unavailable(&snapshot);
         } else {
             assert_eq!(snapshot["status"], "available", "{snapshot}");
+            let served_seq = commit_seq::read(&dataset);
+            assert!(served_seq > 0);
+            assert_eq!(snapshot["commit_seq"], served_seq, "inventory must name the measured generation");
             assert_eq!(snapshot["count"], 4);
             let bytes = [&removable, &unknown, &newest_a, &newest_b].into_iter()
                 .map(|path| fs::metadata(path).unwrap().len()).sum::<u64>();
