@@ -24477,30 +24477,53 @@ Content-Length: 0\r\n\
 
     #[test]
     fn shard_gc_removes_only_proven_unreferenced_history() {
-        assert_shard_gc_with_backup_inventory(None, false, false);
+        assert_shard_gc_with_backup_inventory(None, false, false, false);
     }
 
     #[test]
     fn shard_gc_refuses_missing_required_backup_even_with_an_extra_backup() {
-        assert_shard_gc_with_backup_inventory(None, true, false);
+        assert_shard_gc_with_backup_inventory(None, true, false, false);
     }
 
     #[test]
     fn shard_gc_refuses_missing_required_archive_in_present_backup() {
-        assert_shard_gc_with_backup_inventory(Some(0), false, false);
+        assert_shard_gc_with_backup_inventory(Some(0), false, false, false);
     }
 
     #[test]
     fn shard_gc_refuses_missing_required_manifest_in_present_backup() {
-        assert_shard_gc_with_backup_inventory(Some(6), false, false);
+        assert_shard_gc_with_backup_inventory(Some(6), false, false, false);
     }
 
     #[test]
     fn shard_gc_keeps_slow_inventory_outside_the_publication_lock() {
-        assert_shard_gc_with_backup_inventory(None, false, true);
+        assert_shard_gc_with_backup_inventory(None, false, true, false);
     }
 
-    fn assert_shard_gc_with_backup_inventory(missing_artifact: Option<usize>, missing_required: bool, measure_lock: bool) {
+    #[test]
+    fn shard_gc_refuses_eacces_resolving_a_shard_link() {
+        const TEST_NAME: &str = "tests::shard_gc_refuses_eacces_resolving_a_shard_link";
+        if unsafe { libc::geteuid() } == 0 && std::env::var_os("OIRAN_TEST_SHARD_GC_NO_CAPS").is_none() {
+            let status = std::process::Command::new("setpriv")
+                .args(["--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env("OIRAN_TEST_SHARD_GC_NO_CAPS", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "capability-free shard GC guard failed");
+            return;
+        }
+        assert_shard_gc_with_backup_inventory(None, false, false, true);
+    }
+
+    fn assert_shard_gc_with_backup_inventory(
+        missing_artifact: Option<usize>,
+        missing_required: bool,
+        measure_lock: bool,
+        deny_shard_link: bool,
+    ) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
         use event_shard_gc::REQUIRED_BACKUPS;
 
         let bench = RetentionBench0_7_0::new("shard-gc-union");
@@ -24598,14 +24621,33 @@ Content-Length: 0\r\n\
                 *probe.borrow_mut() = Some((bench.base.clone(), Duration::ZERO));
             });
         }
+        let denied_parent = deny_shard_link.then(|| {
+            let outside = temporary_root("shard-gc-denied-target");
+            let denied = outside.join("denied");
+            fs::create_dir(&denied).unwrap();
+            let target = denied.join(removable.file_name().unwrap());
+            symlink(&removable, &target).unwrap();
+            let rollback_shards = rollback.join("event-shards");
+            fs::create_dir(&rollback_shards).unwrap();
+            let alias = rollback_shards.join("shard-alias.jsonl");
+            symlink(&target, &alias).unwrap();
+            assert_eq!(alias.canonicalize().unwrap(), removable.canonicalize().unwrap());
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(alias.canonicalize().unwrap_err().raw_os_error(), Some(libc::EACCES));
+            (outside, denied)
+        });
         bench.cycle(None, &[]);
+        if let Some((_outside, denied)) = denied_parent {
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(removable.is_file(), "EACCES while resolving a shard link must prevent unlink");
+        }
         if measure_lock {
             let (_, held) = event_shard_gc::LOCK_PROBE.with(|probe| probe.replace(None)).unwrap();
             assert!(held <= Duration::from_millis(50), "inventory occupied the publication lock for {held:?}");
         }
         if missing_required || missing_artifact.is_some() {
             assert!(removable.is_file(), "missing required backup data must prevent unlink");
-        } else {
+        } else if !deny_shard_link {
             assert!(!removable.exists(), "a covered orphan must be removed");
         }
         assert!(original.is_file(), "the rollback still needs the original shard");
