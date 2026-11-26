@@ -15,6 +15,18 @@ npm test
 npm run build
 ```
 
+For a disposable build/test cache, run from this workspace:
+
+```bash
+python3 ../scripts/cargo_targets.py run control-validation -- test --locked --workspace
+```
+
+The shared wrapper sweeps its private targets on the next managed invocation.
+A target expires after seven days without use. For a standalone sweep, run
+`python3 ../scripts/cargo_targets.py expire`. A sweep defers while a managed
+build is active. Cargo invocations outside the wrapper continue to use their
+usual target directories. Use the managed directory only for build artifacts.
+
 ## Authorized local preview
 
 ```bash

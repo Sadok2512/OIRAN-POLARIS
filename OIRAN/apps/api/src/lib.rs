@@ -1682,6 +1682,7 @@ fn compute_health_counters(state: &AppState) -> Value {
     let queryable_session_count = queryable_session_ids(state).len();
     json!({
         "dataset":dataset,
+        "archive":state.inner.capture_manager.archive_inventory(),
         "source_events":source_events,
         // Same union as an unfiltered GET /sessions. The narrower continuous
         // manifest count is named explicitly instead of overloading this key.
@@ -11387,6 +11388,32 @@ mod tests {
             "LTE_PAGINATION_INVALID"
         );
     }
+    #[tokio::test]
+    async fn health_reports_archive_volume_count_and_oldest_2_21_183() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let mut config = test_config(workspace, "health-archive");
+        let capture_root = temporary_directory("health-archive-captures");
+        config.capture_root = capture_root.clone();
+        let archive = capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID).join("archive");
+        let mut bytes = 0;
+        for (name, created) in [("newer", 200), ("older", 100)] {
+            let segment = archive.join(name);
+            fs::create_dir_all(&segment).unwrap();
+            let events = b"{}\n";
+            let manifest = json!({"created_epoch_s": created}).to_string();
+            fs::write(segment.join("events.jsonl"), events).unwrap();
+            fs::write(segment.join("manifest.json"), &manifest).unwrap();
+            bytes += events.len() + manifest.len();
+        }
+        let app = router(AppState::load(config).unwrap(), None);
+        let body = json_body(app.oneshot(req("/api/v1/health", true)).await.unwrap()).await;
+        assert_eq!(body["data"]["archive"], json!({
+            "status":"ready","bytes":bytes,"segments":2,"oldest_created_epoch_s":100,
+        }));
+        assert!(archive.join("older/events.jsonl").is_file());
+        fs::remove_dir_all(capture_root).unwrap();
+    }
+
     #[tokio::test]
     async fn health_reports_real_dataset() {
         let r = router(state(), None)
