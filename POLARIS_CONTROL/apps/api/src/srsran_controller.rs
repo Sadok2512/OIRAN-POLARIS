@@ -2942,7 +2942,7 @@ pub(super) fn line_carries_authentication_material(lower: &str) -> bool {
             end -= 1;
         }
         let mut start = end;
-        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'_' | b'-')) {
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'_' | b'-' | b'*')) {
             start -= 1;
         }
         let word = &lower[start..end];
@@ -2964,6 +2964,9 @@ pub(super) fn line_carries_authentication_material(lower: &str) -> bool {
     }
     // Formes sans séparateur déjà connues (en-têtes de vidage).
     ["auth key", "subscriber key"].iter().any(|marker| lower.contains(marker))
+        || lower
+            .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '*')))
+            .any(|token| matches!(token, "hmac" | "xres" | "xres*" | "xres_star" | "hxres" | "hxres*" | "hxres_star"))
 }
 
 fn sanitize_log_line(line: &str) -> Option<String> {

@@ -23773,9 +23773,16 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             assert!(telemetry_reference_is_sensitive_with(value, true));
             assert_ne!(sanitize_history_text_with(value, None, true), value);
         }
-        let material = "XRES=synthetic-test-marker";
-        assert_ne!(sanitize_history_text_with(material, None, true), material);
-        assert_ne!(safe_telemetry_code_with(material, true), material);
+        for material in [
+            "XRES=synthetic-test-marker",
+            "XRES*=synthetic-test-marker",
+            "HXRES* synthetic-test-marker",
+            "HMAC synthetic-test-marker",
+        ] {
+            assert_ne!(sanitize_history_text_with(material, None, true), material);
+            assert_ne!(safe_telemetry_code_with(material, true), material);
+            assert!(srsran_controller::line_carries_authentication_material(&material.to_ascii_lowercase()));
+        }
     }
 
     /// 0.36.31 (ordre cœur #9 7133029202) — interrupteur
