@@ -1,8 +1,12 @@
 # Changelog
 
-## oiran-api 2.21.184 — archive visibility and mount-bounded Cargo expiry
+## oiran-api 2.21.186 — archive visibility and mount-bounded Cargo expiry
 
 Patch. Order #10 7175865262 and review 7177285745. The cached health snapshot exposes the retention archive's logical bytes, finalized segment count and oldest creation date. Archive inventory is read-only. The shared Cargo wrapper expires private build targets after seven days without use and retains targets with a nested mount, including same-device bind mounts.
+
+## oiran-api 2.21.185 / decoder-sbi 0.4.11 — N12 subscriber pseudonym
+
+Patch. The SBI decoder reads the authentication body's `supiOrSuci` and emits the existing subscriber pseudonym identifier. IMSI SUPIs and null-scheme SUCIs use the shared canonical subscriber domain. Protected SUCIs remain opaque. The existing SBI session association rules are reused.
 
 ## oiran-api 2.21.183 — N3 downlink coverage in session callflows
 
