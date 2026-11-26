@@ -1852,6 +1852,8 @@ pub struct CaptureManager {
     /// Persistance : `<root>/quarantine.json`. Chargé au `new()`,
     /// réécrit atomiquement à chaque nouveau segment quarantiné.
     quarantined_segments: Arc<Mutex<BTreeMap<SegmentQuarantineKey, SegmentQuarantineEntry>>>,
+    #[cfg(test)]
+    after_quarantine_insert: Option<Arc<dyn Fn() + Send + Sync>>,
     // 2.7.6: per-deployment HMAC-SHA256 secret. Loaded once from a root-only
     // 0600 file at startup and shared by every import this manager runs,
     // including after a probe restart against the same key path. Wrapped in
@@ -2216,6 +2218,13 @@ impl CaptureManager {
             },
         );
         persist_quarantined_segments(&self.root, &guard);
+        #[cfg(test)]
+        if let Some(pause) = &self.after_quarantine_insert {
+            // The fixture must be able to observe the table while the
+            // worker is held before its next inventory scan.
+            drop(guard);
+            pause();
+        }
         true
     }
 
@@ -2344,6 +2353,8 @@ impl CaptureManager {
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
             vtap_publication_triggers: Arc::new(Mutex::new(BTreeSet::new())),
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
+            #[cfg(test)]
+            after_quarantine_insert: None,
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
             sbi_hpack_carry_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
@@ -16712,14 +16723,21 @@ mod tests {
         let truncated_path = source.join("N2/final-1.pcapng");
         fs::write(&truncated_path, &n2[..n2.len() * 3 / 5 + 7]).unwrap();
         write_rotation_closures(&source, "N2", 1);
-        thread::sleep(Duration::from_millis(250));
 
-        let manager = CaptureManager::with_pseudonym_key_path(
+        let mut manager = CaptureManager::with_pseudonym_key_path(
             root.to_path_buf(),
             false,
             root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
+        let (paused, wait_for_pause) = std::sync::mpsc::sync_channel(1);
+        let (resume, wait_for_observation) = std::sync::mpsc::channel();
+        let wait_for_observation = Mutex::new(wait_for_observation);
+        manager.after_quarantine_insert = Some(Arc::new(move || {
+            paused.send(()).unwrap();
+            // Disconnect also releases the worker if the test panics.
+            let _ = wait_for_observation.lock().unwrap().recv();
+        }));
         manager
             .start_continuous_import(ContinuousImportConfig {
                 source_root: source.to_path_buf(),
@@ -16735,17 +16753,32 @@ mod tests {
             })
             .unwrap();
 
-        // Attend la quarantaine puis un cycle supplémentaire pour que
-        // les compteurs soient re-publiés après la quarantaine.
-        wait_for(|| {
-            manager
-                .quarantined_segments_snapshot()
-                .iter()
-                .any(|((p, _, _), _)| p == &truncated_path.display().to_string())
-        });
-        thread::sleep(Duration::from_millis(500));
+        wait_for_pause
+            .recv_timeout(Duration::from_secs(30))
+            .expect("worker paused after the quarantine table was persisted");
+        let mut resume = Some(resume);
+        let mut observe_job = || {
+            let snapshot = manager.get(CONTINUOUS_CAPTURE_ID).expect("continuous job");
+            if let Some(resume) = resume.take() {
+                resume.send(()).unwrap();
+            }
+            snapshot
+        };
 
-        let job = manager.get(CONTINUOUS_CAPTURE_ID).expect("continuous job");
+        // The quarantine registry is updated during ingestion, before the
+        // worker publishes the next scan's inventory to the job. Observe
+        // that inventory directly and assert on the same snapshot.
+        let path = truncated_path.display().to_string();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let job = loop {
+            let snapshot = observe_job();
+            if snapshot.metrics.quarantined_segment_paths.contains(&path) || Instant::now() >= deadline {
+                break snapshot;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+
         assert_eq!(
             job.metrics.pending_segments, 0,
             "2.21.68 : un segment quarantiné ne doit PLUS être compté en attente ; metrics: {:?}",
@@ -16769,7 +16802,8 @@ mod tests {
                 .quarantined_segment_paths
                 .iter()
                 .any(|p| p == &truncated_path.display().to_string()),
-            "le chemin du segment quarantiné doit être listé"
+            "le scan doit publier le chemin du segment quarantiné ; metrics: {:?}",
+            job.metrics
         );
         if let Some(pct) = job.metrics.queue_occupancy_percent {
             assert!(
@@ -16778,7 +16812,6 @@ mod tests {
             );
         }
 
-        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     /// 2.21.68 (ordre #9 7006248573) — `owned_bytes_percent` n'est pas
