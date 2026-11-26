@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.193 / decoder-ngap 0.6.4 — Global gNB ID APER decoding
+
+Decode the aligned gNB ID bit string in captured NGSetup requests.
+
 ## oiran-api 2.21.192 / live-probe 0.7.4 — orphan inventory data roots
 
 Scope the optional installation-tree scan to OIRAN. Report dangling entries separately while keeping incomplete reads unavailable.

@@ -427,16 +427,14 @@ fn decode_global_ran_node_id(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
                 return malformed();
             }
             let plmn = decode_plmn(&payload[0..3]);
-            // gNB-ID CHOICE : 3 bits ext+tag, puis BIT STRING. Rebuild
-            // via BitReader sur le reste de payload à partir de l'offset 3.
-            let mut gnb_bits = BitReader::new(&payload[3..]);
-            let Some(_gnb_ext) = gnb_bits.read(1) else {
+            // The root CHOICE has one alternative, so it carries only its
+            // extension bit. APER aligns the BIT STRING payload after the
+            // constrained length determinant.
+            let mut gnb_header = BitReader::new(&payload[3..4]);
+            let Some(gnb_extension) = gnb_header.read(1) else {
                 return malformed();
             };
-            let Some(gnb_tag) = gnb_bits.read(1) else {
-                return malformed();
-            };
-            if gnb_tag != 0 {
+            if gnb_extension != 0 {
                 return (
                     Some(format!(
                         "plmn={plmn},ran_node_type=globalGNB-ID,gnb_id_choice_extension=true,\
@@ -447,20 +445,17 @@ fn decode_global_ran_node_id(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
                     false,
                 );
             }
-            let Some(len_minus_22) = gnb_bits.read(4) else {
+            let Some(len_minus_22) = gnb_header.read(4) else {
                 return malformed();
             };
             let bit_length = 22u64.saturating_add(len_minus_22);
             if bit_length > 32 {
                 return malformed();
             }
-            let mut gnb_id: u64 = 0;
-            for _ in 0..bit_length {
-                let Some(b) = gnb_bits.read(1) else {
-                    return malformed();
-                };
-                gnb_id = (gnb_id << 1) | u64::from(b);
-            }
+            let mut gnb_bits = BitReader::new(&payload[4..]);
+            let Some(gnb_id) = gnb_bits.read(bit_length as usize) else {
+                return malformed();
+            };
             (
                 Some(format!(
                     "plmn={plmn},ran_node_type=globalGNB-ID,gnb_id={gnb_id},\
@@ -2179,27 +2174,8 @@ fn global_gnb_id_decodes_the_aper_ie_from_captured_ng_setup_requests() {
 /// Octets synthétisés spec (fixture lab ne contient pas IE 27).
 #[test]
 fn global_ran_node_id_decodes_global_gnb_id_with_plmn_and_gnb_bit_length() {
-    // ext=0, tag=00 (globalGNB-ID), puis PLMN 001-01 (02 F8 10 = 001/F/01),
-    // puis gNB-ID choice ext=0, tag=0, longueur 4b encoded = 0 → 22 bits,
-    // gNB-ID value = 0x000001 shifté sur 22 bits.
-    // Octet 0 : ext=0 + tag=00 + padding → 0b0000_0000 = 0x00.
-    // Octet 1-3 : PLMN 001-01 BCD = 02 F8 10.
-    // Octet 4+ : gNB-ID CHOICE encoded.
-    //   ext=0, tag=0, len_minus_22=0 (4 bits), gnb_id=0x000001 (22 bits),
-    //   total 27 bits = 3 octets + 3 bits padding.
-    //   bits: 0 0 0000 followed by 22-bit value "0000000000000000000001".
-    //   = 0b 0 0 0000 0000000000000000000001 000 = 27+3=30 bits
-    //   byte 4: 0b00000000 = 0x00
-    //   byte 5: 0b00000000 = 0x00
-    //   byte 6: 0b00000100 = 0x04 (bit 22 = last data bit, 2 bits pad)
-    //   Actually recalc: bits after preamble (6 bits) = 22 bits data +
-    //   2 bits trailing pad. So:
-    //   byte 4: ext(1) + tag(1) + len(4) + first 2 data bits
-    //          = 0 + 0 + 0000 + 00 = 0x00
-    //   byte 5: next 8 data bits = 0x00
-    //   byte 6: next 8 data bits = 0x00
-    //   byte 7: last 4 data bits + 4 pad bits = 0001_0000 = 0x10
-    let value = [0x00, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x00, 0x10];
+    // Root Global gNB ID, zero length offset and an aligned 22-bit value.
+    let value = [0x00, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x00, 0x04];
     let (text, status, _) = decode_global_ran_node_id(&value);
     assert_eq!(status, DecodeStatus::Decoded);
     let text = text.expect("some");
