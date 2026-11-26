@@ -4341,6 +4341,7 @@ impl CaptureManager {
                 job.metrics.owned_bytes_percent = owned_pct_scan;
             })?;
             let mut pending_publication = std::mem::take(&mut bootstrap_pending);
+            let mut original_segments = BTreeMap::new();
             let mut changed = !pending_publication.is_empty();
             let prior_state = state.clone();
             let mut terminal_error = None;
@@ -4709,6 +4710,12 @@ impl CaptureManager {
                         historical_context: false,
                     },
                 );
+                if let Some(name) = candidate.path.file_name().and_then(|name| name.to_str()) {
+                    if let Some((_, rotation)) = parse_ring_filename(name) {
+                        original_segments.entry(candidate.checksum.clone())
+                            .or_insert((name.to_owned(), rotation));
+                    }
+                }
                 pending_publication.push(candidate.checksum);
                 changed = true;
                 ingested_this_scan = ingested_this_scan.saturating_add(1);
@@ -4828,7 +4835,7 @@ impl CaptureManager {
                     &import_interface_specs(),
                     config.max_owned_bytes,
                     &selected_files,
-                    publication_started_epoch_ms,
+                    PublicationContext { started_epoch_ms: publication_started_epoch_ms, original_segments: &original_segments },
                 ) {
                     Ok(dataset) => {
                         // 2.21.63 — extraire uniquement les petites valeurs
@@ -5457,14 +5464,14 @@ impl CaptureManager {
         interfaces: &[CaptureInterface],
         max_owned_bytes: u64,
         selected_files: &BTreeSet<PathBuf>,
-        publication_started_epoch_ms: u64,
+        publication: PublicationContext<'_>,
     ) -> Result<LiveDataset, String> {
         self.process_continuous_capture_inner(
             base,
             interfaces,
             max_owned_bytes,
             Some(selected_files),
-            Some(publication_started_epoch_ms),
+            Some(publication),
         )
     }
 
@@ -5513,7 +5520,7 @@ impl CaptureManager {
         interfaces: &[CaptureInterface],
         max_owned_bytes: u64,
         selected_files: Option<&BTreeSet<PathBuf>>,
-        publication_started_epoch_ms: Option<u64>,
+        publication: Option<PublicationContext<'_>>,
     ) -> Result<LiveDataset, String> {
         // Cross-process advisory lock (flock) held through the manifest
         // commit. `dataset-restore` takes
@@ -5555,7 +5562,7 @@ impl CaptureManager {
             format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
             interfaces,
             selected_files,
-            publication_started_epoch_ms,
+            publication,
         );
         let dataset = match result {
             Ok(dataset) => dataset,
@@ -6907,8 +6914,9 @@ impl CaptureManager {
         dataset_path: String,
         interfaces: &[CaptureInterface],
         selected_files: Option<&BTreeSet<PathBuf>>,
-        publication_started_epoch_ms: Option<u64>,
+        publication: Option<PublicationContext<'_>>,
     ) -> Result<LiveDataset, String> {
+        let publication_started_epoch_ms = publication.as_ref().map(|context| context.started_epoch_ms);
         // 2.7.6 (adjusted): the per-deployment key is owned by the manager
         // and shared across every capture processed by this binary — so a
         // probe restart that rebuilds the same dataset reuses the same key
@@ -7148,7 +7156,18 @@ impl CaptureManager {
                             .map(|s| s.to_owned())
                             .unwrap_or_default(),
                     };
-                    let mut sink = |event: NormalizedEvent| -> Result<(), String> {
+                    let original_segment = publication.as_ref()
+                        .and_then(|context| context.original_segments.get(&checksum));
+                    let mut sink = |mut event: NormalizedEvent| -> Result<(), String> {
+                        if let Some((name, rotation)) = original_segment {
+                            for packet in &mut event.packet_references {
+                                if let Some(provenance) = &mut packet.sctp_association {
+                                    let provenance = Arc::make_mut(provenance);
+                                    provenance.original_segment_name = Some(name.clone());
+                                    provenance.rotation_index = Some(*rotation);
+                                }
+                            }
+                        }
                         // 2.9.5 (devmat #9 T1) : les keepalives (PFCP HB,
                         // Diameter Device-Watchdog, GTPv2 Echo, GTP-U Echo)
                         // sont toujours agrégés par (interface, paire de
@@ -10448,6 +10467,11 @@ fn validate_request(
         blockers.push("CUSTOM_FILTER_NOT_CERTIFIED".into());
     }
     blockers
+}
+
+struct PublicationContext<'a> {
+    started_epoch_ms: u64,
+    original_segments: &'a BTreeMap<String, (String, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -18494,6 +18518,54 @@ Content-Length: 0\r\n\
                 "PARTIAL_EXTERNAL_RUNTIME_CORROBORATED"
             );
         }
+    }
+
+    #[test]
+    fn continuous_import_preserves_original_sctp_segment_provenance() {
+        let root = temporary_root("original-sctp-segment");
+        let source = temporary_root("original-sctp-source");
+        fs::create_dir(source.join("N2")).unwrap();
+        let name = "n2_20261119T231700Z_00019_20261120171703.pcapng";
+        let fixture = corpus_0_7_0().2.join("N2.pcapng");
+        fs::copy(fixture, source.join("N2").join(name)).unwrap();
+        write_rotation_closures(&source, "N2", 1);
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        manager.start_continuous_import(ContinuousImportConfig {
+            source_root: source.to_path_buf(),
+            scan_interval: Duration::from_millis(200),
+            stable_age: Duration::from_millis(200),
+            max_owned_bytes: 128 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_segments: 8,
+            native_segment_seconds: None,
+            historical_n2_bootstrap: None,
+            runtime_pdu_evidence: None,
+            vtap_out_dirs: Vec::new(),
+        }).unwrap();
+        wait_for(|| manager.dataset(CONTINUOUS_DATASET_ID).is_some_and(|dataset| dataset.event_count > 0));
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+
+        let dataset = manager.dataset(CONTINUOUS_DATASET_ID).unwrap();
+        let directory = root.join(CONTINUOUS_CAPTURE_ID).join("dataset");
+        let mut checked = 0;
+        for shard in dataset.event_shards {
+            for line in fs::read_to_string(directory.join(shard.path)).unwrap().lines() {
+                let event: Value = serde_json::from_str(line).unwrap();
+                if event["protocol"] != "NGAP" { continue; }
+                for packet in event["packet_references"].as_array().unwrap() {
+                    let copied = packet["source_file"].as_str().unwrap();
+                    assert!(copied.rsplit('/').next().unwrap().starts_with("N2.pcap-"), "{copied}");
+                    let association = &packet["sctp_association"];
+                    assert!(association["first_tsn"].is_u64());
+                    assert_eq!(association["original_segment_name"], name, "original segment lost during import");
+                    assert_eq!(association["rotation_index"], 19);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "fixture must produce NGAP packet references");
     }
 
     #[test]

@@ -105,6 +105,10 @@ pub struct SctpAssociationProvenance {
     pub first_tsn: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tsn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_segment_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -570,6 +574,12 @@ fn packet_reference_json(p: &PacketReference) -> String {
         }
         if let Some(tsn) = sctp.last_tsn {
             association.push_str(&format!(",\"last_tsn\":{tsn}"));
+        }
+        if let Some(name) = &sctp.original_segment_name {
+            association.push_str(&format!(",\"original_segment_name\":\"{}\"", escape(name)));
+        }
+        if let Some(index) = sctp.rotation_index {
+            association.push_str(&format!(",\"rotation_index\":{index}"));
         }
         association.push('}');
         parts.push(association);
