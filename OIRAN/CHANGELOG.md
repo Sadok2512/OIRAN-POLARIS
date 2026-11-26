@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.197 / session-engine 0.5.37 / Web 2.14.6 — N2 continuity evidence
+
+Expose an optional link on the details of both PDU sessions when an N2 rotation preserves the directional SCTP endpoint tuple, verification tag and wire TSN continuity between setup and release. Session membership and accounting are preserved.
+
 ## oiran-api 2.21.196 / oiran-decode 0.12.2 — SCTP message TSN bounds
 
 Persist the wire TSN of the first and last SCTP DATA chunks in packet-reference provenance. Historical references keep their original shape. Event-schema 1.13.1 and session-engine 0.5.36 carry the optional bounds.
