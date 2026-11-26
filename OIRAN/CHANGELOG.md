@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.183 — N3 downlink coverage in session callflows
+
+Patch. Correlate an ambiguous downlink G-PDU aggregate through the unique uplink in its segment when the UE address and reversed endpoints agree and the uplink PFCP session owns the receiving downlink tunnel key. Newly emitted aggregates carry a consistency flag when all their packets agree on the UE address and endpoints.
+
 ## oiran-api 2.21.182 — périmètre PFCP du manifeste servi
 
 Montée patch. Ordre #10 7174690790, base `fb459e4`. L’enrichissement PFCP et son préchauffage choisissent les shards dans le manifeste servi. L’index reste en mémoire et conserve son mode incrémental. La reconstruction à froid reste ouverte.

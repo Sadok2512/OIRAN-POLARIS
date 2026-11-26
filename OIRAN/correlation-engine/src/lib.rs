@@ -1418,7 +1418,69 @@ pub fn correlate_discovered_tunnels(
         correlation.rule_version = DISCOVERY_RULE_VERSION.into();
         edges.push(correlation);
     }
+    edges.extend(correlate_n3_downlink_companions(&by_id, discovery));
     edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+    edges
+}
+
+/// An ambiguous receiving TEID can be reused by historical PFCP sessions.
+/// Use a unique opposite-direction observation in the same segment only
+/// when the UL's uniquely identified PFCP session also owns the DL key.
+fn correlate_n3_downlink_companions(
+    by_id: &BTreeMap<&str, &EventRecord>,
+    discovery: &DiscoveryResult,
+) -> Vec<CorrelationEdge> {
+    type DuplexKey<'a> = (&'a str, &'a str, &'a str, &'a str);
+    let mut uplinks = BTreeMap::<DuplexKey<'_>, Vec<_>>::new();
+    let mut downlinks = BTreeMap::<DuplexKey<'_>, Vec<_>>::new();
+    for tunnel in &discovery.gtpu_tunnels {
+        for event in tunnel.event_ids.iter().filter_map(|id| by_id.get(id.as_str()).copied()) {
+            if event.interface != "N3" || event.message_name != "G-PDU"
+                || ie_value(event, "aggregate_duplex_consistent") != Some("true")
+            {
+                continue;
+            }
+            let Some(ue_ip) = event.first_identifier("ue_ip").filter(|ip| !ip.is_empty()) else {
+                continue;
+            };
+            let capture = event.capture_id.as_str();
+            let source = event.source_address.as_str();
+            let destination = event.destination_address.as_str();
+            match event.direction.as_str() {
+                "UPLINK" => uplinks.entry((capture, ue_ip, source, destination))
+                    .or_default().push((event, tunnel)),
+                "DOWNLINK" => downlinks.entry((capture, ue_ip, destination, source))
+                    .or_default().push((event, tunnel)),
+                _ => (),
+            }
+        }
+    }
+
+    let mut edges = Vec::new();
+    for (key, downlinks) in downlinks {
+        let [(downlink, downlink_tunnel)] = downlinks.as_slice() else { continue };
+        let Some([(uplink, uplink_tunnel)]) = uplinks.get(&key).map(Vec::as_slice) else {
+            continue;
+        };
+        if downlink_tunnel.related_pfcp_session.is_some() {
+            continue;
+        }
+        let Some(pfcp_id) = uplink_tunnel.related_pfcp_session.as_deref() else { continue };
+        if !discovery.pfcp_sessions.iter().any(|session| {
+            session.pfcp_session_id == pfcp_id
+                && session.has_tunnel_endpoint(&uplink_tunnel.teid, &uplink.destination_address)
+                && session.has_tunnel_endpoint(&downlink_tunnel.teid, &downlink.destination_address)
+        }) {
+            continue;
+        }
+        let mut association = edge(
+            uplink, downlink, vec![format!("pfcp_session_id={pfcp_id}")],
+            "n3-duplex-pfcp-tunnel-association", "STRONG",
+            "One reverse-direction N3 pair in the same segment shares the UE address and both tunnel keys belong to the same PFCP session",
+        );
+        association.scope = "same-capture-pfcp-session".into();
+        edges.push(association);
+    }
     edges
 }
 
