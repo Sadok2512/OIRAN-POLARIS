@@ -18,6 +18,7 @@ pub(super) struct Totals {
     bytes: u64,
     trees_consulted: usize,
     archives_consulted: usize,
+    broken_links: usize,
 }
 
 pub(super) struct InventoryError {
@@ -51,6 +52,7 @@ pub(super) fn snapshot(result: Result<&Totals, &InventoryError>) -> Value {
         "bytes": totals.map(|totals| totals.bytes),
         "trees_consulted": totals.map(|totals| totals.trees_consulted),
         "archives_consulted": totals.map(|totals| totals.archives_consulted),
+        "broken_links": totals.map(|totals| totals.broken_links),
         "publication_lock_held_ns": 0,
         "error": error,
     })
@@ -191,10 +193,10 @@ fn unavailable(path: &Path, error: impl std::fmt::Display) -> InventoryError {
     }
 }
 
-fn excluded_ui_tree(path: &Path) -> bool {
-    // These are the frontend build account's cache/home and secret store.
-    // Neither is an Analyzer dataset or rollback tree.
-    path.starts_with("/opt/polaris-ui/.home") || path.starts_with("/opt/polaris-ui/secrets")
+const OPT_DATA_ROOT: &str = "/opt/oiran";
+
+fn excluded_opt_tree(path: &Path) -> bool {
+    path.starts_with("/opt") && !path.starts_with(OPT_DATA_ROOT)
 }
 
 fn manifest_name(name: &str) -> bool {
@@ -352,7 +354,7 @@ fn roots(
         (
             vec![
                 captures.to_owned(),
-                "/opt".into(),
+                OPT_DATA_ROOT.into(),
                 "/var/lib/oiran/releases".into(),
             ],
             PathBuf::from("/root"),
@@ -404,9 +406,9 @@ thread_local! {
 fn inventory(
     captures: &Path,
     watch: &InventoryWatch,
-) -> Result<(HashSet<String>, usize, usize), InventoryError> {
+) -> Result<(HashSet<String>, usize, usize, usize), InventoryError> {
     let mut names = HashSet::new();
-    let (mut trees, mut archives) = (0usize, 0usize);
+    let (mut trees, mut archives, mut broken_links) = (0usize, 0usize, 0usize);
     #[cfg(test)]
     LOCK_PROBE.with(|probe| {
         if let Some((base, held)) = probe.borrow_mut().as_mut() {
@@ -425,13 +427,13 @@ fn inventory(
     }
     let mut seen = HashSet::new();
     while let Some(directory) = pending.pop() {
-        if excluded_ui_tree(&directory) {
+        if excluded_opt_tree(&directory) {
             continue;
         }
         let physical = directory
             .canonicalize()
             .map_err(|error| unavailable(&directory, error))?;
-        if excluded_ui_tree(&physical) {
+        if excluded_opt_tree(&physical) {
             continue;
         }
         watch.add(&physical, true)?;
@@ -448,7 +450,7 @@ fn inventory(
         for entry in fs::read_dir(&directory).map_err(|error| unavailable(&directory, error))? {
             let entry = entry.map_err(|error| unavailable(&directory, error))?;
             let path = entry.path();
-            if excluded_ui_tree(&path) {
+            if excluded_opt_tree(&path) {
                 continue;
             }
             let kind = entry
@@ -472,9 +474,14 @@ fn inventory(
             if kind.is_symlink() {
                 #[cfg(test)]
                 inject_failure(FailurePoint::Link, &path)?;
-                let physical = path
-                    .canonicalize()
-                    .map_err(|error| unavailable(&path, error))?;
+                let physical = match path.canonicalize() {
+                    Ok(target) => target,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        broken_links += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(unavailable(&path, error)),
+                };
                 if directory
                     .file_name()
                     .is_some_and(|name| name == "event-shards")
@@ -489,7 +496,7 @@ fn inventory(
                     names.insert(target.into());
                     continue;
                 }
-                if excluded_ui_tree(&physical) {
+                if excluded_opt_tree(&physical) {
                     if manifest_name(name) || name.ends_with(".tar.zst") {
                         return Err(unavailable(
                             &path,
@@ -539,7 +546,7 @@ fn inventory(
     if let Some((path, _)) = expected.first_key_value() {
         return Err(unavailable(&path, "required backup artifact missing"));
     }
-    Ok((names, trees, archives))
+    Ok((names, trees, archives, broken_links))
 }
 
 pub(super) fn measure(
@@ -591,7 +598,7 @@ pub(super) fn measure(
             ));
         }
     }
-    let (names, trees_consulted, archives_consulted) = inventory(captures, &watch)?;
+    let (names, trees_consulted, archives_consulted, broken_links) = inventory(captures, &watch)?;
 
     let (mut count, mut bytes) = (0usize, 0u64);
     for entry in fs::read_dir(&shards).map_err(|error| unavailable(&shards, error))? {
@@ -606,9 +613,9 @@ pub(super) fn measure(
         }
         #[cfg(test)]
         inject_failure(FailurePoint::Shard, &path)?;
-        watch.add(&path, false)?;
         let metadata = fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
         if metadata.is_file() {
+            watch.add(&path, false)?;
             count += 1;
             bytes += metadata.len();
         }
@@ -629,5 +636,6 @@ pub(super) fn measure(
         bytes,
         trees_consulted,
         archives_consulted,
+        broken_links,
     })
 }

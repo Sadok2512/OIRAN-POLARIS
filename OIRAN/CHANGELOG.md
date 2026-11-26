@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.192 / live-probe 0.7.4 — orphan inventory data roots
+
+Scope the optional installation-tree scan to OIRAN. Report dangling entries separately while keeping incomplete reads unavailable.
+
 ## Web 2.14.5 — session event count labels
 
 Name persisted session events and served events after enrichment and filtering. The existing counts and populations are preserved.

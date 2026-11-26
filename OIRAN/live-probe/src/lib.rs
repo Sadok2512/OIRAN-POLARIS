@@ -24647,7 +24647,7 @@ Content-Length: 0\r\n\
 
     fn assert_orphan_totals_unavailable(snapshot: &Value) {
         assert_eq!(snapshot["status"], "unavailable", "{snapshot}");
-        for key in ["count", "bytes", "trees_consulted", "archives_consulted"] {
+        for key in ["count", "bytes", "trees_consulted", "archives_consulted", "broken_links"] {
             assert!(snapshot[key].is_null(), "{key}: {snapshot}");
         }
     }
