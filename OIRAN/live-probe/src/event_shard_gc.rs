@@ -91,17 +91,30 @@ fn archive_manifest(path: &Path, names: &mut HashSet<String>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) const REQUIRED_BACKUPS: [&str; 9] = [
+    "ANR2_oiran_2.7.26_backup_20261105T224027Z",
+    "ANR2_oiran_2.7.27_predeploy_backup_20261106T075717Z",
+    "ANR2_oiran_2.7.28_predeploy_backup_20261106T103354Z",
+    "ANR2_oiran_2.8.0_predeploy_backup_20261106T115119Z",
+    "ANR2_oiran_2.8.1_predeploy_backup_20261106T142802Z",
+    "ANR2_oiran_2.8.2_predeploy_backup_20261106T205304Z",
+    "ANR2_oiran_2.8.3_backup_20261107T100830Z",
+    "ANR2_oiran_2.9.0_backup_20261107T142336Z",
+    "ANR2_oiran_2.9.0_backup_20261107T142417Z",
+];
+
 fn roots(captures: &Path) -> Result<Vec<PathBuf>, String> {
-    if cfg!(test) {
-        return Ok(vec![captures.to_owned()]);
-    }
-    let mut roots = vec![
-        captures.to_owned(),
-        "/opt".into(),
-        "/var/lib/oiran/releases".into(),
-    ];
+    let (mut roots, backup_root) = if cfg!(test) {
+        (vec![captures.to_owned()], captures.join(".gc-backups"))
+    } else {
+        (
+            vec![captures.to_owned(), "/opt".into(), "/var/lib/oiran/releases".into()],
+            PathBuf::from("/root"),
+        )
+    };
     let mut backups = Vec::new();
-    for entry in fs::read_dir("/root").map_err(|error| error.to_string())? {
+    for entry in fs::read_dir(&backup_root).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
         if name
