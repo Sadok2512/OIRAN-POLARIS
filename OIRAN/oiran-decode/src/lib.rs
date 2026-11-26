@@ -1938,9 +1938,15 @@ Content-Length: 0\r\n\
         assert_eq!(expected["verification_tag"], 1);
         assert_eq!(expected["association_generation"], 0);
         assert!(expected["association_id"].as_str().unwrap().starts_with("sctp-"));
-        for event in &events {
+        let bounds = [(1, 1), (2, 4), (5, 5), (6, 6), (7, 7)];
+        for (event, (first, last)) in events.iter().zip(bounds) {
             for packet in event["packet_references"].as_array().unwrap() {
-                assert_eq!(&packet["sctp_association"], expected);
+                let association = &packet["sctp_association"];
+                for field in ["association_id", "association_generation", "verification_tag"] {
+                    assert_eq!(association[field], expected[field]);
+                }
+                assert_eq!(association["first_tsn"], first, "first wire TSN");
+                assert_eq!(association["last_tsn"], last, "last wire TSN");
             }
         }
     }
