@@ -24502,6 +24502,13 @@ Content-Length: 0\r\n\
         assert_eq!(receipt["predecessor"]["event_count"], original.event_count);
         assert_eq!(receipt["successor"]["path"], successor.path);
         assert_eq!(receipt["successor"]["sha256"], successor.sha256);
+        assert_eq!(receipt["successor"]["event_count"], successor.event_count);
+        assert_eq!(
+            receipt["predecessor"]["event_count"].as_u64().unwrap(),
+            receipt["successor"]["event_count"].as_u64().unwrap()
+                + receipt["archived_event_count"].as_u64().unwrap(),
+            "conservation is anchored to the predecessor's declared count",
+        );
         let archive = receipt["archive_id"].as_str().unwrap();
         assert!(bench.base.join("archive").join(archive).join("manifest.json").is_file());
         assert_eq!(receipt["archived_event_count"], original.event_count - 1);
