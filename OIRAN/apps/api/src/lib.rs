@@ -11049,6 +11049,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_explicitly_marks_orphan_inventory_unavailable_before_a_complete_read() {
+        let response = router(state(), None)
+            .oneshot(req("/api/v1/health", false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let inventory = &body["data"]["event_shard_orphans"];
+        assert_eq!(inventory["status"], "unavailable");
+        assert!(inventory["count"].is_null());
+        assert!(inventory["bytes"].is_null());
+        assert!(inventory["error"]["reason"].is_string());
+    }
+
+    #[tokio::test]
     async fn health_published_counters_mirror_the_continuous_manifest_exclusively() {
         use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
         use std::fs;
