@@ -96,10 +96,18 @@ impl ExactTimestamp {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SctpAssociationProvenance {
+    pub association_id: String,
+    pub association_generation: u64,
+    pub verification_tag: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PacketReference {
     pub source_file: String,
     pub source_sha256: Option<String>,
+    pub sctp_association: Option<std::sync::Arc<SctpAssociationProvenance>>,
     pub packet_number: u64,
     pub byte_offset: u64,
     pub interface_id: u32,
@@ -547,6 +555,12 @@ fn packet_reference_json(p: &PacketReference) -> String {
     }
     if let Some(s) = p.sll2_address.as_deref() {
         parts.push(format!("\"sll2_address\":\"{}\"", escape(s)));
+    }
+    if let Some(sctp) = &p.sctp_association {
+        parts.push(format!(
+            "\"sctp_association\":{{\"association_id\":\"{}\",\"association_generation\":{},\"verification_tag\":{}}}",
+            escape(&sctp.association_id), sctp.association_generation, sctp.verification_tag,
+        ));
     }
     parts.push(format!("\"captured_length\":{}", p.captured_length));
     parts.push(format!("\"original_length\":{}", p.original_length));
@@ -1416,6 +1430,7 @@ mod tests {
             capture_id: "sha256:abc".into(),
             packet_references: vec![PacketReference {
                 source_file: "x.pcapng".into(),
+                sctp_association: None,
                 source_sha256: Some("abc".into()),
                 packet_number: 7,
                 byte_offset: 40,
@@ -1514,6 +1529,7 @@ mod tests {
             capture_id: "sha256:cap".into(),
             packet_references: vec![PacketReference {
                 source_file: "x.pcapng".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: 42,
                 byte_offset: 100,
@@ -1631,6 +1647,7 @@ mod tests {
         // `to_json` vs un modèle fidèle de la forme pré-1.5.1 (nulls émis).
         let ref_template = PacketReference {
             source_file: "/captures/5g-session-abcdef/pcap/sbi/sbi.pcapng-00001.pcapng".into(),
+            sctp_association: None,
             source_sha256: None,
             packet_number: 0,
             byte_offset: 0,

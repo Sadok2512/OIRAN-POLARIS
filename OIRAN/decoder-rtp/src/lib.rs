@@ -692,6 +692,7 @@ mod tests {
     fn pr(pn: u64) -> PacketReference {
         PacketReference {
             source_file: "x.pcapng".into(),
+            sctp_association: None,
             source_sha256: None,
             packet_number: pn,
             byte_offset: 0,

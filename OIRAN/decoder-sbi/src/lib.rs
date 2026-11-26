@@ -2045,6 +2045,7 @@ mod tests {
     fn packet(number: u64) -> PacketReference {
         PacketReference {
             source_file: "fixture.pcap".into(),
+            sctp_association: None,
             source_sha256: None,
             packet_number: number,
             byte_offset: number,
@@ -3842,6 +3843,7 @@ mod tests {
                 capture_id: capture_id.into(),
                 packet_references: vec![PacketReference {
                     source_file: "stub.pcapng".into(),
+                    sctp_association: None,
                     source_sha256: None,
                     packet_number,
                     byte_offset: 0,
@@ -3956,6 +3958,7 @@ mod tests {
         fn pr(packet_number: u64) -> PacketReference {
             PacketReference {
                 source_file: "stub.pcap".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number,
                 byte_offset: 0,

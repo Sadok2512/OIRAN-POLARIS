@@ -867,6 +867,7 @@ mod tests {
             decoder_version: "test".into(),
             raw_payload_reference: "sha256:synthetic".into(),
             packet_references: vec![PacketRef {
+                sctp_association: None,
                 source_file: "synthetic.json".into(),
                 packet_number: timestamp as u64,
                 byte_offset: 0,

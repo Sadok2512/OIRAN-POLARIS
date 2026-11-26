@@ -14,6 +14,8 @@ const LTE_CROSS_PLANE_WINDOW_NS: i128 = 300_000_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PacketRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sctp_association: Option<std::sync::Arc<event_schema::SctpAssociationProvenance>>,
     pub source_file: String,
     pub packet_number: u64,
     pub byte_offset: u64,
@@ -69,6 +71,24 @@ pub struct EventRecord {
     pub physical_link: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_source: Option<String>,
+}
+
+#[cfg(test)]
+#[test]
+fn persisted_packet_refs_accept_legacy_rows_and_round_trip_sctp_provenance() {
+    let legacy = serde_json::json!({
+        "source_file": "fixture", "packet_number": 1, "byte_offset": 2,
+        "interface_id": 0, "captured_length": 16, "original_length": 16,
+    });
+    let packet: PacketRef = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(packet.sctp_association.is_none());
+    assert_eq!(serde_json::to_value(packet).unwrap(), legacy);
+    let mut current = legacy;
+    current["sctp_association"] = serde_json::json!({
+        "association_id": "sctp-fixture", "association_generation": 4, "verification_tag": 9,
+    });
+    let packet: PacketRef = serde_json::from_value(current.clone()).unwrap();
+    assert_eq!(serde_json::to_value(packet).unwrap(), current);
 }
 
 impl EventRecord {
@@ -1322,6 +1342,12 @@ fn retained_heap_bytes(record: &SpilledRepresentative) -> usize {
     ));
     for reference in packet_references {
         bytes = bytes.saturating_add(text(&reference.source_file));
+        if let Some(association) = &reference.sctp_association {
+            bytes = bytes.saturating_add(allocation_bytes(
+                std::mem::size_of::<event_schema::SctpAssociationProvenance>()
+                    + 2 * std::mem::size_of::<usize>(),
+            )).saturating_add(text(&association.association_id));
+        }
     }
     bytes = bytes.saturating_add(allocation_bytes(errors.capacity().saturating_mul(std::mem::size_of::<String>())));
     for error in errors {

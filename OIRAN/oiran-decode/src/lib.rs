@@ -669,7 +669,7 @@ where
                 }
             }
             TransportProtocol::Sctp => {
-                for message in state.sctp.consume(&packet, &view) {
+                for mut message in state.sctp.consume(&packet, &view) {
                     let Some(interface) = sctp_route(&config.interface, message.ppid) else {
                         continue;
                     };
@@ -697,6 +697,14 @@ where
                         message.source_port,
                         message.destination_port,
                     );
+                    let association = std::sync::Arc::new(event_schema::SctpAssociationProvenance {
+                        association_id: message.association_id,
+                        association_generation: message.association_generation,
+                        verification_tag: message.verification_tag,
+                    });
+                    for reference in &mut message.packet_references {
+                        reference.sctp_association = Some(association.clone());
+                    }
                     let raw = format!("sha256:{}", sha256_hex(&message.payload));
                     let input = DecoderInput {
                         capture_id: &config.capture_id,
@@ -1397,6 +1405,7 @@ fn packet_reference(packet: &CapturePacket) -> PacketReference {
     let sll2 = packet.metadata.sll2.as_ref();
     PacketReference {
         source_file: packet.metadata.source_file.clone(),
+        sctp_association: None,
         source_sha256: packet
             .metadata
             .capture_id
@@ -2101,6 +2110,7 @@ Content-Length: 0\r\n\
             };
             let packet = event_schema::PacketReference {
                 source_file: "synthetic-s6a.pcap".into(),
+                sctp_association: None,
                 source_sha256: Some("0".repeat(64)),
                 packet_number,
                 byte_offset: packet_number * 64,
@@ -2195,6 +2205,7 @@ Content-Length: 0\r\n\
         fn packet(number: u64, length: usize) -> event_schema::PacketReference {
             event_schema::PacketReference {
                 source_file: "synthetic-s6a.pcap".into(),
+                sctp_association: None,
                 source_sha256: Some("0".repeat(64)),
                 packet_number: number,
                 byte_offset: number * 64,
@@ -2507,6 +2518,7 @@ Content-Length: 0\r\n\
             capture_id: capture_id.into(),
             packet_references: vec![PacketReference {
                 source_file: "capture.pcap".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number,
                 byte_offset: 0,
@@ -2916,6 +2928,7 @@ Content-Length: 0\r\n\
         let n6_raw = format!("sha256:{}", sha256_hex(sip_bytes));
         let n6_refs = [PacketReference {
             source_file: "N6.pcap-synthetic".into(),
+            sctp_association: None,
             source_sha256: None,
             packet_number: 1,
             byte_offset: 0,

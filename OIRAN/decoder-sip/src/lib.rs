@@ -727,6 +727,7 @@ mod tests {
             capture_id: "sha256:test",
             packet_references: Box::leak(Box::new([PacketReference {
                 source_file: "x.pcapng".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: 1,
                 byte_offset: 0,

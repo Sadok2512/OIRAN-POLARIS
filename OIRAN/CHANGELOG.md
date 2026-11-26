@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.194 / oiran-decode 0.12.1 — SCTP association provenance
+
+Preserve the SCTP association identifier, generation and verification tag on decoded packet references through JSONL and callflow publication. Older packet references remain readable. Event populations and attachment rules are unchanged. Event-schema 1.13.0 and session-engine 0.5.35 carry the optional provenance.
+
 ## oiran-api 2.21.193 / decoder-ngap 0.6.4 — Global gNB ID APER decoding
 
 Decode the aligned gNB ID bit string in captured NGSetup requests.

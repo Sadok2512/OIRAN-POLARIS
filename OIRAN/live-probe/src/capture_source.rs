@@ -1217,6 +1217,7 @@ mod tests {
             capture_id: "sha256:x".into(),
             packet_references: vec![PacketReference {
                 source_file: "x".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: 1,
                 byte_offset: 0,

@@ -636,6 +636,7 @@ mod tests {
     fn fixtures() -> (Vec<PacketReference>, ExactTimestamp) {
         let p = vec![PacketReference {
             source_file: "synthetic.pcap".into(),
+            sctp_association: None,
             source_sha256: Some("deadbeef".into()),
             packet_number: 1,
             byte_offset: 0,

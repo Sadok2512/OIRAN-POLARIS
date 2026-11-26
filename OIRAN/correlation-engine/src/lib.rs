@@ -1618,6 +1618,7 @@ mod tests {
             decoder_version: "1".into(),
             raw_payload_reference: "sha256:x".into(),
             packet_references: vec![session_engine::PacketRef {
+                sctp_association: None,
                 source_file: "x".into(),
                 packet_number: packet,
                 byte_offset: 0,
@@ -2207,6 +2208,7 @@ mod tests {
         fn packet(number: u64) -> Vec<PacketReference> {
             vec![PacketReference {
                 source_file: "synthetic.pcap".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: number,
                 byte_offset: 0,
@@ -3525,6 +3527,7 @@ mod tests {
                     source_file: format!(
                         "/var/lib/oiran/captures/continuous-lab-import/pcap/{interface}.pcap-abc.pcapng"
                     ),
+                    sctp_association: None,
                     source_sha256: None,
                     packet_number,
                     byte_offset: packet_number * 64,
@@ -4081,6 +4084,7 @@ mod tests {
             source_file: carrier.packet_references[0]
                 .source_file
                 .replace("N4.pcapng", "IMS.pcapng"),
+            sctp_association: None,
             source_sha256: None,
             packet_number: 1,
             byte_offset: 0,

@@ -10202,6 +10202,7 @@ mod sbi_identity_wiring_tests {
             ]),
         );
         ev.packet_references = vec![session_engine::PacketRef {
+            sctp_association: None,
             source_file: "x".into(),
             packet_number: 42,
             byte_offset: 0,

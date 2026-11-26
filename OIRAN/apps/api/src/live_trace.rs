@@ -409,6 +409,8 @@ pub(crate) fn normalized_event_from_json(v: &Value) -> Option<event_schema::Norm
     for p in v.get("packet_references")?.as_array()? {
         packet_references.push(PacketReference {
             source_file: s(p, "source_file")?,
+            sctp_association: p.get("sctp_association")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
             source_sha256: os(p, "source_sha256"),
             packet_number: u(p, "packet_number")?,
             byte_offset: u(p, "byte_offset")?,
@@ -5618,6 +5620,7 @@ mod tests {
             capture_id: "cap-n3".into(),
             packet_references: vec![PacketReference {
                 source_file: "n3.pcapng".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: packet,
                 byte_offset: 0,
@@ -6414,6 +6417,7 @@ mod tests {
             capture_id: format!("cap-{interface}"),
             packet_references: vec![PacketReference {
                 source_file: "x".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: packet,
                 byte_offset: 0,
@@ -10650,6 +10654,7 @@ mod tests {
         let base_event = |direction: Direction, packet_number: u64, seconds: i64| {
             let p = PacketReference {
                 source_file: "x".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number,
                 byte_offset: 0,
@@ -10775,6 +10780,7 @@ mod tests {
 
         let packet_ref = |number: u64, original: u32| PacketReference {
             source_file: "n3.pcapng".into(),
+            sctp_association: None,
             source_sha256: None,
             packet_number: number,
             byte_offset: 0,
@@ -11039,6 +11045,7 @@ mod tests {
             capture_id: "cap".into(),
             packet_references: vec![PacketReference {
                 source_file: "x".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: packet,
                 byte_offset: 0,
@@ -11173,6 +11180,7 @@ mod tests {
                 capture_id: "cap".into(),
                 packet_references: vec![PacketReference {
                     source_file: "x".into(),
+                    sctp_association: None,
                     source_sha256: None,
                     packet_number: packet,
                     byte_offset: 0,
@@ -11344,6 +11352,7 @@ mod tests {
                 capture_id: "c".into(),
                 packet_references: vec![PacketReference {
                     source_file: "x".into(),
+                    sctp_association: None,
                     source_sha256: None,
                     packet_number: packet,
                     byte_offset: 0,
@@ -11537,6 +11546,7 @@ mod tests {
                 capture_id: "c".into(),
                 packet_references: vec![PacketReference {
                     source_file: "x".into(),
+                    sctp_association: None,
                     source_sha256: None,
                     packet_number: packet,
                     byte_offset: 0,
@@ -11805,6 +11815,7 @@ mod tests {
             capture_id: "c".into(),
             packet_references: vec![PacketReference {
                 source_file: "x".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: 1,
                 byte_offset: 0,
@@ -11951,6 +11962,7 @@ mod tests {
             capture_id: "c".into(),
             packet_references: vec![PacketReference {
                 source_file: "x".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: 1,
                 byte_offset: 0,
@@ -12126,6 +12138,7 @@ mod tests {
             capture_id: "c".into(),
             packet_references: vec![PacketReference {
                 source_file: "x".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number: packet,
                 byte_offset: 0,
@@ -12234,6 +12247,7 @@ mod tests {
                 capture_id: "c".into(),
                 packet_references: vec![PacketReference {
                     source_file: "x".into(),
+                    sctp_association: None,
                     source_sha256: None,
                     packet_number: packet,
                     byte_offset: 0,

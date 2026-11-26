@@ -1352,6 +1352,7 @@ mod tests {
             association: Association::Session,
             procedure_group: "test".into(),
             packet_references: vec![PacketRef {
+                sctp_association: None,
                 source_file: "x".into(),
                 packet_number,
                 byte_offset: 0,

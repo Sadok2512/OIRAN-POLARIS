@@ -30,6 +30,7 @@ fn synthetic_lte_decoders_preserve_planes_direction_and_privacy() {
     }
     let packet = PacketReference {
         source_file: "synthetic-offline.pcap".into(),
+        sctp_association: None,
         source_sha256: Some("0".repeat(64)),
         packet_number: 1,
         byte_offset: 0,

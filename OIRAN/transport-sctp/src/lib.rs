@@ -355,6 +355,7 @@ fn packet_ref(p: &CapturePacket) -> PacketReference {
     let sll2 = p.metadata.sll2.as_ref();
     PacketReference {
         source_file: p.metadata.source_file.clone(),
+        sctp_association: None,
         source_sha256: p
             .metadata
             .capture_id

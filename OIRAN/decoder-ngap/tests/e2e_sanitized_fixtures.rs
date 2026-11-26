@@ -39,6 +39,7 @@ fn sanitized_e2e_frames_preserve_decoder_status_without_subscriber_material() {
         let payload = bytes(&fixture.ngap_hex);
         let packets = vec![PacketReference {
             source_file: "sanitized-fixture".into(),
+            sctp_association: None,
             source_sha256: None,
             packet_number: index as u64 + 1,
             byte_offset: 0,

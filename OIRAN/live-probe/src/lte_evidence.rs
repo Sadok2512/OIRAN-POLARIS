@@ -1963,6 +1963,7 @@ mod tests {
             decoder_version: "test-1".into(),
             raw_payload_reference: format!("sha256:event-{id}"),
             packet_references: vec![PacketRef {
+                sctp_association: None,
                 source_file: source_file.into(),
                 packet_number: frame,
                 byte_offset: frame * 64,

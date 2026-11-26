@@ -21831,6 +21831,7 @@ Content-Length: 0\r\n\
             capture_id: capture_id.into(),
             packet_references: vec![event_schema::PacketReference {
                 source_file: "x.pcapng".into(),
+                sctp_association: None,
                 source_sha256: None,
                 packet_number,
                 byte_offset: packet_number * 64,

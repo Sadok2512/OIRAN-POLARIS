@@ -604,6 +604,7 @@ mod tests {
                 association: Association::Session,
                 procedure_group: "Attach".into(),
                 packet_references: vec![PacketRef {
+                    sctp_association: None,
                     source_file: String::new(),
                     packet_number: packet,
                     byte_offset: 0,

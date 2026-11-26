@@ -1973,6 +1973,7 @@ mod tests {
         );
         let packets = vec![PacketReference {
             source_file: "fixture.pcap".into(),
+            sctp_association: None,
             source_sha256: Some("abc".into()),
             packet_number: 7,
             byte_offset: 20,
@@ -2064,6 +2065,7 @@ mod tests {
         let bytes = pdu(0, 14, &[(10, 0, amf_ue), (85, 0, ran_ue), (94, 0, &security_key)]);
         let packets = vec![PacketReference {
             source_file: "fixture.pcap".into(),
+            sctp_association: None,
             source_sha256: Some("abc".into()),
             packet_number: 7,
             byte_offset: 20,
