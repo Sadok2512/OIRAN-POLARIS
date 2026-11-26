@@ -4120,6 +4120,93 @@ mod tests {
         e
     }
 
+    #[test]
+    fn sctp_continuity_links_pdu_fragments_without_moving_events() {
+        let ids = [("ran_ue_ngap_id", "6"), ("amf_ue_ngap_id", "6"), ("pdu_session_id", "1")];
+        let make = |id: &str, name: &str, second: bool, packet: u64, tsn, generation| {
+            let mut event = event(id, "NGAP", name, &ids, packet);
+            event.interface = "N2".into();
+            event.capture_point_id = "N2".into();
+            event.capture_id = if second { "aaa-behind" } else { "zzz-ahead" }.into();
+            event.source_address = "192.0.2.1".into();
+            event.destination_address = "192.0.2.2".into();
+            event.source_json = serde_json::json!({"sctp_ports": [38412, 34829]});
+            let reference = &mut event.packet_references[0];
+            reference.source_file = if second {
+                "n2_20261119T231700Z_00020_20261120181703.pcapng"
+            } else {
+                "n2_20261119T231700Z_00019_20261120171703.pcapng"
+            }.into();
+            reference.sctp_association = Some(std::sync::Arc::new(event_schema::SctpAssociationProvenance {
+                association_id: "wire-association".into(),
+                association_generation: generation,
+                verification_tag: 17,
+                first_tsn: Some(tsn),
+                last_tsn: Some(tsn),
+            }));
+            event
+        };
+        let mut active = make("active", "InitialContextSetupResponse", false, 1, 7, 4);
+        let mut opening = make("opening", "InitialContextSetupRequest", true, 1, 4, 0);
+        active.identifiers.pop();
+        opening.identifiers.pop();
+        let mut close = make("close", "UEContextReleaseComplete", true, 4, 2, 0);
+        close.identifiers.pop();
+        let mut setup = make("setup", "PDUSessionResourceSetupRequest", false, 2, u32::MAX, 4);
+        let release = make("release", "PDUSessionResourceReleaseCommand", true, 2, 0, 0);
+        let mut reopen = make("reopen", "PDUSessionResourceSetupRequest", true, 3, 1, 0);
+        setup.identifiers.push(("gtp_teid".into(), "0x3754".into()));
+        reopen.identifiers.push(("gtp_teid".into(), "0x59d4".into()));
+        let events = vec![reopen, release, setup, opening, close, active];
+        let report = |events: &[EventRecord]| {
+            serde_json::to_value(discover_sessions(&mut events.to_vec())).unwrap()
+        };
+        let mut measured = report(&events);
+        let sessions = measured["pdu_sessions"].as_array().unwrap();
+        let session_for = |id: &str| {
+            sessions.iter().find(|session| session["event_ids"].as_array().unwrap().iter().any(|value| value == id))
+                .unwrap()["session_id"].clone()
+        };
+        let predecessor = session_for("setup");
+        let successor = session_for("release");
+        assert_ne!(predecessor, successor);
+        assert_eq!(session_for("reopen"), successor);
+        assert_eq!(measured["sctp_continuity_links"], serde_json::json!([{
+            "predecessor_session_id": predecessor,
+            "successor_session_id": successor,
+            "setup_event_id": "setup",
+            "release_event_id": "release"
+        }]));
+
+        let mut historical = events.clone();
+        for event in &mut historical {
+            event.packet_references[0].sctp_association = None;
+        }
+        let historical_result = report(&historical);
+        assert!(historical_result.get("sctp_continuity_links").is_none());
+        measured.as_object_mut().unwrap().remove("sctp_continuity_links");
+        assert_eq!(measured, historical_result, "only the additive link may differ");
+
+        for mismatch in ["tsn", "tag", "direction", "port", "generation", "rotation", "missing"] {
+            let mut adverse = events.clone();
+            let target_id = if mismatch == "generation" { "reopen" } else { "release" };
+            let event = adverse.iter_mut().find(|event| event.event_id == target_id).unwrap();
+            let reference = &mut event.packet_references[0];
+            let association = std::sync::Arc::make_mut(reference.sctp_association.as_mut().unwrap());
+            match mismatch {
+                "tsn" => association.first_tsn = Some(1),
+                "tag" => association.verification_tag += 1,
+                "direction" => std::mem::swap(&mut event.source_address, &mut event.destination_address),
+                "port" => event.source_json["sctp_ports"][0] = serde_json::json!(38413),
+                "generation" => association.association_generation += 1,
+                "rotation" => reference.source_file = "n2_20261119T231700Z_00022_20261120181703.pcapng".into(),
+                "missing" => association.first_tsn = None,
+                _ => unreachable!(),
+            }
+            assert!(report(&adverse).get("sctp_continuity_links").is_none(), "{mismatch}");
+        }
+    }
+
     /// 2.9.9 (#9 comment 6725858177) — `attach_sbi_to_sessions`
     /// rattache un SBI à sa PDU session par clé exacte. ANR2 a
     /// publié sur le run `5g-session-5e3fc8ce83936ea0` :
