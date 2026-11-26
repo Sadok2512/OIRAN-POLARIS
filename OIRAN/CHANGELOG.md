@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.196 / oiran-decode 0.12.2 — SCTP message TSN bounds
+
+Persist the wire TSN of the first and last SCTP DATA chunks in packet-reference provenance. Historical references keep their original shape. Event-schema 1.13.1 and session-engine 0.5.36 carry the optional bounds.
+
 ## oiran-api 2.21.195 / live-probe 0.7.5 — generation-scoped orphan inventory
 
 Report the commit measured by the read-only orphan inventory. Pin the shard population before the walk and retry once if a publication advances the commit. Report both commit sequences if the retry also becomes obsolete.

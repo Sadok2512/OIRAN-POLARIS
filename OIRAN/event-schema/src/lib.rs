@@ -101,6 +101,10 @@ pub struct SctpAssociationProvenance {
     pub association_id: String,
     pub association_generation: u64,
     pub verification_tag: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_tsn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tsn: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -557,10 +561,18 @@ fn packet_reference_json(p: &PacketReference) -> String {
         parts.push(format!("\"sll2_address\":\"{}\"", escape(s)));
     }
     if let Some(sctp) = &p.sctp_association {
-        parts.push(format!(
-            "\"sctp_association\":{{\"association_id\":\"{}\",\"association_generation\":{},\"verification_tag\":{}}}",
+        let mut association = format!(
+            "\"sctp_association\":{{\"association_id\":\"{}\",\"association_generation\":{},\"verification_tag\":{}",
             escape(&sctp.association_id), sctp.association_generation, sctp.verification_tag,
-        ));
+        );
+        if let Some(tsn) = sctp.first_tsn {
+            association.push_str(&format!(",\"first_tsn\":{tsn}"));
+        }
+        if let Some(tsn) = sctp.last_tsn {
+            association.push_str(&format!(",\"last_tsn\":{tsn}"));
+        }
+        association.push('}');
+        parts.push(association);
     }
     parts.push(format!("\"captured_length\":{}", p.captured_length));
     parts.push(format!("\"original_length\":{}", p.original_length));

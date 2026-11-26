@@ -88,6 +88,15 @@ fn persisted_packet_refs_accept_legacy_rows_and_round_trip_sctp_provenance() {
         "association_id": "sctp-fixture", "association_generation": 4, "verification_tag": 9,
     });
     let packet: PacketRef = serde_json::from_value(current.clone()).unwrap();
+    let provenance = packet.sctp_association.as_ref().unwrap();
+    assert_eq!((provenance.first_tsn, provenance.last_tsn), (None, None));
+    assert_eq!(serde_json::to_value(packet).unwrap(), current);
+
+    current["sctp_association"]["first_tsn"] = serde_json::json!(u32::MAX);
+    current["sctp_association"]["last_tsn"] = serde_json::json!(0);
+    let packet: PacketRef = serde_json::from_value(current.clone()).unwrap();
+    let provenance = packet.sctp_association.as_ref().unwrap();
+    assert_eq!((provenance.first_tsn, provenance.last_tsn), (Some(u32::MAX), Some(0)));
     assert_eq!(serde_json::to_value(packet).unwrap(), current);
 }
 
