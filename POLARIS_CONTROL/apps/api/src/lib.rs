@@ -23764,6 +23764,17 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         }
     }
 
+    #[test]
+    fn imsi_switch_keeps_ip_addresses_and_authentication_material_protected() {
+        for value in ["peer 192.0.2.1", "peer 2001:db8::1"] {
+            assert!(telemetry_reference_is_sensitive_with(value, true));
+            assert_ne!(sanitize_history_text_with(value, None, true), value);
+        }
+        let material = "XRES=synthetic-test-marker";
+        assert_ne!(sanitize_history_text_with(material, None, true), material);
+        assert_ne!(safe_telemetry_code_with(material, true), material);
+    }
+
     /// 0.36.31 (ordre cœur #9 7133029202) — interrupteur
     /// `POLARIS_IDENTITIES_IN_CLEAR`, famille B (télémétrie, ligne
     /// `POLARIS_CONTROL_JOB`, History), les deux côtés. Fermé : masqué comme
