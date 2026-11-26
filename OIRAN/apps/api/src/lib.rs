@@ -20145,6 +20145,35 @@ mod tests {
         (state, capture_root, commit_seq_path)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_filter_exposes_the_versioned_datasets_commit_seq() {
+        let (state, capture_root, commit_seq_path) =
+            continuous_sessions_fixture_2_21_165("filter-versioned-commit-seq", 1);
+        state.inner.session_filter_cache_readiness.lock().unwrap().enforced = true;
+        let dataset_dir = commit_seq_path.parent().unwrap();
+        let callflows = "callflow-generations/fixture";
+        fs::create_dir(dataset_dir.join("callflow-generations")).unwrap();
+        fs::rename(dataset_dir.join("callflows"), dataset_dir.join(callflows)).unwrap();
+        let manifest_path = dataset_dir.join("dataset_manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["callflows_path"] = json!(callflows);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        state.inner.capture_manager.recover_continuous_dataset_from_disk(
+            &capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID),
+        ).unwrap();
+        {
+            let _gate = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test");
+        }
+
+        let (status, body) = post_sessions_filter(&state, json!({"limit": 10}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["meta"]["total"], 1);
+        let expected: u64 = fs::read_to_string(&commit_seq_path).unwrap().trim().parse().unwrap();
+        assert_eq!(body["meta"]["commit_seq"], json!(expected));
+        fs::remove_dir_all(capture_root).unwrap();
+    }
+
     /// 2.21.165 (ordre cœur #9 7131640379) — `GET /sessions` sur un jeu
     /// continu de 198 sessions (la taille du lab) : `commit_seq.txt` doit être
     /// ouvert UNE fois par requête, pas N + 1 fois. Mesuré sur la requête en
