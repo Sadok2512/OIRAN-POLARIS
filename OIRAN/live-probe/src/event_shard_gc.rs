@@ -396,10 +396,11 @@ fn inventory(
                     if let Some(name) = entry.file_name().to_str() {
                         names.insert(name.into());
                     }
-                    if let Ok(target) = path.canonicalize() {
-                        if let Some(name) = target.file_name().and_then(|name| name.to_str()) {
-                            names.insert(name.into());
-                        }
+                    let target = path
+                        .canonicalize()
+                        .map_err(|error| unavailable(&path, error))?;
+                    if let Some(name) = target.file_name().and_then(|name| name.to_str()) {
+                        names.insert(name.into());
                     }
                     continue;
                 }
