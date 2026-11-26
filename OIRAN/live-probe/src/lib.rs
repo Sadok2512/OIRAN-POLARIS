@@ -24458,7 +24458,7 @@ Content-Length: 0\r\n\
     }
 
     fn assert_shard_gc_with_backup_inventory(missing_artifact: Option<usize>, missing_required: bool) {
-        use event_shard_gc::{REQUIRED_BACKUPS, REQUIRED_BACKUP_ARTIFACTS};
+        use event_shard_gc::REQUIRED_BACKUPS;
 
         let bench = RetentionBench0_7_0::new("shard-gc-union");
         let backups = bench._root.join(".gc-backups");
@@ -24470,7 +24470,7 @@ Content-Length: 0\r\n\
                 .arg("-C").arg(archive_fixture.as_ref()).args(members)
                 .status().unwrap().success());
         };
-        for (index, (name, expected)) in REQUIRED_BACKUPS.iter().zip(REQUIRED_BACKUP_ARTIFACTS).enumerate() {
+        for (index, (name, expected)) in REQUIRED_BACKUPS.into_iter().enumerate() {
             let directory = backups.join(name);
             fs::create_dir_all(&directory).unwrap();
             if missing_artifact == Some(index) || (index == 0 && missing_required) {
@@ -24495,7 +24495,7 @@ Content-Length: 0\r\n\
         fs::create_dir(&extra).unwrap();
         fs::write(extra.join("dataset_manifest.json"), b"{}").unwrap();
         if missing_required {
-            fs::remove_dir(backups.join(REQUIRED_BACKUPS[0])).unwrap();
+            fs::remove_dir(backups.join(REQUIRED_BACKUPS[0].0)).unwrap();
         }
         let (source, _, _) = corpus_0_7_0();
         let first = bench.cycle(None, &[("N2.pcap-source.pcapng", source)]);
@@ -24530,9 +24530,10 @@ Content-Length: 0\r\n\
         let mut archived_manifest = serde_json::to_value(&first).unwrap();
         archived_manifest["event_shards"][0]["path"] =
             serde_json::json!("event-shards/shard-archive-reference.jsonl");
-        let (archive, members) = REQUIRED_BACKUP_ARTIFACTS[1].unwrap();
+        let (name, artifact) = REQUIRED_BACKUPS[1];
+        let (archive, members) = artifact.unwrap();
         fs::write(archive_fixture.join(members[0]), serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
-        make_archive(&backups.join(REQUIRED_BACKUPS[1]).join(archive), members);
+        make_archive(&backups.join(name).join(archive), members);
         let unknown = shards.join("shard-missing-history.jsonl");
         fs::write(&unknown, b"{\"event_id\":\"missing-history\"}\n").unwrap();
         fs::File::open(&unknown).unwrap().set_modified(old).unwrap();

@@ -3,7 +3,7 @@
 use super::{sha256_hex, sha256_hex_file, LiveDataset};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{BufRead, BufReader},
     os::unix::fs::MetadataExt,
@@ -54,7 +54,11 @@ fn protect_manifest(value: &Value, names: &mut HashSet<String>) -> Result<(), St
     Ok(())
 }
 
-fn archive_manifest(path: &Path, names: &mut HashSet<String>) -> Result<(), String> {
+fn archive_manifest(
+    path: &Path,
+    required_members: &[&str],
+    names: &mut HashSet<String>,
+) -> Result<(), String> {
     let tar = |mode| {
         let mut command = Command::new("/usr/bin/tar");
         command.env_remove("TAR_OPTIONS").arg(mode).arg(path);
@@ -65,10 +69,19 @@ fn archive_manifest(path: &Path, names: &mut HashSet<String>) -> Result<(), Stri
         return Err("cannot list compressed backup".into());
     }
     let listing = std::str::from_utf8(&listing.stdout).map_err(|error| error.to_string())?;
-    let expected = listing
+    let members: Vec<_> = listing
         .lines()
         .filter(|entry| entry.rsplit('/').next().is_some_and(manifest_name))
-        .count();
+        .collect();
+    for required in required_members {
+        if !members
+            .iter()
+            .any(|member| member.trim_start_matches("./") == *required)
+        {
+            return Err(format!("required archive member missing: {required}"));
+        }
+    }
+    let expected = members.len();
     if expected == 0 {
         return Ok(());
     }
@@ -82,7 +95,12 @@ fn archive_manifest(path: &Path, names: &mut HashSet<String>) -> Result<(), Stri
     }
     let mut count = 0;
     for value in serde_json::Deserializer::from_slice(&bodies.stdout).into_iter::<Value>() {
-        protect_manifest(&value.map_err(|error| error.to_string())?, names)?;
+        let value = value.map_err(|error| error.to_string())?;
+        if !required_members.is_empty() && value.get("dataset_id").and_then(Value::as_str).is_none()
+        {
+            return Err("required archive contains an invalid dataset manifest".into());
+        }
+        protect_manifest(&value, names)?;
         count += 1;
     }
     if count != expected {
@@ -91,39 +109,73 @@ fn archive_manifest(path: &Path, names: &mut HashSet<String>) -> Result<(), Stri
     Ok(())
 }
 
-// Mandatory backup identities from the lab inventory in order 7189325354.
-pub(super) const REQUIRED_BACKUPS: [&str; 9] = [
-    "ANR2_oiran_2.7.26_backup_20261105T224027Z",
-    "ANR2_oiran_2.7.27_predeploy_backup_20261106T075717Z",
-    "ANR2_oiran_2.7.28_predeploy_backup_20261106T103354Z",
-    "ANR2_oiran_2.8.0_predeploy_backup_20261106T115119Z",
-    "ANR2_oiran_2.8.1_predeploy_backup_20261106T142802Z",
-    "ANR2_oiran_2.8.2_predeploy_backup_20261106T205304Z",
-    "ANR2_oiran_2.8.3_backup_20261107T100830Z",
-    "ANR2_oiran_2.9.0_backup_20261107T142336Z",
-    "ANR2_oiran_2.9.0_backup_20261107T142417Z",
-];
-
-#[cfg(test)]
-pub(super) const CONTINUOUS_BACKUP_MEMBER: &str =
+const CONTINUOUS_BACKUP_MEMBER: &str =
     "var/lib/oiran/captures/continuous-lab-import/dataset/dataset_manifest.json";
-#[cfg(test)]
-pub(super) const LTE_BACKUP_MEMBER: &str =
+const LTE_BACKUP_MEMBER: &str =
     "var/lib/oiran/lte-evidence/datasets/dataset-lte-run-09913806240271269bd9d7e0d4d07eb2/dataset_manifest.json";
-#[cfg(test)]
-pub(super) const REQUIRED_BACKUP_ARTIFACTS: [Option<(&str, &[&str])>; 9] = [
-    Some(("oiran-production-complete.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
-    Some(("oiran-production-complete.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
-    Some(("oiran-production-complete.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
-    Some(("oiran-2.7.28-full.tar.zst", &[CONTINUOUS_BACKUP_MEMBER, LTE_BACKUP_MEMBER])),
-    Some(("oiran-2.8.0-full.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
-    Some(("dataset-config-unit-watcher.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
-    Some(("data/continuous-lab-import/dataset/dataset_manifest.json", &[])),
-    None, // Executable and service configuration only.
-    Some(("state/continuous-lab-import/dataset/dataset_manifest.json", &[])),
+// The contents of the named rollback sources are part of the safety inventory.
+// An empty member list denotes a plain manifest. None denotes a binary/config backup.
+type Artifact = (&'static str, &'static [&'static str]);
+pub(super) const REQUIRED_BACKUPS: [(&str, Option<Artifact>); 9] = [
+    (
+        "ANR2_oiran_2.7.26_backup_20261105T224027Z",
+        Some((
+            "oiran-production-complete.tar.zst",
+            &[CONTINUOUS_BACKUP_MEMBER],
+        )),
+    ),
+    (
+        "ANR2_oiran_2.7.27_predeploy_backup_20261106T075717Z",
+        Some((
+            "oiran-production-complete.tar.zst",
+            &[CONTINUOUS_BACKUP_MEMBER],
+        )),
+    ),
+    (
+        "ANR2_oiran_2.7.28_predeploy_backup_20261106T103354Z",
+        Some((
+            "oiran-production-complete.tar.zst",
+            &[CONTINUOUS_BACKUP_MEMBER],
+        )),
+    ),
+    (
+        "ANR2_oiran_2.8.0_predeploy_backup_20261106T115119Z",
+        Some((
+            "oiran-2.7.28-full.tar.zst",
+            &[CONTINUOUS_BACKUP_MEMBER, LTE_BACKUP_MEMBER],
+        )),
+    ),
+    (
+        "ANR2_oiran_2.8.1_predeploy_backup_20261106T142802Z",
+        Some(("oiran-2.8.0-full.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
+    ),
+    (
+        "ANR2_oiran_2.8.2_predeploy_backup_20261106T205304Z",
+        Some((
+            "dataset-config-unit-watcher.tar.zst",
+            &[CONTINUOUS_BACKUP_MEMBER],
+        )),
+    ),
+    (
+        "ANR2_oiran_2.8.3_backup_20261107T100830Z",
+        Some((
+            "data/continuous-lab-import/dataset/dataset_manifest.json",
+            &[],
+        )),
+    ),
+    ("ANR2_oiran_2.9.0_backup_20261107T142336Z", None),
+    (
+        "ANR2_oiran_2.9.0_backup_20261107T142417Z",
+        Some((
+            "state/continuous-lab-import/dataset/dataset_manifest.json",
+            &[],
+        )),
+    ),
 ];
 
-fn roots(captures: &Path) -> Result<Vec<PathBuf>, String> {
+type ExpectedArtifacts = BTreeMap<PathBuf, &'static [&'static str]>;
+
+fn roots(captures: &Path) -> Result<(Vec<PathBuf>, ExpectedArtifacts), String> {
     let (mut roots, backup_root) = if cfg!(test) {
         (vec![captures.to_owned()], captures.join(".gc-backups"))
     } else {
@@ -137,7 +189,8 @@ fn roots(captures: &Path) -> Result<Vec<PathBuf>, String> {
         )
     };
     let mut identities = HashSet::new();
-    for name in REQUIRED_BACKUPS {
+    let mut expected = BTreeMap::new();
+    for (name, artifact) in REQUIRED_BACKUPS {
         let path = backup_root.join(name);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("required backup {name} unavailable: {error}"))?;
@@ -145,6 +198,9 @@ fn roots(captures: &Path) -> Result<Vec<PathBuf>, String> {
             return Err(format!(
                 "required backup {name} must be a distinct directory"
             ));
+        }
+        if let Some((relative, members)) = artifact {
+            expected.insert(path.join(relative), members);
         }
         roots.push(path);
     }
@@ -155,12 +211,14 @@ fn roots(captures: &Path) -> Result<Vec<PathBuf>, String> {
         if name.to_str().is_some_and(|name| {
             name.starts_with("ANR2_oiran_")
                 && name.contains("_backup_")
-                && !REQUIRED_BACKUPS.contains(&name)
+                && !REQUIRED_BACKUPS
+                    .iter()
+                    .any(|(required, _)| *required == name)
         }) {
             roots.push(entry.path());
         }
     }
-    Ok(roots)
+    Ok((roots, expected))
 }
 
 fn inventory(
@@ -168,7 +226,7 @@ fn inventory(
     names: &mut HashSet<String>,
     report: &mut Report,
 ) -> Result<(), String> {
-    let mut pending = roots(captures)?;
+    let (mut pending, mut expected) = roots(captures)?;
     let mut seen = HashSet::new();
     while let Some(directory) = pending.pop() {
         let metadata = fs::metadata(&directory).map_err(|error| error.to_string())?;
@@ -184,6 +242,13 @@ fn inventory(
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
             let kind = entry.file_type().map_err(|error| error.to_string())?;
+            let required = expected.get(&path).copied();
+            if required.is_some() && !kind.is_file() {
+                return Err(format!(
+                    "required backup artifact is not a regular file: {}",
+                    path.display()
+                ));
+            }
             if kind.is_dir() {
                 pending.push(path);
                 continue;
@@ -223,15 +288,37 @@ fn inventory(
             let Some(name) = name.to_str() else { continue };
             if manifest_name(name) {
                 let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-                let value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                let value: Value =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                if required.is_some() && value.get("dataset_id").and_then(Value::as_str).is_none() {
+                    return Err(format!(
+                        "required backup manifest is invalid: {}",
+                        path.display()
+                    ));
+                }
                 protect_manifest(&value, names)?;
                 found_manifest = true;
             } else if name.ends_with(".tar.zst") {
-                archive_manifest(&path, names)?;
+                archive_manifest(&path, required.unwrap_or_default(), names)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
                 report.archives_consulted += 1;
+            } else if required.is_some() {
+                return Err(format!(
+                    "unknown required backup artifact: {}",
+                    path.display()
+                ));
+            }
+            if required.is_some() {
+                expected.remove(&path);
             }
         }
         report.trees_consulted += usize::from(found_manifest);
+    }
+    if let Some((path, _)) = expected.first_key_value() {
+        return Err(format!(
+            "required backup artifact missing: {}",
+            path.display()
+        ));
     }
     Ok(())
 }
