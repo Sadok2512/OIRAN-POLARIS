@@ -2163,6 +2163,17 @@ fn arbitrary_endpoint_bytes_are_not_tunnel_evidence() {
 // `tests/aper_transfer_fixtures.rs` cover the real outer-list walker with
 // asn1tools-generated ground truth.
 
+#[test]
+fn global_gnb_id_decodes_the_aper_ie_from_captured_ng_setup_requests() {
+    // IE 27 bytes extracted with tshark PDML from hash-verified lab NGSetup pcaps.
+    let ie = [0x00, 0x00, 0xf1, 0x10, 0x50, 0, 0, 0, 1];
+    let (value, status, _) = decode_global_ran_node_id(&ie);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let value = value.unwrap();
+    assert!(value.split(',').any(|field| field == "gnb_id=1"));
+    assert!(value.split(',').any(|field| field == "gnb_id_bit_length=32"));
+}
+
 /// 2.21.43 (ordre #9 6972973040) — IE 27 `GlobalRANNodeID` décode
 /// `globalGNB-ID` TS 38.413 §9.3.1.5 : PLMN + gNB-ID avec sa longueur.
 /// Octets synthétisés spec (fixture lab ne contient pas IE 27).
