@@ -91,7 +91,7 @@ fn archive_manifest(path: &Path, names: &mut HashSet<String>) -> Result<(), Stri
     Ok(())
 }
 
-#[cfg(test)]
+// Mandatory backup identities from the lab inventory in order 7189325354.
 pub(super) const REQUIRED_BACKUPS: [&str; 9] = [
     "ANR2_oiran_2.7.26_backup_20261105T224027Z",
     "ANR2_oiran_2.7.27_predeploy_backup_20261106T075717Z",
@@ -109,25 +109,38 @@ fn roots(captures: &Path) -> Result<Vec<PathBuf>, String> {
         (vec![captures.to_owned()], captures.join(".gc-backups"))
     } else {
         (
-            vec![captures.to_owned(), "/opt".into(), "/var/lib/oiran/releases".into()],
+            vec![
+                captures.to_owned(),
+                "/opt".into(),
+                "/var/lib/oiran/releases".into(),
+            ],
             PathBuf::from("/root"),
         )
     };
-    let mut backups = Vec::new();
+    let mut identities = HashSet::new();
+    for name in REQUIRED_BACKUPS {
+        let path = backup_root.join(name);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("required backup {name} unavailable: {error}"))?;
+        if !metadata.is_dir() || !identities.insert((metadata.dev(), metadata.ino())) {
+            return Err(format!(
+                "required backup {name} must be a distinct directory"
+            ));
+        }
+        roots.push(path);
+    }
+    // Extra backups expand the manifest union without satisfying a required identity.
     for entry in fs::read_dir(&backup_root).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("ANR2_oiran_") && name.contains("_backup_"))
-        {
-            backups.push(entry.path());
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("ANR2_oiran_")
+                && name.contains("_backup_")
+                && !REQUIRED_BACKUPS.contains(&name)
+        }) {
+            roots.push(entry.path());
         }
     }
-    if backups.len() < 9 {
-        return Err("backup inventory incomplete".into());
-    }
-    roots.extend(backups);
     Ok(roots)
 }
 
