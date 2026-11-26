@@ -1819,7 +1819,7 @@ pub struct CaptureManager {
     sequence: Arc<AtomicU64>,
     continuous_stop: Arc<AtomicBool>,
     last_event_shard_inventory: Arc<Mutex<Option<Instant>>>,
-    shard_inventory_snapshot: Arc<Mutex<Option<Value>>>,
+    shard_inventory_snapshot: Arc<Mutex<Option<Result<event_shard_inventory::Totals, event_shard_inventory::InventoryError>>>>,
     #[cfg(not(test))]
     shard_inventory_running: Arc<AtomicBool>,
     continuous_runtime_evidence: Arc<Mutex<Option<PathBuf>>>,
@@ -2933,11 +2933,9 @@ impl CaptureManager {
 
     /// Latest complete or explicitly unavailable inventory. No filesystem work.
     pub fn event_shard_orphan_inventory(&self) -> Value {
-        self.shard_inventory_snapshot.lock().unwrap().clone().unwrap_or_else(|| {
-            event_shard_inventory::Report::default().snapshot(Err(
-                event_shard_inventory::InventoryError::general("inventory not measured yet"),
-            ))
-        })
+        let cache = self.shard_inventory_snapshot.lock().unwrap();
+        let pending = event_shard_inventory::InventoryError::general("inventory not measured yet");
+        event_shard_inventory::snapshot(cache.as_ref().map_or(Err(&pending), Result::as_ref))
     }
 
     pub fn dataset_events_source(&self, dataset_id: &str) -> Option<(PathBuf, Vec<EventShard>)> {
@@ -5463,15 +5461,13 @@ impl CaptureManager {
             {
                 self.shard_inventory_running.store(false, Ordering::Release);
                 let result = Err(event_shard_inventory::InventoryError::general(error.to_string()));
-                *self.shard_inventory_snapshot.lock().unwrap() =
-                    Some(event_shard_inventory::Report::default().snapshot(result));
+                *self.shard_inventory_snapshot.lock().unwrap() = Some(result);
             }
         }
     }
 
     fn measure_continuous_event_shards(&self, current: &Path) {
         let served = self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned();
-        let mut report = event_shard_inventory::Report::default();
         let result = served
             .as_ref()
             .ok_or_else(|| event_shard_inventory::InventoryError::general("no continuous generation is currently served"))
@@ -5480,9 +5476,9 @@ impl CaptureManager {
                     self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID)
                         .is_some_and(|latest| latest.callflows_path == served.callflows_path
                             && latest.event_count == served.event_count)
-                }, &mut report)
+                })
             });
-        *self.shard_inventory_snapshot.lock().unwrap() = Some(report.snapshot(result));
+        *self.shard_inventory_snapshot.lock().unwrap() = Some(result);
     }
 
     fn process_continuous_capture_inner(
@@ -24488,8 +24484,23 @@ Content-Length: 0\r\n\
         assert_shard_inventory(Some("continuous-lab-import/.dataset-rollback.fixture/event-shards/broken-link"));
     }
 
+    #[test]
+    fn shard_inventory_withholds_all_totals_on_failure_in_each_phase() {
+        use event_shard_inventory::FailurePoint::*;
+        assert_shard_inventory_with_failures(None, &[
+            ActiveManifest, BackupRoots, Directory, Link, Manifest, Archive, Shard, Finish,
+        ]);
+    }
+
     fn assert_shard_inventory(unreadable: Option<&str>) {
-        use event_shard_inventory::REQUIRED_BACKUPS;
+        assert_shard_inventory_with_failures(unreadable, &[]);
+    }
+
+    fn assert_shard_inventory_with_failures(
+        unreadable: Option<&str>,
+        failures: &[event_shard_inventory::FailurePoint],
+    ) {
+        use event_shard_inventory::{FAIL_AT, REQUIRED_BACKUPS};
 
         let bench = RetentionBench0_7_0::new("shard-gc-union");
         let backups = bench._root.join(".gc-backups");
@@ -24575,6 +24586,11 @@ Content-Length: 0\r\n\
             bench._root.to_path_buf(), false, bench._root.join(".oiran-pseudonym.key"),
         ).unwrap();
         bench.manager.recover_continuous_dataset_from_disk(&bench.base).unwrap();
+        if !failures.is_empty() {
+            let aliases = rollback.join("event-shards");
+            fs::create_dir(&aliases).unwrap();
+            std::os::unix::fs::symlink(&original, aliases.join("protected-link")).unwrap();
+        }
         let bad_path = unreadable.map(|relative| {
             let path = bench._root.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -24593,7 +24609,7 @@ Content-Length: 0\r\n\
             assert_eq!(snapshot["status"], "unavailable", "{snapshot}");
             assert_eq!(snapshot["error"]["path"], serde_json::json!(path));
             assert!(snapshot["error"]["reason"].is_string());
-            assert!(snapshot["count"].is_null() && snapshot["bytes"].is_null());
+            assert_orphan_totals_unavailable(&snapshot);
         } else {
             assert_eq!(snapshot["status"], "available", "{snapshot}");
             assert_eq!(snapshot["count"], 4);
@@ -24602,8 +24618,24 @@ Content-Length: 0\r\n\
             assert_eq!(snapshot["bytes"], bytes);
             assert!(snapshot["error"].is_null());
         }
+        for &phase in failures {
+            FAIL_AT.with(|point| point.set(Some(phase)));
+            bench.manager.measure_continuous_event_shards(&dataset);
+            FAIL_AT.with(|point| point.set(None));
+            let snapshot = bench.manager.event_shard_orphan_inventory();
+            assert_orphan_totals_unavailable(&snapshot);
+            assert_eq!(snapshot["error"]["reason"], format!("injected read failure at {phase:?}"));
+            assert!(snapshot["error"]["path"].is_string());
+        }
         assert!([original, archived_reference, removable, unknown, newest_a, newest_b]
             .iter().all(|path| path.is_file()));
+    }
+
+    fn assert_orphan_totals_unavailable(snapshot: &Value) {
+        assert_eq!(snapshot["status"], "unavailable", "{snapshot}");
+        for key in ["count", "bytes", "trees_consulted", "archives_consulted"] {
+            assert!(snapshot[key].is_null(), "{key}: {snapshot}");
+        }
     }
 
     fn corpus_0_7_0() -> (PathBuf, PathBuf, PathBuf) {
