@@ -2,7 +2,7 @@
 use super::{commit_seq, LiveDataset, PublicationLock};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::CString,
     fs,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -13,11 +13,25 @@ use std::{
 };
 
 pub(super) const INTERVAL: Duration = Duration::from_secs(30 * 60);
+#[derive(Default, serde::Serialize)]
+struct ShardUsage {
+    count: usize,
+    bytes: u64,
+}
+
+impl ShardUsage {
+    fn add(&mut self, bytes: u64) {
+        self.count += 1;
+        self.bytes += bytes;
+    }
+}
+
 pub(super) struct Totals {
     commit_seq: u64,
     publication_lock_held_ns: u64,
-    count: usize,
-    bytes: u64,
+    unreferenced: ShardUsage,
+    rollback_held: ShardUsage,
+    by_backup: BTreeMap<String, ShardUsage>,
     trees_consulted: usize,
     archives_consulted: usize,
     broken_links: usize,
@@ -54,8 +68,19 @@ pub(super) fn snapshot(result: Result<&Totals, &InventoryError>) -> Value {
     };
     json!({
         "status": if totals.is_some() { "available" } else { "unavailable" },
-        "count": totals.map(|totals| totals.count),
-        "bytes": totals.map(|totals| totals.bytes),
+        "count": totals.map(|totals| totals.unreferenced.count),
+        "bytes": totals.map(|totals| totals.unreferenced.bytes),
+        "unreferenced": totals.map(|totals| json!({
+            "count": totals.unreferenced.count,
+            "bytes": totals.unreferenced.bytes,
+            "commit_seq": totals.commit_seq,
+        })),
+        "rollback_held": totals.map(|totals| json!({
+            "count": totals.rollback_held.count,
+            "bytes": totals.rollback_held.bytes,
+            "by_backup": totals.by_backup,
+            "commit_seq": totals.commit_seq,
+        })),
         "trees_consulted": totals.map(|totals| totals.trees_consulted),
         "archives_consulted": totals.map(|totals| totals.archives_consulted),
         "broken_links": totals.map(|totals| totals.broken_links),
@@ -181,10 +206,36 @@ fn unavailable(path: &Path, error: impl std::fmt::Display) -> InventoryError {
     }
 }
 
-const OPT_DATA_ROOT: &str = "/opt/oiran";
+const DEPLOYMENT_BACKUPS: &str = "/var/lib/oiran/deployment-backups";
+const RELEASES: &str = "/var/lib/oiran/releases";
 
-fn excluded_opt_tree(path: &Path) -> bool {
-    path.starts_with("/opt") && !path.starts_with(OPT_DATA_ROOT)
+fn deployment_backups(captures: &Path) -> PathBuf {
+    if cfg!(test) {
+        captures.join(".deployment-backups")
+    } else {
+        DEPLOYMENT_BACKUPS.into()
+    }
+}
+
+fn backup_name(path: &Path, deployments: &Path) -> Option<String> {
+    for root in [deployments, Path::new(RELEASES)] {
+        if let Ok(relative) = path.strip_prefix(root) {
+            return relative
+                .components()
+                .next()?
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned);
+        }
+    }
+    path.components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find(|name| {
+            name.starts_with(".dataset-rollback")
+                || name.starts_with(".dataset-previous")
+                || (name.starts_with("ANR2_oiran_") && name.contains("_backup_"))
+        })
+        .map(str::to_owned)
 }
 
 fn manifest_name(name: &str) -> bool {
@@ -339,8 +390,9 @@ fn roots(captures: &Path) -> Result<(Vec<PathBuf>, ExpectedArtifacts), Inventory
         (
             vec![
                 captures.to_owned(),
-                OPT_DATA_ROOT.into(),
-                "/var/lib/oiran/releases".into(),
+                "/opt".into(),
+                RELEASES.into(),
+                deployment_backups(captures),
             ],
             PathBuf::from("/root"),
         )
@@ -386,16 +438,39 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[derive(Default)]
+struct References {
+    names: HashSet<String>,
+    rollback_by_shard: BTreeMap<String, BTreeSet<String>>,
+    trees_consulted: usize,
+    archives_consulted: usize,
+    broken_links: usize,
+}
+
+impl References {
+    fn add(&mut self, names: HashSet<String>, backup: Option<&str>) {
+        if let Some(backup) = backup {
+            for name in names {
+                self.rollback_by_shard
+                    .entry(name)
+                    .or_default()
+                    .insert(backup.to_owned());
+            }
+        } else {
+            self.names.extend(names);
+        }
+    }
+}
+
 fn inventory(
     captures: &Path,
     active_shards: &Path,
     current: &Path,
     population: &[PathBuf],
-    mut names: HashSet<String>,
-) -> Result<(HashSet<String>, usize, usize, usize), InventoryError> {
+) -> Result<References, InventoryError> {
     let active_manifest = current.join("dataset_manifest.json");
-    let staging = current.with_file_name(".dataset-next");
-    let (mut trees, mut archives, mut broken_links) = (0usize, 0usize, 0usize);
+    let deployments = deployment_backups(captures);
+    let mut references = References::default();
     #[cfg(test)]
     LOCK_PROBE.with(|probe| {
         if let Some((base, held)) = probe.borrow_mut().as_mut() {
@@ -412,15 +487,9 @@ fn inventory(
     let mut pending: Vec<_> = roots.into_iter().map(|path| (path, Vec::new())).collect();
     let mut seen = HashSet::new();
     while let Some((directory, mut ancestors)) = pending.pop() {
-        if excluded_opt_tree(&directory) {
-            continue;
-        }
         let physical = directory
             .canonicalize()
             .map_err(|error| unavailable(&directory, error))?;
-        if excluded_opt_tree(&physical) {
-            continue;
-        }
         let metadata = fs::metadata(&directory).map_err(|error| unavailable(&directory, error))?;
         if !metadata.is_dir() {
             return Err(unavailable(&directory, "inventory root is not a directory"));
@@ -429,7 +498,7 @@ fn inventory(
         if ancestors.contains(&identity) {
             return Err(unavailable(&directory, "inventory directory symlink loop"));
         }
-        if !seen.insert(identity) {
+        if !seen.insert((identity, backup_name(&directory, &deployments))) {
             continue;
         }
         ancestors.push(identity);
@@ -451,9 +520,6 @@ fn inventory(
         for path in paths {
             if path == active_manifest {
                 found_manifest = true;
-                continue;
-            }
-            if path == staging || excluded_opt_tree(&path) {
                 continue;
             }
             let kind = fs::symlink_metadata(&path)
@@ -480,7 +546,7 @@ fn inventory(
                 let physical = match path.canonicalize() {
                     Ok(target) => target,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        broken_links += 1;
+                        references.broken_links += 1;
                         continue;
                     }
                     Err(error) => return Err(unavailable(&path, error)),
@@ -494,17 +560,7 @@ fn inventory(
                         .file_name()
                         .and_then(|name| name.to_str())
                         .ok_or_else(|| unavailable(&path, "invalid shard link target name"))?;
-                    names.insert(name.into());
-                    names.insert(target.into());
-                    continue;
-                }
-                if excluded_opt_tree(&physical) {
-                    if manifest_name(name) || name.ends_with(".tar.zst") {
-                        return Err(unavailable(
-                            &path,
-                            "inventory artifact resolves outside Analyzer data trees",
-                        ));
-                    }
+                    references.names.extend([name.into(), target.into()]);
                     continue;
                 }
                 let target = fs::metadata(&physical).map_err(|error| unavailable(&path, error))?;
@@ -522,14 +578,18 @@ fn inventory(
                 if required.is_some() && value.get("dataset_id").and_then(Value::as_str).is_none() {
                     return Err(unavailable(&path, "required backup manifest is invalid"));
                 }
+                let mut names = HashSet::new();
                 protect_manifest(&value, &mut names).map_err(|error| unavailable(&path, error))?;
+                references.add(names, backup_name(&path, &deployments).as_deref());
                 found_manifest = true;
             } else if name.ends_with(".tar.zst") {
                 #[cfg(test)]
                 inject_failure(FailurePoint::Archive, &path)?;
+                let mut names = HashSet::new();
                 archive_manifest(&path, required.unwrap_or_default(), &mut names)
                     .map_err(|error| unavailable(&path, error))?;
-                archives += 1;
+                references.add(names, backup_name(&path, &deployments).as_deref());
+                references.archives_consulted += 1;
             } else if required.is_some() {
                 return Err(unavailable(&path, "unknown required backup artifact"));
             }
@@ -537,12 +597,12 @@ fn inventory(
                 expected.remove(&path);
             }
         }
-        trees += usize::from(found_manifest);
+        references.trees_consulted += usize::from(found_manifest);
     }
     if let Some((path, _)) = expected.first_key_value() {
         return Err(unavailable(&path, "required backup artifact missing"));
     }
-    Ok((names, trees, archives, broken_links))
+    Ok(references)
 }
 
 fn read_sequence(path: &Path) -> Result<u64, InventoryError> {
@@ -643,15 +703,16 @@ pub(super) fn measure(
             let physical_shards = shards
                 .canonicalize()
                 .map_err(|error| unavailable(&shards, error))?;
-            let (names, trees_consulted, archives_consulted, broken_links) =
-                inventory(captures, &physical_shards, current, &population, names)?;
+            let references = inventory(captures, &physical_shards, current, &population)?;
             #[cfg(test)]
             AFTER_TRAVERSAL.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() {
                     hook(current);
                 }
             });
-            let (mut count, mut bytes) = (0usize, 0u64);
+            let mut unreferenced = ShardUsage::default();
+            let mut rollback_held = ShardUsage::default();
+            let mut by_backup = BTreeMap::<String, ShardUsage>::new();
             for path in population {
                 let name = path
                     .file_name()
@@ -665,22 +726,25 @@ pub(super) fn measure(
                 inject_failure(FailurePoint::Shard, &path)?;
                 let metadata =
                     fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
-                if metadata.is_file() {
-                    count += 1;
-                    bytes += metadata.len();
+                if !metadata.is_file() {
+                    continue;
+                }
+                if let Some(backups) = references.rollback_by_shard.get(name) {
+                    rollback_held.add(metadata.len());
+                    for backup in backups {
+                        by_backup
+                            .entry(backup.clone())
+                            .or_default()
+                            .add(metadata.len());
+                    }
+                } else if !references.names.contains(name) {
+                    unreferenced.add(metadata.len());
                 }
             }
             #[cfg(test)]
             inject_failure(FailurePoint::Finish, current)?;
             watch.check_mounts()?;
-            Ok((
-                active,
-                count,
-                bytes,
-                trees_consulted,
-                archives_consulted,
-                broken_links,
-            ))
+            Ok((active, unreferenced, rollback_held, by_backup, references))
         })();
         let watch_result = watch.unchanged(&manifest_path);
         let latest_seq = read_sequence(&sequence_path)?;
@@ -695,7 +759,7 @@ pub(super) fn measure(
             }
             continue;
         }
-        let (active, count, bytes, trees_consulted, archives_consulted, broken_links) = scanned?;
+        let (active, unreferenced, rollback_held, by_backup, references) = scanned?;
         if !served()
             .as_ref()
             .is_some_and(|latest| same_manifest(latest, &active))
@@ -709,11 +773,12 @@ pub(super) fn measure(
         return Ok(Totals {
             commit_seq,
             publication_lock_held_ns,
-            count,
-            bytes,
-            trees_consulted,
-            archives_consulted,
-            broken_links,
+            unreferenced,
+            rollback_held,
+            by_backup,
+            trees_consulted: references.trees_consulted,
+            archives_consulted: references.archives_consulted,
+            broken_links: references.broken_links,
         });
     }
     unreachable!("inventory returns on its second attempt")

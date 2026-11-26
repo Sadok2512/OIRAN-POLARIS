@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.201 / live-probe 0.7.8 — distinguish unreferenced and rollback-held shards
+
+Report unreferenced shards and rollback-held shards separately at the measured commit. Include deployment backup manifests in inventory and show per-backup disk usage without double-counting a shard in the total.
+
 ## oiran-api 2.21.196 / oiran-decode 0.12.2 — SCTP message TSN bounds
 
 Persist the wire TSN of the first and last SCTP DATA chunks in packet-reference provenance. Historical references keep their original shape. Event-schema 1.13.1 and session-engine 0.5.36 carry the optional bounds.
