@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.33 — Finalisation du detach après observation de la sortie du processus
+
+Après un arrêt vérifié et la réconciliation gNB, le registre finalise aussi les jobs que l’observateur avait déjà classés `Stopped`. Le detach conserve son exigence `STOPPED/INACTIVE` et journalise le couple observé en cas de rejet. Simulator-controller passe à 0.3.1.
+
 ## 0.36.32 — 2026-11-24 — Le matériel d'authentification n'est jamais rendu dans les journaux srsRAN ; garde « octet pour octet » déterministe
 
 Ordre cœur #9 7138374225 (priorité 1), refus ANR2 #10 7138095747. Base : `e949ffe` (0.36.31, non déployée).

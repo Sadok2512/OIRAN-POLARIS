@@ -14283,7 +14283,11 @@ fn execute_live_definition_step(
                         ue_id,
                         "detach",
                         "FAILED",
-                        json!({ "error": "DETACH_FINAL_STATE_NOT_OBSERVED" }),
+                        json!({
+                            "error": "DETACH_FINAL_STATE_NOT_OBSERVED",
+                            "process_state": &final_job.process_state,
+                            "pdu_state": &final_job.pdu_session_state,
+                        }),
                     );
                     return Err("DETACH_FINAL_STATE_NOT_OBSERVED".into());
                 }
@@ -24931,6 +24935,12 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert_eq!(measurements["ues"][0]["process_state"], "STOPPED");
         assert_eq!(measurements["ues"][0]["pdu_session_state"], "INACTIVE");
         assert_eq!(measurements["ues"][0]["completion_evidence"], "CONTROLLER_TERMINAL_STATE_OBSERVED");
+        let mut controller = state.multi_ue.lock().unwrap();
+        let jobs = controller.snapshot();
+        let job = jobs.iter().find(|job| job.ue_id == ue_ids[0]).unwrap();
+        assert!(job.operation_id.is_none() && job.process_handle.is_none());
+        let generation = job.generation;
+        assert_eq!(controller.stop_offline(&ue_ids[0]).unwrap().generation, generation);
     }
 
     #[test]

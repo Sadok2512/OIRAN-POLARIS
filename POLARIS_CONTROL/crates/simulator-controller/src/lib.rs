@@ -902,7 +902,20 @@ impl MultiUeController {
         if !job.controller_owned {
             return Err("OWNERSHIP_MISMATCH".into());
         }
-        if matches!(job.lifecycle, UeLifecycle::Stopped) {
+        // A runtime observation can classify EXITED as Stopped while the
+        // stop reservation and gNB mapping still need to be finalized.
+        if matches!(job.lifecycle, UeLifecycle::Stopped)
+            && job.process_state == "STOPPED"
+            && job.registration_state == "DEREGISTERED"
+            && job.pdu_session_state == "INACTIVE"
+            && job.traffic_state == "STOPPED"
+            && job.ue_ip.is_none()
+            && job.process_handle.is_none()
+            && job.operation_id.is_none()
+            && job.operation_locked_at_epoch_s.is_none()
+            && job.approved_runtime.is_none()
+            && job.gnb_ran_ngap_id.is_none()
+        {
             return Ok(job);
         }
         job.lifecycle = UeLifecycle::Stopped;
