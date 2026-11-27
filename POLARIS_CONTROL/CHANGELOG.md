@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.36.36 — History : une adresse garde son pseudonyme `addr-*` à tous les passages du filtre
+
+Lot C3, ordres du cœur #9 7213520584 et 7216533055, après le refus d'ANR2 (#10 7216338396) de la première tête `ecc1be6`, abandonnée. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché et reste en 0.36.35.
+
+- **Défaut.** `sanitize_history_text_with` cherchait une suite d'au moins 10 chiffres sur la chaîne **déjà pseudonymisée**. Le suffixe hexadécimal d'un `addr-*` (12 caractères) pouvait la former à lui seul, et toute la chaîne devenait alors `history-…`. Classe exacte, déterministe par clé : `P = 68359375 / 2^32 ≈ 1,59 %`. L'History repasse le filtre à l'écriture, à la mise à jour et à la réponse : le filtre réagissait donc aussi à ses **propres sorties**. Aucune fuite.
+- **Corrigé, une seule règle.** La suite est cherchée dans le texte **privé des jetons que le filtre produit lui-même** (`without_own_history_tokens`) : `addr-` ou `history-`, suivi d'exactement 12 caractères hexadécimaux, puis d'un caractère non hexadécimal. Le filtre donne ainsi le même résultat à tous les passages. Une adresse ne porte jamais 10 chiffres d'affilée : les vraies suites et les marqueurs d'identité restent protégés à l'identique. L'entrée du HMAC `history-…` ne change pas, ni aucun format.
+- **Écart déclaré.** `psn-…` n'est **pas** retiré du test. Le garde d'octets identiques de 0.36.30 contient `psn-0123456789abcdef`, de 16 caractères, et l'attend remplacé. Le filtre réagit donc encore à ce jeton-là.
+- **Non rétroactif, sur décision du cœur.** Les entrées déjà écrites gardent leur `history-…`.
+- **Gardes.**
+  - `no_address_loses_its_pseudonym_in_history_0_36_36` : 1 024 adresses, un passage, 0 perte.
+  - `an_address_keeps_its_pseudonym_through_write_reload_update_and_response_0_36_36` : parcours réel (écriture, relecture du fichier, mise à jour, réponse de `GET /scenarios/history`). L'adresse est choisie dans la classe, et elle garde son `addr-…` à chaque étape. Une vraie suite de chiffres et `imsi` restent `history-…`.
+- **Preuves rouges.**
+  - Sur `55f480d` (`238f6c1`) : les deux gardes échouent (11 adresses sur 1 024 perdues, perte dès l'écriture).
+  - Sur `ecc1be6` (`365a018`) : le garde du parcours échoue, avec une perte à la mise à jour.
+
 ## 0.36.35 — Références d’adresses dans l’inventaire UE
 
 - Corrige une exposition antérieure au lot IMSI. L’API de l’inventaire renvoie une référence protégée pour les adresses NR, LTE et PDU attribuées. La table UE affiche cette référence.
