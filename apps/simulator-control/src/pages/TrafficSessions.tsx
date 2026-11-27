@@ -11,6 +11,10 @@
 //     perte ≤ 20 Mbit/s" (lab ceiling).
 //   - duration_s slider pinned to [1, 600].
 //   - direction ∈ UL | DL | BOTH; protocol ∈ TCP | UDP.
+//   - 0.37.2 (lot C8) — 5G SA: the API measures TCP only and refuses UDP
+//     (polaris-control-api 0.37.0, HTTP 422 `TRAFFIC_5G_UDP_NOT_MEASURED`).
+//     The 5G form starts in TCP, shows UDP disabled with that reason, and
+//     never sends UDP. LTE keeps its real UDP (`measure_bounded_udp`).
 //   - Start requires an operator session + a covered grant (same as
 //     scenario Run); the backend returns 403 / 423 if the grant is
 //     missing — the UI surfaces the exact code.
@@ -46,6 +50,15 @@ import { ApiError } from '@shared/api';
 import { TechnologySelector, type RadioTechnology } from '@/components/TechnologySelector';
 
 const QUERY_KEY = ['polaris', 'traffic-sessions'] as const;
+
+/** 0.37.2 (lot C8) — reason shown beside the disabled 5G UDP choice: the
+ *  exact refusal code of `POST /traffic/sessions` for a 5G UDP session. */
+export const FIVE_G_UDP_REFUSAL = 'TRAFFIC_5G_UDP_NOT_MEASURED';
+
+/** 0.37.2 (lot C8) — the only protocol each technology really measures. */
+function measuredProtocol(technology: RadioTechnology): TrafficProtocol {
+  return technology === 'LTE' ? 'UDP' : 'TCP';
+}
 
 function formatRate(bps: number | null): string {
   if (bps == null) return '—';
@@ -117,7 +130,7 @@ export function TrafficSessionsPage() {
   const [ueIds, setUeIds] = useState('');
   const [technology, setTechnology] = useState<RadioTechnology>('5G_SA');
   const [direction, setDirection] = useState<TrafficDirection>('BOTH');
-  const [protocol, setProtocol] = useState<TrafficProtocol>('UDP');
+  const [protocol, setProtocol] = useState<TrafficProtocol>(measuredProtocol('5G_SA'));
   const [rateMbps, setRateMbps] = useState(5);
   const [durationS, setDurationS] = useState(30);
   const [formError, setFormError] = useState<string | null>(null);
@@ -165,7 +178,9 @@ export function TrafficSessionsPage() {
         .map((x) => x.trim())
         .filter(Boolean),
       direction,
-      protocol,
+      // 0.37.2 (lot C8) — a 5G session never carries UDP, whatever the
+      // select holds: the API would refuse it.
+      protocol: technology === '5G_SA' ? measuredProtocol('5G_SA') : protocol,
       rate_mbps: rateMbps,
       duration_s: durationS,
     };
@@ -199,8 +214,8 @@ export function TrafficSessionsPage() {
           onChange={(next) => {
             setTechnology(next);
             setUeIds('');
+            setProtocol(measuredProtocol(next));
             if (next === 'LTE') {
-              setProtocol('UDP');
               setRateMbps(1);
               setDurationS(30);
             }
@@ -247,12 +262,23 @@ export function TrafficSessionsPage() {
             <select
               className="h-9 px-3 rounded-md border border-line bg-surface text-md2 text-ink"
               value={protocol}
-              onChange={(e) => setProtocol(e.target.value as TrafficProtocol)}
+              onChange={(e) => {
+                const next = e.target.value as TrafficProtocol;
+                if (technology === '5G_SA' && next === 'UDP') return;
+                setProtocol(next);
+              }}
               data-testid="traffic-protocol"
             >
-              <option value="UDP">UDP</option>
+              <option value="UDP" disabled={technology === '5G_SA'}>
+                {technology === '5G_SA' ? `UDP — ${FIVE_G_UDP_REFUSAL}` : 'UDP'}
+              </option>
               <option value="TCP" disabled={technology === 'LTE'}>TCP</option>
             </select>
+            {technology === '5G_SA' ? (
+              <span className="text-xs2 text-mute" data-testid="traffic-protocol-5g-udp-reason">
+                UDP unavailable on 5G SA ({FIVE_G_UDP_REFUSAL}): the 5G path measures TCP only.
+              </span>
+            ) : null}
           </label>
           <label className="flex flex-col gap-1 text-sm2">
             <span className="text-xs2 uppercase tracking-wider text-mute">

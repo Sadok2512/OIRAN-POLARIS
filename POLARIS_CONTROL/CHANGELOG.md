@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.37.2 — 2026-11-27 — Le formulaire 5G des sessions de trafic s'initialise en TCP et n'émet jamais UDP (lot C8)
+
+Patch. Ordres cœur #9 7222823828 et 7223299148. Base : 0.37.1 @ `22bb4a5` (C7bis, CLAUDE2), elle-même au-dessus de `5892f03` (C2b, production).
+
+Depuis C2b (0.37.0), `POST /api/v1/traffic/sessions` refuse une session 5G en UDP (HTTP 422 `TRAFFIC_5G_UDP_NOT_MEASURED`). Le formulaire de `apps/simulator-control` (`src/pages/TrafficSessions.tsx`) s'initialisait en UDP : toute session 5G lancée depuis l'interface échouait.
+
+- **Valeur initiale 5G = TCP**, le seul protocole mesuré sur le 5G.
+- **UDP désactivé avec son motif** (choix « désactivé avec motif », préféré par le cœur) : l'option porte `TRAFFIC_5G_UDP_NOT_MEASURED`, et une ligne sous le champ l'explique.
+- **Jamais émis** : sur le 5G, la requête porte toujours `TCP`, même si la valeur du champ est forcée ; revenir du LTE au 5G repasse en TCP (avant : l'UDP du LTE restait).
+- **Chemin LTE inchangé** : UDP réel (`measure_bounded_udp`), TCP désactivé.
+- **Aucun autre client de la maison** n'envoie de session de trafic : `git grep -n "traffic/sessions\|startTrafficSession" -- apps packages POLARIS_CONTROL/apps/web e2e` → seule cette page (et un appel e2e à corps vide).
+- **API** : aucun code modifié ; version portée à 0.37.2 pour identifier la release. `apps/simulator-control` passe à 0.37.2. `POLARIS_CONTROL/apps/web` n'est pas touché et garde sa version.
+- **Tests** : `apps/simulator-control/src/pages/TrafficSessions.test.tsx` — 4 gardes ROUGES sur la preuve `proof/control-c8-5g-form-default-on-22bb4a5`, verts ici ; un témoin LTE vert des deux côtés.
+
 ## 0.37.1 — History : les jetons `psn-`/`scenario-`, l'horodatage `started_at` prouvé et les empreintes SHA-256 de transfert ne sont plus remplacés par le test des chiffres
 
 Lot C7bis, ordre du cœur #9 7222731801. Il remplace C7 `6dae3cd`, refusé par ANR2 (#10 7222646595). Base : la production `5892f03` (0.37.0, C2b). Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché.

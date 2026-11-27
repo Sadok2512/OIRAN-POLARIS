@@ -1,5 +1,12 @@
 # @telecom/simulator-control — Changelog
 
+## 0.37.2 — 2026-11-27 — Formulaire 5G des sessions de trafic en TCP (patch, lot C8)
+
+- Le formulaire 5G s'initialise en TCP ; l'UDP y est désactivé avec son
+  motif `TRAFFIC_5G_UDP_NOT_MEASURED` (refus de polaris-control-api 0.37.0).
+- Une session 5G n'émet jamais UDP, même valeur forcée ; retour LTE → 5G
+  repasse en TCP. Le LTE garde son UDP réel.
+
 ## 0.36.5 — 2026-11-14 — UI moins gourmande pour l'API (patch)
 
 - Corrige le FAIL ANR2 #10 6882271073 : la charge de l'UI portait le cgroup
