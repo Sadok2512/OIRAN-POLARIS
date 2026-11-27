@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.204 / session-engine 0.5.39 / Web 2.14.6 — N2 continuity evidence
+
+Expose a link on both PDU session details when the original rotation positions, directional SCTP endpoints, verification tag and wire TSNs prove continuity between setup and release. Historical references without original segment provenance remain unlinked. Session membership and accounting are preserved.
+
 ## oiran-api 2.21.203 / live-probe 0.7.9 — authorized rollback manifests
 
 Read rollback targets from an explicit allowlist. Preserve the pinned unreferenced total when an authorized manifest is unreadable and expose the rollback error separately.
