@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.205 / live-probe 0.7.10 — reject invalid rollback manifests
+
+Withhold both shard totals when a readable rollback manifest is invalid or contradicts its declaration. Preserve the declared unreferenced total when reading an authorized manifest fails.
+
 ## oiran-api 2.21.203 / live-probe 0.7.9 — authorized rollback manifests
 
 Read rollback targets from an explicit allowlist. Preserve the pinned unreferenced total when an authorized manifest is unreadable and expose the rollback error separately.

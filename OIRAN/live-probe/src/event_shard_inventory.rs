@@ -291,13 +291,32 @@ fn rollback_targets() -> Result<Vec<RollbackTarget>, InventoryError> {
     Ok(targets)
 }
 
-fn checked_references(target: &RollbackTarget) -> Result<bool, InventoryError> {
+enum ReferenceCheckError {
+    Read(InventoryError),
+    Invalid(InventoryError),
+}
+
+fn checked_references(target: &RollbackTarget) -> Result<(), ReferenceCheckError> {
     let path = &target.manifest;
-    let bytes = fs::read(path).map_err(|error| unavailable(path, error))?;
-    let value = serde_json::from_slice(&bytes).map_err(|error| unavailable(path, error))?;
+    let bytes =
+        fs::read(path).map_err(|error| ReferenceCheckError::Read(unavailable(path, error)))?;
+    let value = serde_json::from_slice(&bytes).map_err(|error| {
+        ReferenceCheckError::Invalid(unavailable(
+            path,
+            format!("invalid rollback manifest JSON: {error}"),
+        ))
+    })?;
     let mut names = HashSet::new();
-    protect_manifest(&value, &mut names).map_err(|error| unavailable(path, error))?;
-    Ok(names.len() == target.shards.len() && target.shards.iter().all(|name| names.contains(name)))
+    protect_manifest(&value, &mut names)
+        .map_err(|error| ReferenceCheckError::Invalid(unavailable(path, error)))?;
+    if names.len() != target.shards.len() || !target.shards.iter().all(|name| names.contains(name))
+    {
+        return Err(ReferenceCheckError::Invalid(unavailable(
+            path,
+            "rollback manifest disagrees with authorized shard declaration",
+        )));
+    }
+    Ok(())
 }
 
 fn read_sequence(path: &Path) -> Result<u64, InventoryError> {
@@ -408,16 +427,11 @@ pub(super) fn measure(
             let mut rollback_by_shard = BTreeMap::<_, BTreeSet<_>>::new();
             for target in &targets {
                 match checked_references(target) {
-                    Ok(true) => trees_consulted += 1,
-                    Ok(false) => {
-                        return Err(unavailable(
-                            &target.manifest,
-                            "rollback manifest disagrees with authorized shard declaration",
-                        ))
-                    }
-                    Err(error) => {
+                    Ok(()) => trees_consulted += 1,
+                    Err(ReferenceCheckError::Read(error)) => {
                         rollback_error.get_or_insert(error);
                     }
+                    Err(ReferenceCheckError::Invalid(error)) => return Err(error),
                 }
                 for name in &target.shards {
                     rollback_by_shard
