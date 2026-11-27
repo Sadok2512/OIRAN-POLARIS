@@ -4866,6 +4866,50 @@ some_option = 1
         assert_eq!(legacy.0, "LTE_ERAB_NOT_ESTABLISHED");
     }
 
+    /// 0.37.5 (lot C10, ordre cœur #9 7224408968) — une ligne portant À LA
+    /// FOIS un marqueur de recette et un mot d'identité est COMPTÉE par
+    /// `count_markers` / `count_ordered_marker_pairs` et reste REMPLACÉE dans
+    /// tout ce qui est stocké ou affiché : flux persisté
+    /// (`bounded_sanitized_log`), enregistrement de journal
+    /// (`build_full_log_record`, queue et taille), preuve sérialisée. Rouge
+    /// sur la tête de C5 `8ca508b`, vert après.
+    #[test]
+    fn a_marker_line_carrying_an_identity_word_is_counted_and_stays_redacted_0_37_5() {
+        let srsenb = "Tx S1AP SDU, InitialContextSetupResponse, rnti=0x46 imsi=001010000000001";
+        let sgwc_direct = "Modify Bearer Response EBI=5 tmsi=0x0badf00d";
+        let sgwc_pair = "Modify Bearer Request guti=00101-0001-0x0badf00d\nSession Modification Response supi=imsi-001010000000001";
+        assert_eq!(count_markers(srsenb, ICS_RESPONSE_LOG_MARKERS), 1, "marqueur ICS + identité non compté");
+        assert_eq!(count_markers(sgwc_direct, MODIFY_BEARER_RESPONSE_MARKERS), 1, "marqueur MBR + identité non compté");
+        assert_eq!(
+            count_ordered_marker_pairs(sgwc_pair, MODIFY_BEARER_REQUEST_MARKERS, PFCP_MODIFICATION_RESPONSE_MARKERS),
+            1,
+            "paire ordonnée + identité non comptée"
+        );
+        let evidence = evaluate_erab_establishment(srsenb, sgwc_direct).expect("marqueurs comptés malgré l'identité");
+        assert_eq!((evidence.ics_response_e_rab_markers, evidence.modify_bearer_response_markers), (1, 1));
+        let paired = evaluate_erab_establishment(srsenb, sgwc_pair).expect("paire comptée malgré l'identité");
+        assert_eq!(paired.modify_bearer_response_markers, 1);
+        let forbidden = ["001010000000001", "0badf00d", "imsi", "tmsi", "guti", "supi"];
+        for raw in [srsenb, sgwc_direct, sgwc_pair] {
+            let stored = bounded_sanitized_log(raw);
+            let record = build_full_log_record("guard", "/nonexistent/guard.log", raw);
+            let shown = [
+                stored.clone(),
+                record.sanitized_tail.clone(),
+                serde_json::to_string(&evidence).unwrap(),
+                serde_json::to_string(&paired).unwrap(),
+            ];
+            for text in &shown {
+                let lower = text.to_ascii_lowercase();
+                for word in forbidden {
+                    assert!(!lower.contains(word), "« {word} » stocké ou affiché");
+                }
+            }
+            assert!(stored.lines().all(|line| line == "[REDACTED_SUBSCRIBER_MATERIAL]"), "ligne non remplacée dans le flux stocké");
+            assert_eq!(record.bytes, stored.len() as u64);
+        }
+    }
+
     #[test]
     fn enb_network_diagnostic_args_mirror_ip_neigh_and_ip_s_link() {
         let neigh = ip_neigh_args("srsenb-id");
