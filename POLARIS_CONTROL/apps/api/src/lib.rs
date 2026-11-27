@@ -18312,6 +18312,156 @@ mod p0_tests {
             .unwrap();
     }
 
+    /// LOT C1 (ordre #9 7213520584, audit #9 7212972142) — faux runtime
+    /// dont chaque mesure iperf montante dure `measure` : il remplace les
+    /// lancements `docker` / `nsenter` / iperf3 réels, qui durent eux aussi
+    /// plus qu'un instant. Il note l'heure de fin de chaque mesure.
+    struct TimedIperfRuntime {
+        inner: FakeLiveUeRuntime,
+        measure: std::time::Duration,
+        finished_at: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl UeRuntime for TimedIperfRuntime {
+        fn verify_provisioning(&self, profiles: &[UeProfileSpec]) -> Result<BTreeMap<String, String>, String> { self.inner.verify_provisioning(profiles) }
+        fn approve_launch(&self, profile: &UeProfileSpec, profile_sha256: &str) -> Result<LiveLaunchSpec, String> { self.inner.approve_launch(profile, profile_sha256) }
+        fn launch(&self, spec: &LiveLaunchSpec) -> Result<String, UeLaunchFailure> { self.inner.launch(spec) }
+        fn discover(&self, spec: &LiveLaunchSpec) -> Result<Option<String>, String> { self.inner.discover(spec) }
+        fn observe_owned(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<UeObservation, String> { self.inner.observe_owned(spec, handle) }
+        fn observe_shared(&self) -> Result<UeObservation, String> { self.inner.observe_shared() }
+        fn owns(&self, spec: &LiveLaunchSpec, handle: &str) -> bool { self.inner.owns(spec, handle) }
+        fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String> { self.inner.stop(spec, handle) }
+        fn resolve_traffic_target(&self, job: &simulator_controller::UeJob, destination: &str) -> Result<VerifiedTrafficTarget, String> {
+            self.inner.resolve_traffic_target(job, destination)
+        }
+        fn execute_iperf_ul(
+            &self,
+            target: &VerifiedTrafficTarget,
+            bytes: u64,
+            _: &DlSenderConfig,
+        ) -> Result<IperfMeasurement, String> {
+            std::thread::sleep(self.measure);
+            self.finished_at.lock().unwrap().push(
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            );
+            Ok(IperfMeasurement {
+                client_sent_bytes: bytes,
+                server_received_bytes: bytes,
+                retransmissions: 0,
+                warning: None,
+                rate: "1M".into(),
+                tcp_window: "64K".into(),
+                preflight: UeRoutePreflight {
+                    destination: "10.46.0.1".into(),
+                    expected_dev: target.tun_interface.clone(),
+                    actual_dev: Some(target.tun_interface.clone()),
+                    src: Some(target.ue_ip.clone()),
+                    raw: String::new(),
+                    ok: true,
+                    code: None,
+                },
+            })
+        }
+    }
+
+    /// Lance une session de trafic montante de `duration_s` sur UE-05, avec
+    /// des mesures qui durent chacune `measure`, et attend sa conclusion.
+    /// Rend (durée de mur jusqu'à `COMPLETED`, session, échantillons, fins
+    /// de mesure).
+    async fn run_timed_traffic_session(
+        duration_s: u32,
+        measure: std::time::Duration,
+    ) -> (
+        std::time::Duration,
+        traffic_sessions::TrafficSession,
+        Vec<traffic_sessions::TrafficSample>,
+        Vec<u64>,
+    ) {
+        let mut test_state = state();
+        let finished_at = Arc::new(Mutex::new(Vec::new()));
+        test_state.ue_runtime = Arc::new(TimedIperfRuntime {
+            inner: FakeLiveUeRuntime {
+                stopped: Arc::new(Mutex::new(Vec::new())),
+                launched: Arc::new(Mutex::new(Vec::new())),
+                fail_observation: false,
+                fail_verification: false,
+                fail_stop: false,
+                fail_policy_route_cleanup: None,
+            },
+            measure,
+            finished_at: finished_at.clone(),
+        });
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        let state = Arc::new(test_state);
+        let request = traffic_sessions::SessionRequest {
+            ue_ids: vec!["UE-05".into()],
+            direction: traffic_sessions::Direction::Ul,
+            protocol: traffic_sessions::Protocol::Udp,
+            rate_mbps: 1,
+            duration_s,
+        };
+        let session = state.traffic_manager.start(request.clone()).unwrap();
+        state.traffic_manager.transition_running(&session.session_id).unwrap();
+        let started = std::time::Instant::now();
+        spawn_traffic_driver(state.clone(), session.session_id.clone(), request);
+        let deadline = started + std::time::Duration::from_secs(u64::from(duration_s) * 4 + 10);
+        loop {
+            let current = state.traffic_manager.get(&session.session_id).unwrap();
+            if !matches!(current.state, traffic_sessions::SessionState::Running) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "la session ne conclut pas");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let elapsed = started.elapsed();
+        let session = state.traffic_manager.get(&session.session_id).unwrap();
+        let samples = state.traffic_manager.samples(&session.session_id).unwrap();
+        let finished = finished_at.lock().unwrap().clone();
+        (elapsed, session, samples, finished)
+    }
+
+    /// LOT C1 — une session de trafic conclut à `duration_s` de MUR, et ses
+    /// échantillons sont datés à l'heure réelle de leur mesure (audit #9
+    /// 7212972142 : à 55f480d, `duration_s` est compté en tours de boucle,
+    /// chaque tour = mesure + 1 s de sommeil, et l'échantillon k est daté
+    /// `départ + k + 1` quelle que soit la durée réelle).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn traffic_session_completes_at_wall_clock_duration_with_real_sample_times() {
+        // Une mesure qui dure plus d'une seconde, comme un iperf3 réel à
+        // 1 Mbit/s (125 000 octets ≈ 1 s de transfert, plus les lancements).
+        let (elapsed, session, samples, finished) =
+            run_timed_traffic_session(3, std::time::Duration::from_millis(1_200)).await;
+        assert_eq!(session.state, traffic_sessions::SessionState::Completed);
+        assert!(
+            elapsed < std::time::Duration::from_millis(3_000 + 1_500),
+            "session de 3 s conclue en {elapsed:?}"
+        );
+        // Chaque échantillon porte l'heure de la mesure qu'il rapporte.
+        assert_eq!(samples.len(), finished.len(), "un échantillon par mesure");
+        for (sample, measured) in samples.iter().zip(finished.iter()) {
+            assert!(
+                sample.epoch_s.abs_diff(*measured) <= 1,
+                "échantillon daté {}, mesure finie à {measured}",
+                sample.epoch_s
+            );
+        }
+        let started = session.started_at_epoch_s;
+        let ended = session.ended_at_epoch_s.unwrap();
+        assert!(ended.saturating_sub(started) <= 4, "durée enregistrée {}", ended - started);
+    }
+
+    /// LOT C1 — non-régression : avec des mesures brèves, la session garde
+    /// un échantillon par seconde et conclut à `duration_s`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn traffic_session_with_fast_measurements_keeps_one_sample_per_second() {
+        let (elapsed, session, samples, _) =
+            run_timed_traffic_session(3, std::time::Duration::from_millis(50)).await;
+        assert_eq!(session.state, traffic_sessions::SessionState::Completed);
+        assert!(elapsed >= std::time::Duration::from_millis(2_800), "conclue trop tôt : {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(3_000 + 1_000), "conclue en {elapsed:?}");
+        assert_eq!(samples.len(), 3, "un échantillon par seconde");
+    }
+
     fn targeted_scenario_request(
         cookie: &str,
         csrf: &str,
