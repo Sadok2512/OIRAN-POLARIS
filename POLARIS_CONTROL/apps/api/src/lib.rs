@@ -24422,6 +24422,307 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         check("réponse", &item);
     }
 
+    /// LOT C5bis (ordre cœur #9 7225711657, refus ANR2 #10 7225668191) — crée
+    /// par HTTP une définition d'une étape `wait` ; rend le statut.
+    async fn c5bis_create_definition(application: &Router, cookie: &str, csrf: &str, id: &str) -> StatusCode {
+        // Un nom unique par création : la création refuse (409) un doublon de
+        // nom et de version, ce qui fausserait le sondage de longueur.
+        static NAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let name = format!("C5bis key bound {}", NAMES.fetch_add(1, Ordering::SeqCst));
+        let definition = json!({
+            "id": id, "name": name, "loop_count": 1,
+            "steps": [{"type": "wait", "loop_count": 1, "parameters": {"duration_ms": {"fixed": 1}}}]
+        });
+        let response = application
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenario-definitions").header(header::CONTENT_TYPE, "application/json").header(header::COOKIE, cookie).header("x-csrf-token", csrf).body(Body::from(definition.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        if status != StatusCode::CREATED {
+            // Un sondage ne compte comme « refusé pour sa longueur » que sur
+            // le refus d'identifiant ; tout autre refus fait échouer le garde.
+            let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap_or(Value::Null);
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::UNPROCESSABLE_ENTITY, Some("SCENARIO_DEFINITION_INVALID")),
+                "création de {} caractères refusée pour une autre raison",
+                id.len()
+            );
+        }
+        status
+    }
+
+    /// LOT C5bis — lance la définition par le VRAI chemin de génération de
+    /// clé (`POST /scenarios/start`, mode simulé) et rend le `job_id` généré.
+    async fn c5bis_start_definition(application: &Router, cookie: &str, csrf: &str, id: &str) -> String {
+        let response = application
+            .clone()
+            .oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenarios/start").header(header::CONTENT_TYPE, "application/json").header(header::COOKIE, cookie).header("x-csrf-token", csrf).body(Body::from(json!({"scenario_definition_id": id, "ue_ids": ["UE-05"]}).to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "lancement de {} caractères", id.len());
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        body["job_id"].as_str().expect("job_id généré").to_string()
+    }
+
+    /// LOT C5bis — la clé générée doit rester la clé d'origine à chaque
+    /// passage : deux mises à jour, écriture, `recover_runtime`, mise à jour,
+    /// `GET /scenarios/:job_id/steps`.
+    async fn c5bis_assert_generated_key_survives(inspect: &AppState, application: &Router, job_id: &str, case: &str) {
+        for pass in ["première", "deuxième"] {
+            let updated = update_definition_record(inspect, job_id, |record| {
+                record["note_c5bis"] = json!(pass);
+            });
+            assert!(updated.is_ok(), "{case} : {pass} mise à jour : {:?}", updated.err());
+            assert_eq!(updated.unwrap()["job_id"], job_id, "{case} : {pass} mise à jour : clé remplacée");
+        }
+        {
+            let runtime = inspect.runtime.lock().unwrap();
+            persist_runtime(inspect, &runtime);
+        }
+        let written: Value = serde_json::from_slice(&fs::read(&inspect.job_state_path).unwrap()).unwrap();
+        assert!(
+            written["history"].as_array().unwrap().iter().any(|record| record["job_id"] == job_id),
+            "{case} : écriture : clé remplacée sur disque"
+        );
+        *inspect.runtime.lock().unwrap() = recover_runtime(Some(written));
+        let updated = update_definition_record(inspect, job_id, |record| {
+            record["note_c5bis"] = json!("après reprise");
+        });
+        assert!(updated.is_ok(), "{case} : mise à jour après reprise : {:?}", updated.err());
+        let steps = application
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/v1/scenarios/{job_id}/steps")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(steps.status(), StatusCode::OK, "{case} : GET /scenarios/:job_id/steps");
+    }
+
+    /// LOT C5bis — garde sur la FRONTIÈRE entre les deux domaines : une
+    /// définition valide de 52 caractères portant dix chiffres d'affilée
+    /// produit une clé de 65 (52 + `-` + 12 hexadécimaux). Cas exact d'ANR2
+    /// (#10 7225668191). Rouge sur `8ca508b` : la reconnaissance de clé de C5
+    /// bornait à 64.
+    #[tokio::test]
+    async fn c5bis_generated_key_of_65_from_a_52_character_definition_is_never_sanitized_0_37_5() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5bis-key-telemetry-0.37.5-0123456789abcdef".as_slice())));
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        let inspect = test_state.clone();
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let definition_id = format!("{}-1795600000", "b".repeat(41));
+        assert_eq!(definition_id.len(), 52);
+        assert_eq!(c5bis_create_definition(&application, &cookie, &csrf, &definition_id).await, StatusCode::CREATED);
+        let job_id = c5bis_start_definition(&application, &cookie, &csrf, &definition_id).await;
+        assert_eq!(job_id.len(), 65, "clé générée");
+        c5bis_assert_generated_key_survives(&inspect, &application, &job_id, "52/65").await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5bis — garde ANTI-DÉRIVE : la plus longue définition que la
+    /// création accepte RÉELLEMENT (sondée par HTTP, pas lue dans une
+    /// constante) produit une clé que la reconnaissance doit garder. Si la
+    /// borne de `safe_id` change sans que la reconnaissance suive, ce garde
+    /// échoue. Rouge sur `8ca508b` : 64 caractères de définition, clé de 77.
+    #[tokio::test]
+    async fn c5bis_longest_accepted_definition_yields_a_key_that_is_never_sanitized_0_37_5() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5bis-key-telemetry-0.37.5-0123456789abcdef".as_slice())));
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        let inspect = test_state.clone();
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        // Identifiant de longueur exacte `length`, unique par sondage, avec
+        // une suite de dix chiffres (le cas qui déclenche l'assainissement).
+        let id_of = |length: usize, tag: &str| {
+            let head = format!("d{tag}-1795600000-");
+            format!("{head}{}", "b".repeat(length.saturating_sub(head.len())))
+        };
+        // Recherche dichotomique de la plus grande longueur acceptée.
+        let (mut accepted, mut refused) = (24_usize, 4_096_usize);
+        assert_eq!(c5bis_create_definition(&application, &cookie, &csrf, &id_of(accepted, "lo")).await, StatusCode::CREATED);
+        assert_ne!(c5bis_create_definition(&application, &cookie, &csrf, &id_of(refused, "hi")).await, StatusCode::CREATED);
+        while refused - accepted > 1 {
+            let middle = (accepted + refused) / 2;
+            let tag = format!("p{middle}");
+            if c5bis_create_definition(&application, &cookie, &csrf, &id_of(middle, &tag)).await == StatusCode::CREATED {
+                accepted = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        let longest = id_of(accepted, "max");
+        assert_eq!(longest.len(), accepted);
+        assert_eq!(c5bis_create_definition(&application, &cookie, &csrf, &longest).await, StatusCode::CREATED);
+        let job_id = c5bis_start_definition(&application, &cookie, &csrf, &longest).await;
+        assert!(job_id.starts_with(&longest) && job_id.len() > accepted, "clé générée depuis la définition");
+        c5bis_assert_generated_key_survives(&inspect, &application, &job_id, &format!("définition de {accepted}, clé de {}", job_id.len())).await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5 (ordres cœur #9 7218377047 et 7218858535, audit CLAUDE2 #9
+    /// 7218478108) — cas 1 : un job de définition dont le suffixe
+    /// hexadécimal porte dix chiffres d'affilée (classe ≈ 1,59 %) reste
+    /// retrouvable après CHAQUE mise à jour. Avant : la première mise à jour
+    /// assainissait `job_id` en mémoire, la suivante répondait
+    /// `SCENARIO_JOB_NOT_FOUND`, avalée par `let _ =`.
+    #[tokio::test]
+    async fn c5_definition_job_in_the_digit_class_is_found_after_every_update_0_37_4() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5-key-telemetry-0.37.4-0123456789abcdef".as_slice())));
+        let shared = Arc::new(state());
+        let job_id = "c5-def-0123456789ab";
+        shared.runtime.lock().unwrap().history.push(json!({
+            "job_id": job_id, "scenario_id": "c5-def", "state": "RUNNING",
+            "ue_ids": ["UE-05"], "steps": [{"state": "PENDING"}, {"state": "PENDING"}],
+        }));
+        for (position, stage) in ["première", "deuxième", "troisième"].iter().enumerate() {
+            let updated = update_definition_record(&shared, job_id, |record| {
+                record["steps"][position.min(1)]["state"] = json!("COMPLETED");
+            });
+            assert!(updated.is_ok(), "{stage} mise à jour : {:?}", updated.err());
+            assert_eq!(updated.unwrap()["job_id"], job_id, "{stage} mise à jour : clé remplacée");
+        }
+        assert!(definition_record_index(&shared.runtime.lock().unwrap(), job_id).is_some());
+        let steps = app((*shared).clone())
+            .oneshot(Request::builder().uri(format!("/api/v1/scenarios/{job_id}/steps")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(steps.status(), StatusCode::OK, "GET /scenarios/:job_id/steps");
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5 — cas 2 : écriture, relecture du fichier, `recover_runtime`,
+    /// mise à jour et réponse (parcours réel `history_real_path_0_37_1`) :
+    /// `job_id` reste la clé d'origine à chaque étape, et les autres champs
+    /// texte restent protégés (propriété au repos de 0.36.31 conservée).
+    #[tokio::test]
+    async fn c5_job_id_in_the_digit_class_survives_write_and_recovery_0_37_4() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5-key-telemetry-0.37.4-0123456789abcdef".as_slice())));
+        let record = json!({
+            "job_id": "c5-def-0123456789ab", "state": "RUNNING",
+            "target_ue_id": "UE-05", "ue_ids": ["UE-05"],
+            "note": "subscriber 001010000000201 refused",
+        });
+        history_real_path_0_37_1("c5-def-0123456789ab", record, |stage, record| {
+            assert_eq!(record["job_id"], "c5-def-0123456789ab", "{stage} : job_id remplacé");
+            assert_eq!(record["target_ue_id"], "UE-05", "{stage} : target_ue_id remplacé");
+            assert_eq!(record["ue_ids"], json!(["UE-05"]), "{stage} : ue_ids remplacés");
+            assert!(record["note"].as_str().unwrap_or_default().starts_with("history-"), "{stage} : protection perdue");
+        })
+        .await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5 — cas 2c : après un redémarrage, un `scenario_id` certifié qui
+    /// porte dix chiffres (un horodatage) est RETROUVÉ par `POST
+    /// /scenarios/start` : la garde d'appartenance répond
+    /// `OWNERSHIP_TARGET_MISMATCH` sur une autre cible, l'idempotence répond
+    /// sur la même. Avant : la clé assainie au disque n'était plus retrouvée,
+    /// et les deux gardes étaient sautées sans bruit.
+    #[tokio::test]
+    async fn c5_certified_scenario_id_with_ten_digits_is_found_after_restart_0_37_4() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5-key-telemetry-0.37.4-0123456789abcdef".as_slice())));
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-04", true);
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        let scenario_id = "c5-run-1795600000";
+        {
+            let mut runtime = test_state.runtime.lock().unwrap();
+            runtime.history.push(json!({
+                "job_id": scenario_id, "state": "STOPPED", "target_ue_id": "UE-04",
+                "scenario_type": "bounded-controller-ue-udp-v1",
+            }));
+            persist_runtime(&test_state, &runtime);
+        }
+        let written: Value = serde_json::from_slice(&fs::read(&test_state.job_state_path).unwrap()).unwrap();
+        *test_state.runtime.lock().unwrap() = recover_runtime(Some(written));
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+
+        assert_eq!(validate_targeted(&application, &cookie, &csrf, "UE-05").await, StatusCode::OK);
+        let other_target = application.clone().oneshot(targeted_scenario_request(&cookie, &csrf, scenario_id, "UE-05")).await.unwrap();
+        assert_eq!(other_target.status(), StatusCode::CONFLICT, "garde d'appartenance sautée");
+        let body: Value = serde_json::from_slice(&to_bytes(other_target.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "OWNERSHIP_TARGET_MISMATCH");
+
+        assert_eq!(validate_targeted(&application, &cookie, &csrf, "UE-04").await, StatusCode::OK);
+        let same_target = application.clone().oneshot(targeted_scenario_request(&cookie, &csrf, scenario_id, "UE-04")).await.unwrap();
+        assert_eq!(same_target.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(same_target.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["idempotent"], true, "idempotence sautée");
+        assert_eq!(body["job_id"], scenario_id);
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5 — cas 2c, second volet : un `scenario_id` (ou un identifiant de
+    /// définition) qui porte un marqueur d'abonné est REFUSÉ À L'ENTRÉE, avec
+    /// une erreur nommée, au lieu d'être accepté puis muté.
+    #[tokio::test]
+    async fn c5_scenario_id_carrying_a_subscriber_marker_is_refused_at_entry_0_37_4() {
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-04", true);
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        for scenario_id in ["c5-imsi-run", "C5-SUPI-run", "msisdn_c5", "c5-imei", "c5-suci", "c5-guti", "c5-tmsi"] {
+            let response = application.clone().oneshot(targeted_scenario_request(&cookie, &csrf, scenario_id, "UE-04")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{scenario_id}");
+            let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(body["error"], "SCENARIO_ID_SUBSCRIBER_MARKER", "{scenario_id}");
+        }
+        let definition = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/scenarios/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"scenario_definition_id":"c5-imsi-def","ue_ids":["UE-04"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(definition.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = serde_json::from_slice(&to_bytes(definition.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "SCENARIO_ID_SUBSCRIBER_MARKER");
+    }
+
+    /// LOT C5 — point 3 : quand l'enregistrement d'un job de définition en
+    /// cours est introuvable, le stop répond une erreur NOMMÉE, au lieu de
+    /// fabriquer `{"state":"STOPPING"}` sans rien enregistrer.
+    #[tokio::test]
+    async fn c5_stop_of_a_definition_job_without_record_reports_a_named_error_0_37_4() {
+        let test_state = state();
+        test_state
+            .definition_jobs
+            .lock()
+            .unwrap()
+            .insert("c5-lost-0123456789ab".into(), definition_control_for(&["UE-05"]));
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/scenarios/stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"job_id":"c5-lost-0123456789ab"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR, "état STOPPING fabriqué");
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "SCENARIO_JOB_NOT_FOUND");
+        assert_eq!(body["cancel_requested"], true);
+    }
+
     /// 0.37.1 (lot C7, clause 1, ordre cœur #9 7220805261) — les références
     /// `psn-` et `scenario-` à 12 hexadécimaux, dont le suffixe porte 10
     /// chiffres, restent TELLES QUELLES à toutes les étapes ; le littéral à 16
