@@ -18374,6 +18374,178 @@ mod p0_tests {
             .unwrap();
     }
 
+    /// LOT C2b (ordre #9 7214037835, audit #9 7213941919) — faux runtime qui
+    /// compte les mesures iperf lancées et répond aussitôt.
+    struct CountingIperfRuntime {
+        inner: FakeLiveUeRuntime,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UeRuntime for CountingIperfRuntime {
+        fn verify_provisioning(&self, profiles: &[UeProfileSpec]) -> Result<BTreeMap<String, String>, String> { self.inner.verify_provisioning(profiles) }
+        fn approve_launch(&self, profile: &UeProfileSpec, profile_sha256: &str) -> Result<LiveLaunchSpec, String> { self.inner.approve_launch(profile, profile_sha256) }
+        fn launch(&self, spec: &LiveLaunchSpec) -> Result<String, UeLaunchFailure> { self.inner.launch(spec) }
+        fn discover(&self, spec: &LiveLaunchSpec) -> Result<Option<String>, String> { self.inner.discover(spec) }
+        fn observe_owned(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<UeObservation, String> { self.inner.observe_owned(spec, handle) }
+        fn observe_shared(&self) -> Result<UeObservation, String> { self.inner.observe_shared() }
+        fn owns(&self, spec: &LiveLaunchSpec, handle: &str) -> bool { self.inner.owns(spec, handle) }
+        fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String> { self.inner.stop(spec, handle) }
+        fn resolve_traffic_target(&self, job: &simulator_controller::UeJob, destination: &str) -> Result<VerifiedTrafficTarget, String> {
+            self.inner.resolve_traffic_target(job, destination)
+        }
+        fn execute_iperf_ul(
+            &self,
+            target: &VerifiedTrafficTarget,
+            bytes: u64,
+            _: &DlSenderConfig,
+        ) -> Result<IperfMeasurement, String> {
+            self.calls.lock().unwrap().push(format!("ul:{bytes}"));
+            Ok(IperfMeasurement {
+                client_sent_bytes: bytes,
+                server_received_bytes: bytes,
+                retransmissions: 0,
+                warning: None,
+                rate: "1M".into(),
+                tcp_window: "64K".into(),
+                preflight: UeRoutePreflight {
+                    destination: "10.46.0.1".into(),
+                    expected_dev: target.tun_interface.clone(),
+                    actual_dev: Some(target.tun_interface.clone()),
+                    src: Some(target.ue_ip.clone()),
+                    raw: String::new(),
+                    ok: true,
+                    code: None,
+                },
+            })
+        }
+    }
+
+    fn counting_iperf_state() -> (AppState, Arc<Mutex<Vec<String>>>) {
+        let mut test_state = state();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        test_state.ue_runtime = Arc::new(CountingIperfRuntime {
+            inner: FakeLiveUeRuntime {
+                stopped: Arc::new(Mutex::new(Vec::new())),
+                launched: Arc::new(Mutex::new(Vec::new())),
+                fail_observation: false,
+                fail_verification: false,
+                fail_stop: false,
+                fail_policy_route_cleanup: None,
+            },
+            calls: calls.clone(),
+        });
+        test_state.dl_sender_health_override = Some(Ok(()));
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        (test_state, calls)
+    }
+
+    fn traffic_step(parameters: Value) -> ResolvedStep {
+        ResolvedStep {
+            index: 0,
+            step_type: "traffic_ul".into(),
+            scenario_loop_iteration: 1,
+            scenario_loop_count: 1,
+            step_loop_iteration: 1,
+            step_loop_count: 1,
+            parameters: serde_json::from_value(parameters).unwrap(),
+        }
+    }
+
+    fn definition_control_for(ue_ids: &[&str]) -> DefinitionJobControl {
+        let owned: Vec<String> = ue_ids.iter().map(|ue| (*ue).to_string()).collect();
+        DefinitionJobControl {
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+            established_pdus: Arc::new(Mutex::new(BTreeMap::new())),
+            ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
+            started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(&owned, "test-fixture")),
+        }
+    }
+
+    /// LOT C2b — les gabarits 5G de données déclarent ce qu'ils mesurent :
+    /// du TCP. Avant : libellé « UDP », `protocol = "UDP"`,
+    /// `tcp_authorized = false`, alors que l'étape mesure en TCP (relevé
+    /// ANR2 : l'exécution `tpl-5g-registration-pdu-data` du 14/11 porte des
+    /// `retransmissions` et un `tcp_window`).
+    #[test]
+    fn five_g_data_templates_declare_the_tcp_they_measure() {
+        let five_g_data: Vec<_> = scenario_definitions::default_scenario_templates()
+            .into_iter()
+            .filter(|template| template.rat == "5G_SA")
+            .filter(|template| {
+                template
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step.step_type.as_str(), "traffic_ul" | "traffic_dl"))
+            })
+            .collect();
+        assert_eq!(five_g_data.len(), 4, "tpl-5g-data-ul, -data-dl, -registration-pdu-data, -full-session");
+        for template in &five_g_data {
+            assert!(
+                template.description.contains("TCP") && !template.description.contains("UDP"),
+                "{} : libellé « {} »",
+                template.template_id,
+                template.description
+            );
+            assert_eq!(template.parameters["transport"], "TCP", "{}", template.template_id);
+            assert_eq!(template.parameters["tcp_authorized"], true, "{}", template.template_id);
+            for step in template
+                .steps
+                .iter()
+                .filter(|step| matches!(step.step_type.as_str(), "traffic_ul" | "traffic_dl"))
+            {
+                let declared = serde_json::to_value(&step.parameters).unwrap();
+                assert_eq!(declared["protocol"]["fixed"], "TCP", "{} : étape {}", template.template_id, step.step_type);
+                assert_eq!(declared["tcp_authorized"]["fixed"], true, "{} : étape {}", template.template_id, step.step_type);
+            }
+            assert!(scenario_definitions::validate_template_descriptor(template).is_ok(), "{}", template.template_id);
+        }
+    }
+
+    /// LOT C2b — une étape de trafic 5G qui déclare UDP est REFUSÉE, au lieu
+    /// d'être mesurée en TCP. Avant : seul `bytes` était lu, et la mesure
+    /// TCP partait.
+    #[test]
+    fn five_g_traffic_step_declared_udp_is_refused_and_never_measured() {
+        let (test_state, calls) = counting_iperf_state();
+        let step = traffic_step(json!({
+            "bytes": 125_000, "protocol": "UDP", "rate_bps": 1_000_000,
+            "duration_seconds": 1, "tcp_authorized": false
+        }));
+        let result = execute_live_definition_step(&test_state, &step, &["UE-05".into()], &definition_control_for(&["UE-05"]));
+        assert_eq!(result.unwrap_err(), "TRAFFIC_UDP_NOT_MEASURED_ON_5G");
+        assert!(calls.lock().unwrap().is_empty(), "aucune mesure lancée");
+    }
+
+    /// LOT C2b — une session de trafic 5G qui demande UDP est refusée.
+    #[tokio::test]
+    async fn five_g_traffic_session_requesting_udp_is_refused() {
+        let test_state = state();
+        install_live_grant_for(&test_state, &["UE-02"]);
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/traffic/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        json!({"ue_ids":["UE-02"],"direction":"UL","protocol":"UDP","rate_mbps":1,"duration_s":2}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "TRAFFIC_5G_UDP_NOT_MEASURED");
+    }
+
     /// 0.36.38 — référence d'adresse protégée : `addr-` suivi de douze
     /// caractères hexadécimaux minuscules (HMAC), ou `addr-redacted` sans clé.
     fn is_protected_address_reference(value: &str) -> bool {
