@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.37.3 — Reprise de l'History : le jumeau `started_at_epoch_s` ne se dérive jamais de la chaîne `started_at` (lot C9)
+
+Lot C9, ordre du cœur #9 7223299148, à la suite de l'écart déclaré en #9 7222978560 et 7223413399. Base : la tête de C8 `e41120b` (0.37.2), qui contient C7bis `22bb4a5`, la production 0.37.1. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché par ce lot.
+
+- **Défaut.** À la reprise (`recover_runtime` → `normalize_terminal_record`), un enregistrement sans `started_at_epoch_s` recevait `started_at` parsé en `u64`, puis `ended_at_epoch_s` = cette valeur + `duration_seconds`. Le filtre de l'History ne visite que les chaînes, donc ces deux **nombres** sortaient **en clair**. De plus, la valeur ainsi parsée devenait le jumeau qui exemptait `started_at` lui-même (clause 2 de 0.37.1), ce qui rendait l'exemption circulaire.
+- **Correction.** Le jumeau n'est lu que s'il est **déjà** un nombre. Sinon `started_at_epoch_s` reste **absent** et `started_at` passe par le filtre. Faute de début connu, `ended_at_epoch_s` manquant vaut `0 + duration_seconds`, comme c'était déjà le cas pour un `started_at` non parseable.
+- **Garde** `a_started_at_without_twin_never_creates_its_own_twin_on_recovery_0_37_3`. Il prend un enregistrement sans jumeau, avec un `started_at` synthétique de quinze chiffres, et un enregistrement avec jumeau concordant. Il vérifie après la reprise, puis à la réponse, à la mise à jour, à l'écriture et à une seconde reprise, que :
+  - `started_at` est remplacé ;
+  - le jumeau est absent ;
+  - ni la valeur ni valeur + durée n'apparaît ;
+  - le `started_at` concordant reste intact.
+
+  Il est **rouge sur la tête de C8**.
+- **Non couvert, déclaré :** aucune réécriture des fichiers d'History existants. Le nombre d'enregistrements relus sans jumeau n'a pas été mesuré.
+
 ## 0.37.2 — 2026-11-27 — Le formulaire 5G des sessions de trafic s'initialise en TCP et n'émet jamais UDP (lot C8)
 
 Patch. Ordres cœur #9 7222823828 et 7223299148. Base : 0.37.1 @ `22bb4a5` (C7bis, CLAUDE2), elle-même au-dessus de `5892f03` (C2b, production).
