@@ -10540,6 +10540,19 @@ fn sanitize_history_value(value: &mut Value, clear: bool) {
                     *value = json!("PROTECTED");
                     continue;
                 }
+                // 0.37.1 (lot C7, ordre cœur #9 7220805261) — `started_at` est un
+                // horodatage en secondes écrit en texte (`job_json`,
+                // `record_certified_failure`) : 10 chiffres jusqu'en 2286, donc
+                // remplacé à 100 % par le test de chiffres. Il est exclu du test
+                // UNIQUEMENT s'il n'est fait que de chiffres (un horodatage) ;
+                // tout autre contenu y passe comme avant.
+                if field == "started_at"
+                    && value
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+                {
+                    continue;
+                }
                 if matches!(field.as_str(), "error_code" | "cause" | "terminal_result") {
                     if let Some(text) = value.as_str() {
                         let sanitized_text =
@@ -10628,7 +10641,13 @@ fn without_own_history_tokens(value: &str) -> String {
     'scan: while index < bytes.len() {
         let boundary = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
         if boundary {
-            for prefix in ["addr-", "history-"] {
+            // 0.37.1 (lot C7, ordre cœur #9 7220805261) — aussi `psn-` et
+            // `scenario-` : mêmes références à 12 hexadécimaux produites par
+            // `safe_telemetry_reference_with_key`. L'ancrage sur exactement 12
+            // hexadécimaux suivis d'un non-hexadécimal laisse hors du retrait
+            // un jeton plus long (le littéral `psn-0123456789abcdef` à 16 du
+            // garde d'octets identiques de 0.36.30 reste testé et remplacé).
+            for prefix in ["addr-", "history-", "psn-", "scenario-"] {
                 let start = index + prefix.len();
                 let end = start + 12;
                 if value[index..].starts_with(prefix)
@@ -24351,6 +24370,87 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         check("réponse", &item);
         TEST_TELEMETRY_KEY.with(|key| key.set(None));
     }
+
+    /// 0.37.1 (lot C7) — fait passer une entrée par le parcours RÉEL de
+    /// l'History (écriture, relecture du fichier, mise à jour, réponse) et
+    /// applique `check` à chaque étape.
+    async fn history_real_path_0_37_1(job_id: &str, record: Value, check: impl Fn(&str, &Value)) {
+        let shared = Arc::new(state());
+        {
+            let mut runtime = shared.runtime.lock().unwrap();
+            runtime.history.push(record);
+            persist_runtime(&shared, &runtime);
+        }
+        let written: Value = serde_json::from_slice(&fs::read(&shared.job_state_path).unwrap()).unwrap();
+        check("écriture", &written["history"][0]);
+        *shared.runtime.lock().unwrap() = recover_runtime(Some(written));
+        check("relecture", &shared.runtime.lock().unwrap().history[0].clone());
+        let updated = update_definition_record(&shared, job_id, |record| {
+            record["state"] = json!("STOPPING");
+        })
+        .unwrap();
+        check("mise à jour", &updated);
+        let payload = history(State(shared.clone())).await.0;
+        let item = payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["job_id"] == job_id)
+            .cloned()
+            .expect("entrée servie");
+        check("réponse", &item);
+    }
+
+    /// 0.37.1 (lot C7, clause 1, ordre cœur #9 7220805261) — les références
+    /// `psn-` et `scenario-` à 12 hexadécimaux, dont le suffixe porte 10
+    /// chiffres, restent TELLES QUELLES à toutes les étapes ; le littéral à 16
+    /// hexadécimaux de 0.36.30 `psn-0123456789abcdef`, une vraie suite de
+    /// chiffres et un `imsi` restent `history-…`. Rouge sur `ed0169a`.
+    #[tokio::test]
+    async fn own_psn_and_scenario_references_survive_every_history_pass_0_37_1() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c7-path-telemetry-key-0.37.1-0123456789abcdef".as_slice())));
+        let record = json!({
+            "job_id": "c7-references", "state": "RUNNING",
+            "target_ue_pseudonym": "psn-0123456789ab",
+            "scenario_id": "scenario-9876543210fe",
+            "legacy_16": "psn-0123456789abcdef",
+            "real_digits": "subscriber 001010000000201 refused",
+            "marker": "imsi of peer unknown",
+        });
+        history_real_path_0_37_1("c7-references", record, |stage, record| {
+            assert_eq!(record["target_ue_pseudonym"], "psn-0123456789ab", "{stage} : référence psn- remplacée");
+            assert_eq!(record["scenario_id"], "scenario-9876543210fe", "{stage} : référence scenario- remplacée");
+            for field in ["legacy_16", "real_digits", "marker"] {
+                assert!(record[field].as_str().unwrap_or_default().starts_with("history-"), "{stage} / {field} : protection perdue");
+            }
+        })
+        .await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// 0.37.1 (lot C7, clause 2, ordre cœur #9 7220805261) — `started_at` en
+    /// texte d'horodatage (10 chiffres) reste TEL QUEL à toutes les étapes ;
+    /// un `started_at` qui n'est pas un pur horodatage reste protégé.
+    /// Rouge sur `ed0169a`.
+    #[tokio::test]
+    async fn a_started_at_timestamp_survives_every_history_pass_0_37_1() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c7-path-telemetry-key-0.37.1-0123456789abcdef".as_slice())));
+        let record = json!({
+            "job_id": "c7-started-at", "state": "RUNNING",
+            "started_at": "1795600000",
+            "nested": [{"started_at": "imsi 001010000000201"}],
+        });
+        history_real_path_0_37_1("c7-started-at", record, |stage, record| {
+            assert_eq!(record["started_at"], "1795600000", "{stage} : started_at remplacé");
+            assert!(
+                record["nested"][0]["started_at"].as_str().unwrap_or_default().starts_with("history-"),
+                "{stage} : un started_at qui n'est pas un horodatage reste protégé"
+            );
+        })
+        .await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
 
     #[test]
     fn imsi_switch_keeps_ip_addresses_and_authentication_material_protected() {

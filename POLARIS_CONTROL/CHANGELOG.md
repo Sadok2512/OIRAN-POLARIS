@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.37.1 — History : les références `psn-`/`scenario-` et l'horodatage `started_at` ne sont plus remplacés par le test des chiffres
+
+Lot C7, ordre du cœur #9 7220805261, à la suite de l'inventaire #9 7220217031. Base : la tête C2b `5892f03` (0.37.0), dont `ed0169a`, la production relevée, est l'ancêtre. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché.
+
+- **Clause 1.** Le test des 10 chiffres ne réagit plus aux références que le filtre produit : `addr-`, `history-`, **`psn-`** et **`scenario-`**, chacune ancrée sur exactement 12 hexadécimaux suivis d'un non-hexadécimal. Avant, une référence `psn-…` (`target_ue_pseudonym`) ou `scenario-…` (échecs certifiés) dont le suffixe portait 10 chiffres était remplacée, soit environ 1,59 % de chacune. Le littéral à 16 hexadécimaux du garde d'octets identiques de 0.36.30, `psn-0123456789abcdef`, échappe à l'ancrage : il reste testé et **reste remplacé**, et la sortie figée est inchangée.
+- **Clause 2.** `started_at`, horodatage en secondes écrit en texte par `job_json` et `record_certified_failure`, était remplacé à **100 %** : 10 chiffres jusqu'en 2286. Il est exclu du test **seulement s'il n'est fait que de chiffres**, tout autre contenu y passe comme avant. Le même instant existe en nombre (`started_at_epoch_s`). La duplication est notée au dossier et n'est pas traitée ici, sur décision du cœur.
+- **Non couvert, déclaré :** les textes fournis par l'utilisateur (nom, identifiant et version d'une définition, `resolved_parameters`). Le filtre les protège : c'est sa raison d'être.
+- **Gardes**, sur le parcours réel de l'History (écriture, relecture, mise à jour, réponse) :
+  - `own_psn_and_scenario_references_survive_every_history_pass_0_37_1`, pour la clause 1 ;
+  - `a_started_at_timestamp_survives_every_history_pass_0_37_1`, pour la clause 2.
+
+  Les deux sont **rouges sur `ed0169a`** (`proof/control-c7-guard-on-ed0169a`) et verts ici. Le garde d'octets identiques de 0.36.30 reste vert.
+
 ## 0.37.0 — 2026-11-27 — Le chemin 5G déclare le TCP qu'il mesure, et refuse l'UDP qu'il ne mesure pas (lot C2b)
 
 **Mineure** `polaris-control-api` : des requêtes acceptées jusqu'ici sont désormais refusées, et une variable d'environnement cesse d'avoir effet. Ordre cœur #9 7214037835 et 7216533055, audit #9 7213941919. Base : 0.36.38 (lot C4).
