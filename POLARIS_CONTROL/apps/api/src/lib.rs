@@ -18374,6 +18374,16 @@ mod p0_tests {
             .unwrap();
     }
 
+    /// 0.36.38 — référence d'adresse protégée : `addr-` suivi de douze
+    /// caractères hexadécimaux minuscules (HMAC), ou `addr-redacted` sans clé.
+    fn is_protected_address_reference(value: &str) -> bool {
+        value == "addr-redacted"
+            || value.strip_prefix("addr-").is_some_and(|suffix| {
+                suffix.len() == 12
+                    && suffix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    }
+
     /// LOT C1 (ordre #9 7213520584, audit #9 7212972142) — faux runtime
     /// dont chaque mesure iperf montante dure `measure` : il remplace les
     /// lancements `docker` / `nsenter` / iperf3 réels, qui durent eux aussi
@@ -20924,8 +20934,24 @@ mod p0_tests {
         assert_eq!(inventory["active_count"], 3);
         assert_eq!(inventory["registered_count"], 3);
         assert_eq!(inventory["pdu_session_count"], 3);
-        assert_eq!(inventory["items"][1]["ue_ip"], "10.46.0.5");
-        assert_eq!(inventory["items"][2]["ue_ip"], "10.46.0.6");
+        // 0.36.38 (lot C4, ordre #9 7214037835) — le contrat de `/ues`
+        // depuis 0.36.35 : une référence protégée, jamais une adresse brute.
+        // Le test attendait encore l'adresse en clair et était rouge à la
+        // base de production. Ni clé en dur, ni valeur attendue en clair :
+        // la forme de la référence, et l'absence de toute adresse brute.
+        for index in [1, 2] {
+            let reference = inventory["items"][index]["ue_ip"]
+                .as_str()
+                .unwrap_or_else(|| panic!("UE {index} : une référence d'adresse est attendue"));
+            assert!(
+                is_protected_address_reference(reference),
+                "UE {index} : `ue_ip` n'est pas une référence protégée"
+            );
+        }
+        let body = inventory.to_string();
+        for raw in ["10.46.0.4", "10.46.0.5", "10.46.0.6"] {
+            assert!(!body.contains(raw), "`/ues` rend une adresse brute observée par le runtime");
+        }
 
         let stopped = application
             .clone()

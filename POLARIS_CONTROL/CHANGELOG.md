@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.36.38 — 2026-11-27 — Le test de l'inventaire UE affirme une référence protégée, plus une adresse en clair (lot C4)
+
+Patch `polaris-control-api`, test seul. Ordre cœur #9 7214037835. Base : 0.36.37 (lot C1).
+
+- `live_group_starts_only_ue_02_and_ue_03_and_inventory_uses_current_observations` attendait `items[1].ue_ip == "10.46.0.5"` en clair. Depuis 0.36.35 (`55f480d`, « protect assigned addresses in UE inventory »), `/ues` rend une référence protégée : le test était **rouge à la base de production** (5 sur 5, et rejoué sur `55f480d` pur). Le code a raison, le test avait tort.
+- Le test affirme désormais, pour les deux UE démarrés, une référence de la forme `addr-` + douze caractères hexadécimaux (ou `addr-redacted` sans clé), et **l'absence de toute adresse brute** observée par le runtime dans la réponse entière. Ni clé en dur, ni valeur attendue en clair.
+- Aucun code de production ne change.
+
 ## 0.36.37 — 2026-11-27 — Une session de trafic conclut à sa durée de mur ; ses échantillons sont datés à l'heure réelle (lot C1)
 
 Patch `polaris-control-api`. Ordre cœur #9 7213520584, audit #9 7212972142. Base : 0.36.36 @ `1004202` (lot C3, nouvelle tête, CLAUDE2 #9 7216898492 ; `ecc1be6` abandonné), elle-même au-dessus de `55f480d` (0.36.35, relevée sur le processus par ANR2 #10 7213626334) — têtes successives, ordre #9 7214037835. Preuve : `proof/control-traffic-duration-on-1004202` (première preuve sur `55f480d` : `proof/control-traffic-duration` @ `a888b5e`).
