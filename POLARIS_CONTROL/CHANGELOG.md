@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.37.4 — 2026-11-27 — Une clé n'est jamais assainie, un marqueur d'abonné est refusé à l'entrée, une recherche perdue n'est plus avalée (lot C5)
+
+Patch. Ordres cœur #9 7218377047, 7218858535 (règles arbitrées), 7223299148 (version et base), audit CLAUDE2 #9 7218478108. Base : 0.37.3 @ `995a173` (C9, production). Antériorité mesurée par ANR2 : 1 échec sur 42 passages sur `55f480d`.
+
+**Le défaut** : `job_id` passait par le filtre de l'History. Dès que son suffixe portait dix chiffres d'affilée, il devenait `history-…`. Cela arrivait pour environ 1,59 % des jobs de définition (`random_hex(6)`), et toujours pour un `scenario_id` certifié horodaté. L'enregistrement était muté en mémoire à chaque mise à jour, et sur disque par `persist_runtime`, puis rechargé tel quel par `recover_runtime`. Les recherches par valeur d'origine échouaient ensuite, et `let _ =` avalait `SCENARIO_JOB_NOT_FOUND`. Résultat : transitions d'étape, `STEP_FAILED` et état terminal perdus sans bruit ; un stop qui répondait `STOPPING` sans rien enregistrer ; après un redémarrage, l'idempotence et `OWNERSHIP_TARGET_MISMATCH` sautées sans bruit.
+
+- **Règle 1, une clé n'est jamais assainie** (`sanitize_history_value`) : au premier niveau d'un enregistrement, `job_id`, `target_ue_id` et `ue_ids` sont retirés avant le filtre et remis tels quels. Cela vaut en mémoire, sur disque et dans la réponse. Une valeur n'est traitée en clé que si elle en a la forme (`valid_job_id`) **et** ne porte aucun marqueur d'abonné ; un enregistrement ancien qui en porterait un reste assaini comme avant. Tous les autres champs texte restent assainis à l'écriture : **la propriété au repos de 0.36.31 est conservée.**
+- **Règle 2, la clé est validée à l'entrée** :
+  - `POST /api/v1/scenarios/start` refuse un `scenario_id` ou un `scenario_definition_id` qui porte `imsi`, `supi`, `msisdn`, `imei`, `suci`, `guti` ou `tmsi`, quelle que soit la casse, avec **422 `SCENARIO_ID_SUBSCRIBER_MARKER`**, sans audit ni journal de la valeur.
+  - La création d'une définition (`validate_mutation`) refuse le même cas.
+  - **Une suite de chiffres seule est acceptée.**
+- **Règle 3, une recherche perdue n'est plus avalée** :
+  - les six `let _ = update_definition_record(…)` (pilote et annulation par UE) passent par `record_definition_update`, qui journalise `event=RECORD_UPDATE_LOST context=<étape> error=<code>` ;
+  - le stop d'un job de définition dont l'enregistrement est introuvable répond **500 `SCENARIO_JOB_NOT_FOUND`** avec `cancel_requested: true` (l'annulation est bien demandée), au lieu d'un `STOPPING` fabriqué.
+- **Clients de la maison** (règle #9 7222823828) : `newScenarioId()` (envoyé par `encodeDefinition` à `POST /scenario-definitions`) et la copie de `duplicateScenario` tiraient en base 36. Simulés, 42 tirages sur 2 000 000 formaient un marqueur. Ils tirent désormais en hexadécimal, qui ne peut en former aucun. `@telecom/simulator-control` passe à 0.37.4. Les autres identifiants envoyés ne portent aucun marqueur par défaut : les 27 du catalogue, `${scenario.id}-${Date.now()}`, `POLARIS-WEB-${Date.now()}`, `lte-e2e-certification-v1`. `slugify` ne part que d'un nom saisi.
+- **OUVERT** :
+  - (1) les enregistrements déjà écrits sur disque avec un `job_id` devenu `history-…` ne retrouvent pas leur clé, qui est irréversible ;
+  - (2) une définition stockée avant 0.37.4 dont l'identifiant porte un marqueur ne se lance plus (422) ;
+  - (3) le nom saisi d'un scénario de laboratoire qui contient un marqueur est refusé à la création (choix de l'opérateur, pas une valeur par défaut).
+- **Tests** :
+  - Côté Control : `c5_definition_job_in_the_digit_class_is_found_after_every_update_0_37_4` (cas 1), `c5_job_id_in_the_digit_class_survives_write_and_recovery_0_37_4` (cas 2, parcours réel), `c5_certified_scenario_id_with_ten_digits_is_found_after_restart_0_37_4` et `c5_scenario_id_carrying_a_subscriber_marker_is_refused_at_entry_0_37_4` (cas 2c), `c5_stop_of_a_definition_job_without_record_reports_a_named_error_0_37_4` (règle 3), `scenario_definitions::tests::c5_definition_id_carrying_a_subscriber_marker_is_refused_0_37_4`.
+  - Côté web : `apps/simulator-control/src/scenarios/scenarioIds.test.ts`.
+  - Tous ROUGES sur la preuve `proof/control-c5-keys-never-sanitized-on-995a173`, sauf le témoin d'alphabet, VERTS ici.
+
 ## 0.37.3 — Reprise de l'History : le jumeau `started_at_epoch_s` ne se dérive jamais de la chaîne `started_at` (lot C9)
 
 Lot C9, ordre du cœur #9 7223299148, à la suite de l'écart déclaré en #9 7222978560 et 7223413399. Base : la tête de C8 `e41120b` (0.37.2), qui contient C7bis `22bb4a5`, la production 0.37.1. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché par ce lot.

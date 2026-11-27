@@ -489,8 +489,16 @@ export function sampleLoopCount(loop: LoopMode, rand: () => number = Math.random
   }
 }
 
+/** 0.37.4 (lot C5) — the id is sent to `POST /scenario-definitions`, which
+ *  refuses an id carrying a subscriber marker (`SCENARIO_ID_SUBSCRIBER_MARKER`:
+ *  imsi, supi, msisdn, imei, suci, guti, tmsi). Both variable parts are
+ *  hexadecimal: `0-9a-f` cannot spell any marker. Before: base 36, which did
+ *  (42 of 2 000 000 simulated draws). */
 export function newScenarioId(): string {
-  return `scn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const random = Math.floor(Math.random() * 0x1000000)
+    .toString(16)
+    .padStart(6, '0');
+  return `scn-${Date.now().toString(16)}-${random}`;
 }
 
 export function newStepId(): string {
