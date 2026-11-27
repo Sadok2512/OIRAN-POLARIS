@@ -18569,6 +18569,78 @@ Content-Length: 0\r\n\
     }
 
     #[test]
+    fn continuous_import_links_wire_adjacent_sctp_segments_using_original_provenance() {
+        let root = temporary_root("sctp-continuity-publication");
+        let source = temporary_root("sctp-continuity-source");
+        let plane = source.join("N2");
+        fs::create_dir(&plane).unwrap();
+        let first = plane.join("n2_20261119T231700Z_00019_20261120171703.pcapng");
+        let second = plane.join("n2_20261119T231700Z_00020_20261120181703.pcapng");
+        let mut setup = None;
+        capture_pcap::visit_capture(corpus_0_7_0().2.join("N2.pcapng"), "fixture", |packet| {
+            // Ethernet + IPv4 + common SCTP header + DATA, procedure 29.
+            if packet.data.get(62..64) == Some(&[0, 29]) && setup.is_none() {
+                setup = Some(packet.data);
+            }
+        }).unwrap();
+        let setup = setup.expect("fixture contains a PDU setup request");
+        let first_tsn = u32::from_be_bytes(setup[50..54].try_into().unwrap());
+        let as_sctp_frame = |payload: &[u8], tsn: u32| {
+            let mut frame = setup[..62].to_vec();
+            frame[50..54].copy_from_slice(&tsn.to_be_bytes());
+            let chunk_size = (16 + payload.len()) as u16;
+            frame[48..50].copy_from_slice(&chunk_size.to_be_bytes());
+            frame.extend_from_slice(payload);
+            while frame.len() % 4 != 2 { frame.push(0); }
+            let ip_size = (frame.len() - 14) as u16;
+            frame[16..18].copy_from_slice(&ip_size.to_be_bytes());
+            frame
+        };
+        // APER release-command fixture from decoder-ngap, with the PDU and
+        // UE IDs of the source setup. A context release separates the
+        // already-discovered sessions in canonical capture ordering.
+        let release = [0x00,0x1c,0,0x19,0,0,3,0,0x0a,0,2,0,4,0,0x55,0,2,0,4,0,0x4f,0,6,0,0,1,2,0,0];
+        let context_release = [0x20,0x29,0,0x0f,0,0,2,0,0x0a,0x40,2,0,4,0,0x55,0x40,2,0,4];
+        let release_frame = as_sctp_frame(&release, first_tsn.wrapping_add(1));
+        let context_frame = as_sctp_frame(&context_release, first_tsn.wrapping_add(2));
+        write_pcap_at(&first, 1_795_000_000, &[setup.clone()]);
+        let first_sha = sha256_hex_file(&first).unwrap();
+        // Vary an undecodable Ethernet frame to place the second capture
+        // first in canonical digest order. No NGAP or wire proof is edited.
+        let mut canonical_fixture_ready = false;
+        for marker in 0..=255 {
+            write_pcap_at(&second, 1_795_000_000, &[release_frame.clone(), context_frame.clone(), vec![marker; 64]]);
+            if sha256_hex_file(&second).unwrap() < first_sha {
+                canonical_fixture_ready = true;
+                break;
+            }
+        }
+        assert!(canonical_fixture_ready);
+        write_rotation_closures(&source, "N2", 2);
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.to_path_buf(), false, root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        manager.start_continuous_import(ContinuousImportConfig {
+            source_root: source.to_path_buf(),
+            scan_interval: Duration::from_millis(200),
+            stable_age: Duration::from_millis(200),
+            max_owned_bytes: 128 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_segments: 8,
+            native_segment_seconds: None,
+            historical_n2_bootstrap: None,
+            runtime_pdu_evidence: None,
+            vtap_out_dirs: Vec::new(),
+        }).unwrap();
+        wait_for(|| manager.dataset(CONTINUOUS_DATASET_ID).is_some_and(|dataset| dataset.checksums.len() >= 2));
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+        let dataset = manager.dataset(CONTINUOUS_DATASET_ID).unwrap();
+        let discovery = serde_json::to_value(dataset.discovery.as_deref().unwrap()).unwrap();
+        assert_eq!(discovery["pdu_sessions"].as_array().unwrap().len(), 2, "{discovery}");
+        assert_eq!(discovery["sctp_continuity_links"].as_array().map(Vec::len), Some(1), "published sessions must link through copied segments");
+    }
+
+    #[test]
     fn continuous_worker_ingests_three_rotations_during_and_after_publication() {
         if skip_if_disk_too_full(
             "continuous_worker_ingests_three_rotations_during_and_after_publication",

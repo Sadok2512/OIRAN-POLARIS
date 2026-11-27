@@ -11,7 +11,8 @@ import { StatusBadge } from '../components/StatusBadge';
 import { Pagination } from '../components/Pagination';
 import { formatTimestampUtc } from '../utils/time';
 
-type Detail={summary:Session;procedures:{name:string;event_ids:string[];status:string}[];accounting:Record<string,number>;capture_references:string[]};
+type SctpContinuityLink={predecessor_session_id:string;successor_session_id:string};
+type Detail={summary:Session;procedures:{name:string;event_ids:string[];status:string}[];accounting:Record<string,number>;capture_references:string[];sctp_continuity_links?:SctpContinuityLink[]};
 const duration=(value:string)=>{const ns=Number(value);if(!Number.isFinite(ns))return '—';if(ns<1_000_000_000)return `${(ns/1_000_000).toFixed(1)} ms`;return `${(ns/1_000_000_000).toFixed(3)} s`};
 const queryString=(params:URLSearchParams)=>{const value=params.toString();return value?`?${value}`:''};
 
@@ -234,7 +235,19 @@ function SessionTab({tab,detail,events,loading,page,setPage}:{tab:string;detail:
   if(tab==='summary')return <div className="detail-grid"><dl className="detail-list"><dt>UE pseudonym</dt><dd>{detail.summary.ue_pseudonym||'UNKNOWN'}</dd><dt>PDU Session ID</dt><dd>{detail.summary.pdu_session_id??'UNKNOWN'}</dd><dt>Last observed state</dt><dd>{detail.summary.state==='ACTIVE_WITH_USER_PLANE'?'PDU Active':detail.summary.state}</dd><dt>Technology</dt><dd>{detail.summary.technology}</dd><dt>Serving node</dt><dd>{detail.summary.serving_node??'UNKNOWN'}</dd><dt>Interfaces</dt><dd>{detail.summary.interfaces.join(' · ')||'UNKNOWN'}</dd></dl><dl className="detail-list"><dt>Start (UTC)</dt><dd className="mono">{formatTimestampUtc(detail.summary.start_timestamp)}</dd><dt>Duration</dt><dd>{duration(detail.summary.duration_ns)}</dd><dt>Persisted session events</dt><dd>{detail.summary.message_count}</dd><dt>Background events</dt><dd>{detail.summary.background_event_count??'UNKNOWN'}</dd><dt>Fully decoded</dt><dd>{detail.summary.decode_completeness.decoded??'UNKNOWN'}</dd><dt>Partial</dt><dd>{detail.summary.decode_completeness.partial??'UNKNOWN'}</dd></dl></div>;
   if(tab==='procedures')return <div className="procedure-list">{detail.procedures.filter(x=>x.name!=='Background / Lifecycle').map(x=><article key={x.name}><StatusBadge value={x.status}/><div><b>{x.name}</b><p>{x.event_ids.length} observed events</p></div></article>)}</div>;
   if(tab==='correlation')return <div className="evidence-summary"><StatusBadge value={detail.summary.correlation_status}/><p>Session-scoped evidence is available in Correlation Studio.</p></div>;
-  if(tab==='provenance')return <div className="capture-refs">{detail.capture_references.map(x=><code key={x}>{x}</code>)}</div>;
+  if(tab==='provenance')return <>
+    <div className="capture-refs">{detail.capture_references.map(x=><code key={x}>{x}</code>)}</div>
+    {detail.sctp_continuity_links?.map(link=>{
+      const isPredecessor=link.predecessor_session_id===detail.summary.session_id;
+      const peer=isPredecessor?link.successor_session_id:link.predecessor_session_id;
+      const context=new URLSearchParams({dataset_id:detail.summary.dataset_id});
+      return <p key={peer}>
+        <Link to={`/investigation/callflow/${encodeURIComponent(peer)}${queryString(context)}`}>
+          {isPredecessor?'SCTP continuation':'Previous SCTP fragment'} · {peer}
+        </Link>
+      </p>;
+    })}
+  </>;
   if(tab==='messages'||tab==='background'){if(loading)return <LoadingState/>;return <><div className="message-list">{events?.data.map(e=><article key={e.event_id}><span className="mono time">{formatTimestampUtc(e.timestamp)}</span><StatusBadge value={e.decoding_status}/><div><b>{e.message_name}</b><small>{e.protocol} · {e.interface} · packet {e.packet_references[0]?.packet_number}</small></div></article>)}</div><Pagination page={page} totalPages={events?.meta.total_pages??1} onChange={setPage}/></>}
   return null;
 }

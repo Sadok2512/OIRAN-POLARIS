@@ -1,6 +1,6 @@
 [package]
 name = "oiran-api"
-version = "2.21.205"
+version = "2.21.206"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
