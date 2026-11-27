@@ -7981,7 +7981,7 @@ fn record_certified_failure(
         safe_telemetry_reference("scenario", scenario_definition_id);
     let error_code = safe_telemetry_code(error_code);
     runtime.history.push(json!({
-        "job_id":format!("failure-{}", random_hex(8)),
+        "job_id":format!("{FAILURE_JOB_ID_PREFIX}{}", random_hex(FAILURE_JOB_SUFFIX_BYTES)),
         "scenario_id":scenario_definition_id,
         "scenario_definition_id":scenario_definition_id,
         "technology":"5G SA",
@@ -10547,7 +10547,107 @@ fn sanitize_history_value(value: &mut Value, clear: bool) {
         let epoch = record.get("started_at_epoch_s")?.as_u64()?.to_string();
         (record.get("started_at")?.as_str()? == epoch).then_some(epoch)
     });
+    // 0.37.4 (lot C5, ordre cœur #9 7218858535, règle 1) — une CLÉ n'est
+    // jamais assainie, ni en mémoire ni sur disque : elle est retirée de
+    // l'enregistrement avant le filtre et remise telle quelle après. Avant :
+    // `job_id` passait le filtre ; dès que son suffixe portait dix chiffres
+    // (≈ 1,59 % des jobs de définition, déterministe pour un `scenario_id`
+    // horodaté), il devenait `history-…` et toute recherche par sa valeur
+    // d'origine échouait (audit CLAUDE2 #9 7218478108). Les autres champs
+    // texte restent assainis à l'écriture : la propriété au repos de 0.36.31
+    // est conservée.
+    let keys = take_history_record_keys(value);
     sanitize_history_value_at(value, clear, proven_started_at.as_deref());
+    if let Some(record) = value.as_object_mut() {
+        record.extend(keys);
+    }
+}
+
+/// 0.37.5 (lot C5bis, ordre cœur #9 7225711657, refus ANR2 #10 7225668191) —
+/// les TROIS générateurs de `job_id` de l'History, et la borne de
+/// reconnaissance DÉRIVÉE de leurs maxima. Avant (0.37.4, refusé) : la
+/// reconnaissance réutilisait `valid_job_id`, borné à 64, alors qu'un job de
+/// définition vaut `<identifiant de définition ≤ 64>-<12 hexadécimaux>`, soit
+/// jusqu'à 77 : une définition de 52 caractères produisait une clé de 65,
+/// non reconnue, donc assainie. Un prédicat d'entrée réutilisé pour
+/// reconnaître des valeurs générées, plus longues par construction.
+const DEFINITION_JOB_SUFFIX_BYTES: usize = 6;
+const FAILURE_JOB_ID_PREFIX: &str = "failure-";
+const FAILURE_JOB_SUFFIX_BYTES: usize = 8;
+
+/// 0.37.5 (lot C5bis) — clé d'un job de définition : `<définition>-<hex>`.
+fn definition_job_id(definition_id: &str) -> String {
+    format!("{definition_id}-{}", random_hex(DEFINITION_JOB_SUFFIX_BYTES))
+}
+
+const fn max_len(left: usize, right: usize) -> usize {
+    if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+/// 0.37.5 (lot C5bis) — plus longue clé que le système peut générer :
+/// `scenario_id` certifié, job de définition (maximum de `safe_id`, plus le
+/// séparateur, plus `random_hex` = 2 caractères par octet), échec certifié.
+/// Rien n'est écrit en dur : si une de ces bornes change, celle-ci suit.
+const HISTORY_KEY_MAX_LEN: usize = max_len(
+    CERTIFIED_JOB_ID_MAX_LEN,
+    max_len(
+        scenario_definitions::DEFINITION_ID_MAX_LEN + 1 + 2 * DEFINITION_JOB_SUFFIX_BYTES,
+        FAILURE_JOB_ID_PREFIX.len() + 2 * FAILURE_JOB_SUFFIX_BYTES,
+    ),
+);
+
+/// 0.37.4 (lot C5) — champs de PREMIER NIVEAU d'un enregistrement d'History
+/// qui servent de recherche, d'index ou de clé d'appartenance : `job_id`
+/// (`definition_record_index`, `GET /scenarios/:job_id/steps`, idempotence de
+/// `POST /scenarios/start`, stop), `target_ue_id` (garde
+/// `OWNERSHIP_TARGET_MISMATCH`, dernier job d'un UE), `ue_ids` (annulation
+/// par UE, activité).
+const HISTORY_RECORD_KEYS: [&str; 3] = ["job_id", "target_ue_id", "ue_ids"];
+
+/// 0.37.4 (lot C5) — une valeur n'est traitée en clé que si elle en a la
+/// FORME (caractères alphanumériques, `-`, `_`, donc ni adresse ni texte
+/// libre) et ne porte AUCUN marqueur d'abonné. Les points d'entrée refusent
+/// ces marqueurs ; un enregistrement ancien qui en porterait un reste
+/// assaini, comme avant.
+/// 0.37.5 (lot C5bis) — la longueur est bornée par `HISTORY_KEY_MAX_LEN`
+/// (tout ce que le système génère), plus par `valid_job_id` (ce que
+/// l'appelant fournit). Jeu de caractères et refus des marqueurs inchangés :
+/// ce sont eux qui protègent, pas la longueur.
+fn is_history_key_text(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= HISTORY_KEY_MAX_LEN
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        && !scenario_definitions::carries_subscriber_marker(text)
+}
+
+fn is_history_record_key(value: &Value) -> bool {
+    let key = is_history_key_text;
+    match value {
+        Value::String(text) => key(text),
+        Value::Array(items) => items.iter().all(|item| item.as_str().is_some_and(key)),
+        _ => false,
+    }
+}
+
+fn take_history_record_keys(value: &mut Value) -> Vec<(String, Value)> {
+    let Some(record) = value.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for field in HISTORY_RECORD_KEYS {
+        if record.get(field).is_some_and(is_history_record_key) {
+            if let Some(key) = record.remove(field) {
+                keys.push((field.to_string(), key));
+            }
+        }
+    }
+    keys
 }
 
 /// 0.37.1 (lot C7bis) — `sender_sha256` / `receiver_sha256` (preuve de
@@ -13430,9 +13530,13 @@ struct StartScenarioInput {
     ue_ids: Vec<String>,
 }
 
+/// 0.37.5 (lot C5bis) — longueur maximale d'un `scenario_id` certifié
+/// fourni par l'appelant (domaine d'ENTRÉE, inchangé).
+const CERTIFIED_JOB_ID_MAX_LEN: usize = 64;
+
 fn valid_job_id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 64
+        && value.len() <= CERTIFIED_JOB_ID_MAX_LEN
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
@@ -13485,7 +13589,7 @@ fn run_mock_definition_scenario(
             )
         })?;
     let resolved = resolve_steps(&definition).map_err(|error| scenario_definition_error(error))?;
-    let job_id = format!("{}-{}", definition.id, random_hex(6));
+    let job_id = definition_job_id(&definition.id);
     let started_at = epoch_seconds();
     let steps = resolved
         .iter()
@@ -13592,13 +13696,36 @@ fn cancel_definition_jobs_for_ue(state: &AppState, ue_id: &str) -> Vec<String> {
             continue;
         }
         control.cancel.store(true, Ordering::SeqCst);
-        let _ = update_definition_record(state, &job_id, |record| {
+        record_definition_update(state, &job_id, "ue_cancel", |record| {
             record["state"] = json!("STOPPING");
             record["terminal_result"] = json!("UE_STOPPED_BY_OPERATOR");
         });
         cancelled.push(job_id);
     }
     cancelled
+}
+
+/// 0.37.4 (lot C5, ordre cœur #9 7218858535, règle 3) — une mise à jour
+/// d'enregistrement de job qui ne trouve pas sa clé n'est plus avalée par
+/// `let _ =` : elle est JOURNALISÉE avec son code nommé
+/// (`event=RECORD_UPDATE_LOST`), le contexte et le job. C'est ce silence qui
+/// a rendu le défaut C5 invisible pendant un mois.
+fn record_definition_update(
+    state: &AppState,
+    job_id: &str,
+    context: &str,
+    update: impl FnOnce(&mut Value),
+) -> bool {
+    match update_definition_record(state, job_id, update) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!(
+                "POLARIS_CONTROL_JOB job_id={job_id} event=RECORD_UPDATE_LOST context={context} error={}",
+                safe_telemetry_code(&error)
+            );
+            false
+        }
+    }
 }
 
 fn update_definition_record(
@@ -15486,7 +15613,7 @@ fn execute_live_definition_job(
             terminal_result = "OPERATOR_STOP".into();
             break;
         }
-        let _ = update_definition_record(&state, &job_id, |record| {
+        record_definition_update(&state, &job_id, "step_running", |record| {
             record["steps"][position]["state"] = json!("RUNNING");
             record["steps"][position]["started_at"] = json!(epoch_seconds());
         });
@@ -15497,7 +15624,7 @@ fn execute_live_definition_job(
                     .lock()
                     .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
                     .unwrap_or_default();
-                let _ = update_definition_record(&state, &job_id, |record| {
+                record_definition_update(&state, &job_id, "step_completed", |record| {
                     record["steps"][position]["state"] = json!("COMPLETED");
                     record["steps"][position]["ended_at"] = json!(epoch_seconds());
                     record["steps"][position]["measurements"] = measurements;
@@ -15511,7 +15638,7 @@ fn execute_live_definition_job(
                     "POLARIS_CONTROL_JOB job_id={job_id} event=STEP_FAILED step_index={} step_type={} error=SCENARIO_STOP_REQUESTED",
                     step.index, step.step_type
                 );
-                let _ = update_definition_record(&state, &job_id, |record| {
+                record_definition_update(&state, &job_id, "step_stop_requested", |record| {
                     record["steps"][position]["state"] = json!("FAILED");
                     record["steps"][position]["ended_at"] = json!(epoch_seconds());
                     record["steps"][position]["error"] = json!(error);
@@ -15527,7 +15654,7 @@ fn execute_live_definition_job(
                     step.step_type,
                     safe_telemetry_code(&error)
                 );
-                let _ = update_definition_record(&state, &job_id, |record| {
+                record_definition_update(&state, &job_id, "step_failed", |record| {
                     let evidence = serde_json::from_str::<Value>(&error).ok();
                     let code = evidence
                         .as_ref()
@@ -15554,7 +15681,7 @@ fn execute_live_definition_job(
         terminal_state = "FAILED";
         terminal_result = "UE_CLEANUP_FAILED".into();
     }
-    let _ = update_definition_record(&state, &job_id, |record| {
+    record_definition_update(&state, &job_id, "terminal", |record| {
         record["state"] = json!(terminal_state);
         record["ended_at_epoch_s"] = json!(epoch_seconds());
         record["terminal_result"] = json!(terminal_result);
@@ -15682,7 +15809,7 @@ fn start_live_definition_scenario(
             Json(json!({"error":"VOICE_TWO_DISTINCT_UES_REQUIRED"})),
         ));
     }
-    let job_id = format!("{}-{}", definition.id, random_hex(6));
+    let job_id = definition_job_id(&definition.id);
     let initial_jobs = state
         .multi_ue
         .lock()
@@ -16138,6 +16265,23 @@ async fn start_scenario(
         )
             .into_response();
     }
+    // 0.37.4 (lot C5, ordre cœur #9 7218858535, règle 2) — une clé fournie
+    // par l'appelant est validée à l'entrée : un `scenario_id` ou un
+    // identifiant de définition qui porte un marqueur d'abonné est REFUSÉ,
+    // jamais accepté puis muté. Une suite de chiffres seule est acceptée.
+    // Rien n'est audité ni journalisé avec la valeur refusée.
+    if input
+        .scenario_id
+        .iter()
+        .chain(input.scenario_definition_id.iter())
+        .any(|key| scenario_definitions::carries_subscriber_marker(key))
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_ID_SUBSCRIBER_MARKER"})),
+        )
+            .into_response();
+    }
     if let Some(definition_id) = input.scenario_definition_id.as_deref() {
         let definition = state
             .scenario_catalog
@@ -16585,11 +16729,33 @@ async fn stop_scenario(
         .and_then(|jobs| jobs.get(&input.job_id).cloned());
     if let Some(control) = definition_control {
         control.cancel.store(true, Ordering::SeqCst);
-        let response = update_definition_record(&state, &input.job_id, |record| {
+        // 0.37.4 (lot C5, règle 3) — un enregistrement introuvable est une
+        // erreur NOMMÉE et journalisée, plus un `STOPPING` fabriqué sans rien
+        // enregistrer. L'annulation, elle, est bien demandée.
+        let response = match update_definition_record(&state, &input.job_id, |record| {
             record["state"] = json!("STOPPING");
             record["terminal_result"] = json!("OPERATOR_STOP_REQUESTED");
-        })
-        .unwrap_or_else(|_| json!({"job_id":input.job_id,"state":"STOPPING"}));
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                let code = safe_telemetry_code(&error);
+                eprintln!(
+                    "POLARIS_CONTROL_JOB job_id={} event=RECORD_UPDATE_LOST context=operator_stop error={code}",
+                    input.job_id
+                );
+                audit(
+                    &state,
+                    &identity.role,
+                    "STOP_SCENARIO_DEFINITION",
+                    &code,
+                    Some(&input.job_id),
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":code,"job_id":input.job_id,"cancel_requested":true})),
+                );
+            }
+        };
         audit(
             &state,
             &identity.role,
@@ -24497,6 +24663,28 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             .await
             .unwrap();
         assert_eq!(steps.status(), StatusCode::OK, "{case} : GET /scenarios/:job_id/steps");
+    }
+
+    /// 0.37.5 (lot C5bis) — complément au garde anti-dérive par HTTP : chaque
+    /// générateur de `job_id`, appelé à sa longueur maximale, produit une clé
+    /// reconnue, et la borne dérivée n'admet rien de plus long que le plus
+    /// long générateur.
+    #[test]
+    fn c5bis_every_key_generator_at_its_maximum_is_recognised_0_37_5() {
+        let longest_definition = "b".repeat(scenario_definitions::DEFINITION_ID_MAX_LEN);
+        let generated = [
+            definition_job_id(&longest_definition),
+            format!("{FAILURE_JOB_ID_PREFIX}{}", random_hex(FAILURE_JOB_SUFFIX_BYTES)),
+            "c".repeat(CERTIFIED_JOB_ID_MAX_LEN),
+        ];
+        for key in &generated {
+            assert!(is_history_key_text(key), "clé générée de {} caractères non reconnue", key.len());
+        }
+        let longest = generated.iter().map(String::len).max().unwrap();
+        assert_eq!(HISTORY_KEY_MAX_LEN, longest, "borne dérivée ≠ plus long générateur");
+        assert!(!is_history_key_text(&"b".repeat(HISTORY_KEY_MAX_LEN + 1)));
+        assert!(!is_history_key_text("c5bis-imsi-0123456789ab"), "marqueur d'abonné");
+        assert!(!is_history_key_text("10.46.0.5"), "adresse");
     }
 
     /// LOT C5bis — garde sur la FRONTIÈRE entre les deux domaines : une

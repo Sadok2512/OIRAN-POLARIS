@@ -538,6 +538,11 @@ fn validate_mutation(input: &ScenarioMutation) -> Result<(), String> {
     if !safe_id(&input.id) || input.name.trim().is_empty() || input.name.len() > 128 {
         return Err("SCENARIO_DEFINITION_INVALID".into());
     }
+    // 0.37.4 (lot C5) — l'identifiant devient la clé de ses jobs : refusé à
+    // l'entrée s'il porte un marqueur d'abonné, jamais accepté puis muté.
+    if carries_subscriber_marker(&input.id) {
+        return Err("SCENARIO_ID_SUBSCRIBER_MARKER".into());
+    }
     if input.steps.is_empty() || input.steps.len() > MAX_STEPS {
         return Err("SCENARIO_STEP_COUNT_INVALID".into());
     }
@@ -1378,9 +1383,26 @@ fn default_definition_simulator() -> String {
     "UERANSIM".into()
 }
 
+/// 0.37.4 (lot C5, ordre cœur #9 7218858535) — marqueurs d'abonné qui font
+/// refuser une CLÉ fournie par l'appelant (`scenario_id`, identifiant de
+/// définition) à l'entrée. Une suite de chiffres seule n'en est PAS un : un
+/// horodatage dans un identifiant est légitime.
+pub const KEY_SUBSCRIBER_MARKERS: [&str; 7] = ["imsi", "supi", "msisdn", "imei", "suci", "guti", "tmsi"];
+
+pub fn carries_subscriber_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    KEY_SUBSCRIBER_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// 0.37.5 (lot C5bis, ordre cœur #9 7225711657) — longueur maximale d'un
+/// identifiant de définition. La reconnaissance des clés de l'History
+/// (`lib.rs`, `HISTORY_KEY_MAX_LEN`) en est DÉRIVÉE : elle suit si cette
+/// borne change.
+pub const DEFINITION_ID_MAX_LEN: usize = 64;
+
 fn safe_id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 64
+        && value.len() <= DEFINITION_ID_MAX_LEN
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))

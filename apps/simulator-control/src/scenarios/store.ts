@@ -8,7 +8,7 @@
 // for TanStack-Query hooks without changing the UI.
 
 import { useCallback, useEffect, useState } from 'react';
-import type { Scenario, ScenarioAssignment } from './model';
+import { newScenarioId, type Scenario, type ScenarioAssignment } from './model';
 
 const LIBRARY_KEY = 'polaris.scenarios.v1';
 const ASSIGNMENT_KEY = 'polaris.assignments.v1';
@@ -69,7 +69,8 @@ export function duplicateScenario(id: string): Scenario | null {
   const now = Date.now();
   const copy: Scenario = {
     ...source,
-    id: `scn-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    // 0.37.4 (lot C5) — same generator as a new scenario: never a marker.
+    id: newScenarioId(),
     name: `${source.name} (copy)`,
     version: 1,
     createdAt: now,

@@ -1,5 +1,12 @@
 # @telecom/simulator-control — Changelog
 
+## 0.37.5 — 2026-11-27 — Identifiants de scénario sans marqueur d'abonné (patch, lot C5bis ; contenu web de C5 0.37.4, refusé et jamais posé)
+
+- `newScenarioId` et `duplicateScenario` tirent en hexadécimal au lieu de la
+  base 36 : un identifiant généré ne peut plus former `imsi`, `supi`,
+  `imei`, `suci`, `guti` ni `tmsi`, que polaris-control-api 0.37.5 refuse
+  (`SCENARIO_ID_SUBSCRIBER_MARKER`).
+
 ## 0.37.2 — 2026-11-27 — Formulaire 5G des sessions de trafic en TCP (patch, lot C8)
 
 - Le formulaire 5G s'initialise en TCP ; l'UDP y est désactivé avec son

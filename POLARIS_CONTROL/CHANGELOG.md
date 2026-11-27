@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.37.5 — 2026-11-27 — Une clé n'est jamais assainie, jusqu'à la plus longue clé que le système génère ; un marqueur d'abonné est refusé à l'entrée ; une recherche perdue n'est plus avalée (lot C5bis, reprise de C5)
+
+Patch. Ordres cœur #9 7218377047, 7218858535 (règles arbitrées), 7225711657 (C5bis, base et version), refus ANR2 #10 7225668191 de C5 `8ca508b` (0.37.4, jamais posé). Base : 0.37.4 @ `4e848fd` (C10, CLAUDE2), elle-même au-dessus de la production `995a173` (C9). Antériorité mesurée par ANR2 : 1 échec sur 42 passages sur `55f480d`.
+
+Ce lot reprend **tout C5**, dont les règles 2 et 3 restent inchangées, et corrige la borne refusée.
+
+**Le défaut corrigé par C5** : `job_id` passait par le filtre de l'History. Dès que son suffixe portait dix chiffres d'affilée, il devenait `history-…`. Cela arrivait pour environ 1,59 % des jobs de définition, et toujours pour un `scenario_id` certifié horodaté. L'enregistrement était muté en mémoire et sur disque, puis rechargé tel quel par `recover_runtime`. Les recherches par valeur d'origine échouaient ensuite, et `let _ =` avalait l'erreur : transitions, `STEP_FAILED` et état terminal perdus sans bruit ; stop `STOPPING` fabriqué ; après un redémarrage, idempotence et `OWNERSHIP_TARGET_MISMATCH` sautées.
+
+**Le défaut de C5 refusé** : la reconnaissance de clé réutilisait `valid_job_id`, prédicat d'**entrée** borné à 64, pour reconnaître des clés **générées**. Or un job de définition vaut `<définition ≤ 64>-<12 hexadécimaux>`, jusqu'à 77 caractères : une définition de 52 caractères produisait une clé de 65, non reconnue, donc assainie.
+
+- **Règle 1, une clé n'est jamais assainie** (`sanitize_history_value`) : au premier niveau, `job_id`, `target_ue_id` et `ue_ids` sont retirés avant le filtre et remis tels quels, en mémoire, sur disque et dans la réponse. Une valeur est traitée en clé si :
+  - elle n'utilise que `[A-Za-z0-9_-]`, donc ni adresse ni texte libre ;
+  - elle ne porte aucun marqueur d'abonné ;
+  - elle mesure au plus **`HISTORY_KEY_MAX_LEN`**.
+
+  Les autres champs texte restent assainis à l'écriture : la propriété au repos de 0.36.31 est conservée.
+- **Borne dérivée, jamais écrite en dur** : `HISTORY_KEY_MAX_LEN` est le maximum des trois générateurs de `job_id`. Si `safe_id` ou un générateur change, la reconnaissance suit. Aujourd'hui elle vaut 77.
+  - `scenario_id` certifié : `CERTIFIED_JOB_ID_MAX_LEN`, borne de `valid_job_id` ;
+  - job de définition : `scenario_definitions::DEFINITION_ID_MAX_LEN` (borne de `safe_id`), plus le séparateur, plus `2 × DEFINITION_JOB_SUFFIX_BYTES` (`definition_job_id`) ;
+  - échec certifié : `FAILURE_JOB_ID_PREFIX` plus `2 × FAILURE_JOB_SUFFIX_BYTES`.
+- **Règle 2, la clé est validée à l'entrée** (inchangée depuis C5) :
+  - `POST /api/v1/scenarios/start` refuse un `scenario_id` ou un `scenario_definition_id` portant `imsi`, `supi`, `msisdn`, `imei`, `suci`, `guti` ou `tmsi`, quelle que soit la casse : **422 `SCENARIO_ID_SUBSCRIBER_MARKER`** ;
+  - la création d'une définition refuse le même cas ;
+  - une suite de chiffres seule est acceptée.
+- **Règle 3, une recherche perdue n'est plus avalée** (inchangée depuis C5) : les six `let _ = update_definition_record(…)` journalisent `event=RECORD_UPDATE_LOST`. Le stop sans enregistrement répond **500 `SCENARIO_JOB_NOT_FOUND`** avec `cancel_requested: true`.
+- **Client** (règle #9 7222823828) : `newScenarioId()` et `duplicateScenario` tirent en hexadécimal, au lieu de la base 36 qui formait un marqueur 42 fois sur 2 000 000 tirages simulés. `@telecom/simulator-control` passe à **0.37.5**.
+- **OUVERT** :
+  - (1) les enregistrements déjà écrits avec un `job_id` devenu `history-…` ne retrouvent pas leur clé ; ANR2 en a compté 10 parmi les jobs de définition et 10 parmi les jobs certifiés (#10 7225746176) ;
+  - (2) une définition stockée dont l'identifiant porte un marqueur ne se lance plus (422) ;
+  - (3) le nom saisi d'un scénario de laboratoire qui contient un marqueur est refusé à la création.
+- **Tests** :
+  - Côté Control : les six gardes C5 (`c5_*_0_37_4`), plus deux gardes C5bis. `c5bis_generated_key_of_65_from_a_52_character_definition_is_never_sanitized_0_37_5` couvre la frontière 52/65 ; `c5bis_longest_accepted_definition_yields_a_key_that_is_never_sanitized_0_37_5` est le garde anti-dérive : il sonde par HTTP la plus longue définition acceptée et génère sa clé par le vrai chemin.
+  - Côté web : `scenarioIds.test.ts`.
+  - Tous ROUGES sur la preuve `proof/control-c5bis-on-4e848fd`, sauf le témoin d'alphabet. Les deux gardes C5bis sont aussi **ROUGES sur la tête refusée `8ca508b`** (`proof/control-c5bis-guards-on-8ca508b`). Tous sont VERTS ici.
+  - `c5bis_every_key_generator_at_its_maximum_is_recognised_0_37_5` : ajouté avec le candidat et non rejouable avant, puisqu'il appelle les constantes dérivées.
+
 ## 0.37.4 — La porte E-RAB compte ses marqueurs sur le texte brut : une ligne qui porte aussi un mot d'identité n'est plus perdue (lot C10)
 
 Lot C10, ordre du cœur #9 7224408968, à la suite de l'écart C6 mesuré à zéro cooccurrence par ANR2. L'incident est fermé, le défaut de conception restait ouvert. Base : la production `995a173` (C9, 0.37.3). Reprise sur ordre du cœur #9 7225711657 : la première version de ce lot (`de8bf1a`, 0.37.5) était empilée sur C5 `8ca508b`, refusée ; elle ne se rebase pas sur du code refusé. C5bis suit en 0.37.5 sur cette tête. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché.
