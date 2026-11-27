@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.37.0 — 2026-11-27 — Le chemin 5G déclare le TCP qu'il mesure, et refuse l'UDP qu'il ne mesure pas (lot C2b)
+
+**Mineure** `polaris-control-api` : des requêtes acceptées jusqu'ici sont désormais refusées, et une variable d'environnement cesse d'avoir effet. Ordre cœur #9 7214037835 et 7216533055, audit #9 7213941919. Base : 0.36.38 (lot C4).
+
+Depuis 0.20.1 (`58bea57`, 31/10), toute mesure de données 5G de Control est un iperf3 **TCP** (jamais de `-u`), quel que soit le protocole affiché. Les gabarits `tpl-5g-*` de données déclaraient « UDP », `protocol = "UDP"`, `tcp_authorized = false`, et l'exécution ne lisait que `bytes`. Relevé ANR2 : l'exécution `tpl-5g-registration-pdu-data` du 14/11 porte `retransmissions` et `tcp_window`.
+
+- **Gabarits** : `tpl-5g-data-ul`, `tpl-5g-data-dl`, `tpl-5g-registration-pdu-data`, `tpl-5g-full-session` déclarent ce qui est mesuré — libellés « TCP », `transport = "TCP"`, `tcp_authorized = true`, étapes `protocol = "TCP"`. Les gabarits LTE (UDP réel) et les gabarits 5G sans données ne changent pas. La validation du catalogue exige ce contrat.
+- **L'exécution lit et applique `protocol` et `rate_bps`, ou refuse l'étape** (`traffic_ul` / `traffic_dl`) : `UDP` → `TRAFFIC_UDP_NOT_MEASURED_ON_5G`, sans mesure ; `TCP` déclaré sans `tcp_authorized = true` → `TCP_EXPLICIT_AUTHORIZATION_REQUIRED` ; autre valeur → `TRAFFIC_PROTOCOL_INVALID`. Le débit appliqué à iperf3 (`-b`) est `rate_bps` de l'étape, borné à ]0, 100 Mbit/s].
+- **Étape sans `protocol` déclaré** (`simple-data-ul-dl`, relevé ANR2 : aucun champ `protocol`) : défaut **écrit** dans le code, TCP à 1 Mbit/s (`TRAFFIC_STEP_DEFAULT_PROTOCOL`, `TRAFFIC_STEP_DEFAULT_RATE_BPS`). Le résultat de chaque étape de données expose `protocol`, `protocol_source` (`declared` / `default`) et `rate_bps`.
+- **`POLARIS_IPERF3_RATE` n'a plus d'effet** : le débit vient toujours de ce que l'appelant déclare. Le test `iperf_rate_is_bounded_to_an_explicit_numeric_unit` est remplacé par `iperf_rate_comes_from_the_declared_rate_and_is_bounded`.
+- **Session de trafic 5G** (`POST /api/v1/traffic/sessions`) : `"protocol":"UDP"` → 422 `TRAFFIC_5G_UDP_NOT_MEASURED`. Le débit de la mesure est `rate_mbps`. Le chemin LTE n'est pas touché.
+- **Changements de comportement à connaître** : (1) au lab, `simple-data-ul-dl` mesurait au débit de `POLARIS_IPERF3_RATE` (`"5M"` dans un relevé du 15/11, #10 6899243388) ; il mesure désormais à **1 Mbit/s**, sauf si sa définition déclare `rate_bps`. (2) La page des sessions de trafic de `apps/simulator-control` propose `UDP` par défaut : sur un UE 5G, elle reçoit désormais le refus. Aucun fichier web n'est modifié dans ce lot.
+- **OUVERT** : mesurer réellement en UDP sur le 5G (lot C2a, non commencé). Les valeurs par défaut globales du catalogue (`"transport":"UDP"`, `lib.rs`) restent celles du LTE. `duration_seconds` n'est toujours pas appliqué par l'étape (c'est `bytes` qui borne le transfert).
+- **Tests** : `five_g_data_templates_declare_the_tcp_they_measure`, `five_g_traffic_step_declared_udp_is_refused_and_never_measured`, `five_g_traffic_session_requesting_udp_is_refused` — ROUGES sur la preuve `proof/control-c2b-declared-protocol`, VERTS ici ; `five_g_traffic_step_applies_the_declared_rate_and_reports_its_protocol` (débit transmis à la mesure, défaut écrit, TCP non autorisé refusé) — ajouté avec le candidat, non rejouable à la base : l'interface ne transmettait pas le débit, c'est le défaut corrigé.
+
 ## 0.36.38 — 2026-11-27 — Le test de l'inventaire UE affirme une référence protégée, plus une adresse en clair (lot C4)
 
 Patch `polaris-control-api`, test seul. Ordre cœur #9 7214037835. Base : 0.36.37 (lot C1).

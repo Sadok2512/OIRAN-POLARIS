@@ -885,18 +885,44 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
     templates
 }
 
-fn template_parameters() -> BTreeMap<String, Value> {
+/// 0.37.0 (lot C2b, ordre #9 7214037835) — un gabarit dont les étapes de
+/// données passent par le chemin 5G (`traffic_ul` / `traffic_dl`) mesure en
+/// TCP : il le déclare. Avant : `transport = "UDP"` et libellé « UDP » pour
+/// une mesure iperf3 TCP (relevé ANR2 : `retransmissions` et `tcp_window`
+/// dans l'exécution `tpl-5g-registration-pdu-data` du 14/11).
+fn measures_five_g_tcp(steps: &[ScenarioStep]) -> bool {
+    steps
+        .iter()
+        .any(|step| matches!(step.step_type.as_str(), "traffic_ul" | "traffic_dl"))
+}
+
+fn template_parameters(tcp: bool) -> BTreeMap<String, Value> {
     BTreeMap::from([
         ("ue_count".into(), Value::from(DEFAULT_TEMPLATE_UE_COUNT)),
         ("execution".into(), Value::from("ONCE")),
-        ("transport".into(), Value::from("UDP")),
+        ("transport".into(), Value::from(if tcp { "TCP" } else { "UDP" })),
         ("rate_bps".into(), Value::from(DEFAULT_TEMPLATE_RATE_BPS)),
         (
             "duration_seconds".into(),
             Value::from(DEFAULT_TEMPLATE_DURATION_SECONDS),
         ),
-        ("tcp_authorized".into(), Value::Bool(false)),
+        ("tcp_authorized".into(), Value::Bool(tcp)),
         ("multi_ue".into(), Value::Bool(false)),
+    ])
+}
+
+/// 0.37.0 — paramètres des étapes de données 5G : ce que l'exécution
+/// applique réellement (TCP, débit et taille déclarés).
+fn bounded_tcp_parameters() -> BTreeMap<String, ParameterSpec> {
+    BTreeMap::from([
+        ("bytes".into(), fixed(7_500_000_u64)),
+        ("protocol".into(), fixed("TCP")),
+        ("rate_bps".into(), fixed(DEFAULT_TEMPLATE_RATE_BPS)),
+        (
+            "duration_seconds".into(),
+            fixed(DEFAULT_TEMPLATE_DURATION_SECONDS),
+        ),
+        ("tcp_authorized".into(), fixed(true)),
     ])
 }
 
@@ -929,8 +955,8 @@ fn descriptor(
         rat: rat.into(),
         simulator: simulator.into(),
         description: description.into(),
+        parameters: template_parameters(measures_five_g_tcp(&steps)),
         steps,
-        parameters: template_parameters(),
         required_capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
         backend_support: backend_support.into(),
         certification_required,
@@ -944,6 +970,7 @@ fn descriptor(
 pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
     let internet = || BTreeMap::from([("dnn".into(), fixed("internet"))]);
     let data = bounded_udp_parameters;
+    let tcp_data = bounded_tcp_parameters;
     let templates = vec![
         descriptor(
             "tpl-lte-attach",
@@ -1057,8 +1084,8 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
             "tpl-5g-data-ul",
             "5G_SA",
             "UERANSIM",
-            "5G SA Data UL — UDP 1 Mbit/s for 60 seconds",
-            vec![step("traffic_ul", data())],
+            "5G SA Data UL — TCP 1 Mbit/s for 60 seconds",
+            vec![step("traffic_ul", tcp_data())],
             &["pdu_session", "udp_rate_duration_v1"],
             SUPPORT_SUPPORTED,
             false,
@@ -1067,8 +1094,8 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
             "tpl-5g-data-dl",
             "5G_SA",
             "UERANSIM",
-            "5G SA Data DL — UDP 1 Mbit/s for 60 seconds",
-            vec![step("traffic_dl", data())],
+            "5G SA Data DL — TCP 1 Mbit/s for 60 seconds",
+            vec![step("traffic_dl", tcp_data())],
             &["pdu_session", "udp_rate_duration_v1", "dn_sender"],
             SUPPORT_SUPPORTED,
             false,
@@ -1077,12 +1104,12 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
             "tpl-5g-registration-pdu-data",
             "5G_SA",
             "UERANSIM",
-            "5G SA Registration, PDU Session and bounded UDP UL/DL",
+            "5G SA Registration, PDU Session and bounded TCP UL/DL",
             vec![
                 step("ue_start", BTreeMap::new()),
                 step("pdu_establish", internet()),
-                step("traffic_ul", data()),
-                step("traffic_dl", data()),
+                step("traffic_ul", tcp_data()),
+                step("traffic_dl", tcp_data()),
             ],
             &[
                 "ueransim_lifecycle",
@@ -1097,12 +1124,12 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
             "tpl-5g-full-session",
             "5G_SA",
             "UERANSIM",
-            "5G SA full session: Registration, PDU, bounded UDP UL/DL and Deregistration",
+            "5G SA full session: Registration, PDU, bounded TCP UL/DL and Deregistration",
             vec![
                 step("ue_start", BTreeMap::new()),
                 step("pdu_establish", internet()),
-                step("traffic_ul", data()),
-                step("traffic_dl", data()),
+                step("traffic_ul", tcp_data()),
+                step("traffic_dl", tcp_data()),
                 step("detach", BTreeMap::new()),
             ],
             &[
@@ -1154,7 +1181,8 @@ pub fn validate_template_descriptor(template: &ScenarioTemplateDescriptor) -> Re
     if template.parameters.get("ue_count").and_then(Value::as_u64)
         != Some(DEFAULT_TEMPLATE_UE_COUNT)
         || template.parameters.get("execution").and_then(Value::as_str) != Some("ONCE")
-        || template.parameters.get("transport").and_then(Value::as_str) != Some("UDP")
+        || template.parameters.get("transport").and_then(Value::as_str)
+            != Some(if measures_five_g_tcp(&template.steps) { "TCP" } else { "UDP" })
         || template.parameters.get("rate_bps").and_then(Value::as_u64)
             != Some(DEFAULT_TEMPLATE_RATE_BPS)
         || template
@@ -1166,7 +1194,7 @@ pub fn validate_template_descriptor(template: &ScenarioTemplateDescriptor) -> Re
             .parameters
             .get("tcp_authorized")
             .and_then(Value::as_bool)
-            != Some(false)
+            != Some(measures_five_g_tcp(&template.steps))
         || template.parameters.get("multi_ue").and_then(Value::as_bool) != Some(false)
     {
         return Err("SCENARIO_TEMPLATE_DEFAULTS_INVALID".into());
@@ -1685,15 +1713,23 @@ mod tests {
         assert!(templates
             .iter()
             .all(|item| validate_template_descriptor(item).is_ok()));
+        // 0.37.0 (lot C2b) — les gabarits 5G de données déclarent le TCP
+        // qu'ils mesurent ; tous les autres gardent UDP, non autorisé TCP.
         assert!(templates.iter().all(|item| {
+            let tcp = measures_five_g_tcp(&item.steps);
             item.parameters["ue_count"] == json!(1)
                 && item.parameters["execution"] == json!("ONCE")
-                && item.parameters["transport"] == json!("UDP")
+                && item.parameters["transport"] == json!(if tcp { "TCP" } else { "UDP" })
                 && item.parameters["rate_bps"] == json!(1_000_000_u64)
                 && item.parameters["duration_seconds"] == json!(60)
-                && item.parameters["tcp_authorized"] == json!(false)
+                && item.parameters["tcp_authorized"] == json!(tcp)
                 && item.parameters["multi_ue"] == json!(false)
         }));
+        assert_eq!(
+            templates.iter().filter(|item| measures_five_g_tcp(&item.steps)).count(),
+            4,
+            "tpl-5g-data-ul, -data-dl, -registration-pdu-data, -full-session"
+        );
         assert_eq!(
             template_descriptor("tpl-lte-attach")
                 .unwrap()

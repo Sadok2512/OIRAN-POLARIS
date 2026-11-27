@@ -717,24 +717,54 @@ struct TransferVerification {
 const UE_POLICY_TABLE: &str = "100";
 const UE_POLICY_PRIORITY: &str = "10000";
 const IPERF_TCP_WINDOW: &str = "64K";
-const IPERF_DEFAULT_RATE: &str = "1M";
 const TRANSFER_VERIFY_BYTES: u64 = 1024 * 1024;
 
-fn iperf3_rate() -> Result<String, String> {
-    let value =
-        std::env::var("POLARIS_IPERF3_RATE").unwrap_or_else(|_| IPERF_DEFAULT_RATE.to_string());
-    let suffix_ok = value
-        .chars()
-        .last()
-        .is_some_and(|suffix| matches!(suffix, 'K' | 'M' | 'G'));
-    let number = value
-        .get(..value.len().saturating_sub(1))
-        .unwrap_or_default();
-    if suffix_ok && !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()) {
-        Ok(value)
-    } else {
-        Err("IPERF3_RATE_INVALID".into())
+/// 0.37.0 (lot C2b, ordre #9 7214037835) — débit d'une mesure iperf3,
+/// toujours issu de ce que l'appelant a déclaré (`rate_bps` d'une étape,
+/// `rate_mbps` d'une session), jamais d'une variable d'environnement.
+/// Avant : `POLARIS_IPERF3_RATE`, défaut `"1M"`, quel que soit le débit
+/// déclaré.
+fn iperf3_rate_for(rate_bps: u64) -> Result<String, String> {
+    if rate_bps == 0 || rate_bps > TRAFFIC_MAX_RATE_BPS {
+        return Err("TRAFFIC_RATE_OUT_OF_RANGE".into());
     }
+    Ok(rate_bps.to_string())
+}
+
+/// 0.37.0 — débit maximal accepté pour une mesure iperf3 (100 Mbit/s, la
+/// borne déjà appliquée aux définitions de scénario).
+const TRAFFIC_MAX_RATE_BPS: u64 = 100_000_000;
+
+/// 0.37.0 — protocole et débit appliqués à une étape de trafic 5G quand la
+/// définition ne les déclare pas (`simple-data-ul-dl`, relevé ANR2 : aucun
+/// champ `protocol`). Défauts ÉCRITS ici, plus jamais implicites.
+const TRAFFIC_STEP_DEFAULT_PROTOCOL: &str = "TCP";
+const TRAFFIC_STEP_DEFAULT_RATE_BPS: u64 = 1_000_000;
+
+/// 0.37.0 — contrat d'une étape de trafic 5G (`traffic_ul` / `traffic_dl`) :
+/// l'exécution LIT et APPLIQUE `protocol` et `rate_bps`, ou elle REFUSE
+/// l'étape. Le chemin 5G ne mesure qu'en TCP (iperf3 sans `-u`) : une étape
+/// qui déclare UDP est refusée au lieu d'être mesurée en TCP. Rend
+/// `(protocole, origine du protocole, débit en bit/s)`.
+fn five_g_traffic_step_contract(step: &ResolvedStep) -> Result<(&'static str, &'static str, u64), String> {
+    let (protocol, source) = match step.parameters.get("protocol") {
+        None => (TRAFFIC_STEP_DEFAULT_PROTOCOL, "default"),
+        Some(value) => match value.as_str() {
+            Some("TCP") => ("TCP", "declared"),
+            Some("UDP") => return Err("TRAFFIC_UDP_NOT_MEASURED_ON_5G".into()),
+            _ => return Err("TRAFFIC_PROTOCOL_INVALID".into()),
+        },
+    };
+    if source == "declared"
+        && step.parameters.get("tcp_authorized").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("TCP_EXPLICIT_AUTHORIZATION_REQUIRED".into());
+    }
+    let rate_bps = resolved_parameter_u64(step, "rate_bps", TRAFFIC_STEP_DEFAULT_RATE_BPS, TRAFFIC_MAX_RATE_BPS)?;
+    if rate_bps == 0 {
+        return Err("TRAFFIC_RATE_OUT_OF_RANGE".into());
+    }
+    Ok((protocol, source, rate_bps))
 }
 
 fn iperf3_program() -> String {
@@ -1564,6 +1594,7 @@ trait UeRuntime: Send + Sync {
         &self,
         target: &VerifiedTrafficTarget,
         bytes: u64,
+        rate_bps: u64,
         sender: &DlSenderConfig,
     ) -> Result<IperfMeasurement, String> {
         sender.health()?;
@@ -1634,7 +1665,7 @@ trait UeRuntime: Send + Sync {
             return Err(preflight_failure("UL_ROUTE_NOT_VIA_UE_TUN", &preflight));
         }
         let iperf = iperf3_program();
-        let rate = iperf3_rate()?;
+        let rate = iperf3_rate_for(rate_bps)?;
         let command = vec![
             iperf.clone(),
             "-c".into(),
@@ -1756,6 +1787,7 @@ trait UeRuntime: Send + Sync {
         &self,
         target: &VerifiedTrafficTarget,
         bytes: u64,
+        rate_bps: u64,
         sender: &DlSenderConfig,
     ) -> Result<IperfMeasurement, String> {
         sender.health()?;
@@ -1788,7 +1820,7 @@ trait UeRuntime: Send + Sync {
             return Err(preflight_failure("DL_ROUTE_NOT_VIA_UE_TUN", &preflight));
         }
         let iperf = iperf3_program();
-        let rate = iperf3_rate()?;
+        let rate = iperf3_rate_for(rate_bps)?;
         let receiver = Command::new("/usr/bin/timeout")
             .args([
                 "--signal=TERM",
@@ -12693,6 +12725,15 @@ async fn post_traffic_session(
         .ue_ids
         .iter()
         .any(|id| id == srsran_controller::LTE_UE_ID);
+    // 0.37.0 (lot C2b) — le chemin 5G ne mesure qu'en TCP : une session 5G
+    // qui demande UDP est refusée, au lieu d'être acceptée et mesurée en
+    // TCP comme depuis 0.20.1.
+    if !lte_request && matches!(request.protocol, traffic_sessions::Protocol::Udp) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"TRAFFIC_5G_UDP_NOT_MEASURED"})),
+        );
+    }
     let mut lte_constraints = None;
     let mut lte_grant_id = None;
     if !lte_request && !active_grant_covers(&state, &request.ue_ids) {
@@ -13134,10 +13175,11 @@ async fn measure_traffic_tick(
     let runtime = state.ue_runtime.clone();
     let sender = state.dl_sender.clone();
     let bytes = (u64::from(rate_mbps) * 1_000_000 / 8).max(1);
+    let rate_bps = u64::from(rate_mbps).saturating_mul(1_000_000);
     let outcome = tokio::task::spawn_blocking(move || -> Result<ObservedTrafficTick, String> {
         match direction {
             traffic_sessions::Direction::Ul => {
-                let m = runtime.execute_iperf_ul(&target, bytes, &sender)?;
+                let m = runtime.execute_iperf_ul(&target, bytes, rate_bps, &sender)?;
                 Ok(ObservedTrafficTick {
                     bytes_ul: m.server_received_bytes,
                     bytes_dl: 0,
@@ -13145,7 +13187,7 @@ async fn measure_traffic_tick(
                 })
             }
             traffic_sessions::Direction::Dl => {
-                let m = runtime.execute_iperf_dl(&target, bytes, &sender)?;
+                let m = runtime.execute_iperf_dl(&target, bytes, rate_bps, &sender)?;
                 Ok(ObservedTrafficTick {
                     bytes_ul: 0,
                     bytes_dl: m.server_received_bytes,
@@ -13153,8 +13195,8 @@ async fn measure_traffic_tick(
                 })
             }
             traffic_sessions::Direction::Both => {
-                let ul = runtime.execute_iperf_ul(&target, bytes, &sender)?;
-                let dl = runtime.execute_iperf_dl(&target, bytes, &sender)?;
+                let ul = runtime.execute_iperf_ul(&target, bytes, rate_bps, &sender)?;
+                let dl = runtime.execute_iperf_dl(&target, bytes, rate_bps, &sender)?;
                 Ok(ObservedTrafficTick {
                     bytes_ul: ul.server_received_bytes,
                     bytes_dl: dl.server_received_bytes,
@@ -14048,6 +14090,7 @@ fn execute_live_definition_step(
             Ok(json!({"datagrams":5}))
         }
         "traffic_dl" => {
+            let (protocol, protocol_source, rate_bps) = five_g_traffic_step_contract(step)?;
             dl_sender_health(state).map_err(|_| "DL_SENDER_NOT_AVAILABLE".to_string())?;
             let bytes = resolved_parameter_u64(step, "bytes", 0, 200 * 1024 * 1024)?;
             if bytes == 0 {
@@ -14081,7 +14124,7 @@ fn execute_live_definition_step(
                     },
                     state
                         .ue_runtime
-                        .execute_iperf_dl(&target, bytes, &state.dl_sender),
+                        .execute_iperf_dl(&target, bytes, rate_bps, &state.dl_sender),
                 )?;
                 sender_bytes = sender_bytes
                     .checked_add(measurement.client_sent_bytes)
@@ -14104,6 +14147,9 @@ fn execute_live_definition_step(
             }
             Ok(json!({
                 "requested_bytes_per_ue":bytes,
+                "protocol":protocol,
+                "protocol_source":protocol_source,
+                "rate_bps":rate_bps,
                 "measured_sender_bytes":sender_bytes,
                 "measured_ue_bytes":ue_bytes,
                 "rate":rate,
@@ -14114,6 +14160,7 @@ fn execute_live_definition_step(
             }))
         }
         "traffic_ul" => {
+            let (protocol, protocol_source, rate_bps) = five_g_traffic_step_contract(step)?;
             let bytes = resolved_parameter_u64(step, "bytes", 0, 200 * 1024 * 1024)?;
             if bytes == 0 {
                 return Err("TRAFFIC_BYTES_OUT_OF_RANGE".into());
@@ -14147,7 +14194,7 @@ fn execute_live_definition_step(
                     },
                     state
                         .ue_runtime
-                        .execute_iperf_ul(&target, bytes, &state.dl_sender),
+                        .execute_iperf_ul(&target, bytes, rate_bps, &state.dl_sender),
                 )?;
                 ue_sender_bytes = ue_sender_bytes
                     .checked_add(measurement.client_sent_bytes)
@@ -14170,6 +14217,9 @@ fn execute_live_definition_step(
             }
             Ok(json!({
                 "requested_bytes_per_ue":bytes,
+                "protocol":protocol,
+                "protocol_source":protocol_source,
+                "rate_bps":rate_bps,
                 "measured_ul_bytes":ue_sender_bytes,
                 "measured_ue_sender_bytes":ue_sender_bytes,
                 "measured_dn_receiver_bytes":dn_receiver_bytes,
@@ -18397,9 +18447,10 @@ mod p0_tests {
             &self,
             target: &VerifiedTrafficTarget,
             bytes: u64,
+            rate_bps: u64,
             _: &DlSenderConfig,
         ) -> Result<IperfMeasurement, String> {
-            self.calls.lock().unwrap().push(format!("ul:{bytes}"));
+            self.calls.lock().unwrap().push(format!("ul:{bytes}:{rate_bps}"));
             Ok(IperfMeasurement {
                 client_sent_bytes: bytes,
                 server_received_bytes: bytes,
@@ -18582,6 +18633,7 @@ mod p0_tests {
             &self,
             target: &VerifiedTrafficTarget,
             bytes: u64,
+            _: u64,
             _: &DlSenderConfig,
         ) -> Result<IperfMeasurement, String> {
             std::thread::sleep(self.measure);
@@ -18640,7 +18692,7 @@ mod p0_tests {
         let request = traffic_sessions::SessionRequest {
             ue_ids: vec!["UE-05".into()],
             direction: traffic_sessions::Direction::Ul,
-            protocol: traffic_sessions::Protocol::Udp,
+            protocol: traffic_sessions::Protocol::Tcp,
             rate_mbps: 1,
             duration_s,
         };
@@ -25960,15 +26012,47 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         );
     }
 
+    /// 0.37.0 (lot C2b) — remplace `iperf_rate_is_bounded_to_an_explicit_numeric_unit` :
+    /// le débit ne vient plus de `POLARIS_IPERF3_RATE` mais de ce que
+    /// l'appelant déclare, borné à ]0, 100 Mbit/s].
     #[test]
-    fn iperf_rate_is_bounded_to_an_explicit_numeric_unit() {
+    fn iperf_rate_comes_from_the_declared_rate_and_is_bounded() {
+        assert_eq!(iperf3_rate_for(1_000_000).unwrap(), "1000000");
+        assert_eq!(iperf3_rate_for(750_000).unwrap(), "750000");
+        assert_eq!(iperf3_rate_for(0).unwrap_err(), "TRAFFIC_RATE_OUT_OF_RANGE");
+        assert_eq!(iperf3_rate_for(100_000_001).unwrap_err(), "TRAFFIC_RATE_OUT_OF_RANGE");
+        std::env::set_var("POLARIS_IPERF3_RATE", "5M");
+        assert_eq!(iperf3_rate_for(1_000_000).unwrap(), "1000000", "l'environnement n'a plus d'effet");
         std::env::remove_var("POLARIS_IPERF3_RATE");
-        assert_eq!(iperf3_rate().unwrap(), "1M");
-        std::env::set_var("POLARIS_IPERF3_RATE", "750K");
-        assert_eq!(iperf3_rate().unwrap(), "750K");
-        std::env::set_var("POLARIS_IPERF3_RATE", "5M;touch /tmp/x");
-        assert_eq!(iperf3_rate().unwrap_err(), "IPERF3_RATE_INVALID");
-        std::env::remove_var("POLARIS_IPERF3_RATE");
+    }
+
+    /// 0.37.0 (lot C2b) — l'étape de trafic 5G APPLIQUE le débit déclaré, et
+    /// une étape sans protocole déclaré (`simple-data-ul-dl`) reçoit le
+    /// défaut ÉCRIT (TCP, 1 Mbit/s), visible dans son résultat.
+    #[test]
+    fn five_g_traffic_step_applies_the_declared_rate_and_reports_its_protocol() {
+        let (test_state, calls) = counting_iperf_state();
+        let declared = traffic_step(json!({
+            "bytes": 125_000, "protocol": "TCP", "rate_bps": 2_000_000,
+            "duration_seconds": 1, "tcp_authorized": true
+        }));
+        let result = execute_live_definition_step(&test_state, &declared, &["UE-05".into()], &definition_control_for(&["UE-05"])).unwrap();
+        assert_eq!(result["protocol"], "TCP");
+        assert_eq!(result["protocol_source"], "declared");
+        assert_eq!(result["rate_bps"], 2_000_000);
+        let silent = traffic_step(json!({"bytes": 125_000}));
+        let result = execute_live_definition_step(&test_state, &silent, &["UE-05".into()], &definition_control_for(&["UE-05"])).unwrap();
+        assert_eq!(result["protocol"], "TCP");
+        assert_eq!(result["protocol_source"], "default");
+        assert_eq!(result["rate_bps"], 1_000_000);
+        assert_eq!(*calls.lock().unwrap(), vec!["ul:125000:2000000".to_string(), "ul:125000:1000000".to_string()]);
+        // TCP déclaré sans autorisation : refusé, sans mesure.
+        let unauthorised = traffic_step(json!({"bytes": 125_000, "protocol": "TCP", "rate_bps": 1_000_000}));
+        assert_eq!(
+            execute_live_definition_step(&test_state, &unauthorised, &["UE-05".into()], &definition_control_for(&["UE-05"])).unwrap_err(),
+            "TCP_EXPLICIT_AUTHORIZATION_REQUIRED"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 2, "aucune mesure pour l'étape refusée");
     }
 
     #[test]
@@ -26114,7 +26198,9 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         json!({
             "ue_ids":["UE-02"],
             "direction":"UL",
-            "protocol":"UDP",
+            // 0.37.0 (lot C2b) — le chemin 5G refuse UDP : les tests de
+            // session de trafic 5G demandent ce qui est mesuré, du TCP.
+            "protocol":"TCP",
             "rate_mbps":5,
             "duration_s":2
         })
@@ -26155,7 +26241,9 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         let bad = json!({
             "ue_ids":[],
             "direction":"UL",
-            "protocol":"UDP",
+            // 0.37.0 (lot C2b) — le chemin 5G refuse UDP : les tests de
+            // session de trafic 5G demandent ce qui est mesuré, du TCP.
+            "protocol":"TCP",
             "rate_mbps":5,
             "duration_s":2,
         });
