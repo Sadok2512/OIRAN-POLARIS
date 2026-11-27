@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.36.37 — 2026-11-27 — Une session de trafic conclut à sa durée de mur ; ses échantillons sont datés à l'heure réelle (lot C1)
+
+Patch `polaris-control-api`. Ordre cœur #9 7213520584, audit #9 7212972142. Base : 0.36.36 @ `1004202` (lot C3, nouvelle tête, CLAUDE2 #9 7216898492 ; `ecc1be6` abandonné), elle-même au-dessus de `55f480d` (0.36.35, relevée sur le processus par ANR2 #10 7213626334) — têtes successives, ordre #9 7214037835. Preuve : `proof/control-traffic-duration-on-1004202` (première preuve sur `55f480d` : `proof/control-traffic-duration` @ `a888b5e`).
+
+- **Durée** : sur le chemin 5G (`spawn_traffic_driver`), `duration_s` était compté en tours de boucle, chaque tour valant la mesure iperf3 **puis** une seconde de sommeil. À 1 Mbit/s (125 000 octets, ≈ 1 s de transfert plus les lancements `docker` / `nsenter`), une session de 20 s restait `RUNNING` plus de 40 s. La boucle s'arrête désormais à `duration_s` de mur ; un tour dure une seconde au moins, mesure comprise : plus de sommeil par-dessus une mesure qui a déjà duré une seconde, jamais de sommeil au-delà de l'échéance.
+- **Horodatage** : chaque échantillon était daté `départ + numéro du tour + 1`, ce qui affichait 20 s pour 40 s réelles et masquait le défaut. Il est daté à l'heure réelle de la mesure qu'il rapporte.
+- **Changement de comportement** : quand les mesures durent plus d'une seconde, une session compte moins d'échantillons qu'avant (un par mesure réelle, pas `duration_s`) ; le débit par seconde publié devient juste.
+- **OUVERT** : un tour déjà commencé à l'échéance termine sa mesure ; une mesure iperf3 qui s'accroche peut encore prolonger la session jusqu'à ses `timeout 30s`. Le chemin LTE (`spawn_lte_traffic_driver`) n'est pas modifié. Une session déclarée UDP reste mesurée en TCP sur le chemin 5G : lot C2, audit séparé.
+- **Tests** : `traffic_session_completes_at_wall_clock_duration_with_real_sample_times` (mesures de 1,2 s, session de 3 s : conclue avant 4,5 s, chaque échantillon daté à moins d'une seconde de la fin de sa mesure) — ROUGE à `55f480d` (« session de 3 s conclue en 6.611125018s ») et sur la preuve au-dessus de `1004202`, VERT ici ; `traffic_session_with_fast_measurements_keeps_one_sample_per_second` (mesures de 50 ms : trois échantillons, conclusion à 3 s) — vert avant et après.
+
 ## 0.36.36 — History : une adresse garde son pseudonyme `addr-*` à tous les passages du filtre
 
 Lot C3, ordres du cœur #9 7213520584 et 7216533055, après le refus d'ANR2 (#10 7216338396) de la première tête `ecc1be6`, abandonnée. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché et reste en 0.36.35.

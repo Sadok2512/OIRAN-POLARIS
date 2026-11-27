@@ -12656,7 +12656,9 @@ async fn traffic_status(State(state): State<Arc<AppState>>) -> Json<Value> {
 //
 // iperf3 drive: a short async driver loop is spawned per POST. The
 // loop pushes one `TrafficSample` per second into the ring buffer and,
-// at `duration_s`, flips the session to COMPLETED. On every tick it
+// at `duration_s` of wall-clock time (0.36.37), flips the session to
+// COMPLETED. A tick lasts at least one second, measurement included;
+// each sample carries the real time of its measurement. On every tick it
 // attempts to resolve a `VerifiedTrafficTarget` for each UE in the
 // request and, when the resolution succeeds, calls
 // `UeRuntime::execute_iperf_ul` / `_dl` on a blocking thread. When the
@@ -13002,8 +13004,10 @@ async fn get_traffic_samples(
 }
 
 /// 0.20.1 driver loop. One `tokio::spawn` per session. Ticks at 1 Hz,
-/// pushes a sample per tick, and after `duration_s` seconds flips the
-/// session to COMPLETED. On each tick the driver:
+/// pushes a sample per tick, and once `duration_s` seconds of wall-clock
+/// time have elapsed (0.36.37 — before, `duration_s` counted loop turns
+/// of « measurement + 1 s ») flips the session to COMPLETED. A tick that
+/// is already running at the deadline finishes its measurement first. On each tick the driver:
 ///   1. Attempts to resolve a `VerifiedTrafficTarget` for every UE in
 ///      the request (via `UeRuntime::resolve_traffic_target`).
 ///   2. For UEs whose target resolves, spawns a blocking iperf3
@@ -13022,18 +13026,22 @@ fn spawn_traffic_driver(
     request: traffic_sessions::SessionRequest,
 ) {
     tokio::spawn(async move {
-        let started_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // 0.36.37 (lot C1, ordre #9 7213520584, audit #9 7212972142) — la
+        // session conclut à `duration_s` de MUR. Avant : `duration_s` était
+        // compté en tours de boucle, chaque tour = la mesure PUIS une
+        // seconde de sommeil ; à 1 Mbit/s, 20 s demandées en duraient
+        // plus de 40.
+        let tick = std::time::Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(u64::from(request.duration_s).max(1));
         let direction = request.direction;
-        let total_ticks = u64::from(request.duration_s).max(1);
         let mut per_ue_bytes: BTreeMap<String, (u64, u64)> = request
             .ue_ids
             .iter()
             .map(|ue| (ue.clone(), (0u64, 0u64)))
             .collect();
-        for tick in 0..total_ticks {
+        while tokio::time::Instant::now() < deadline {
+            let tick_started = tokio::time::Instant::now();
             // Give the test harness a chance to pre-empt by observing
             // the session state before each tick.
             match state.traffic_manager.get(&session_id) {
@@ -13045,7 +13053,6 @@ fn spawn_traffic_driver(
                 None => break,
                 _ => {}
             }
-            let now = started_at.saturating_add(tick + 1);
             let mut cum_ul = 0u64;
             let mut cum_dl = 0u64;
             for ue_id in &request.ue_ids {
@@ -13072,17 +13079,28 @@ fn spawn_traffic_driver(
                     measured.warnings,
                 );
             }
+            // 0.36.37 — l'échantillon est daté à l'heure réelle de la
+            // mesure qu'il rapporte. Avant : `départ + numéro du tour + 1`,
+            // une date fabriquée qui affichait 20 s pour 40 s réelles et
+            // rendait le défaut de durée invisible.
             let _ = state.traffic_manager.push_sample(
                 &session_id,
                 traffic_sessions::TrafficSample {
-                    epoch_s: now,
+                    epoch_s: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
                     bytes_ul_cum: cum_ul,
                     bytes_dl_cum: cum_dl,
                     rate_ul_bps: None,
                     rate_dl_bps: None,
                 },
             );
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // 0.36.37 — un tour dure une seconde au moins, mesure comprise :
+            // aucun sommeil par-dessus une mesure qui a déjà duré une
+            // seconde ou plus, et jamais au-delà de l'échéance.
+            let wake = (tick_started + tick).min(deadline);
+            tokio::time::sleep_until(wake).await;
         }
         let _ = state.traffic_manager.complete(&session_id);
     });
