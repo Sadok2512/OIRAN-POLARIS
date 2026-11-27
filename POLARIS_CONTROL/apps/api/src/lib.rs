@@ -24422,6 +24422,167 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         check("réponse", &item);
     }
 
+    /// LOT C5 (ordres cœur #9 7218377047 et 7218858535, audit CLAUDE2 #9
+    /// 7218478108) — cas 1 : un job de définition dont le suffixe
+    /// hexadécimal porte dix chiffres d'affilée (classe ≈ 1,59 %) reste
+    /// retrouvable après CHAQUE mise à jour. Avant : la première mise à jour
+    /// assainissait `job_id` en mémoire, la suivante répondait
+    /// `SCENARIO_JOB_NOT_FOUND`, avalée par `let _ =`.
+    #[tokio::test]
+    async fn c5_definition_job_in_the_digit_class_is_found_after_every_update_0_37_4() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5-key-telemetry-0.37.4-0123456789abcdef".as_slice())));
+        let shared = Arc::new(state());
+        let job_id = "c5-def-0123456789ab";
+        shared.runtime.lock().unwrap().history.push(json!({
+            "job_id": job_id, "scenario_id": "c5-def", "state": "RUNNING",
+            "ue_ids": ["UE-05"], "steps": [{"state": "PENDING"}, {"state": "PENDING"}],
+        }));
+        for (position, stage) in ["première", "deuxième", "troisième"].iter().enumerate() {
+            let updated = update_definition_record(&shared, job_id, |record| {
+                record["steps"][position.min(1)]["state"] = json!("COMPLETED");
+            });
+            assert!(updated.is_ok(), "{stage} mise à jour : {:?}", updated.err());
+            assert_eq!(updated.unwrap()["job_id"], job_id, "{stage} mise à jour : clé remplacée");
+        }
+        assert!(definition_record_index(&shared.runtime.lock().unwrap(), job_id).is_some());
+        let steps = app((*shared).clone())
+            .oneshot(Request::builder().uri(format!("/api/v1/scenarios/{job_id}/steps")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(steps.status(), StatusCode::OK, "GET /scenarios/:job_id/steps");
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5 — cas 2 : écriture, relecture du fichier, `recover_runtime`,
+    /// mise à jour et réponse (parcours réel `history_real_path_0_37_1`) :
+    /// `job_id` reste la clé d'origine à chaque étape, et les autres champs
+    /// texte restent protégés (propriété au repos de 0.36.31 conservée).
+    #[tokio::test]
+    async fn c5_job_id_in_the_digit_class_survives_write_and_recovery_0_37_4() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5-key-telemetry-0.37.4-0123456789abcdef".as_slice())));
+        let record = json!({
+            "job_id": "c5-def-0123456789ab", "state": "RUNNING",
+            "target_ue_id": "UE-05", "ue_ids": ["UE-05"],
+            "note": "subscriber 001010000000201 refused",
+        });
+        history_real_path_0_37_1("c5-def-0123456789ab", record, |stage, record| {
+            assert_eq!(record["job_id"], "c5-def-0123456789ab", "{stage} : job_id remplacé");
+            assert_eq!(record["target_ue_id"], "UE-05", "{stage} : target_ue_id remplacé");
+            assert_eq!(record["ue_ids"], json!(["UE-05"]), "{stage} : ue_ids remplacés");
+            assert!(record["note"].as_str().unwrap_or_default().starts_with("history-"), "{stage} : protection perdue");
+        })
+        .await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5 — cas 2c : après un redémarrage, un `scenario_id` certifié qui
+    /// porte dix chiffres (un horodatage) est RETROUVÉ par `POST
+    /// /scenarios/start` : la garde d'appartenance répond
+    /// `OWNERSHIP_TARGET_MISMATCH` sur une autre cible, l'idempotence répond
+    /// sur la même. Avant : la clé assainie au disque n'était plus retrouvée,
+    /// et les deux gardes étaient sautées sans bruit.
+    #[tokio::test]
+    async fn c5_certified_scenario_id_with_ten_digits_is_found_after_restart_0_37_4() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c5-key-telemetry-0.37.4-0123456789abcdef".as_slice())));
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-04", true);
+        prepare_owned_traffic_target(&test_state, "UE-05", true);
+        let scenario_id = "c5-run-1795600000";
+        {
+            let mut runtime = test_state.runtime.lock().unwrap();
+            runtime.history.push(json!({
+                "job_id": scenario_id, "state": "STOPPED", "target_ue_id": "UE-04",
+                "scenario_type": "bounded-controller-ue-udp-v1",
+            }));
+            persist_runtime(&test_state, &runtime);
+        }
+        let written: Value = serde_json::from_slice(&fs::read(&test_state.job_state_path).unwrap()).unwrap();
+        *test_state.runtime.lock().unwrap() = recover_runtime(Some(written));
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+
+        assert_eq!(validate_targeted(&application, &cookie, &csrf, "UE-05").await, StatusCode::OK);
+        let other_target = application.clone().oneshot(targeted_scenario_request(&cookie, &csrf, scenario_id, "UE-05")).await.unwrap();
+        assert_eq!(other_target.status(), StatusCode::CONFLICT, "garde d'appartenance sautée");
+        let body: Value = serde_json::from_slice(&to_bytes(other_target.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "OWNERSHIP_TARGET_MISMATCH");
+
+        assert_eq!(validate_targeted(&application, &cookie, &csrf, "UE-04").await, StatusCode::OK);
+        let same_target = application.clone().oneshot(targeted_scenario_request(&cookie, &csrf, scenario_id, "UE-04")).await.unwrap();
+        assert_eq!(same_target.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(same_target.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["idempotent"], true, "idempotence sautée");
+        assert_eq!(body["job_id"], scenario_id);
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// LOT C5 — cas 2c, second volet : un `scenario_id` (ou un identifiant de
+    /// définition) qui porte un marqueur d'abonné est REFUSÉ À L'ENTRÉE, avec
+    /// une erreur nommée, au lieu d'être accepté puis muté.
+    #[tokio::test]
+    async fn c5_scenario_id_carrying_a_subscriber_marker_is_refused_at_entry_0_37_4() {
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-04", true);
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        for scenario_id in ["c5-imsi-run", "C5-SUPI-run", "msisdn_c5", "c5-imei", "c5-suci", "c5-guti", "c5-tmsi"] {
+            let response = application.clone().oneshot(targeted_scenario_request(&cookie, &csrf, scenario_id, "UE-04")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{scenario_id}");
+            let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(body["error"], "SCENARIO_ID_SUBSCRIBER_MARKER", "{scenario_id}");
+        }
+        let definition = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/scenarios/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"scenario_definition_id":"c5-imsi-def","ue_ids":["UE-04"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(definition.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = serde_json::from_slice(&to_bytes(definition.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "SCENARIO_ID_SUBSCRIBER_MARKER");
+    }
+
+    /// LOT C5 — point 3 : quand l'enregistrement d'un job de définition en
+    /// cours est introuvable, le stop répond une erreur NOMMÉE, au lieu de
+    /// fabriquer `{"state":"STOPPING"}` sans rien enregistrer.
+    #[tokio::test]
+    async fn c5_stop_of_a_definition_job_without_record_reports_a_named_error_0_37_4() {
+        let test_state = state();
+        test_state
+            .definition_jobs
+            .lock()
+            .unwrap()
+            .insert("c5-lost-0123456789ab".into(), definition_control_for(&["UE-05"]));
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/scenarios/stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"job_id":"c5-lost-0123456789ab"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR, "état STOPPING fabriqué");
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "SCENARIO_JOB_NOT_FOUND");
+        assert_eq!(body["cancel_requested"], true);
+    }
+
     /// 0.37.1 (lot C7, clause 1, ordre cœur #9 7220805261) — les références
     /// `psn-` et `scenario-` à 12 hexadécimaux, dont le suffixe porte 10
     /// chiffres, restent TELLES QUELLES à toutes les étapes ; le littéral à 16

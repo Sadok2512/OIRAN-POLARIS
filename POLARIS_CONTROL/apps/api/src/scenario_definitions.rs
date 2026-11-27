@@ -1429,6 +1429,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// LOT C5 (ordre cœur #9 7218858535) — un identifiant de définition est une
+    /// clé : il est refusé à l'entrée s'il porte un marqueur d'abonné, et
+    /// accepté s'il ne porte qu'un nombre (un horodatage est légitime).
+    #[test]
+    fn c5_definition_id_carrying_a_subscriber_marker_is_refused_0_37_4() {
+        for id in ["c5-imsi-def", "C5-Supi", "msisdn-c5", "c5-imei", "c5-suci", "c5-guti", "c5-tmsi"] {
+            assert_eq!(validate_mutation(&mutation(id)).unwrap_err(), "SCENARIO_ID_SUBSCRIBER_MARKER", "{id}");
+        }
+        validate_mutation(&mutation("c5-def-1795600000")).unwrap();
+    }
+
     fn mutation(id: &str) -> ScenarioMutation {
         ScenarioMutation {
             id: id.into(),
