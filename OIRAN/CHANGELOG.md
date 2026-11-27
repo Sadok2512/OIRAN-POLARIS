@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.203 / live-probe 0.7.9 — authorized rollback manifests
+
+Read rollback targets from an explicit allowlist. Preserve the pinned unreferenced total when an authorized manifest is unreadable and expose the rollback error separately.
+
 ## oiran-api 2.21.201 / live-probe 0.7.8 — distinguish unreferenced and rollback-held shards
 
 Report unreferenced shards and rollback-held shards separately at the measured commit. Include deployment backup manifests in inventory and show per-backup disk usage without double-counting a shard in the total.

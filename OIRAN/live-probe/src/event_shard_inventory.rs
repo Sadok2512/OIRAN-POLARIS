@@ -6,9 +6,8 @@ use std::{
     ffi::CString,
     fs,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -32,6 +31,7 @@ pub(super) struct Totals {
     unreferenced: ShardUsage,
     rollback_held: ShardUsage,
     by_backup: BTreeMap<String, ShardUsage>,
+    rollback_error: Option<InventoryError>,
     trees_consulted: usize,
     archives_consulted: usize,
     broken_links: usize,
@@ -76,9 +76,14 @@ pub(super) fn snapshot(result: Result<&Totals, &InventoryError>) -> Value {
             "commit_seq": totals.commit_seq,
         })),
         "rollback_held": totals.map(|totals| json!({
-            "count": totals.rollback_held.count,
-            "bytes": totals.rollback_held.bytes,
-            "by_backup": totals.by_backup,
+            "status": if totals.rollback_error.is_some() { "unavailable" } else { "available" },
+            "count": totals.rollback_error.is_none().then_some(totals.rollback_held.count),
+            "bytes": totals.rollback_error.is_none().then_some(totals.rollback_held.bytes),
+            "by_backup": totals.rollback_error.is_none().then_some(&totals.by_backup),
+            "error": totals.rollback_error.as_ref().map(|error| json!({
+                "path": error.path.as_deref().map(Path::to_string_lossy),
+                "reason": error.reason,
+            })),
             "commit_seq": totals.commit_seq,
         })),
         "trees_consulted": totals.map(|totals| totals.trees_consulted),
@@ -105,11 +110,7 @@ fn shard_inventory_serializes_errors_for_non_utf8_paths() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FailurePoint {
     ActiveManifest,
-    BackupRoots,
-    Directory,
     Link,
-    Manifest,
-    Archive,
     Shard,
     Finish,
 }
@@ -206,42 +207,6 @@ fn unavailable(path: &Path, error: impl std::fmt::Display) -> InventoryError {
     }
 }
 
-const DEPLOYMENT_BACKUPS: &str = "/var/lib/oiran/deployment-backups";
-const RELEASES: &str = "/var/lib/oiran/releases";
-
-fn deployment_backups(captures: &Path) -> PathBuf {
-    if cfg!(test) {
-        captures.join(".deployment-backups")
-    } else {
-        DEPLOYMENT_BACKUPS.into()
-    }
-}
-
-fn backup_name(path: &Path, deployments: &Path) -> Option<String> {
-    for root in [deployments, Path::new(RELEASES)] {
-        if let Ok(relative) = path.strip_prefix(root) {
-            return relative
-                .components()
-                .next()?
-                .as_os_str()
-                .to_str()
-                .map(str::to_owned);
-        }
-    }
-    path.components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .find(|name| {
-            name.starts_with(".dataset-rollback")
-                || name.starts_with(".dataset-previous")
-                || (name.starts_with("ANR2_oiran_") && name.contains("_backup_"))
-        })
-        .map(str::to_owned)
-}
-
-fn manifest_name(name: &str) -> bool {
-    name.starts_with("dataset_manifest") && name.ends_with(".json")
-}
-
 fn protect_manifest(value: &Value, names: &mut HashSet<String>) -> Result<(), String> {
     if !value.is_object() {
         return Err("manifest must be an object".into());
@@ -262,347 +227,77 @@ fn protect_manifest(value: &Value, names: &mut HashSet<String>) -> Result<(), St
     Ok(())
 }
 
-fn archive_manifest(
-    path: &Path,
-    required_members: &[&str],
-    names: &mut HashSet<String>,
-) -> Result<(), String> {
-    let tar = |mode| {
-        let mut command = Command::new("/usr/bin/tar");
-        command.env_remove("TAR_OPTIONS").arg(mode).arg(path);
-        command
-    };
-    let listing = tar("-tf").output().map_err(|error| error.to_string())?;
-    if !listing.status.success() {
-        return Err("cannot list compressed backup".into());
-    }
-    let listing = std::str::from_utf8(&listing.stdout).map_err(|error| error.to_string())?;
-    let members: Vec<_> = listing
-        .lines()
-        .filter(|entry| entry.rsplit('/').next().is_some_and(manifest_name))
-        .collect();
-    for required in required_members {
-        if !members
-            .iter()
-            .any(|member| member.trim_start_matches("./") == *required)
-        {
-            return Err(format!("required archive member missing: {required}"));
-        }
-    }
-    let expected = members.len();
-    if expected == 0 {
-        return Ok(());
-    }
-    let mut command = tar("-xOf");
-    let bodies = command
-        .args(["--wildcards", "--no-anchored", "dataset_manifest*.json"])
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !bodies.status.success() {
-        return Err("cannot read backup manifests".into());
-    }
-    let mut count = 0;
-    for value in serde_json::Deserializer::from_slice(&bodies.stdout).into_iter::<Value>() {
-        let value = value.map_err(|error| error.to_string())?;
-        if !required_members.is_empty() && value.get("dataset_id").and_then(Value::as_str).is_none()
-        {
-            return Err("required archive contains an invalid dataset manifest".into());
-        }
-        protect_manifest(&value, names)?;
-        count += 1;
-    }
-    if count != expected {
-        return Err("backup manifest inventory mismatch".into());
-    }
-    Ok(())
+/// One immutable rollback manifest and its configured protection declaration.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackTarget {
+    name: String,
+    manifest: PathBuf,
+    shards: BTreeSet<String>,
 }
 
-const CONTINUOUS_BACKUP_MEMBER: &str =
-    "var/lib/oiran/captures/continuous-lab-import/dataset/dataset_manifest.json";
-const LTE_BACKUP_MEMBER: &str =
-    "var/lib/oiran/lte-evidence/datasets/dataset-lte-run-09913806240271269bd9d7e0d4d07eb2/dataset_manifest.json";
-// The contents of the named rollback sources are part of the safety inventory.
-// An empty member list denotes a plain manifest. None denotes a binary/config backup.
-type Artifact = (&'static str, &'static [&'static str]);
-pub(super) const REQUIRED_BACKUPS: [(&str, Option<Artifact>); 9] = [
-    (
-        "ANR2_oiran_2.7.26_backup_20261105T224027Z",
-        Some((
-            "oiran-production-complete.tar.zst",
-            &[CONTINUOUS_BACKUP_MEMBER],
-        )),
-    ),
-    (
-        "ANR2_oiran_2.7.27_predeploy_backup_20261106T075717Z",
-        Some((
-            "oiran-production-complete.tar.zst",
-            &[CONTINUOUS_BACKUP_MEMBER],
-        )),
-    ),
-    (
-        "ANR2_oiran_2.7.28_predeploy_backup_20261106T103354Z",
-        Some((
-            "oiran-production-complete.tar.zst",
-            &[CONTINUOUS_BACKUP_MEMBER],
-        )),
-    ),
-    (
-        "ANR2_oiran_2.8.0_predeploy_backup_20261106T115119Z",
-        Some((
-            "oiran-2.7.28-full.tar.zst",
-            &[CONTINUOUS_BACKUP_MEMBER, LTE_BACKUP_MEMBER],
-        )),
-    ),
-    (
-        "ANR2_oiran_2.8.1_predeploy_backup_20261106T142802Z",
-        Some(("oiran-2.8.0-full.tar.zst", &[CONTINUOUS_BACKUP_MEMBER])),
-    ),
-    (
-        "ANR2_oiran_2.8.2_predeploy_backup_20261106T205304Z",
-        Some((
-            "dataset-config-unit-watcher.tar.zst",
-            &[CONTINUOUS_BACKUP_MEMBER],
-        )),
-    ),
-    (
-        "ANR2_oiran_2.8.3_backup_20261107T100830Z",
-        Some((
-            "data/continuous-lab-import/dataset/dataset_manifest.json",
-            &[],
-        )),
-    ),
-    ("ANR2_oiran_2.9.0_backup_20261107T142336Z", None),
-    (
-        "ANR2_oiran_2.9.0_backup_20261107T142417Z",
-        Some((
-            "state/continuous-lab-import/dataset/dataset_manifest.json",
-            &[],
-        )),
-    ),
-];
-
-type ExpectedArtifacts = BTreeMap<PathBuf, &'static [&'static str]>;
-
-fn roots(captures: &Path) -> Result<(Vec<PathBuf>, ExpectedArtifacts), InventoryError> {
-    let (mut roots, backup_root) = if cfg!(test) {
-        (vec![captures.to_owned()], captures.join(".gc-backups"))
-    } else {
-        (
-            vec![
-                captures.to_owned(),
-                "/opt".into(),
-                RELEASES.into(),
-                deployment_backups(captures),
-            ],
-            PathBuf::from("/root"),
-        )
-    };
-    #[cfg(test)]
-    inject_failure(FailurePoint::BackupRoots, &backup_root)?;
-    let mut identities = HashSet::new();
-    let mut expected = BTreeMap::new();
-    for (name, artifact) in REQUIRED_BACKUPS {
-        let path = backup_root.join(name);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
-        if !metadata.is_dir() || !identities.insert((metadata.dev(), metadata.ino())) {
-            return Err(unavailable(
-                &path,
-                "required backup must be a distinct directory",
-            ));
-        }
-        if let Some((relative, members)) = artifact {
-            expected.insert(path.join(relative), members);
-        }
-        roots.push(path);
-    }
-    // Extra backups expand the manifest union without satisfying a required identity.
-    for entry in fs::read_dir(&backup_root).map_err(|error| unavailable(&backup_root, error))? {
-        let entry = entry.map_err(|error| unavailable(&backup_root, error))?;
-        let name = entry.file_name();
-        if name.to_str().is_some_and(|name| {
-            name.starts_with("ANR2_oiran_")
-                && name.contains("_backup_")
-                && !REQUIRED_BACKUPS
-                    .iter()
-                    .any(|(required, _)| *required == name)
-        }) {
-            roots.push(entry.path());
-        }
-    }
-    Ok((roots, expected))
-}
+#[cfg(not(test))]
+const ALLOWLIST_ENV: &str = "OIRAN_ROLLBACK_ALLOWLIST";
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static TEST_ALLOWLIST: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
     pub(super) static LOCK_PROBE: std::cell::RefCell<Option<(PathBuf, Duration)>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[derive(Default)]
-struct References {
-    names: HashSet<String>,
-    rollback_by_shard: BTreeMap<String, BTreeSet<String>>,
-    trees_consulted: usize,
-    archives_consulted: usize,
-    broken_links: usize,
-}
-
-impl References {
-    fn add(&mut self, names: HashSet<String>, backup: Option<&str>) {
-        if let Some(backup) = backup {
-            for name in names {
-                self.rollback_by_shard
-                    .entry(name)
-                    .or_default()
-                    .insert(backup.to_owned());
-            }
-        } else {
-            self.names.extend(names);
-        }
-    }
-}
-
-fn inventory(
-    captures: &Path,
-    active_shards: &Path,
-    current: &Path,
-    population: &[PathBuf],
-) -> Result<References, InventoryError> {
-    let active_manifest = current.join("dataset_manifest.json");
-    let deployments = deployment_backups(captures);
-    let mut references = References::default();
+fn rollback_targets() -> Result<Vec<RollbackTarget>, InventoryError> {
     #[cfg(test)]
-    LOCK_PROBE.with(|probe| {
-        if let Some((base, held)) = probe.borrow_mut().as_mut() {
-            let locked = super::PublicationLock::try_acquire(base).is_err();
-            let started = std::time::Instant::now();
-            std::thread::sleep(Duration::from_millis(120));
-            if locked {
-                assert!(super::PublicationLock::try_acquire(base).is_err());
-                *held += started.elapsed();
-            }
-        }
-    });
-    let (roots, mut expected) = roots(captures)?;
-    let mut pending: Vec<_> = roots.into_iter().map(|path| (path, Vec::new())).collect();
-    let mut seen = HashSet::new();
-    while let Some((directory, mut ancestors)) = pending.pop() {
-        let physical = directory
-            .canonicalize()
-            .map_err(|error| unavailable(&directory, error))?;
-        let metadata = fs::metadata(&directory).map_err(|error| unavailable(&directory, error))?;
-        if !metadata.is_dir() {
-            return Err(unavailable(&directory, "inventory root is not a directory"));
-        }
-        let identity = (metadata.dev(), metadata.ino());
-        if ancestors.contains(&identity) {
-            return Err(unavailable(&directory, "inventory directory symlink loop"));
-        }
-        if !seen.insert((identity, backup_name(&directory, &deployments))) {
-            continue;
-        }
-        ancestors.push(identity);
-        #[cfg(test)]
-        inject_failure(FailurePoint::Directory, &directory)?;
-        let mut found_manifest = false;
-        let paths = if physical == active_shards {
-            population.to_vec()
-        } else {
-            fs::read_dir(&directory)
-                .map_err(|error| unavailable(&directory, error))?
-                .map(|entry| {
-                    entry
-                        .map(|entry| entry.path())
-                        .map_err(|error| unavailable(&directory, error))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for path in paths {
-            if path == active_manifest {
-                found_manifest = true;
-                continue;
-            }
-            let kind = fs::symlink_metadata(&path)
-                .map_err(|error| unavailable(&path, error))?
-                .file_type();
-            let required = expected.get(&path).copied();
-            if required.is_some() && !kind.is_file() {
-                return Err(unavailable(
-                    &path,
-                    "required backup artifact is not a regular file",
-                ));
-            }
-            if kind.is_dir() {
-                pending.push((path, ancestors.clone()));
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| unavailable(&path, "inventory entry has a non-UTF-8 name"))?;
-            if kind.is_symlink() {
-                #[cfg(test)]
-                inject_failure(FailurePoint::Link, &path)?;
-                let physical = match path.canonicalize() {
-                    Ok(target) => target,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        references.broken_links += 1;
-                        continue;
-                    }
-                    Err(error) => return Err(unavailable(&path, error)),
-                };
-                if directory
-                    .file_name()
-                    .is_some_and(|name| name == "event-shards")
-                {
-                    // Both the alias and the resolved shard name are references.
-                    let target = physical
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .ok_or_else(|| unavailable(&path, "invalid shard link target name"))?;
-                    references.names.extend([name.into(), target.into()]);
-                    continue;
-                }
-                let target = fs::metadata(&physical).map_err(|error| unavailable(&path, error))?;
-                if target.is_dir() {
-                    pending.push((path, ancestors.clone()));
-                    continue;
-                }
-            }
-            if manifest_name(name) {
-                #[cfg(test)]
-                inject_failure(FailurePoint::Manifest, &path)?;
-                let bytes = fs::read(&path).map_err(|error| unavailable(&path, error))?;
-                let value: Value =
-                    serde_json::from_slice(&bytes).map_err(|error| unavailable(&path, error))?;
-                if required.is_some() && value.get("dataset_id").and_then(Value::as_str).is_none() {
-                    return Err(unavailable(&path, "required backup manifest is invalid"));
-                }
-                let mut names = HashSet::new();
-                protect_manifest(&value, &mut names).map_err(|error| unavailable(&path, error))?;
-                references.add(names, backup_name(&path, &deployments).as_deref());
-                found_manifest = true;
-            } else if name.ends_with(".tar.zst") {
-                #[cfg(test)]
-                inject_failure(FailurePoint::Archive, &path)?;
-                let mut names = HashSet::new();
-                archive_manifest(&path, required.unwrap_or_default(), &mut names)
-                    .map_err(|error| unavailable(&path, error))?;
-                references.add(names, backup_name(&path, &deployments).as_deref());
-                references.archives_consulted += 1;
-            } else if required.is_some() {
-                return Err(unavailable(&path, "unknown required backup artifact"));
-            }
-            if required.is_some() {
-                expected.remove(&path);
-            }
-        }
-        references.trees_consulted += usize::from(found_manifest);
+    let path = match TEST_ALLOWLIST.with(|path| path.borrow().clone()) {
+        Some(path) => path,
+        None => return Ok(Vec::new()),
+    };
+    #[cfg(not(test))]
+    let path = std::env::var_os(ALLOWLIST_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| InventoryError::general(format!("{ALLOWLIST_ENV} is required")))?;
+    if !path.is_absolute() {
+        return Err(unavailable(
+            &path,
+            "OIRAN_ROLLBACK_ALLOWLIST must name an absolute path",
+        ));
     }
-    if let Some((path, _)) = expected.first_key_value() {
-        return Err(unavailable(&path, "required backup artifact missing"));
+    let targets: Vec<RollbackTarget> =
+        serde_json::from_slice(&fs::read(&path).map_err(|error| unavailable(&path, error))?)
+            .map_err(|error| unavailable(&path, error))?;
+    let mut names = HashSet::new();
+    let mut manifests = HashSet::new();
+    for target in &targets {
+        let manifest_name = target.manifest.file_name().and_then(|name| name.to_str());
+        if target.name.trim().is_empty()
+            || !names.insert(&target.name)
+            || !manifests.insert(&target.manifest)
+            || !target.manifest.is_absolute()
+            || !manifest_name
+                .is_some_and(|name| name.starts_with("dataset_manifest") && name.ends_with(".json"))
+            || target
+                .shards
+                .iter()
+                .any(|name| Path::new(name).file_name().and_then(|v| v.to_str()) != Some(name))
+        {
+            return Err(unavailable(
+                &path,
+                "invalid or duplicate authorized rollback target",
+            ));
+        }
     }
-    Ok(references)
+    Ok(targets)
+}
+
+fn checked_references(target: &RollbackTarget) -> Result<bool, InventoryError> {
+    let path = &target.manifest;
+    let bytes = fs::read(path).map_err(|error| unavailable(path, error))?;
+    let value = serde_json::from_slice(&bytes).map_err(|error| unavailable(path, error))?;
+    let mut names = HashSet::new();
+    protect_manifest(&value, &mut names).map_err(|error| unavailable(path, error))?;
+    Ok(names.len() == target.shards.len() && target.shards.iter().all(|name| names.contains(name)))
 }
 
 fn read_sequence(path: &Path) -> Result<u64, InventoryError> {
@@ -651,7 +346,6 @@ fn shard_population(current: &Path) -> Result<Vec<PathBuf>, InventoryError> {
 }
 
 pub(super) fn measure(
-    captures: &Path,
     current: &Path,
     served: impl Fn() -> Option<LiveDataset>,
 ) -> Result<Totals, InventoryError> {
@@ -699,11 +393,39 @@ pub(super) fn measure(
                     "served and disk generations disagree or are not sharded",
                 ));
             }
-            let shards = current.join("event-shards");
-            let physical_shards = shards
-                .canonicalize()
-                .map_err(|error| unavailable(&shards, error))?;
-            let references = inventory(captures, &physical_shards, current, &population)?;
+            #[cfg(test)]
+            LOCK_PROBE.with(|probe| {
+                if let Some((base, held)) = probe.borrow_mut().as_mut() {
+                    let started = Instant::now();
+                    if PublicationLock::try_acquire(base).is_err() {
+                        *held += started.elapsed() + Duration::from_nanos(1);
+                    }
+                }
+            });
+            let targets = rollback_targets()?;
+            let mut rollback_error = None;
+            let mut trees_consulted = 1;
+            let mut rollback_by_shard = BTreeMap::<_, BTreeSet<_>>::new();
+            for target in &targets {
+                match checked_references(target) {
+                    Ok(true) => trees_consulted += 1,
+                    Ok(false) => {
+                        return Err(unavailable(
+                            &target.manifest,
+                            "rollback manifest disagrees with authorized shard declaration",
+                        ))
+                    }
+                    Err(error) => {
+                        rollback_error.get_or_insert(error);
+                    }
+                }
+                for name in &target.shards {
+                    rollback_by_shard
+                        .entry(name.as_str())
+                        .or_default()
+                        .insert(&target.name);
+                }
+            }
             #[cfg(test)]
             AFTER_TRAVERSAL.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -713,6 +435,7 @@ pub(super) fn measure(
             let mut unreferenced = ShardUsage::default();
             let mut rollback_held = ShardUsage::default();
             let mut by_backup = BTreeMap::<String, ShardUsage>::new();
+            let mut broken_links = 0;
             for path in population {
                 let name = path
                     .file_name()
@@ -726,25 +449,45 @@ pub(super) fn measure(
                 inject_failure(FailurePoint::Shard, &path)?;
                 let metadata =
                     fs::symlink_metadata(&path).map_err(|error| unavailable(&path, error))?;
+                if metadata.is_symlink() {
+                    #[cfg(test)]
+                    inject_failure(FailurePoint::Link, &path)?;
+                    match path.canonicalize() {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            broken_links += 1
+                        }
+                        Err(error) => return Err(unavailable(&path, error)),
+                    }
+                    continue;
+                }
                 if !metadata.is_file() {
                     continue;
                 }
-                if let Some(backups) = references.rollback_by_shard.get(name) {
+                if let Some(backups) = rollback_by_shard.get(name) {
                     rollback_held.add(metadata.len());
                     for backup in backups {
                         by_backup
-                            .entry(backup.clone())
+                            .entry((*backup).clone())
                             .or_default()
                             .add(metadata.len());
                     }
-                } else if !references.names.contains(name) {
+                } else {
                     unreferenced.add(metadata.len());
                 }
             }
             #[cfg(test)]
             inject_failure(FailurePoint::Finish, current)?;
             watch.check_mounts()?;
-            Ok((active, unreferenced, rollback_held, by_backup, references))
+            Ok((
+                active,
+                unreferenced,
+                rollback_held,
+                by_backup,
+                rollback_error,
+                trees_consulted,
+                broken_links,
+            ))
         })();
         let watch_result = watch.unchanged(&manifest_path);
         let latest_seq = read_sequence(&sequence_path)?;
@@ -759,7 +502,15 @@ pub(super) fn measure(
             }
             continue;
         }
-        let (active, unreferenced, rollback_held, by_backup, references) = scanned?;
+        let (
+            active,
+            unreferenced,
+            rollback_held,
+            by_backup,
+            rollback_error,
+            trees_consulted,
+            broken_links,
+        ) = scanned?;
         if !served()
             .as_ref()
             .is_some_and(|latest| same_manifest(latest, &active))
@@ -776,9 +527,10 @@ pub(super) fn measure(
             unreferenced,
             rollback_held,
             by_backup,
-            trees_consulted: references.trees_consulted,
-            archives_consulted: references.archives_consulted,
-            broken_links: references.broken_links,
+            rollback_error,
+            trees_consulted,
+            archives_consulted: 0,
+            broken_links,
         });
     }
     unreachable!("inventory returns on its second attempt")

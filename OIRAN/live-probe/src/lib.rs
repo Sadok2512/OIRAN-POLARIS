@@ -5508,7 +5508,7 @@ impl CaptureManager {
     }
 
     fn measure_continuous_event_shards(&self, current: &Path) {
-        let result = event_shard_inventory::measure(&self.root, current, || {
+        let result = event_shard_inventory::measure(current, || {
             self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned()
         });
         *self.shard_inventory_snapshot.lock().unwrap() = Some(result);
@@ -24494,7 +24494,10 @@ Content-Length: 0\r\n\
 
     impl RetentionBench0_7_0 {
         fn new(label: &str) -> Self {
-            let root = temporary_root(label);
+            Self::with_root(temporary_root(label))
+        }
+
+        fn with_root(root: TempRoot) -> Self {
             let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
             manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
             let base = root.join(CONTINUOUS_CAPTURE_ID);
@@ -24668,25 +24671,43 @@ Content-Length: 0\r\n\
     }
 
     #[test]
+    fn shard_inventory_ignores_unlisted_foreign_0700_directory() {
+        const CHILD: &str = "OIRAN_8D_FOREIGN_DIRECTORY_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            assert_shard_inventory(None);
+            return;
+        }
+        let root = temporary_root("foreign-rollback-directory");
+        let private = root.join(".deployment-backups").join("unlisted");
+        fs::create_dir_all(&private).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(std::process::Command::new("chown").args(["995:987"])
+            .arg(&private).status().unwrap().success());
+        let output = std::process::Command::new("setpriv")
+            .args(["--reuid=0", "--regid=0", "--groups=987", "--bounding-set=-all",
+                "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::shard_inventory_ignores_unlisted_foreign_0700_directory", "--nocapture"])
+            .env(CHILD, root.as_ref()).output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
     fn shard_inventory_pins_population_and_retries_once_outside_publication_lock() {
         assert_shard_inventory(None);
     }
 
     #[test]
-    fn shard_inventory_hides_counts_when_a_tree_cannot_be_read() {
-        assert_shard_inventory(Some("unreadable-tree"));
-    }
-
-    #[test]
     fn shard_inventory_hides_counts_when_shard_link_resolution_fails() {
-        assert_shard_inventory(Some("continuous-lab-import/.dataset-rollback.fixture/event-shards/broken-link"));
+        assert_shard_inventory(Some("continuous-lab-import/dataset/event-shards/shard-broken-link.jsonl"));
     }
 
     #[test]
     fn shard_inventory_withholds_all_totals_on_failure_in_each_phase() {
         use event_shard_inventory::FailurePoint::*;
         assert_shard_inventory_with_failures(None, &[
-            ActiveManifest, BackupRoots, Directory, Link, Manifest, Archive, Shard, Finish,
+            ActiveManifest, Link, Shard, Finish,
         ], false);
     }
 
@@ -24704,39 +24725,17 @@ Content-Length: 0\r\n\
         failures: &[event_shard_inventory::FailurePoint],
         dangling: bool,
     ) {
-        use event_shard_inventory::{FAIL_AT, REQUIRED_BACKUPS};
+        use event_shard_inventory::{FAIL_AT, TEST_ALLOWLIST};
 
-        let bench = RetentionBench0_7_0::new("shard-gc-union");
-        let backups = bench._root.join(".gc-backups");
-        let archive_fixture = temporary_root("shard-gc-backup-source");
-        let make_archive = |path: &Path, members: &[&str]| {
-            assert!(std::process::Command::new("/usr/bin/tar")
-                .args(["--zstd", "-cf"])
-                .arg(path)
-                .arg("-C").arg(archive_fixture.as_ref()).args(members)
-                .status().unwrap().success());
+        let foreign_root = std::env::var_os("OIRAN_8D_FOREIGN_DIRECTORY_TEST").map(PathBuf::from);
+        let bench = match &foreign_root {
+            Some(root) => RetentionBench0_7_0::with_root(TempRoot(root.clone())),
+            None => RetentionBench0_7_0::new("shard-gc-union"),
         };
-        for (name, expected) in REQUIRED_BACKUPS {
-            let directory = backups.join(name);
-            fs::create_dir_all(&directory).unwrap();
-            if let Some((path, members)) = expected {
-                let artifact = directory.join(path);
-                if members.is_empty() {
-                    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-                    fs::write(artifact, br#"{"dataset_id":"fixture"}"#).unwrap();
-                } else {
-                    for member in members {
-                        let manifest = archive_fixture.join(member);
-                        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-                        fs::write(manifest, br#"{"dataset_id":"fixture"}"#).unwrap();
-                    }
-                    make_archive(&artifact, members);
-                }
-            }
+        let foreign = foreign_root.map(|root| root.join(".deployment-backups").join("unlisted"));
+        if let Some(private) = &foreign {
+            assert_eq!(fs::read_dir(private).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
         }
-        let extra = backups.join("ANR2_oiran_2.21.166_predeploy_backup_20261124T2258Z");
-        fs::create_dir(&extra).unwrap();
-        fs::write(extra.join("dataset_manifest.json"), b"{}").unwrap();
         let (source, _, _) = corpus_0_7_0();
         let first = bench.cycle(None, &[("N2.pcap-source.pcapng", source)]);
         assert!(first.event_count > 0);
@@ -24770,10 +24769,8 @@ Content-Length: 0\r\n\
         let mut archived_manifest = serde_json::to_value(&first).unwrap();
         archived_manifest["event_shards"][0]["path"] =
             serde_json::json!("event-shards/shard-archive-reference.jsonl");
-        let (name, artifact) = REQUIRED_BACKUPS[1];
-        let (archive, members) = artifact.unwrap();
-        fs::write(archive_fixture.join(members[0]), serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
-        make_archive(&backups.join(name).join(archive), members);
+        let archive_manifest = rollback.join("dataset_manifest.archived.json");
+        fs::write(&archive_manifest, serde_json::to_vec(&archived_manifest).unwrap()).unwrap();
         let deployment = bench._root.join(".deployment-backups").join("release-A");
         fs::create_dir_all(&deployment).unwrap();
         let rollback_shard = fixture_shard("shard-deployment-only.jsonl");
@@ -24783,6 +24780,15 @@ Content-Length: 0\r\n\
         let second_deployment = deployment.with_file_name("release-B");
         fs::create_dir_all(&second_deployment).unwrap();
         fs::write(second_deployment.join("dataset_manifest.saved.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let allowlist = bench._root.join("rollback-allowlist.json");
+        let mut targets = vec![
+            serde_json::json!({"name":"release-A","manifest":deployment.join("dataset_manifest.saved.json"),"shards":["shard-deployment-only.jsonl"]}),
+            serde_json::json!({"name":"release-B","manifest":second_deployment.join("dataset_manifest.saved.json"),"shards":["shard-deployment-only.jsonl"]}),
+            serde_json::json!({"name":"restore","manifest":rollback.join("dataset_manifest.json"),"shards":[original.file_name().unwrap().to_str().unwrap()]}),
+            serde_json::json!({"name":"archive","manifest":archive_manifest,"shards":["shard-archive-reference.jsonl"]}),
+        ];
+        fs::write(&allowlist, serde_json::to_vec(&targets).unwrap()).unwrap();
+        TEST_ALLOWLIST.with(|path| *path.borrow_mut() = Some(allowlist.clone()));
         let unknown = shards.join("shard-missing-history.jsonl");
         fs::write(&unknown, b"{\"event_id\":\"missing-history\"}\n").unwrap();
         fs::File::open(&unknown).unwrap().set_modified(old).unwrap();
@@ -24800,14 +24806,10 @@ Content-Length: 0\r\n\
         ).unwrap();
         bench.manager.recover_continuous_dataset_from_disk(&bench.base).unwrap();
         if !failures.is_empty() {
-            let aliases = rollback.join("event-shards");
-            fs::create_dir(&aliases).unwrap();
-            std::os::unix::fs::symlink(&original, aliases.join("protected-link")).unwrap();
+            std::os::unix::fs::symlink(&original, shards.join("shard-protected-link.jsonl")).unwrap();
         }
         if dangling {
-            let aliases = rollback.join("event-shards");
-            fs::create_dir(&aliases).unwrap();
-            std::os::unix::fs::symlink(aliases.join("absent-target"), aliases.join("dangling-link")).unwrap();
+            std::os::unix::fs::symlink(shards.join("absent-target"), shards.join("shard-dangling-link.jsonl")).unwrap();
         }
         let bad_path = unreadable.map(|relative| {
             let path = bench._root.join(relative);
@@ -24847,6 +24849,24 @@ Content-Length: 0\r\n\
                 .map(|path| fs::metadata(path).unwrap().len()).sum::<u64>();
             assert_eq!(snapshot["bytes"], bytes);
             assert!(snapshot["error"].is_null());
+        }
+        if let Some(private) = foreign {
+            let manifest = private.join("dataset_manifest.json");
+            targets.push(serde_json::json!({
+                "name":"unreadable-authorized","manifest":manifest,
+                "shards":["shard-missing-history.jsonl"]
+            }));
+            fs::write(&allowlist, serde_json::to_vec(&targets).unwrap()).unwrap();
+            bench.manager.measure_continuous_event_shards(&dataset);
+            let degraded = bench.manager.event_shard_orphan_inventory();
+            assert_eq!(degraded["unreferenced"]["count"], 3);
+            assert_eq!(degraded["commit_seq"], snapshot["commit_seq"]);
+            assert_eq!(degraded["rollback_held"]["status"], "unavailable");
+            assert!(degraded["rollback_held"]["count"].is_null());
+            assert_eq!(degraded["rollback_held"]["error"]["path"], serde_json::json!(manifest));
+            assert!(degraded["rollback_held"]["error"]["reason"].as_str().unwrap().contains("Permission denied"));
+            TEST_ALLOWLIST.with(|path| path.replace(None));
+            return;
         }
         if bad_path.is_none() && failures.is_empty() && !dangling {
             use event_shard_inventory::AFTER_TRAVERSAL;
@@ -24895,8 +24915,9 @@ Content-Length: 0\r\n\
             fs::write(&damaged_manifest, b"{").unwrap();
             bench.manager.measure_continuous_event_shards(&dataset);
             let unavailable = bench.manager.event_shard_orphan_inventory();
-            assert_orphan_totals_unavailable(&unavailable);
-            assert_eq!(unavailable["error"]["path"], serde_json::json!(damaged_manifest));
+            assert_eq!(unavailable["unreferenced"]["count"], 5);
+            assert_eq!(unavailable["rollback_held"]["status"], "unavailable");
+            assert_eq!(unavailable["rollback_held"]["error"]["path"], serde_json::json!(damaged_manifest));
         }
         for &phase in failures {
             FAIL_AT.with(|point| point.set(Some(phase)));
@@ -24907,6 +24928,7 @@ Content-Length: 0\r\n\
             assert_eq!(snapshot["error"]["reason"], format!("injected read failure at {phase:?}"));
             assert!(snapshot["error"]["path"].is_string());
         }
+        TEST_ALLOWLIST.with(|path| path.replace(None));
         assert!([original, archived_reference, removable, unknown, newest_a, newest_b]
             .iter().all(|path| path.is_file()));
     }
