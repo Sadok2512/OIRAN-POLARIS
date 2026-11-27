@@ -24494,7 +24494,10 @@ Content-Length: 0\r\n\
 
     impl RetentionBench0_7_0 {
         fn new(label: &str) -> Self {
-            let root = temporary_root(label);
+            Self::with_root(temporary_root(label))
+        }
+
+        fn with_root(root: TempRoot) -> Self {
             let manager = CaptureManager::with_pseudonym_key_path(root.to_path_buf(), false, root.join(".oiran-pseudonym.key")).unwrap();
             manager.in_memory_session_events_limit.store(0, Ordering::SeqCst);
             let base = root.join(CONTINUOUS_CAPTURE_ID);
@@ -24668,6 +24671,29 @@ Content-Length: 0\r\n\
     }
 
     #[test]
+    fn shard_inventory_ignores_unlisted_foreign_0700_directory() {
+        const CHILD: &str = "OIRAN_8D_FOREIGN_DIRECTORY_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            assert_shard_inventory(None);
+            return;
+        }
+        let root = temporary_root("foreign-rollback-directory");
+        let private = root.join(".deployment-backups").join("unlisted");
+        fs::create_dir_all(&private).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(std::process::Command::new("chown").args(["995:987"])
+            .arg(&private).status().unwrap().success());
+        let output = std::process::Command::new("setpriv")
+            .args(["--reuid=0", "--regid=0", "--groups=987", "--bounding-set=-all",
+                "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::shard_inventory_ignores_unlisted_foreign_0700_directory", "--nocapture"])
+            .env(CHILD, root.as_ref()).output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
     fn shard_inventory_pins_population_and_retries_once_outside_publication_lock() {
         assert_shard_inventory(None);
     }
@@ -24706,7 +24732,15 @@ Content-Length: 0\r\n\
     ) {
         use event_shard_inventory::{FAIL_AT, REQUIRED_BACKUPS};
 
-        let bench = RetentionBench0_7_0::new("shard-gc-union");
+        let foreign_root = std::env::var_os("OIRAN_8D_FOREIGN_DIRECTORY_TEST").map(PathBuf::from);
+        let bench = match &foreign_root {
+            Some(root) => RetentionBench0_7_0::with_root(TempRoot(root.clone())),
+            None => RetentionBench0_7_0::new("shard-gc-union"),
+        };
+        let foreign = foreign_root.map(|root| root.join(".deployment-backups").join("unlisted"));
+        if let Some(private) = &foreign {
+            assert_eq!(fs::read_dir(private).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        }
         let backups = bench._root.join(".gc-backups");
         let archive_fixture = temporary_root("shard-gc-backup-source");
         let make_archive = |path: &Path, members: &[&str]| {
