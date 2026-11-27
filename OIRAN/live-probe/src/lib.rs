@@ -24912,12 +24912,26 @@ Content-Length: 0\r\n\
             assert_eq!(unavailable["error"]["commit_seq_after"], original_seq + 3);
 
             let damaged_manifest = deployment.join("dataset_manifest.saved.json");
-            fs::write(&damaged_manifest, b"{").unwrap();
-            bench.manager.measure_continuous_event_shards(&dataset);
-            let unavailable = bench.manager.event_shard_orphan_inventory();
-            assert_eq!(unavailable["unreferenced"]["count"], 5);
-            assert_eq!(unavailable["rollback_held"]["status"], "unavailable");
-            assert_eq!(unavailable["rollback_held"]["error"]["path"], serde_json::json!(damaged_manifest));
+            let contradictory = serde_json::json!({
+                "event_shards": [
+                    {"path":"event-shards/shard-missing-history.jsonl"},
+                    {}
+                ]
+            });
+            for (bytes, reason) in [
+                (serde_json::to_vec(&contradictory).unwrap(), "invalid shard path"),
+                (b"{".to_vec(), "invalid rollback manifest JSON"),
+                (b"[]".to_vec(), "manifest must be an object"),
+                (br#"{"event_shards":[{"path":"event-shards/shard-missing-history.jsonl"}]}"#.to_vec(),
+                 "disagrees with authorized shard declaration"),
+            ] {
+                fs::write(&damaged_manifest, bytes).unwrap();
+                bench.manager.measure_continuous_event_shards(&dataset);
+                let unavailable = bench.manager.event_shard_orphan_inventory();
+                assert_orphan_totals_unavailable(&unavailable);
+                assert_eq!(unavailable["error"]["path"], serde_json::json!(damaged_manifest));
+                assert!(unavailable["error"]["reason"].as_str().unwrap().contains(reason), "{unavailable}");
+            }
         }
         for &phase in failures {
             FAIL_AT.with(|point| point.set(Some(phase)));
