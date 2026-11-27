@@ -5502,7 +5502,7 @@ impl CaptureManager {
             {
                 self.shard_inventory_running.store(false, Ordering::Release);
                 let result = Err(event_shard_inventory::InventoryError::general(error.to_string()));
-                *self.shard_inventory_snapshot.lock().unwrap() = Some(result);
+                self.assign_shard_inventory(result);
             }
         }
     }
@@ -5511,7 +5511,28 @@ impl CaptureManager {
         let result = event_shard_inventory::measure(current, || {
             self.datasets.lock().unwrap().get(CONTINUOUS_DATASET_ID).cloned()
         });
-        *self.shard_inventory_snapshot.lock().unwrap() = Some(result);
+        self.assign_shard_inventory(result);
+    }
+
+    fn assign_shard_inventory(
+        &self,
+        result: Result<event_shard_inventory::Totals, event_shard_inventory::InventoryError>,
+    ) {
+        let commit_seq = result.as_ref().ok().map(|totals| totals.commit_seq);
+        let assigned_epoch_ms = {
+            let mut cache = self.shard_inventory_snapshot.lock().unwrap();
+            *cache = Some(result);
+            epoch_ms()
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "EVENT_SHARD_INVENTORY_CACHE_ASSIGNED",
+                "commit_seq": commit_seq,
+                "assigned_epoch_ms": assigned_epoch_ms,
+                "status": if commit_seq.is_some() { "available" } else { "unavailable" },
+            }),
+        );
     }
 
     fn process_continuous_capture_inner(
@@ -24763,6 +24784,32 @@ Content-Length: 0\r\n\
             .args(["--exact", "tests::shard_inventory_ignores_unlisted_foreign_0700_directory", "--nocapture"])
             .env(CHILD, root.as_ref()).output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn shard_inventory_journals_cache_assignment_with_sequence_and_instant() {
+        let started = epoch_ms();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::shard_inventory_pins_population_and_retries_once_outside_publication_lock", "--nocapture"])
+            .output().unwrap();
+        let finished = epoch_ms();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let assignments: Vec<Value> = stderr.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["event"] == "EVENT_SHARD_INVENTORY_CACHE_ASSIGNED")
+            .collect();
+        assert!(!assignments.is_empty(), "inventory assignments must be journaled");
+        assert!(assignments.iter().any(|line| {
+            line["status"] == "available" && line["commit_seq"].as_u64().is_some_and(|seq| seq > 0)
+        }));
+        assert!(assignments.iter().any(|line| {
+            line["status"] == "unavailable" && line.get("commit_seq") == Some(&Value::Null)
+        }));
+        for line in assignments {
+            let assigned = line["assigned_epoch_ms"].as_u64().expect("assignment instant");
+            assert!((started..=finished).contains(&assigned), "{line}");
+        }
     }
 
     #[test]

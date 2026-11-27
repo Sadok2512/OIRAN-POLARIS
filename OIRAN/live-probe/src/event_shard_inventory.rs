@@ -26,7 +26,7 @@ impl ShardUsage {
 }
 
 pub(super) struct Totals {
-    commit_seq: u64,
+    pub(super) commit_seq: u64,
     publication_lock_held_ns: u64,
     unreferenced: ShardUsage,
     rollback_held: ShardUsage,

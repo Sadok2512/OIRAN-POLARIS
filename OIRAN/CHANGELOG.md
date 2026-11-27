@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.207 / live-probe 0.7.11 — shard inventory assignment journal
+
+Log the UTC assignment instant and measured commit sequence when the shard inventory cache receives a result.
+
 ## oiran-api 2.21.206 / session-engine 0.5.39 / Web 2.14.6 — N2 continuity evidence
 
 Expose a link on both PDU session details when the original rotation positions, directional SCTP endpoints, verification tag and wire TSNs prove continuity between setup and release. Historical references without original segment provenance remain unlinked. Session membership and accounting are preserved.
