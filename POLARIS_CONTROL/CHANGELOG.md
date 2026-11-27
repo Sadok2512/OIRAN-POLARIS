@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.36.37 — 2026-11-27 — Une session de trafic conclut à sa durée de mur ; ses échantillons sont datés à l'heure réelle (lot C1)
+
+Patch `polaris-control-api`. Ordre cœur #9 7213520584, audit #9 7212972142. Base : `55f480d` (0.36.35, relevée sur le processus par ANR2 #10 7213626334). Preuve : `proof/control-traffic-duration` @ `a888b5e`. **Numéro** : 0.36.36 est pris par le lot C3 de CLAUDE2 (`fix/control-0.36.36-history-digit-run`, même base).
+
+- **Durée** : sur le chemin 5G (`spawn_traffic_driver`), `duration_s` était compté en tours de boucle, chaque tour valant la mesure iperf3 **puis** une seconde de sommeil. À 1 Mbit/s (125 000 octets, ≈ 1 s de transfert plus les lancements `docker` / `nsenter`), une session de 20 s restait `RUNNING` plus de 40 s. La boucle s'arrête désormais à `duration_s` de mur ; un tour dure une seconde au moins, mesure comprise : plus de sommeil par-dessus une mesure qui a déjà duré une seconde, jamais de sommeil au-delà de l'échéance.
+- **Horodatage** : chaque échantillon était daté `départ + numéro du tour + 1`, ce qui affichait 20 s pour 40 s réelles et masquait le défaut. Il est daté à l'heure réelle de la mesure qu'il rapporte.
+- **Changement de comportement** : quand les mesures durent plus d'une seconde, une session compte moins d'échantillons qu'avant (un par mesure réelle, pas `duration_s`) ; le débit par seconde publié devient juste.
+- **OUVERT** : un tour déjà commencé à l'échéance termine sa mesure ; une mesure iperf3 qui s'accroche peut encore prolonger la session jusqu'à ses `timeout 30s`. Le chemin LTE (`spawn_lte_traffic_driver`) n'est pas modifié. Une session déclarée UDP reste mesurée en TCP sur le chemin 5G : lot C2, audit séparé.
+- **Tests** : `traffic_session_completes_at_wall_clock_duration_with_real_sample_times` (mesures de 1,2 s, session de 3 s : conclue avant 4,5 s, chaque échantillon daté à moins d'une seconde de la fin de sa mesure) — ROUGE à `55f480d` (« session de 3 s conclue en 6.611125018s »), VERT ici ; `traffic_session_with_fast_measurements_keeps_one_sample_per_second` (mesures de 50 ms : trois échantillons, conclusion à 3 s) — vert avant et après.
+
 ## 0.36.35 — Références d’adresses dans l’inventaire UE
 
 - Corrige une exposition antérieure au lot IMSI. L’API de l’inventaire renvoie une référence protégée pour les adresses NR, LTE et PDU attribuées. La table UE affiche cette référence.
