@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.37.4 — La porte E-RAB compte ses marqueurs sur le texte brut : une ligne qui porte aussi un mot d'identité n'est plus perdue (lot C10)
+
+Lot C10, ordre du cœur #9 7224408968, à la suite de l'écart C6 mesuré à zéro cooccurrence par ANR2. L'incident est fermé, le défaut de conception restait ouvert. Base : la production `995a173` (C9, 0.37.3). Reprise sur ordre du cœur #9 7225711657 : la première version de ce lot (`de8bf1a`, 0.37.5) était empilée sur C5 `8ca508b`, refusée ; elle ne se rebase pas sur du code refusé. C5bis suit en 0.37.5 sur cette tête. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché.
+
+- **Défaut.** `count_markers` et `count_ordered_marker_pairs` (porte `evaluate_erab_establishment`) comptaient **après** `sanitize_log_line`. Or cette fonction remplace **toute** la ligne dès qu'elle porte un mot d'identité, et la tronque à 500 caractères. Une ligne portant à la fois un marqueur de recette et un mot d'identité tombait donc du compteur **en silence**, et la porte pouvait conclure `LTE_ERAB_NOT_ESTABLISHED` à tort.
+- **Correction.** Le texte de comptage est la ligne **brute**, en minuscules et sur toute sa longueur (`marker_text`). Les lignes de vidage hexadécimal restent écartées comme avant. **On compte sur ce qu'on garde, on montre ce qui est assaini** : seuls des comptes sortent de la porte. Le flux stocké (`bounded_sanitized_log`), l'enregistrement de journal (`build_full_log_record`) et la preuve sérialisée passent par l'assainissement, sans changement.
+- **Garde** `a_marker_line_carrying_an_identity_word_is_counted_and_stays_redacted_0_37_5`. Un marqueur ICS, un marqueur MBR direct et la paire ordonnée MBR/PFCP portent chacun un mot d'identité synthétique. Le garde vérifie que :
+  - chacun est **compté** ;
+  - la porte passe ;
+  - **aucun** mot d'identité ni aucune valeur n'apparaît dans le flux stocké, la queue de l'enregistrement ou la preuve sérialisée ;
+  - chaque ligne stockée vaut `[REDACTED_SUBSCRIBER_MATERIAL]`.
+
+  Il est **rouge sur `995a173`** (`proof/control-c10-guard-on-995a173`) comme sur `8ca508b` (`proof/control-c10-guard-on-8ca508b`), avec le message `marqueur ICS + identité non compté` et un compte de 0, et vert ici.
+- **Déclaré :** un marqueur situé au-delà du 500ᵉ caractère d'une ligne est désormais compté lui aussi. C'est la même règle, « compter sur ce qu'on garde ».
+
 ## 0.37.3 — Reprise de l'History : le jumeau `started_at_epoch_s` ne se dérive jamais de la chaîne `started_at` (lot C9)
 
 Lot C9, ordre du cœur #9 7223299148, à la suite de l'écart déclaré en #9 7222978560 et 7223413399. Base : la tête de C8 `e41120b` (0.37.2), qui contient C7bis `22bb4a5`, la production 0.37.1. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché par ce lot.
