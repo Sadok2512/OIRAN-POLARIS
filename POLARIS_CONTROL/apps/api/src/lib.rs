@@ -10533,11 +10533,43 @@ fn sanitize_history_record_with(record: &Value, clear: bool) -> Value {
 }
 
 fn sanitize_history_value(value: &mut Value, clear: bool) {
+    // 0.37.1 (lot C7bis, ordre cœur #9 7222731801) — le filtre ne s'ouvre que
+    // sur une valeur dont la nature est vérifiable dans l'enregistrement
+    // lui-même. `started_at` (horodatage en texte, 10 chiffres jusqu'en 2286,
+    // donc remplacé à 100 % par le test de chiffres) n'est exempté que si les
+    // trois conditions sont réunies : il est au PREMIER niveau de
+    // l'enregistrement, `started_at_epoch_s` du même enregistrement est un
+    // NOMBRE, et `started_at` en est EXACTEMENT l'écriture décimale. Un
+    // `started_at` imbriqué, discordant ou sans jumeau passe par le filtre.
+    let proven_started_at = value.as_object().and_then(|record| {
+        let epoch = record.get("started_at_epoch_s")?.as_u64()?.to_string();
+        (record.get("started_at")?.as_str()? == epoch).then_some(epoch)
+    });
+    sanitize_history_value_at(value, clear, proven_started_at.as_deref());
+}
+
+/// 0.37.1 (lot C7bis) — `sender_sha256` / `receiver_sha256` (preuve de
+/// `TRANSFER_VERIFY`) : exemptés SEULEMENT si la valeur fait exactement 64
+/// caractères `0-9a-f`. Ces deux noms relevés, et aucun autre.
+fn is_proven_transfer_digest(field: &str, value: &Value) -> bool {
+    matches!(field, "sender_sha256" | "receiver_sha256")
+        && value.as_str().is_some_and(|text| {
+            text.len() == 64 && text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+fn sanitize_history_value_at(value: &mut Value, clear: bool, proven_started_at: Option<&str>) {
     match value {
         Value::Object(fields) => {
             for (field, value) in fields {
                 if srsran_controller::is_authentication_field_name(&field.to_ascii_lowercase()) {
                     *value = json!("PROTECTED");
+                    continue;
+                }
+                if field == "started_at" && proven_started_at.is_some() && value.as_str() == proven_started_at {
+                    continue;
+                }
+                if is_proven_transfer_digest(field, value) {
                     continue;
                 }
                 if matches!(field.as_str(), "error_code" | "cause" | "terminal_result") {
@@ -10552,10 +10584,10 @@ fn sanitize_history_value(value: &mut Value, clear: bool) {
                         continue;
                     }
                 }
-                sanitize_history_value(value, clear);
+                sanitize_history_value_at(value, clear, None);
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(|item| sanitize_history_value(item, clear)),
+        Value::Array(items) => items.iter_mut().for_each(|item| sanitize_history_value_at(item, clear, None)),
         Value::String(text) => {
             *text = sanitize_history_text_with(text, telemetry_pseudonym_key(), clear)
         }
@@ -10628,7 +10660,13 @@ fn without_own_history_tokens(value: &str) -> String {
     'scan: while index < bytes.len() {
         let boundary = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
         if boundary {
-            for prefix in ["addr-", "history-"] {
+            // 0.37.1 (lot C7, ordre cœur #9 7220805261) — aussi `psn-` et
+            // `scenario-` : mêmes références à 12 hexadécimaux produites par
+            // `safe_telemetry_reference_with_key`. L'ancrage sur exactement 12
+            // hexadécimaux suivis d'un non-hexadécimal laisse hors du retrait
+            // un jeton plus long (le littéral `psn-0123456789abcdef` à 16 du
+            // garde d'octets identiques de 0.36.30 reste testé et remplacé).
+            for prefix in ["addr-", "history-", "psn-", "scenario-"] {
                 let start = index + prefix.len();
                 let end = start + 12;
                 if value[index..].starts_with(prefix)
@@ -24351,6 +24389,149 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         check("réponse", &item);
         TEST_TELEMETRY_KEY.with(|key| key.set(None));
     }
+
+    /// 0.37.1 (lot C7) — fait passer une entrée par le parcours RÉEL de
+    /// l'History (écriture, relecture du fichier, mise à jour, réponse) et
+    /// applique `check` à chaque étape.
+    async fn history_real_path_0_37_1(job_id: &str, record: Value, check: impl Fn(&str, &Value)) {
+        let shared = Arc::new(state());
+        {
+            let mut runtime = shared.runtime.lock().unwrap();
+            runtime.history.push(record);
+            persist_runtime(&shared, &runtime);
+        }
+        let written: Value = serde_json::from_slice(&fs::read(&shared.job_state_path).unwrap()).unwrap();
+        check("écriture", &written["history"][0]);
+        *shared.runtime.lock().unwrap() = recover_runtime(Some(written));
+        check("relecture", &shared.runtime.lock().unwrap().history[0].clone());
+        let updated = update_definition_record(&shared, job_id, |record| {
+            record["state"] = json!("STOPPING");
+        })
+        .unwrap();
+        check("mise à jour", &updated);
+        let payload = history(State(shared.clone())).await.0;
+        let item = payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["job_id"] == job_id)
+            .cloned()
+            .expect("entrée servie");
+        check("réponse", &item);
+    }
+
+    /// 0.37.1 (lot C7, clause 1, ordre cœur #9 7220805261) — les références
+    /// `psn-` et `scenario-` à 12 hexadécimaux, dont le suffixe porte 10
+    /// chiffres, restent TELLES QUELLES à toutes les étapes ; le littéral à 16
+    /// hexadécimaux de 0.36.30 `psn-0123456789abcdef`, une vraie suite de
+    /// chiffres et un `imsi` restent `history-…`. Rouge sur `ed0169a`.
+    #[tokio::test]
+    async fn own_psn_and_scenario_references_survive_every_history_pass_0_37_1() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c7-path-telemetry-key-0.37.1-0123456789abcdef".as_slice())));
+        let record = json!({
+            "job_id": "c7-references", "state": "RUNNING",
+            "target_ue_pseudonym": "psn-0123456789ab",
+            "scenario_id": "scenario-9876543210fe",
+            "legacy_16": "psn-0123456789abcdef",
+            "real_digits": "subscriber 001010000000201 refused",
+            "marker": "imsi of peer unknown",
+        });
+        history_real_path_0_37_1("c7-references", record, |stage, record| {
+            assert_eq!(record["target_ue_pseudonym"], "psn-0123456789ab", "{stage} : référence psn- remplacée");
+            assert_eq!(record["scenario_id"], "scenario-9876543210fe", "{stage} : référence scenario- remplacée");
+            for field in ["legacy_16", "real_digits", "marker"] {
+                assert!(record[field].as_str().unwrap_or_default().starts_with("history-"), "{stage} / {field} : protection perdue");
+            }
+        })
+        .await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// 0.37.1 (lot C7bis, clause 2, ordre cœur #9 7222731801) — `started_at`
+    /// n'est exempté que s'il est au premier niveau ET égal, en texte, au
+    /// nombre `started_at_epoch_s` du même enregistrement. Cas adverses
+    /// d'ANR2 (#10 7222646595) : imbriqué entièrement numérique, premier
+    /// niveau discordant, premier niveau sans jumeau numérique ⇒ remplacés.
+    /// Rouge sur la production `5892f03`.
+    #[tokio::test]
+    async fn a_started_at_equal_to_its_numeric_twin_survives_every_history_pass_0_37_1() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c7-path-telemetry-key-0.37.1-0123456789abcdef".as_slice())));
+        let concordant = json!({
+            "job_id": "c7-started-at", "state": "RUNNING",
+            "started_at": "1795600000", "started_at_epoch_s": 1795600000u64,
+            "nested": [{"started_at": "1795600000", "started_at_epoch_s": 1795600000u64}],
+            "inner": {"started_at": "1795600000"},
+        });
+        history_real_path_0_37_1("c7-started-at", concordant, |stage, record| {
+            assert_eq!(record["started_at"], "1795600000", "{stage} : started_at concordant remplacé");
+            for (path, value) in [("nested[0]", &record["nested"][0]["started_at"]), ("inner", &record["inner"]["started_at"])] {
+                assert!(
+                    value.as_str().unwrap_or_default().starts_with("history-"),
+                    "{stage} / {path} : un started_at imbriqué entièrement numérique traverse le filtre"
+                );
+            }
+        })
+        .await;
+        let discordant = json!({
+            "job_id": "c7-started-at-discordant", "state": "RUNNING",
+            "started_at": "1795600001", "started_at_epoch_s": 1795600000u64,
+        });
+        history_real_path_0_37_1("c7-started-at-discordant", discordant, |stage, record| {
+            assert!(
+                record["started_at"].as_str().unwrap_or_default().starts_with("history-"),
+                "{stage} : un started_at discordant traverse le filtre"
+            );
+        })
+        .await;
+        let textual_twin = json!({
+            "job_id": "c7-started-at-text-twin", "state": "RUNNING",
+            "started_at": "1795600000", "started_at_epoch_s": "1795600000",
+        });
+        history_real_path_0_37_1("c7-started-at-text-twin", textual_twin, |stage, record| {
+            assert!(
+                record["started_at"].as_str().unwrap_or_default().starts_with("history-"),
+                "{stage} : un started_at dont le jumeau n'est pas un nombre traverse le filtre"
+            );
+        })
+        .await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
+    /// 0.37.1 (lot C7bis, clause 3, ordre cœur #9 7222731801) — les empreintes
+    /// `sender_sha256` / `receiver_sha256` de 64 hexadécimaux portant 10
+    /// chiffres d'affilée restent intactes, imbriquées dans `transfers` comme
+    /// en production ; une empreinte mal formée (63 caractères, majuscule) et
+    /// un autre nom de champ (`payload_sha256`) restent remplacés. Rouge sur
+    /// la production `5892f03`.
+    #[tokio::test]
+    async fn transfer_digests_of_64_hex_survive_every_history_pass_0_37_1() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c7-path-telemetry-key-0.37.1-0123456789abcdef".as_slice())));
+        let digest = format!("{}{}", "0123456789", "ab".repeat(27));
+        assert_eq!(digest.len(), 64);
+        let short = digest[..63].to_string();
+        let upper = format!("{}{}", "0123456789", "AB".repeat(27));
+        let record = json!({
+            "job_id": "c7-digests", "state": "RUNNING",
+            "transfers": [
+                {"sender_sha256": digest, "receiver_sha256": digest},
+                {"sender_sha256": short, "receiver_sha256": upper, "payload_sha256": digest},
+            ],
+        });
+        history_real_path_0_37_1("c7-digests", record, |stage, record| {
+            let transfers = &record["transfers"];
+            assert_eq!(transfers[0]["sender_sha256"], json!(digest), "{stage} : empreinte émetteur remplacée");
+            assert_eq!(transfers[0]["receiver_sha256"], json!(digest), "{stage} : empreinte récepteur remplacée");
+            for field in ["sender_sha256", "receiver_sha256", "payload_sha256"] {
+                assert!(
+                    transfers[1][field].as_str().unwrap_or_default().starts_with("history-"),
+                    "{stage} / {field} : valeur non prouvée exemptée"
+                );
+            }
+        })
+        .await;
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
 
     #[test]
     fn imsi_switch_keeps_ip_addresses_and_authentication_material_protected() {

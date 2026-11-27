@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.37.1 — History : les jetons `psn-`/`scenario-`, l'horodatage `started_at` prouvé et les empreintes SHA-256 de transfert ne sont plus remplacés par le test des chiffres
+
+Lot C7bis, ordre du cœur #9 7222731801. Il remplace C7 `6dae3cd`, refusé par ANR2 (#10 7222646595). Base : la production `5892f03` (0.37.0, C2b). Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché.
+
+Le principe : **le filtre ne s'ouvre que sur une valeur dont la nature se vérifie dans l'enregistrement lui-même**. On n'exempte pas un nom de champ, on exempte une valeur prouvée.
+
+- **Clause 1, jetons propres du filtre.** Le test des 10 chiffres ignore `addr-`, `history-`, **`psn-`** et **`scenario-`**, chacun ancré sur exactement 12 hexadécimaux suivis d'un caractère non hexadécimal. Le littéral à 16 hexadécimaux de 0.36.30, `psn-0123456789abcdef`, échappe à l'ancrage : il **reste remplacé**, et le garde d'octets identiques reste vert.
+- **Clause 2, `started_at`.** Il est exempté **seulement** si trois conditions sont réunies :
+  - il est au **premier niveau** de l'enregistrement ;
+  - `started_at_epoch_s` du même enregistrement est un **nombre** ;
+  - `started_at` en est **exactement** l'écriture décimale.
+
+  Un `started_at` imbriqué, même entièrement numérique, passe par le filtre, ainsi qu'une valeur discordante ou une valeur sans jumeau numérique. Le `started_at` exempté n'apporte rien qui ne soit déjà en clair dans `started_at_epoch_s`.
+- **Clause 3, empreintes de `TRANSFER_VERIFY`.** `sender_sha256` et `receiver_sha256` sont exemptés **seulement** si la valeur fait exactement 64 caractères `0-9a-f`. Il n'y a pas de règle générique en `*_sha256` : un autre nom de champ, ou une forme non stricte (63 caractères, majuscules), passe par le filtre. Avant ce lot, environ 18 % des empreintes (probabilité 0,1812) étaient remplacées, ce qui rendait la comparaison émetteur/récepteur impossible.
+- **Gardes**, sur le parcours réel de l'History (écriture, relecture, mise à jour, réponse), un par clause :
+  - `own_psn_and_scenario_references_survive_every_history_pass_0_37_1` ;
+  - `a_started_at_equal_to_its_numeric_twin_survives_every_history_pass_0_37_1`, qui couvre aussi les cas adverses d'ANR2 : `started_at` imbriqué entièrement numérique, discordant, et jumeau non numérique ;
+  - `transfer_digests_of_64_hex_survive_every_history_pass_0_37_1`.
+
+  Les trois sont **rouges sur `5892f03`** (`proof/control-c7bis-guards-on-5892f03`) et verts ici. Le garde de la clause 2 est aussi rouge sur C7 `6dae3cd`, sur le cas imbriqué entièrement numérique.
+- **Non couvert, déclaré :**
+  - les textes fournis par l'utilisateur ;
+  - **aucune réparation rétroactive** : les empreintes déjà remplacées sont perdues.
+
 ## 0.37.0 — 2026-11-27 — Le chemin 5G déclare le TCP qu'il mesure, et refuse l'UDP qu'il ne mesure pas (lot C2b)
 
 **Mineure** `polaris-control-api` : des requêtes acceptées jusqu'ici sont désormais refusées, et une variable d'environnement cesse d'avoir effet. Ordre cœur #9 7214037835 et 7216533055, audit #9 7213941919. Base : 0.36.38 (lot C4).
