@@ -23781,6 +23781,115 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         }
     }
 
+    /// 0.36.36 (lot C3, ordre cœur #9 7213520584) — garde adverse d'ANR1
+    /// (#10 7088604418) : 1 024 adresses synthétiques dans un texte d'History,
+    /// clé de télémétrie fixée. AUCUNE ne perd son pseudonyme `addr-*`, aucune
+    /// n'apparaît en clair. Avant 0.36.36 : la suite de 10 chiffres était
+    /// cherchée sur la chaîne DÉJÀ pseudonymisée, et le suffixe hexadécimal
+    /// d'un `addr-*` pouvait à lui seul la former (classe exacte
+    /// `P = 68359375 / 2^32`, #9 7212993786) : toute la chaîne devenait
+    /// `history-…`. La protection des vraies suites de chiffres et des
+    /// marqueurs d'identité est vérifiée dans le même garde.
+    #[test]
+    fn no_address_loses_its_pseudonym_in_history_0_36_36() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c3-adversarial-telemetry-key-0.36.36-0123456789".as_slice())));
+        let mut lost = Vec::new();
+        for index in 0u32..1024 {
+            let address = format!("10.{}.{}.1", index >> 8, index & 0xff);
+            let text = format!("UE_START_FAILED from {address} refused");
+            let out = sanitize_history_text_with_key(&text, telemetry_pseudonym_key());
+            assert!(!out.contains(&address), "adresse en clair : index {index}");
+            if !out.contains("addr-") || out.starts_with("history-") {
+                lost.push(index);
+            }
+        }
+        // Les vraies suites de chiffres et les identités restent protégées.
+        let protected = [
+            "subscriber 001010000000201 at 10.45.0.2 refused",
+            "UE_START_FAILED imsi-001010000000201",
+            "imsi of peer 10.45.0.2 unknown",
+        ];
+        for text in protected {
+            let out = sanitize_history_text_with_key(text, telemetry_pseudonym_key());
+            assert!(out.starts_with("history-"), "protection perdue pour une suite ou un marqueur réel");
+        }
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+        assert!(lost.is_empty(), "{} adresses sur 1 024 perdent leur pseudonyme addr-* : {:?}", lost.len(), lost);
+    }
+
+    /// 0.36.36 (refus ANR2 #10 7216338396, ordre cœur #9 7216533055) — le
+    /// PARCOURS RÉEL de l'History : écriture (`persist_runtime`), relecture du
+    /// fichier (`recover_runtime`), mise à jour (`update_definition_record`),
+    /// puis réponse de `GET /scenarios/history`. L'adresse est CHOISIE pour que
+    /// le suffixe de son pseudonyme porte 10 chiffres consécutifs sous la clé
+    /// du test : elle garde son `addr-…` à CHAQUE étape. Dans la même entrée,
+    /// une vraie suite de chiffres et un marqueur `imsi` restent `history-…`.
+    /// Rouge sur `55f480d` (perte dès l'écriture) et sur `ecc1be6` (perte au
+    /// passage suivant).
+    #[tokio::test]
+    async fn an_address_keeps_its_pseudonym_through_write_reload_update_and_response_0_36_36() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c3-path-telemetry-key-0.36.36-0123456789abcdef".as_slice())));
+        let ten_digits = |text: &str| {
+            text.bytes()
+                .fold((false, 0usize), |(found, run), byte| {
+                    let run = if byte.is_ascii_digit() { run + 1 } else { 0 };
+                    (found || run >= 10, run)
+                })
+                .0
+        };
+        let address = (0u32..1024)
+            .map(|index| format!("10.{}.{}.1", index >> 8, index & 0xff))
+            .find(|candidate| ten_digits(&safe_telemetry_reference_with_key("addr", candidate, telemetry_pseudonym_key())))
+            .expect("une adresse de la classe parmi 1 024");
+        let text = format!("UE_START_FAILED from {address} refused");
+        let shared = Arc::new(state());
+        {
+            let mut runtime = shared.runtime.lock().unwrap();
+            runtime.history.push(json!({
+                "job_id": "c3-path-guard", "state": "RUNNING",
+                "detail": text, "error_code": text, "nested": [text],
+                "real_digits": "subscriber 001010000000201 refused",
+                "marker": "imsi of peer 10.45.0.2 unknown",
+            }));
+            persist_runtime(&shared, &runtime);
+        }
+        let check = |stage: &str, record: &Value| {
+            for field in ["detail", "error_code"] {
+                let value = record[field].as_str().unwrap_or_default();
+                assert!(!value.contains(&address), "{stage} / {field} : adresse en clair");
+                assert!(value.contains("addr-") && !value.starts_with("history-"), "{stage} / {field} : pseudonyme perdu ({value})");
+            }
+            let nested = record["nested"][0].as_str().unwrap_or_default();
+            assert!(nested.contains("addr-") && !nested.starts_with("history-"), "{stage} / nested : pseudonyme perdu ({nested})");
+            for field in ["real_digits", "marker"] {
+                assert!(record[field].as_str().unwrap_or_default().starts_with("history-"), "{stage} / {field} : protection perdue");
+            }
+        };
+        // 1. écriture
+        let written: Value = serde_json::from_slice(&fs::read(&shared.job_state_path).unwrap()).unwrap();
+        check("écriture", &written["history"][0]);
+        // 2. relecture du fichier, comme au redémarrage
+        *shared.runtime.lock().unwrap() = recover_runtime(Some(written));
+        check("relecture", &shared.runtime.lock().unwrap().history[0].clone());
+        // 3. mise à jour
+        let updated = update_definition_record(&shared, "c3-path-guard", |record| {
+            record["state"] = json!("STOPPING");
+        })
+        .unwrap();
+        check("mise à jour", &updated);
+        // 4. réponse
+        let payload = history(State(shared.clone())).await.0;
+        let item = payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["job_id"] == "c3-path-guard")
+            .cloned()
+            .expect("entrée servie");
+        check("réponse", &item);
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
     #[test]
     fn imsi_switch_keeps_ip_addresses_and_authentication_material_protected() {
         for value in ["peer 192.0.2.1", "peer 2001:db8::1"] {
