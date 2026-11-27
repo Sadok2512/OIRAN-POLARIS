@@ -24533,6 +24533,67 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
     }
 
 
+    /// 0.37.3 (lot C9, ordre cœur #9 7223299148) — un enregistrement relu
+    /// SANS jumeau `started_at_epoch_s`, avec un `started_at` de quinze
+    /// chiffres parseable en `u64`, ne fabrique pas son jumeau à la reprise :
+    /// après `recover_runtime`, à la réponse, à la mise à jour et à
+    /// l'écriture, `started_at` est remplacé, `started_at_epoch_s` reste
+    /// absent et `ended_at_epoch_s` ne porte pas la valeur. Un enregistrement
+    /// AVEC jumeau numérique concordant garde son `started_at` (clause 2 de
+    /// 0.37.1). Rouge sur la tête de C8, vert après.
+    #[tokio::test]
+    async fn a_started_at_without_twin_never_creates_its_own_twin_on_recovery_0_37_3() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c9-recovery-telemetry-key-0.37.3-0123456789abcdef".as_slice())));
+        const PLANTED: u64 = 123_456_789_012_345;
+        let stored = json!({"history": [
+            {"job_id": "c9-no-twin", "scenario_id": "c9-no-twin", "state": "COMPLETED",
+             "started_at": PLANTED.to_string(), "duration_seconds": 7},
+            {"job_id": "c9-twin", "scenario_id": "c9-twin", "state": "COMPLETED",
+             "started_at": "1795600000", "started_at_epoch_s": 1_795_600_000_u64, "duration_seconds": 7},
+        ]});
+        let shared = Arc::new(state());
+        *shared.runtime.lock().unwrap() = recover_runtime(Some(stored));
+        let planted_text = PLANTED.to_string();
+        let carries_planted = |value: &Value| -> bool {
+            let text = value.to_string();
+            text.contains(&planted_text) || text.contains(&(PLANTED + 7).to_string())
+        };
+        let check = |stage: &str, no_twin: &Value, twin: &Value| {
+            assert!(
+                no_twin["started_at"].as_str().unwrap_or_default().starts_with("history-"),
+                "{stage} : un started_at sans jumeau traverse le filtre"
+            );
+            assert!(no_twin.get("started_at_epoch_s").is_none(), "{stage} : jumeau fabriqué depuis la chaîne");
+            assert!(!carries_planted(no_twin), "{stage} : la valeur plantée sort en clair");
+            assert_eq!(twin["started_at"], "1795600000", "{stage} : started_at concordant remplacé");
+        };
+        let find = |items: &[Value], id: &str| items.iter().find(|item| item["job_id"] == id).cloned().expect(id);
+        let served = history(State(shared.clone())).await.0;
+        let items = served["items"].as_array().unwrap().clone();
+        check("réponse", &find(&items, "c9-no-twin"), &find(&items, "c9-twin"));
+        let updated = update_definition_record(&shared, "c9-no-twin", |record| {
+            record["state"] = json!("STOPPED");
+        })
+        .unwrap();
+        let twin = update_definition_record(&shared, "c9-twin", |record| {
+            record["state"] = json!("STOPPED");
+        })
+        .unwrap();
+        check("mise à jour", &updated, &twin);
+        {
+            let runtime = shared.runtime.lock().unwrap();
+            persist_runtime(&shared, &runtime);
+        }
+        let written: Value = serde_json::from_slice(&fs::read(&shared.job_state_path).unwrap()).unwrap();
+        let written_items = written["history"].as_array().unwrap().clone();
+        check("écriture", &find(&written_items, "c9-no-twin"), &find(&written_items, "c9-twin"));
+        *shared.runtime.lock().unwrap() = recover_runtime(Some(written));
+        let served = history(State(shared.clone())).await.0;
+        let items = served["items"].as_array().unwrap().clone();
+        check("seconde reprise", &find(&items, "c9-no-twin"), &find(&items, "c9-twin"));
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+    }
+
     #[test]
     fn imsi_switch_keeps_ip_addresses_and_authentication_material_protected() {
         for value in ["peer 192.0.2.1", "peer 2001:db8::1"] {
