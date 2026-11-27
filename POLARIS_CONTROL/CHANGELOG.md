@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.37.5 — La porte E-RAB compte ses marqueurs sur le texte brut : une ligne qui porte aussi un mot d'identité n'est plus perdue (lot C10)
+
+Lot C10, ordre du cœur #9 7224408968, à la suite de l'écart C6 mesuré à zéro cooccurrence par ANR2. L'incident est fermé, le défaut de conception restait ouvert. Base : la tête de C5 `8ca508b` (0.37.4), qui contient C9 `995a173`. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché.
+
+- **Défaut.** `count_markers` et `count_ordered_marker_pairs` (porte `evaluate_erab_establishment`) comptaient **après** `sanitize_log_line`. Or cette fonction remplace **toute** la ligne dès qu'elle porte un mot d'identité, et la tronque à 500 caractères. Une ligne portant à la fois un marqueur de recette et un mot d'identité tombait donc du compteur **en silence**, et la porte pouvait conclure `LTE_ERAB_NOT_ESTABLISHED` à tort.
+- **Correction.** Le texte de comptage est la ligne **brute**, en minuscules et sur toute sa longueur (`marker_text`). Les lignes de vidage hexadécimal restent écartées comme avant. **On compte sur ce qu'on garde, on montre ce qui est assaini** : seuls des comptes sortent de la porte. Le flux stocké (`bounded_sanitized_log`), l'enregistrement de journal (`build_full_log_record`) et la preuve sérialisée passent par l'assainissement, sans changement.
+- **Garde** `a_marker_line_carrying_an_identity_word_is_counted_and_stays_redacted_0_37_5`. Un marqueur ICS, un marqueur MBR direct et la paire ordonnée MBR/PFCP portent chacun un mot d'identité synthétique. Le garde vérifie que :
+  - chacun est **compté** ;
+  - la porte passe ;
+  - **aucun** mot d'identité ni aucune valeur n'apparaît dans le flux stocké, la queue de l'enregistrement ou la preuve sérialisée ;
+  - chaque ligne stockée vaut `[REDACTED_SUBSCRIBER_MATERIAL]`.
+
+  Il est **rouge sur `8ca508b`** (`proof/control-c10-guard-on-8ca508b` : `marqueur ICS + identité non compté`, compte 0) et vert ici.
+- **Déclaré :** un marqueur situé au-delà du 500ᵉ caractère d'une ligne est désormais compté lui aussi. C'est la même règle, « compter sur ce qu'on garde ».
+
 ## 0.37.4 — 2026-11-27 — Une clé n'est jamais assainie, un marqueur d'abonné est refusé à l'entrée, une recherche perdue n'est plus avalée (lot C5)
 
 Patch. Ordres cœur #9 7218377047, 7218858535 (règles arbitrées), 7223299148 (version et base), audit CLAUDE2 #9 7218478108. Base : 0.37.3 @ `995a173` (C9, production). Antériorité mesurée par ANR2 : 1 échec sur 42 passages sur `55f480d`.
