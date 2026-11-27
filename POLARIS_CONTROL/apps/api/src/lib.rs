@@ -10559,7 +10559,16 @@ fn sanitize_history_text_with(value: &str, key: Option<&[u8]>, clear: bool) -> S
     let identity_marker = ["imsi", "supi", "msisdn", "imei"]
         .iter()
         .any(|marker| lower.contains(marker));
-    let long_digit_run = without_addresses
+    // 0.36.36 (lot C3, ordre cœur #9 7213520584) — la suite de 10 chiffres
+    // est cherchée dans le texte D'ORIGINE, avant le remplacement des
+    // adresses. Avant : sur `without_addresses`, où le suffixe hexadécimal
+    // d'un `addr-*` pouvait à lui seul former la suite (classe exacte
+    // `P = 68359375 / 2^32`, #9 7212993786) et faire remplacer toute la
+    // chaîne. Une adresse IPv4 ou IPv6 ne porte jamais 10 chiffres d'affilée
+    // (au plus 3 entre deux points, 4 entre deux deux-points) : les vraies
+    // suites restent détectées à l'identique, et l'entrée du HMAC
+    // `history-…` est inchangée.
+    let long_digit_run = value
         .bytes()
         .fold((false, 0_usize), |(found, run), byte| {
             let run = if byte.is_ascii_digit() { run + 1 } else { 0 };
@@ -23779,6 +23788,42 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
                 "stopped-UE payload must not expose {banned}: {body}",
             );
         }
+    }
+
+    /// 0.36.36 (lot C3, ordre cœur #9 7213520584) — garde adverse d'ANR1
+    /// (#10 7088604418) : 1 024 adresses synthétiques dans un texte d'History,
+    /// clé de télémétrie fixée. AUCUNE ne perd son pseudonyme `addr-*`, aucune
+    /// n'apparaît en clair. Avant 0.36.36 : la suite de 10 chiffres était
+    /// cherchée sur la chaîne DÉJÀ pseudonymisée, et le suffixe hexadécimal
+    /// d'un `addr-*` pouvait à lui seul la former (classe exacte
+    /// `P = 68359375 / 2^32`, #9 7212993786) : toute la chaîne devenait
+    /// `history-…`. La protection des vraies suites de chiffres et des
+    /// marqueurs d'identité est vérifiée dans le même garde.
+    #[test]
+    fn no_address_loses_its_pseudonym_in_history_0_36_36() {
+        TEST_TELEMETRY_KEY.with(|key| key.set(Some(b"c3-adversarial-telemetry-key-0.36.36-0123456789".as_slice())));
+        let mut lost = Vec::new();
+        for index in 0u32..1024 {
+            let address = format!("10.{}.{}.1", index >> 8, index & 0xff);
+            let text = format!("UE_START_FAILED from {address} refused");
+            let out = sanitize_history_text_with_key(&text, telemetry_pseudonym_key());
+            assert!(!out.contains(&address), "adresse en clair : index {index}");
+            if !out.contains("addr-") || out.starts_with("history-") {
+                lost.push(index);
+            }
+        }
+        // Les vraies suites de chiffres et les identités restent protégées.
+        let protected = [
+            "subscriber 001010000000201 at 10.45.0.2 refused",
+            "UE_START_FAILED imsi-001010000000201",
+            "imsi of peer 10.45.0.2 unknown",
+        ];
+        for text in protected {
+            let out = sanitize_history_text_with_key(text, telemetry_pseudonym_key());
+            assert!(out.starts_with("history-"), "protection perdue pour une suite ou un marqueur réel");
+        }
+        TEST_TELEMETRY_KEY.with(|key| key.set(None));
+        assert!(lost.is_empty(), "{} adresses sur 1 024 perdent leur pseudonyme addr-* : {:?}", lost.len(), lost);
     }
 
     #[test]

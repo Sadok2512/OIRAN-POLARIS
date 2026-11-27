@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.36.36 — History : une adresse ne perd plus son pseudonyme `addr-*`
+
+Lot C3, ordre cœur #9 7213520584, sur l'écart fermé comme diagnostic en #9 7212993786. Montée : **patch**, de `polaris-control-api` seul. Le web n'est pas touché et reste en 0.36.35.
+
+- **Défaut.** `sanitize_history_text_with` cherchait la suite d'au moins 10 chiffres sur la chaîne **déjà pseudonymisée**. Le suffixe hexadécimal d'un `addr-*` (12 caractères, 6 octets HMAC-SHA-256) pouvait former cette suite à lui seul, et toute la chaîne devenait `history-…`. C'est une classe exacte et déterministe par clé : `P = 68359375 / 2^32 ≈ 1,59 %` des adresses. Il n'y avait aucune fuite.
+- **Corrigé.** La suite est cherchée dans le texte **d'origine**, avant le remplacement des adresses. Une adresse IPv4 ou IPv6 ne porte jamais 10 chiffres d'affilée : les vraies suites et les marqueurs d'identité restent protégés à l'identique, et l'entrée du HMAC `history-…` ne change pas. Aucun format de pseudonyme ne change.
+- **Non rétroactif, sur décision du cœur.** Les entrées d'History déjà écrites gardent leur `history-…` : aucune réparation n'est tentée.
+- **Garde.** `no_address_loses_its_pseudonym_in_history_0_36_36` prend 1 024 adresses, avec une clé fixée : 0 perte, 0 adresse en clair, et la protection des vraies suites et des identités vérifiée. **Rouge sur `55f480d`** : 11 adresses sur 1 024 perdues (branche `proof/control-c3-history-digit-run-on-55f480d` @ `a4df3bc`).
+
 ## 0.36.35 — Références d’adresses dans l’inventaire UE
 
 - Corrige une exposition antérieure au lot IMSI. L’API de l’inventaire renvoie une référence protégée pour les adresses NR, LTE et PDU attribuées. La table UE affiche cette référence.
