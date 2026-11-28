@@ -10912,6 +10912,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sessions_list_keeps_the_shared_session_in_each_requested_live_dataset() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let mut config = test_config(workspace, "sessions-list-shared-session");
+        config.reference_dataset_enabled = false;
+        config.capture_root = temporary_directory("sessions-list-shared-session");
+        let mut flow: Value = serde_json::from_slice(
+            &fs::read(workspace.join("OIRAN_5G_E2E_CALLFLOW.json")).unwrap(),
+        ).unwrap();
+        let session_id = "5g-session-shared";
+        flow["session_id"] = json!(session_id);
+
+        for (capture_id, dataset_id) in [("capture-a", "dataset-a"), ("capture-b", "dataset-b")] {
+            let base = config.capture_root.join(capture_id);
+            let dataset = base.join("dataset");
+            fs::create_dir_all(dataset.join("callflows")).unwrap();
+            let job = json!({
+                "capture_id": capture_id, "probe_id": "fixture", "name": "fixture",
+                "profile": "fixture", "interfaces": [], "state": "COMPLETED",
+                "created_epoch_ms": 0, "owner": "fixture",
+                "metrics": live_probe::CaptureMetrics::default(),
+                "output_directory": base, "dataset_id": dataset_id,
+                "session_ids": [session_id], "process_ids": []
+            });
+            let manifest = json!({
+                "dataset_id": dataset_id, "capture_id": capture_id, "path": dataset,
+                "event_count": 0, "session_ids": [session_id], "decode_reports": {},
+                "checksums": {}, "state": "PUBLISHED"
+            });
+            fs::write(base.join("job.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+            fs::write(dataset.join("dataset_manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+            fs::write(
+                dataset.join("callflows").join(format!("{session_id}.json")),
+                serde_json::to_vec(&flow).unwrap(),
+            ).unwrap();
+        }
+
+        let state = AppState::load(config).unwrap();
+        for dataset_id in ["dataset-a", "dataset-b"] {
+            assert!(state.inner.capture_manager.callflow(dataset_id, session_id).is_some());
+        }
+        let app = router(state, None);
+        for dataset_id in ["dataset-a", "dataset-b"] {
+            let response = app.clone().oneshot(req(
+                &format!("/api/v1/sessions?dataset_id={dataset_id}"),
+                false,
+            )).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["meta"]["total"], 1, "dataset {dataset_id}");
+            assert_eq!(body["data"][0]["dataset_id"], dataset_id);
+            assert_eq!(body["data"][0]["session_id"], session_id);
+        }
+    }
+
     /// 2.7.19 (issue #9 part 2): /health and the on-disk
     /// `dataset_manifest.json` MUST come from the same LiveDataset. The
     /// ANR2 lab observed /health=25 939/10 while the on-disk manifest
