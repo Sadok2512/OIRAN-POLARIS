@@ -5618,10 +5618,16 @@ fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
     // 2N `statx`).
     let reads = SourceReads::new(state);
     let journey_index = cached_journey_index_with(state, &reads);
+    // Scope rows before deduplicating: the same session can belong to multiple datasets.
+    let dataset_matches = |dataset_id: Option<&str>| {
+        query.dataset_id.as_deref().is_none_or(|requested| Some(requested) == dataset_id)
+    };
+    let reference_dataset = state.inner.manifest.get("scenario_id").and_then(Value::as_str);
     let mut unique = state
         .inner
         .flows
         .values()
+        .filter(|_| dataset_matches(reference_dataset))
         .map(|flow| {
             let mut summary = session_summary(state, flow);
             decorate_subscriber_summary(&mut summary, flow, &journey_index);
@@ -5639,6 +5645,9 @@ fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
         })
         .collect::<BTreeMap<_, _>>();
     for dataset in state.inner.capture_manager.datasets() {
+        if !dataset_matches(Some(&dataset.dataset_id)) {
+            continue;
+        }
         for session_id in &dataset.session_ids {
             let Some(summary) =
                 cached_live_list_row_with(state, &reads, &dataset, session_id, &journey_index)
@@ -5650,6 +5659,9 @@ fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
     }
     if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
         for manifest in catalog {
+            if !dataset_matches(Some(&manifest.dataset_id)) {
+                continue;
+            }
             if let Ok(page) = state
                 .inner
                 .lte_evidence_store
@@ -5678,9 +5690,6 @@ fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
     if let Some(search) = query.search.as_deref() {
         let q = search.to_ascii_lowercase();
         items.retain(|x| x.to_string().to_ascii_lowercase().contains(&q));
-    }
-    if let Some(dataset) = query.dataset_id.as_deref() {
-        items.retain(|item| item["dataset_id"] == dataset);
     }
     if let Some(dataset_kind) = query.dataset_kind.as_deref() {
         items.retain(|item| item["dataset_kind"] == dataset_kind);

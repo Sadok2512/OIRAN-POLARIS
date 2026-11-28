@@ -1,5 +1,9 @@
 # Changelog
 
+## oiran-api 2.21.208 — dataset-scoped session lists
+
+Apply the requested dataset scope before deduplicating sessions so that each dataset list keeps its own row for a shared session identifier.
+
 ## oiran-api 2.21.207 / live-probe 0.7.11 — shard inventory assignment journal
 
 Log the UTC assignment instant and measured commit sequence when the shard inventory cache receives a result.
